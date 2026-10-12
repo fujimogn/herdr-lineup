@@ -46,16 +46,36 @@ impl Default for Settings {
 /// Safe fixed failure categories. Never retain a URL, response body or auth error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
-    Credentials,
+    AuthMissing,
+    AuthIo,
+    AuthShape,
+    AuthAmbiguous,
+    Unauthorized,
     Request,
     Transient,
     InvalidResponse,
 }
 
+impl Failure {
+    pub(crate) fn diagnostic(self) -> crate::doctor::WeeklyResult {
+        use crate::doctor::WeeklyResult;
+        match self {
+            Self::AuthMissing => WeeklyResult::AuthMissing,
+            Self::AuthIo => WeeklyResult::AuthIo,
+            Self::AuthShape => WeeklyResult::AuthShape,
+            Self::AuthAmbiguous => WeeklyResult::AuthAmbiguous,
+            Self::Unauthorized => WeeklyResult::Unauthorized,
+            Self::Request => WeeklyResult::Request,
+            Self::Transient => WeeklyResult::Transient,
+            Self::InvalidResponse => WeeklyResult::InvalidResponse,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WeeklyUsage {
     pub used_percent: f64,
-    pub resets_at: SystemTime,
+    pub resets_at: Option<SystemTime>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -77,7 +97,7 @@ pub fn auth_path(
     }
     let base = match grok_home {
         Some(path) => PathBuf::from(path),
-        None => PathBuf::from(home.ok_or(Failure::Credentials)?).join(".grok"),
+        None => PathBuf::from(home.ok_or(Failure::AuthMissing)?).join(".grok"),
     };
     Ok(base.join("auth.json"))
 }
@@ -90,6 +110,8 @@ pub struct Client {
     agent: ureq::Agent,
     next_request: Option<Instant>,
     cached: Outcome,
+    last_result: crate::doctor::WeeklyResult,
+    last_success: Option<Instant>,
 }
 
 impl Client {
@@ -123,7 +145,6 @@ impl Client {
             .timeout_global(Some(timeout))
             .max_redirects(0)
             .https_only(!cfg!(test))
-            .proxy(None)
             .build()
             .new_agent();
         Self {
@@ -132,8 +153,18 @@ impl Client {
             endpoint,
             agent,
             next_request: None,
-            cached: Outcome::Unavailable(Failure::Credentials),
+            cached: Outcome::Unavailable(Failure::AuthMissing),
+            last_result: crate::doctor::WeeklyResult::Pending,
+            last_success: None,
         }
+    }
+
+    pub(crate) fn last_success(&self) -> Option<Instant> {
+        self.last_success
+    }
+
+    pub(crate) fn last_result(&self) -> crate::doctor::WeeklyResult {
+        self.last_result
     }
 
     /// At most one request per configured interval, including after failures.
@@ -148,15 +179,25 @@ impl Client {
     fn poll_at(&mut self, now: Instant, wall_now: SystemTime) -> Outcome {
         if self.next_request.is_none_or(|next| now >= next) {
             self.next_request = Some(now + self.settings.interval);
-            self.cached = match self.fetch() {
+            let fetched = self.fetch();
+            if matches!(fetched, Ok(Outcome::Weekly(_))) {
+                self.last_success = Some(now);
+            }
+            self.last_result = match fetched {
+                Ok(Outcome::Weekly(_)) => crate::doctor::WeeklyResult::Ok,
+                Ok(Outcome::NonWeekly) => crate::doctor::WeeklyResult::NonWeekly,
+                Ok(Outcome::Unavailable(failure)) | Err(failure) => failure.diagnostic(),
+            };
+            self.cached = match fetched {
                 Ok(outcome) => outcome,
-                Err(Failure::Transient) if matches!(self.cached, Outcome::Weekly(usage) if usage.resets_at > wall_now) => {
+                Err(Failure::Transient) if matches!(self.cached, Outcome::Weekly(usage) if usage.resets_at.is_some_and(|reset| reset > wall_now)) => {
                     self.cached
                 }
                 Err(failure) => Outcome::Unavailable(failure),
             };
         }
-        if matches!(self.cached, Outcome::Weekly(usage) if usage.resets_at <= wall_now) {
+        if matches!(self.cached, Outcome::Weekly(usage) if usage.resets_at.is_some_and(|reset| reset <= wall_now))
+        {
             self.cached = Outcome::Unavailable(Failure::InvalidResponse);
         }
         self.cached
@@ -175,7 +216,7 @@ impl Client {
         }
         // Never format, store, log or return the HTTP library's errors.
         let mut response = request.call().map_err(|error| match error {
-            ureq::Error::StatusCode(401 | 403) => Failure::Credentials,
+            ureq::Error::StatusCode(401 | 403) => Failure::Unauthorized,
             ureq::Error::StatusCode(500..=599) => Failure::Transient,
             ureq::Error::StatusCode(_) => Failure::Request,
             _ => Failure::Transient,
@@ -211,29 +252,31 @@ struct Period {
 
 fn parse_billing(bytes: &[u8]) -> Result<Outcome, Failure> {
     let billing: Billing = serde_json::from_slice(bytes).map_err(|_| Failure::InvalidResponse)?;
-    match billing.config.current_period.r#type.as_str() {
-        "MONTHLY" => Ok(Outcome::NonWeekly),
-        "WEEKLY" => {
-            // Grok's proto3 schema omits the scalar for a new unused period.
-            let used_percent = billing.config.credit_usage_percent.unwrap_or(0.0);
-            if !used_percent.is_finite() || !(0.0..=100.0).contains(&used_percent) {
-                return Err(Failure::InvalidResponse);
-            }
-            let end = billing
-                .config
-                .current_period
-                .end
-                .ok_or(Failure::InvalidResponse)?;
-            let resets_at = chrono::DateTime::parse_from_rfc3339(&end)
-                .map_err(|_| Failure::InvalidResponse)?
-                .with_timezone(&chrono::Utc)
-                .into();
-            Ok(Outcome::Weekly(WeeklyUsage {
-                used_percent,
-                resets_at,
-            }))
+    let kind = billing.config.current_period.r#type.to_ascii_uppercase();
+    if kind.contains("WEEKLY") {
+        // Grok's proto3 schema omits the scalar for a new unused period.
+        let used_percent = billing.config.credit_usage_percent.unwrap_or(0.0);
+        if !used_percent.is_finite() || !(0.0..=100.0).contains(&used_percent) {
+            return Err(Failure::InvalidResponse);
         }
-        _ => Err(Failure::InvalidResponse),
+        let resets_at = billing
+            .config
+            .current_period
+            .end
+            .map(|end| {
+                chrono::DateTime::parse_from_rfc3339(&end)
+                    .map(|value| value.with_timezone(&chrono::Utc).into())
+                    .map_err(|_| Failure::InvalidResponse)
+            })
+            .transpose()?;
+        Ok(Outcome::Weekly(WeeklyUsage {
+            used_percent,
+            resets_at,
+        }))
+    } else if kind.contains("MONTHLY") {
+        Ok(Outcome::NonWeekly)
+    } else {
+        Err(Failure::InvalidResponse)
     }
 }
 
@@ -324,19 +367,25 @@ impl<'de> Deserialize<'de> for AuthNode {
 }
 
 fn read_credentials(path: &Path) -> Result<Credentials, Failure> {
-    let file = std::fs::File::open(path).map_err(|_| Failure::Credentials)?;
+    let file = std::fs::File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Failure::AuthMissing
+        } else {
+            Failure::AuthIo
+        }
+    })?;
     let mut bytes = Vec::new();
     file.take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| Failure::Credentials)?;
+        .map_err(|_| Failure::AuthIo)?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(Failure::Credentials);
+        return Err(Failure::AuthShape);
     }
-    let mut node: AuthNode = serde_json::from_slice(&bytes).map_err(|_| Failure::Credentials)?;
-    if node.0.len() != 1 {
-        return Err(Failure::Credentials);
+    let mut node: AuthNode = serde_json::from_slice(&bytes).map_err(|_| Failure::AuthShape)?;
+    if node.0.len() > 1 {
+        return Err(Failure::AuthAmbiguous);
     }
-    let credentials = node.0.pop().ok_or(Failure::Credentials)?;
+    let credentials = node.0.pop().ok_or(Failure::AuthShape)?;
     let valid_header = |value: &str| value.bytes().all(|byte| (0x20..=0x7e).contains(&byte));
     if !valid_header(&credentials.key)
         || credentials
@@ -344,7 +393,7 @@ fn read_credentials(path: &Path) -> Result<Credentials, Failure> {
             .as_deref()
             .is_some_and(|id| !valid_header(id))
     {
-        return Err(Failure::Credentials);
+        return Err(Failure::AuthShape);
     }
     Ok(credentials)
 }
@@ -355,6 +404,76 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn prefixed_case_insensitive_periods_and_missing_reset_are_supported() {
+        for kind in ["BILLING_PERIOD_TYPE_WEEKLY", "weekly"] {
+            let body = format!(
+                r#"{{"config":{{"creditUsagePercent":35,"currentPeriod":{{"type":"{kind}"}}}}}}"#
+            );
+            assert!(matches!(
+                parse_billing(body.as_bytes()),
+                Ok(Outcome::Weekly(_))
+            ));
+        }
+        assert_eq!(
+            parse_billing(br#"{"config":{"currentPeriod":{"type":"billing_period_monthly"}}}"#),
+            Ok(Outcome::NonWeekly)
+        );
+    }
+
+    #[test]
+    fn missing_reset_preserves_weekly_usage() {
+        assert!(matches!(
+            parse_billing(
+                br#"{"config":{"creditUsagePercent":35,"currentPeriod":{"type":"WEEKLY"}}}"#
+            ),
+            Ok(Outcome::Weekly(_))
+        ));
+    }
+
+    #[test]
+    fn unique_provider_url_auth_shape_and_failure_categories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        assert!(matches!(read_credentials(&path), Err(Failure::AuthMissing)));
+        std::fs::write(
+            &path,
+            r#"{"https://auth.x.ai::fake-id":{"key":"fake-key","user_id":"fake-user"}}"#,
+        )
+        .unwrap();
+        assert!(read_credentials(&path).is_ok());
+        std::fs::write(&path, "{}").unwrap();
+        assert!(matches!(read_credentials(&path), Err(Failure::AuthShape)));
+        std::fs::write(&path, r#"[{"key":"fake-a"},{"key":"fake-b"}]"#).unwrap();
+        assert!(matches!(
+            read_credentials(&path),
+            Err(Failure::AuthAmbiguous)
+        ));
+    }
+
+    #[test]
+    fn environment_proxy_is_inherited_without_redirects() {
+        if std::env::var_os("LINEUP_FAKE_PROXY_CHILD").is_some() {
+            let client = Client::new(PathBuf::from("/fake/auth.json"), Settings::default());
+            assert!(client.agent.config().proxy().is_some());
+            assert_eq!(client.agent.config().max_redirects(), 0);
+            return;
+        }
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "quota_grok::tests::environment_proxy_is_inherited_without_redirects",
+            ])
+            .env("LINEUP_FAKE_PROXY_CHILD", "1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:12345")
+            .env_remove("https_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "fake proxy child failed");
+    }
 
     const WEEK: &str = r#"{"config":{"creditUsagePercent":25,"currentPeriod":{"type":"WEEKLY","end":"2099-01-01T00:00:00Z"}}}"#;
 
@@ -476,7 +595,7 @@ mod tests {
         std::fs::write(dir.path().join("auth.json"), "invalid fake-test-secret").unwrap();
         assert_eq!(
             client.poll_at(now + Duration::from_secs(300), SystemTime::now()),
-            Outcome::Unavailable(Failure::Credentials)
+            Outcome::Unavailable(Failure::AuthShape)
         );
     }
 
@@ -497,6 +616,14 @@ mod tests {
             let (url, handle) = server(status, "fake-test-secret", delay);
             client.endpoint = url;
             let result = client.poll_at(now + Duration::from_secs(300), SystemTime::now());
+            assert_eq!(
+                client.last_result(),
+                if retain {
+                    crate::doctor::WeeklyResult::Transient
+                } else {
+                    crate::doctor::WeeklyResult::Unauthorized
+                }
+            );
             if retain {
                 assert_eq!(result, original);
                 assert_eq!(
@@ -526,14 +653,9 @@ mod tests {
         let credentials = read_credentials(&path).unwrap();
         assert_eq!(credentials.key, "fake-key");
         assert_eq!(credentials.user_id.as_deref(), Some("fake-user"));
-        for json in [
-            r#"{"a":{"key":"one"},"b":{"key":"two"}}"#,
-            r#"{"key":"bad\nheader"}"#,
-            "{}",
-            "not-json fake-key",
-        ] {
+        for json in [r#"{"key":"bad\nheader"}"#, "{}", "not-json fake-key"] {
             std::fs::write(&path, json).unwrap();
-            assert!(matches!(read_credentials(&path), Err(Failure::Credentials)));
+            assert!(matches!(read_credentials(&path), Err(Failure::AuthShape)));
         }
     }
 
@@ -548,7 +670,7 @@ mod tests {
             r#"{"key":"fake-key","user_id":null,"user_id":"second"}"#,
         ] {
             std::fs::write(&path, json).unwrap();
-            assert!(matches!(read_credentials(&path), Err(Failure::Credentials)));
+            assert!(matches!(read_credentials(&path), Err(Failure::AuthShape)));
         }
     }
 
@@ -556,8 +678,7 @@ mod tests {
     fn invalid_billing_never_becomes_a_weekly_observation() {
         for body in [
             r#"{"config":{"creditUsagePercent":101,"currentPeriod":{"type":"WEEKLY","end":"2099-01-01T00:00:00Z"}}}"#,
-            r#"{"config":{"currentPeriod":{"type":"WEEKLY"}}}"#,
-            r#"{"config":{"currentPeriod":{"type":"ALMOST_WEEKLY","end":"2099-01-01T00:00:00Z"}}}"#,
+            r#"{"config":{"currentPeriod":{"type":"UNKNOWN","end":"2099-01-01T00:00:00Z"}}}"#,
             "fake-secret",
         ] {
             assert_eq!(

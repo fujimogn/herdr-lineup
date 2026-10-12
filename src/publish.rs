@@ -53,6 +53,30 @@ impl Homes {
     }
 }
 
+fn grok_sample(outcome: crate::quota_grok::Outcome) -> Option<model::WeeklySample> {
+    match outcome {
+        crate::quota_grok::Outcome::Weekly(weekly) => Some(model::WeeklySample {
+            used_percent: weekly.used_percent,
+            resets_at: weekly.resets_at,
+        }),
+        _ => None,
+    }
+}
+
+fn fresh_grok_weekly(
+    sample: Option<model::WeeklySample>,
+    observed: Option<Instant>,
+    now: Instant,
+    max_age_ms: u64,
+) -> Option<model::WeeklySample> {
+    sample.filter(|value| {
+        value.resets_at.is_some()
+            || observed.is_some_and(|observed| {
+                now.saturating_duration_since(observed) <= Duration::from_millis(max_age_ms)
+            })
+    })
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointRow {
@@ -75,6 +99,8 @@ pub struct MetadataPublisher {
     shutdown: Option<Arc<AtomicBool>>,
     codex_weekly: Option<model::WeeklyWorker>,
     grok_weekly: Option<model::WeeklyWorker>,
+    weekly_diagnostics_initialized: bool,
+    grok_observed: Arc<std::sync::Mutex<Option<Instant>>>,
     codex_control: Arc<crate::quota_codex::QueryControl>,
 }
 impl MetadataPublisher {
@@ -99,56 +125,97 @@ impl MetadataPublisher {
             shutdown: None,
             codex_weekly: None,
             grok_weekly: None,
+            weekly_diagnostics_initialized: false,
+            grok_observed: Arc::new(std::sync::Mutex::new(None)),
             codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
         })
     }
 
     fn start_weekly(&mut self, config: &Config) -> io::Result<()> {
-        if !config.allow_network {
-            return Ok(());
-        }
+        use crate::doctor::{WeeklyProvider, WeeklyResult, write_weekly_result};
         // Only the daemon holding the session lock receives a shutdown flag.
         let Some(shutdown) = self.shutdown.clone() else {
             return Ok(());
         };
         self.check_shutdown()?;
-        if self.codex_weekly.is_none()
-            && config.providers.iter().any(|id| id == "codex")
-            && let Some(home) = self.homes.codex.clone()
-        {
-            let mut client = crate::quota_codex::WeeklyClient::new(
-                home,
-                crate::quota_codex::DEFAULT_REFRESH_INTERVAL,
-                crate::quota_codex::DEFAULT_TIMEOUT,
-            );
-            let interval = client.interval();
-            let control = self.codex_control.clone();
-            self.codex_weekly = Some(model::WeeklyWorker::start(
-                shutdown.clone(),
-                interval,
-                move || {
-                    client
-                        .refresh_controlled(&control)
-                        .map(|weekly| model::WeeklySample {
-                            used_percent: weekly.used_percent,
-                            resets_at: weekly.resets_at,
-                        })
-                },
-            )?);
+        if !self.weekly_diagnostics_initialized {
+            for (provider, name) in [
+                (WeeklyProvider::Codex, "codex"),
+                (WeeklyProvider::Grok, "grok"),
+            ] {
+                let result = if config.allow_network && config.providers.iter().any(|id| id == name)
+                {
+                    WeeklyResult::Pending
+                } else {
+                    WeeklyResult::Disabled
+                };
+                write_weekly_result(&self.directory, provider, result)?;
+            }
+            self.weekly_diagnostics_initialized = true;
+        }
+        if !config.allow_network {
+            return Ok(());
+        }
+        if self.codex_weekly.is_none() && config.providers.iter().any(|id| id == "codex") {
+            if let Some(home) = self.homes.codex.clone() {
+                let mut client = crate::quota_codex::WeeklyClient::new(
+                    home,
+                    crate::quota_codex::DEFAULT_REFRESH_INTERVAL,
+                    crate::quota_codex::DEFAULT_TIMEOUT,
+                );
+                let interval = client.interval();
+                let control = self.codex_control.clone();
+                let directory = self.directory.clone();
+                self.codex_weekly = Some(model::WeeklyWorker::start(
+                    shutdown.clone(),
+                    interval,
+                    move || {
+                        let sample =
+                            client
+                                .refresh_controlled(&control)
+                                .map(|weekly| model::WeeklySample {
+                                    used_percent: weekly.used_percent,
+                                    resets_at: weekly.resets_at,
+                                });
+                        // Saving a diagnostic must not replace or block a quota result.
+                        let _ = write_weekly_result(
+                            &directory,
+                            WeeklyProvider::Codex,
+                            client.last_result(),
+                        );
+                        sample
+                    },
+                )?);
+            } else {
+                write_weekly_result(
+                    &self.directory,
+                    WeeklyProvider::Codex,
+                    WeeklyResult::AuthMissing,
+                )?;
+            }
         }
         if self.grok_weekly.is_none() && config.providers.iter().any(|id| id == "grok") {
             let settings = crate::quota_grok::Settings::default();
-            // Auth resolution and credential handling remain inside quota_grok.
-            let mut client = crate::quota_grok::Client::from_env(settings).ok();
+            // Preserve resolution failures as fixed categories, not silent None.
+            let mut client = crate::quota_grok::Client::from_env(settings);
+            let directory = self.directory.clone();
+            let observed = self.grok_observed.clone();
             self.grok_weekly = Some(model::WeeklyWorker::start(
                 shutdown,
                 settings.interval(),
-                move || match client.as_mut()?.poll() {
-                    crate::quota_grok::Outcome::Weekly(weekly) => Some(model::WeeklySample {
-                        used_percent: weekly.used_percent,
-                        resets_at: Some(weekly.resets_at),
-                    }),
-                    _ => None,
+                move || {
+                    let (sample, result) = match client.as_mut() {
+                        Ok(client) => {
+                            let outcome = client.poll();
+                            if let Ok(mut observed) = observed.lock() {
+                                *observed = client.last_success();
+                            }
+                            (grok_sample(outcome), client.last_result())
+                        }
+                        Err(failure) => (None, failure.diagnostic()),
+                    };
+                    let _ = write_weekly_result(&directory, WeeklyProvider::Grok, result);
+                    sample
                 },
             )?);
         }
@@ -393,6 +460,12 @@ impl MetadataPublisher {
                     .and_then(|worker| worker.sample(now))
             })
             .flatten();
+        let grok_weekly = fresh_grok_weekly(
+            grok_weekly,
+            self.grok_observed.try_lock().ok().and_then(|value| *value),
+            Instant::now(),
+            config.usage_max_age_ms,
+        );
         let mode = match config.logo_mode.as_str() {
             "font" => tokens::LogoMode::Font,
             "text" => tokens::LogoMode::Text,
@@ -745,6 +818,80 @@ mod tests {
         os::unix::net::UnixListener,
         time::Duration,
     };
+
+    #[test]
+    fn missing_reset_weekly_expires_at_configured_freshness() {
+        let now = Instant::now();
+        let sample = Some(model::WeeklySample {
+            used_percent: 35.0,
+            resets_at: None,
+        });
+        assert!(
+            fresh_grok_weekly(sample, Some(now), now + Duration::from_secs(59), 60000).is_some()
+        );
+        assert!(
+            fresh_grok_weekly(sample, Some(now), now + Duration::from_secs(61), 60000).is_none()
+        );
+    }
+
+    #[test]
+    fn worker_auth_failure_is_visible_to_doctor_with_injected_home() {
+        if let Some(root) = std::env::var_os("LINEUP_FAKE_DIAGNOSTIC_CHILD") {
+            let root = PathBuf::from(root);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let mut publisher =
+                MetadataPublisher::new(root.clone(), "fake".into(), Homes::from_env()).unwrap();
+            publisher.set_shutdown(shutdown.clone());
+            publisher
+                .start_weekly(&Config {
+                    allow_network: true,
+                    providers: vec!["grok".into()],
+                    ..Config::default()
+                })
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let diagnostic = crate::doctor::weekly_diagnostics(&root);
+                if diagnostic.contains("grok=auth_shape") {
+                    assert!(diagnostic.contains("codex=disabled"));
+                    break;
+                }
+                assert!(Instant::now() < deadline, "fixed auth result not saved");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            shutdown.store(true, Ordering::Release);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let grok = dir.path().join(".grok");
+        std::fs::create_dir(&grok).unwrap();
+        std::fs::write(grok.join("auth.json"), "{}").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "publish::tests::worker_auth_failure_is_visible_to_doctor_with_injected_home",
+            ])
+            .env("LINEUP_FAKE_DIAGNOSTIC_CHILD", dir.path())
+            .env("HOME", dir.path())
+            .env_remove("GROK_HOME")
+            .env_remove("GROK_AUTH_FILE")
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "fake diagnostic worker failed");
+    }
+
+    #[test]
+    fn disabled_workers_save_fixed_diagnostics_without_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        publisher.set_shutdown(Arc::new(AtomicBool::new(false)));
+        publisher.start_weekly(&Config::default()).unwrap();
+        assert_eq!(
+            crate::doctor::weekly_diagnostics(dir.path()),
+            "Last saved weekly query results: codex=disabled; grok=disabled"
+        );
+    }
 
     #[test]
     fn fake_socket_weekly_cache_publishes_without_waiting_for_queries() {

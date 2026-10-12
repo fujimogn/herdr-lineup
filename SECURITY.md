@@ -27,14 +27,17 @@ temporary input bytes exist only in memory; they are not persisted or displayed.
 Calling `poll` sends an HTTPS GET to
 `https://cli-chat-proxy.grok.com/v1/billing?format=credits` with the key as a
 Bearer token, `X-XAI-Token-Auth: xai-grok-cli`, and optional `x-userid`.
-TLS uses rustls with certificate validation. Redirects and environment proxies
-are disabled. Dependency wire logging is disabled at compile time using
+TLS uses rustls with certificate validation. Redirects are disabled. Environment
+proxy settings are inherited, matching the retired quota client. Dependency wire logging is disabled at compile time using
 `log/max_level_off`; errors expose only fixed categories, never HTTP bodies,
 headers, credential paths or underlying library error messages. No telemetry
 or conversation/session data is sent.
 
-Results are held only in memory. Only exact `WEEKLY` periods expose used percent
-and reset time; `MONTHLY` returns `NonWeekly`, so weekly displays stay missing.
+Quota values are held only in memory. Case-insensitive period names containing
+`WEEKLY` expose used percent and optional reset time; `MONTHLY` returns
+`NonWeekly`, so weekly displays stay missing. Without a reset, publication
+expires the value at `usage_max_age_ms` after its last successful query;
+transient failures do not retain a value with an unknown reset.
 The default request interval is five minutes, clamped to one minute through one
 hour, independent of the daemon cadence. The total HTTP timeout defaults to ten
 seconds and is clamped to one through thirty seconds. Transient connection,
@@ -45,6 +48,15 @@ missing data. All failure paths are throttled; expired reset times clear cached
 usage. The synchronous client runs only on its worker. Its one configured auth
 source supplies weekly quota to all Grok panes independently of local context.
 Restart the Lineup daemon after account changes to discard cached quota.
+
+The daemon saves only fixed query-result categories in private per-session
+`weekly-codex.json` and `weekly-grok.json` files under `HERDR_PLUGIN_STATE_DIR`.
+Atomic writes replace records without following destination symlinks. `doctor`
+reads at most 128 bytes per regular file without following symlinks and validates
+the closed enum before displaying it. No quota values, account identities,
+authentication paths, tokens, headers, bodies or upstream error messages are saved.
+The last query category may differ from retained cache availability and can be
+stale after shutdown. Diagnostics do not make provider queries.
 
 Development tests use only temporary fake credentials and loopback HTTP servers.
 Authenticated production provider requests are not run during development.

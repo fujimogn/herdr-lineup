@@ -130,9 +130,20 @@ credentials are displayed or persisted by Lineup. Do not restart the Herdr serve
 One background worker per enabled provider polls its client every five minutes,
 independently of refresh. Client request intervals are bounded to 1..=60 minutes.
 Refresh reads memory only for quota and never waits for a provider request.
+`doctor` reads the session state directory and prints the last saved Codex/Grok
+query categories (`ok`, `auth_missing`, `auth_io`, `auth_shape`,
+`auth_ambiguous`, `unauthorized`, `transient`, `invalid_response`, `request`,
+`non_weekly`, `disabled`, or `pending`). `not_observed` means no saved result;
+`invalid_diagnostic` means the local record cannot be safely decoded. These are
+last query results, not cache availability or a new provider query. Values,
+credentials, paths, response bodies and error text are never recorded.
 Temporary failures retain the last success until its known reset; authentication
 failures clear it. Before the first successful query, after reset, and for Grok
-MONTHLY allowances, weekly stays `—`. Disabled network access also keeps Codex
+MONTHLY allowances, weekly stays `—`. Period names containing `WEEKLY`
+(case-insensitive, including enum prefixes) supply weekly usage; `MONTHLY`
+periods remain unavailable for 7d. Without a reset, the remaining percentage
+is shown without a countdown and expires after `usage_max_age_ms` from the
+last successful query. Environment proxies are inherited; redirects stay disabled. Disabled network access also keeps Codex
 and Grok weekly at `—` while preserving local context.
 
 Codex context uses `max(total_tokens - 12000, 0) / (model_context_window - 12000)`.

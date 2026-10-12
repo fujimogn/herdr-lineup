@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Secret-free per-session weekly query diagnostics displayed by `doctor`,
+  including distinct Grok auth-file, schema, ambiguity and HTTP failure categories.
+- Grok billing compatibility with case-insensitive prefixed weekly period names,
+  optional reset times with bounded freshness, and inherited environment proxies.
+
 - Opt-in Codex account and Grok billing quota workers (`allow_network = true`).
   Refresh reads memory without waiting for quota queries. Grok weekly is shared
   across its panes; Codex weekly requires an exact session in the daemon home.

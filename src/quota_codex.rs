@@ -71,6 +71,7 @@ pub struct WeeklyClient {
     timeout: Duration,
     last_attempt: Option<Instant>,
     cached: Option<Weekly>,
+    last_result: crate::doctor::WeeklyResult,
 }
 
 impl WeeklyClient {
@@ -81,11 +82,17 @@ impl WeeklyClient {
             timeout: timeout.clamp(Duration::from_millis(1), MAX_TIMEOUT),
             last_attempt: None,
             cached: None,
+            last_result: crate::doctor::WeeklyResult::Pending,
         }
     }
 
     pub fn interval(&self) -> Duration {
         self.interval
+    }
+
+    /// Last actual query category, independent of the display cache.
+    pub(crate) fn last_result(&self) -> crate::doctor::WeeklyResult {
+        self.last_result
     }
 
     /// Returns a cached value between attempts, including after transient errors.
@@ -127,10 +134,22 @@ impl WeeklyClient {
             return self.cached;
         }
         self.last_attempt = Some(now);
+        use crate::doctor::WeeklyResult;
         match query() {
-            Ok(value) => self.cached = value,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => self.cached = None,
+            Ok(value) => {
+                self.last_result = if value.is_some() {
+                    WeeklyResult::Ok
+                } else {
+                    WeeklyResult::NonWeekly
+                };
+                self.cached = value;
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                self.last_result = WeeklyResult::Unauthorized;
+                self.cached = None;
+            }
             Err(_) => {
+                self.last_result = WeeklyResult::Transient;
                 // An unknown reset cannot justify retaining a failed observation.
                 if self.cached.is_some_and(|weekly| weekly.resets_at.is_none()) {
                     self.cached = None;
@@ -469,6 +488,40 @@ mod tests {
             assert!(Instant::now() < deadline, "test PID handshake timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn last_query_result_is_separate_from_retained_cache() {
+        use crate::doctor::WeeklyResult;
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut client = WeeklyClient::new(
+            PathBuf::from("/fake"),
+            MIN_REFRESH_INTERVAL,
+            DEFAULT_TIMEOUT,
+        );
+        let sample = Some(Weekly {
+            used_percent: 35.0,
+            resets_at: Some(wall + Duration::from_secs(600)),
+        });
+        assert_eq!(client.refresh_with(now, wall, || Ok(sample)), sample);
+        assert_eq!(client.last_result(), WeeklyResult::Ok);
+        assert_eq!(
+            client.refresh_with(now + MIN_REFRESH_INTERVAL, wall, || Err(io::Error::other(
+                "fake private error"
+            ))),
+            sample
+        );
+        assert_eq!(client.last_result(), WeeklyResult::Transient);
+        client.refresh_with(now + MIN_REFRESH_INTERVAL * 2, wall, || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fake private error",
+            ))
+        });
+        assert_eq!(client.last_result(), WeeklyResult::Unauthorized);
+        client.refresh_with(now + MIN_REFRESH_INTERVAL * 3, wall, || Ok(None));
+        assert_eq!(client.last_result(), WeeklyResult::NonWeekly);
     }
 
     #[test]
