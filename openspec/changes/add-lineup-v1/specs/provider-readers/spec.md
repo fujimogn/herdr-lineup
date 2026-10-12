@@ -38,8 +38,8 @@ not be mislabeled weekly. Used percentage SHALL be converted to remaining by
 ### Requirement: Provider source availability remains explicit
 The plugin SHALL register these six reader slots and treat unimplemented or
 unconfirmed adapters as `unsupported`. Source implementation details SHALL be
-resolved by the usage-source research before enabling an adapter; the following
-table is a contract, not a statement that the fields can currently be obtained.
+resolved by the usage-source research before enabling an adapter. The following
+table is the contract for the outcomes each adapter obtains.
 
 #### Scenario: Enumerate reader availability
 - **WHEN** a supported provider is selected
@@ -48,8 +48,8 @@ table is a contract, not a statement that the fields can currently be obtained.
 | Reader | Context outcome | Weekly remaining outcome | Source detail status |
 | --- | --- | --- | --- |
 | `claude` | Validated statusLine context or unavailable | Session-bound seven-day remaining or unavailable | Implemented capture and local reader; hook opt-in required |
-| `codex` | Common context contract or unavailable | Common weekly contract or unavailable | TBD research |
-| `grok` | Common context contract or unavailable | Common weekly contract or unavailable | TBD research |
+| `codex` | Exact native-session rollout context (`total_tokens / model_context_window`) or unavailable | Unavailable (`unsupported`) | Implemented local reader; no app-server, auth file, or weekly quota |
+| `grok` | Exact native-session `signals.json` context or unavailable | Unavailable (`unsupported`) | Implemented local reader; no billing API or auth file |
 | `agy` | Validated statusLine context or unavailable | Active-pool weekly remaining or unavailable | Implemented capture and local reader; hook opt-in required |
 | `kimi` | Unavailable in stage one | Unavailable in stage one | TBD; enable only after confirmed source |
 | `hermes` | Unavailable in stage one | Unavailable in stage one | TBD; enable only after confirmed source |
@@ -95,7 +95,8 @@ contain credential values, conversation contents, or personal account identifier
 `herdr-lineup statusline <claude|agy>` SHALL accept at most 1 MiB for JSON
 parsing and SHALL atomically replace a private observation under
 `$HERDR_PLUGIN_STATE_DIR/statusline/`. The root MUST be absolute. Missing or
-invalid state configuration SHALL disable recording without disabling display.
+invalid state configuration SHALL disable recording. The wrapper SHALL NOT
+render usage. Stdout stays empty unless `--then` copies the chained command.
 The observation SHALL retain only the provider, exact opaque binding key,
 receipt time, context percentage, weekly remaining percentage, and optional
 absolute reset time. Raw stdin, model names, counters, transcript paths,
