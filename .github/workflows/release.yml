@@ -68,15 +68,7 @@ jobs:
           cat dist/SHA256SUMS-*.txt > dist/SHA256SUMS.txt
           rm dist/SHA256SUMS-*.txt
           version="${GITHUB_REF_NAME#v}"
-          awk -v version="$version" '
-            $0 ~ "^## \\[" version "\\]" { found=1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > RELEASE_NOTES.md
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "error: CHANGELOG.md has no section for [${version}]" >&2
-            exit 1
-          fi
+          scripts/extract-release-notes.sh "$version" > RELEASE_NOTES.md
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

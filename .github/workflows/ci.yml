@@ -41,6 +41,8 @@ jobs:
         run: cargo test --locked
       - name: Check version consistency
         run: scripts/check-version.sh
+      - name: Test release notes extraction
+        run: scripts/test-extract-release-notes.sh
       - name: Release build
         run: cargo build --release --locked
       - name: CLI help
