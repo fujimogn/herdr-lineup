@@ -131,8 +131,19 @@ where
     if worker.is_err() {
         return UsageReading::missing(request, source, MissingReason::SourceError);
     }
+    receive_by_deadline(request, source, deadline, receiver)
+}
+
+fn receive_by_deadline(
+    request: &ReadRequest<'_>,
+    source: SourceKind,
+    deadline: Instant,
+    receiver: std::sync::mpsc::Receiver<UsageReading>,
+) -> UsageReading {
     match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(result) => result,
+        Ok(result) if Instant::now() < deadline => result,
+        // recv_timeout can dequeue a ready message even when its wait duration is zero.
+        Ok(_) => UsageReading::missing(request, source, MissingReason::Timeout),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             UsageReading::missing(request, source, MissingReason::Timeout)
         }
@@ -303,6 +314,26 @@ pub(crate) mod tests {
             max_age: Duration::from_secs(60),
             timeout: Duration::from_secs(2),
         }
+    }
+    #[test]
+    fn queued_available_result_is_discarded_after_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(UsageReading::sample(
+                &r,
+                SourceKind::CodexRollout,
+                7.0,
+                r.now,
+            ))
+            .unwrap();
+        let result = receive_by_deadline(&r, SourceKind::CodexRollout, Instant::now(), receiver);
+        assert_eq!(
+            result.context,
+            UsageOutcome::Unavailable(MissingReason::Timeout)
+        );
     }
     #[test]
     fn stalled_io_returns_by_deadline_without_spawning_repeated_workers() {
