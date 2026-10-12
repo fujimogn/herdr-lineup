@@ -1,0 +1,7 @@
+/target/
+.DS_Store
+AGENTS.local.md
+graphify-out/
+.codegraph/
+.claude/worktrees/
+.Codex/worktrees/

@@ -1,0 +1,20 @@
+[package]
+name = "herdr-lineup"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+description = "Agent status, context, quota, and repository ship times for the Herdr sidebar"
+repository = "https://github.com/fujimogn/herdr-lineup"
+readme = "README.md"
+keywords = ["herdr", "plugin", "sidebar", "agents", "usage"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

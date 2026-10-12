@@ -1,0 +1,49 @@
+id = "herdr-lineup"
+name = "Lineup"
+version = "0.1.0"
+# Baseline for the planned sidebar metadata publisher and agent integrations.
+# Startup is one-shot; ensure must also recover after workspace.focused.
+min_herdr_version = "0.9.0"
+description = "Agent status, context, quota, and repository ship times in the sidebar (planned)."
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[startup]]
+command = ["target/release/herdr-lineup", "ensure"]
+
+[[events]]
+on = "workspace.focused"
+command = ["target/release/herdr-lineup", "ensure"]
+
+[[actions]]
+id = "start"
+title = "Start Lineup publisher (planned)"
+contexts = ["workspace"]
+command = ["target/release/herdr-lineup", "ensure"]
+
+[[actions]]
+id = "stop"
+title = "Stop Lineup publisher (planned)"
+contexts = ["workspace"]
+command = ["target/release/herdr-lineup", "stop"]
+
+[[actions]]
+id = "doctor"
+title = "Check Lineup setup (planned)"
+contexts = ["workspace"]
+command = ["target/release/herdr-lineup", "doctor"]
+
+# Configuration changes are explicit actions, never startup or event hooks.
+[[actions]]
+id = "configure"
+title = "Configure Lineup sidebar (opt-in, planned)"
+contexts = ["workspace"]
+command = ["target/release/herdr-lineup", "configure"]
+
+[[actions]]
+id = "unconfigure"
+title = "Remove Lineup sidebar configuration (opt-in, planned)"
+contexts = ["workspace"]
+command = ["target/release/herdr-lineup", "unconfigure"]
