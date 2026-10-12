@@ -147,6 +147,112 @@ impl SessionLock {
     }
 }
 
+/// Observe process termination through a kernel handle, without sending signals
+/// or trusting the diagnostic PID file. Register before requesting shutdown so
+/// later PID reuse cannot change the process being observed.
+pub(crate) struct ProcessExit {
+    file: File,
+}
+impl ProcessExit {
+    pub(crate) fn observe(pid: u32) -> io::Result<Self> {
+        let pid = i32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| io::Error::other("invalid daemon process identity"))?;
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: pidfd_open takes scalar arguments and returns an owned fd.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                file: unsafe { File::from_raw_fd(fd as i32) },
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: kqueue returns an owned descriptor; File closes all errors.
+            let fd = unsafe { libc::kqueue() };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let event = libc::kevent {
+                ident: pid as libc::uintptr_t,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            if unsafe { libc::kevent(fd, &event, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { file })
+        }
+    }
+
+    pub(crate) fn exited(&self) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut descriptor = libc::pollfd {
+                fd: self.file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // A pidfd becomes readable only after the last process thread exits.
+            let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                return if error.kind() == io::ErrorKind::Interrupted {
+                    Ok(false)
+                } else {
+                    Err(error)
+                };
+            }
+            if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(io::Error::other("daemon process monitor failed"));
+            }
+            Ok(descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let result = unsafe {
+                libc::kevent(
+                    self.file.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &mut event,
+                    1,
+                    &timeout,
+                )
+            };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                return if error.kind() == io::ErrorKind::Interrupted {
+                    Ok(false)
+                } else {
+                    Err(error)
+                };
+            }
+            if result > 0 && event.flags & libc::EV_ERROR != 0 {
+                return Err(io::Error::other("daemon process monitor failed"));
+            }
+            Ok(result > 0 && event.fflags & libc::NOTE_EXIT != 0)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

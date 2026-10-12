@@ -3,7 +3,7 @@
 use crate::{
     config::Config,
     doctor,
-    lock::{RuntimePaths, SessionLock, StartupLockContention},
+    lock::{ProcessExit, RuntimePaths, SessionLock, StartupLockContention},
     socket::{EndpointIdentity, Transport, read_frame},
 };
 use serde::{Deserialize, Serialize};
@@ -139,9 +139,14 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
             loop {
                 if let Some(health) = probe_starting(&paths, &options.socket)? {
                     if health.endpoint == endpoint {
-                        return Ok(());
+                        if health.pid == child.id() {
+                            return Ok(());
+                        }
+                        // A healthy competing daemon does not prove our child
+                        // has exited. Reap the typed loser before returning.
+                    } else {
+                        return Err(io::Error::other("daemon endpoint identity mismatch"));
                     }
-                    return Err(io::Error::other("daemon endpoint identity mismatch"));
                 }
                 if let Some(status) = child.try_wait()? {
                     if status.code() == Some(i32::from(LOCK_CONTENDED_EXIT_CODE)) {
@@ -480,6 +485,8 @@ pub fn stop(options: &Options) -> io::Result<()> {
         };
     };
     let identity = read_identity(&mut stream, &paths, &options.socket)?;
+    verify_peer_pid(stream.get_ref(), identity.pid)?;
+    let process = ProcessExit::observe(identity.pid)?;
     let request = serde_json::json!({"stop":identity.nonce,"plugin":PLUGIN_ID,"socket_key":paths.key,"endpoint":identity.endpoint});
     serde_json::to_writer(stream.get_mut(), &request)?;
     stream.get_mut().write_all(b"\n")?;
@@ -487,7 +494,9 @@ pub fn stop(options: &Options) -> io::Result<()> {
         return Err(io::Error::other("daemon refused shutdown identity"));
     }
     loop {
-        if !SessionLock::is_held(&paths)? {
+        // Termination includes destruction after flock release. A new ensure
+        // may already own the lock, so do not wait on that unrelated owner.
+        if process.exited()? {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -497,6 +506,49 @@ pub fn stop(options: &Options) -> io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+fn verify_peer_pid(stream: &UnixStream, expected: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    let pid = {
+        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of_val(&credentials) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::addr_of_mut!(credentials).cast(),
+                &mut length,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        credentials.pid
+    };
+    #[cfg(target_os = "macos")]
+    let pid = {
+        let mut pid: libc::pid_t = 0;
+        let mut length = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                libc::LOCAL_PEERPID,
+                std::ptr::addr_of_mut!(pid).cast(),
+                &mut length,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        pid
+    };
+    if u32::try_from(pid).ok() != Some(expected) {
+        return Err(io::Error::other("daemon control peer process mismatch"));
+    }
+    Ok(())
 }
 fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
     // BSD/macOS accept inherits O_NONBLOCK from our listener. A timeout does
@@ -641,6 +693,14 @@ mod tests {
             || std::env::var_os("LINEUP_TEST_FOREGROUND").is_some()
         {
             let options = Options::from_env().unwrap();
+            if std::env::var_os("LINEUP_TEST_RECORD_START").is_some() {
+                let mut record = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(options.state.join("starts"))
+                    .unwrap();
+                writeln!(record, "{}", std::process::id()).unwrap();
+            }
             if std::env::var_os("LINEUP_TEST_FAIL_STARTUP").is_some() {
                 let error = io::Error::new(io::ErrorKind::WouldBlock, "synthetic socket failure");
                 std::process::exit(i32::from(crate::failure_exit_code(&error)));
@@ -671,6 +731,7 @@ mod tests {
                 }
                 let error = run_foreground(&options, true, &mut NoopPublisher).unwrap_err();
                 fs::write(options.state.join("contended"), error.to_string()).unwrap();
+                std::thread::sleep(Duration::from_millis(800));
                 std::process::exit(i32::from(crate::failure_exit_code(&error)));
             }
             if std::env::var_os("LINEUP_TEST_QUOTA_STOP").is_some() {
@@ -752,6 +813,23 @@ mod tests {
                 return;
             }
             struct SlowRefresh(PathBuf, Option<Arc<AtomicBool>>);
+            impl Drop for SlowRefresh {
+                fn drop(&mut self) {
+                    if std::env::var_os("LINEUP_TEST_LATE_DROP").is_some() {
+                        let paths =
+                            RuntimePaths::new(&self.0, &Options::from_env().unwrap().socket)
+                                .unwrap();
+                        assert!(!SessionLock::is_held(&paths).unwrap());
+                        fs::write(self.0.join("drop-entered"), "").unwrap();
+                        let delay = std::env::var("LINEUP_TEST_LATE_DROP_MS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(800);
+                        std::thread::sleep(Duration::from_millis(delay));
+                        fs::write(self.0.join("drop-completed"), "").unwrap();
+                    }
+                }
+            }
             impl Publisher for SlowRefresh {
                 fn set_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
                     self.1 = Some(shutdown);
@@ -780,7 +858,7 @@ mod tests {
             }
             run_foreground(
                 &options,
-                true,
+                std::env::var_os("LINEUP_TEST_FOREGROUND").is_none(),
                 &mut SlowRefresh(options.state.clone(), None),
             )
             .unwrap();
@@ -805,6 +883,115 @@ mod tests {
             pid.is_some()
         });
         pid.unwrap()
+    }
+
+    #[test]
+    fn stop_waits_for_process_after_lock_release_before_immediate_start() {
+        let (_dir, options, done, server) = fixture();
+        fs::create_dir(&options.state).unwrap();
+        let mut old = child_command()
+            .env("LINEUP_TEST_FOREGROUND", "1")
+            .env("LINEUP_TEST_LATE_DROP", "1")
+            .env("HERDR_SOCKET_PATH", &options.socket)
+            .env("HERDR_PLUGIN_STATE_DIR", &options.state)
+            .env("HERDR_PLUGIN_CONFIG_DIR", &options.config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| probe(&paths, &options.socket).ok().flatten().is_some());
+        let started = Instant::now();
+        let stopped = stop(&options);
+        let elapsed = started.elapsed();
+        let drop_completed = options.state.join("drop-completed").exists();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_RECORD_START", "1");
+        let restarted = ensure_command(&options, command);
+        let new = probe(&paths, &options.socket).unwrap().unwrap();
+        // Reap only the child owned by this fixture, even on a regression.
+        let old_exited_at_start = old.try_wait().unwrap().is_some();
+        old.wait().unwrap();
+        stop(&options).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        stopped.unwrap();
+        restarted.unwrap();
+        assert!(drop_completed, "stop returned before post-lock destruction");
+        assert!(old_exited_at_start, "old daemon overlapped immediate start");
+        assert!(elapsed >= Duration::from_millis(800));
+        assert!(elapsed < STOP_DEADLINE);
+        let starts = fs::read_to_string(options.state.join("starts")).unwrap();
+        assert_eq!(starts.lines().count(), 1, "ensure spawned more than once");
+        assert_eq!(starts.trim(), new.pid.to_string());
+    }
+
+    #[test]
+    fn stop_deadline_does_not_signal_a_process_still_tearing_down() {
+        let (_dir, options, done, server) = fixture();
+        fs::create_dir(&options.state).unwrap();
+        let mut child = child_command()
+            .env("LINEUP_TEST_FOREGROUND", "1")
+            .env("LINEUP_TEST_LATE_DROP", "1")
+            .env("LINEUP_TEST_LATE_DROP_MS", "10000")
+            .env("HERDR_SOCKET_PATH", &options.socket)
+            .env("HERDR_PLUGIN_STATE_DIR", &options.state)
+            .env("HERDR_PLUGIN_CONFIG_DIR", &options.config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| probe(&paths, &options.socket).ok().flatten().is_some());
+        let started = Instant::now();
+        let stopped = stop(&options);
+        let elapsed = started.elapsed();
+        let still_running = child.try_wait().unwrap().is_none();
+        // Test cleanup owns the Child; production stop never sends a signal.
+        if still_running {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(stopped.unwrap_err().to_string().contains("no signal sent"));
+        assert!(still_running);
+        assert!(elapsed >= STOP_DEADLINE);
+        assert!(elapsed < STOP_DEADLINE + Duration::from_millis(500));
+    }
+
+    #[test]
+    fn stop_rejects_health_pid_that_does_not_match_control_peer() {
+        let (_dir, options, done, server) = fixture();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let lock = SessionLock::acquire(&paths).unwrap().unwrap();
+        let listener = UnixListener::bind(&paths.control).unwrap();
+        let health = Health {
+            plugin: PLUGIN_ID.into(),
+            socket_path: options.socket.clone(),
+            socket_key: paths.key.clone(),
+            endpoint: EndpointIdentity::read(&options.socket).unwrap(),
+            nonce: "a".repeat(64),
+            pid: std::process::id() + 1,
+            last_refresh_ms: None,
+            refresh_failed: false,
+        };
+        let fake = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            assert!(!serve_control(stream, &health).unwrap());
+        });
+        let stopped = stop(&options);
+        fake.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(
+            stopped
+                .unwrap_err()
+                .to_string()
+                .contains("peer process mismatch")
+        );
+        assert!(SessionLock::is_held(&paths).unwrap());
+        drop(lock);
     }
 
     #[test]
@@ -1048,7 +1235,7 @@ mod tests {
         let (_dir, options, done, server) = fixture();
         let winning_options = options.clone();
         let winner = std::thread::spawn(move || {
-            let pid = wait_for_pid(&winning_options.state.join("released"));
+            wait_for_pid(&winning_options.state.join("released"));
             let paths = RuntimePaths::new(&winning_options.state, &winning_options.socket).unwrap();
             let mut lock = None;
             wait_until(|| {
@@ -1057,25 +1244,48 @@ mod tests {
             });
             fs::write(winning_options.state.join("winner-locked"), "").unwrap();
             wait_until(|| winning_options.state.join("contended").exists());
-            // Readiness is withheld until ensure has reaped the losing child.
-            // Thus success cannot bypass the child-exit branch under test.
-            wait_until(|| unsafe { libc::kill(pid, 0) } < 0
-                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+            // The winner becomes healthy while the losing child is still in
+            // its post-contention teardown. Ensure must reap that child first.
             // Preserve this exact ownership even if another unit test's fork
             // inherited a descriptor: dropping and reacquiring would race it.
-            run_locked(
-                &winning_options,
-                false,
-                Config::load(&winning_options.config).unwrap(),
-                paths,
-                lock.unwrap(),
-                &mut NoopPublisher,
-            )
-            .unwrap();
+            let lock = lock.unwrap();
+            let descriptor = lock.raw_fd();
+            let endpoint = EndpointIdentity::read(&winning_options.socket).unwrap();
+            let mut command = child_command();
+            command
+                .env("HERDR_SOCKET_PATH", &winning_options.socket)
+                .env("HERDR_PLUGIN_STATE_DIR", &winning_options.state)
+                .env("HERDR_PLUGIN_CONFIG_DIR", &winning_options.config)
+                .env("LINEUP_INHERITED_LOCK", "3")
+                .env("LINEUP_EXPECTED_DEVICE", endpoint.device.to_string())
+                .env("LINEUP_EXPECTED_INODE", endpoint.inode.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    if descriptor != 3 && libc::dup2(descriptor, 3) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            drop(lock);
+            assert!(child.wait().unwrap().success());
         });
         let mut command = child_command();
-        command.env("LINEUP_TEST_CONTEND", "1");
+        command
+            .env("LINEUP_TEST_CONTEND", "1")
+            .env("LINEUP_TEST_RECORD_START", "1");
+        let started = Instant::now();
         let result = ensure_command(&options, command);
+        let elapsed = started.elapsed();
+        let losing_pid = wait_for_pid(&options.state.join("released"));
+        let loser_reaped = unsafe { libc::kill(losing_pid, 0) } < 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
         let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
         wait_until(|| probe(&paths, &options.socket).ok().flatten().is_some());
         stop(&options).unwrap();
@@ -1086,6 +1296,11 @@ mod tests {
             result.is_ok(),
             "losing ensure rejected the winner: {result:?}"
         );
+        assert!(loser_reaped, "ensure left its losing daemon process behind");
+        assert!(elapsed >= Duration::from_millis(800));
+        let starts = fs::read_to_string(options.state.join("starts")).unwrap();
+        assert_eq!(starts.lines().count(), 1, "ensure respawned a losing child");
+        assert_eq!(starts.trim(), losing_pid.to_string());
     }
 
     #[test]
@@ -1128,7 +1343,11 @@ mod tests {
         let workers: Vec<_> = (0..8)
             .map(|_| {
                 let options = options.clone();
-                std::thread::spawn(move || ensure_command(&options, child_command()).unwrap())
+                std::thread::spawn(move || {
+                    let mut command = child_command();
+                    command.env("LINEUP_TEST_RECORD_START", "1");
+                    ensure_command(&options, command).unwrap();
+                })
             })
             .collect();
         for worker in workers {
@@ -1136,6 +1355,9 @@ mod tests {
         }
         let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
         let identity = probe(&paths, &options.socket).unwrap().unwrap();
+        let starts = fs::read_to_string(options.state.join("starts")).unwrap();
+        assert_eq!(starts.lines().count(), 1);
+        assert_eq!(starts.trim(), identity.pid.to_string());
         assert!(SessionLock::acquire(&paths).unwrap().is_none());
         std::fs::write(&paths.pid, "1").unwrap();
         stop(&options).unwrap();

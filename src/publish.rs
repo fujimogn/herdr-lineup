@@ -2540,6 +2540,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "isolated metadata daemon subprocess entry point"]
+    fn metadata_daemon_child() {
+        let options = crate::daemon::Options::from_env().unwrap();
+        let paths = crate::lock::RuntimePaths::new(&options.state, &options.socket).unwrap();
+        // Missing homes exercise unavailable usage without reading real data.
+        let mut publisher =
+            MetadataPublisher::new(paths.root, paths.key, Homes::default()).unwrap();
+        crate::daemon::run_foreground(&options, false, &mut publisher).unwrap();
+    }
+
+    #[test]
     fn daemon_hook_publishes_missing_usage_heading_and_clears_on_stop() {
         let dir = tempfile::tempdir().unwrap();
         let options = crate::daemon::Options {
@@ -2611,19 +2622,23 @@ mod tests {
             reports
         });
         let paths = crate::lock::RuntimePaths::new(&options.state, &options.socket).unwrap();
-        let publisher = MetadataPublisher::new(
-            paths.root.clone(),
-            paths.key.clone(),
-            // Missing homes exercise unavailable usage without competing with
-            // the reader modules' separately serialized process-wide workers.
-            Homes::default(),
-        )
-        .unwrap();
-        let daemon_options = options.clone();
-        let daemon = std::thread::spawn(move || {
-            let mut publisher = publisher;
-            crate::daemon::run_foreground(&daemon_options, false, &mut publisher).unwrap();
-        });
+        let mut daemon = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "publish::tests::metadata_daemon_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HERDR_SOCKET_PATH", &options.socket)
+            .env("HERDR_PLUGIN_STATE_DIR", &options.state)
+            .env("HERDR_PLUGIN_CONFIG_DIR", &options.config)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if crate::daemon::probe(&paths, &options.socket)
@@ -2637,7 +2652,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         crate::daemon::stop(&options).unwrap();
-        daemon.join().unwrap();
+        assert!(daemon.wait().unwrap().success());
         let reports = server.join().unwrap();
         assert_eq!(reports.len(), 4);
         assert_eq!(reports[0]["params"]["tokens"]["lineup_context_text"], "—");
