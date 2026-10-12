@@ -29,13 +29,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Planned: ensure one detached publisher is running for this Herdr session.
+    /// Ensure one detached daemon is running for this Herdr session.
     Ensure,
-    /// Planned: run the metadata publisher in the foreground.
+    /// Run the daemon in the foreground.
     Daemon,
-    /// Planned: stop only this plugin's publisher.
+    /// Stop only this plugin's daemon.
     Stop,
-    /// Planned: check the plugin's local setup.
+    /// Check local config, Herdr compatibility, and daemon health.
     Doctor,
     /// Planned, opt-in: add sidebar rows to the user's Herdr configuration.
     Configure,
@@ -50,20 +50,31 @@ enum Command {
 /// Run the command-line scaffold.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    if matches!(cli.command, Command::InstallFont | Command::UninstallFont) {
-        return match font::run(matches!(cli.command, Command::UninstallFont)) {
-            Ok(notes) => {
-                for note in notes {
-                    println!("{note}");
-                }
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("font: {error}");
-                ExitCode::FAILURE
-            }
-        };
+    let result = match cli.command {
+        Command::Ensure => daemon::Options::from_env().and_then(|options| daemon::ensure(&options)),
+        Command::Daemon => {
+            daemon::Options::from_env().and_then(|options| daemon::foreground(&options))
+        }
+        Command::Stop => daemon::Options::from_env().and_then(|options| daemon::stop(&options)),
+        Command::Doctor => daemon::Options::from_env().and_then(|options| doctor::run(&options)),
+        Command::Configure | Command::Unconfigure => Err(std::io::Error::other(
+            "Planned: this command is not implemented yet. No changes were made.",
+        )),
+        Command::InstallFont | Command::UninstallFont => {
+            font::run(matches!(cli.command, Command::UninstallFont))
+                .map(|notes| {
+                    for note in notes {
+                        println!("{note}");
+                    }
+                })
+                .map_err(|error| std::io::Error::other(format!("font: {error}")))
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
     }
-    eprintln!("Planned: this command is not implemented yet. No changes were made.");
-    ExitCode::FAILURE
 }

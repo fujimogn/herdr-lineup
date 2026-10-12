@@ -3,7 +3,7 @@ name = "Lineup"
 version = "0.1.0"
 # Baseline for the planned sidebar metadata publisher and agent integrations.
 # Startup is one-shot; ensure must also recover after workspace.focused.
-min_herdr_version = "0.9.0"
+min_herdr_version = "0.9.3"
 description = "Agent status, context, quota, and repository ship times in the sidebar (planned)."
 platforms = ["macos", "linux"]
 
@@ -19,19 +19,19 @@ command = ["target/release/herdr-lineup", "ensure"]
 
 [[actions]]
 id = "start"
-title = "Start Lineup publisher (planned)"
+title = "Start Lineup daemon"
 contexts = ["workspace"]
 command = ["target/release/herdr-lineup", "ensure"]
 
 [[actions]]
 id = "stop"
-title = "Stop Lineup publisher (planned)"
+title = "Stop Lineup daemon"
 contexts = ["workspace"]
 command = ["target/release/herdr-lineup", "stop"]
 
 [[actions]]
 id = "doctor"
-title = "Check Lineup setup (planned)"
+title = "Check Lineup setup"
 contexts = ["workspace"]
 command = ["target/release/herdr-lineup", "doctor"]
 
