@@ -91,6 +91,86 @@ pub trait UsageReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading;
 }
 
+/// Account quota only; no credentials, raw responses or conversation data.
+#[derive(Clone, Copy)]
+pub(crate) struct WeeklySample {
+    pub used_percent: f64,
+    pub resets_at: Option<SystemTime>,
+}
+
+/// One long-lived query loop per provider. The query owns its existing client,
+/// including its transient/authentication cache policy. Publication only tries
+/// the cache lock; it never takes a client lock or waits for a request.
+pub(crate) struct WeeklyWorker {
+    cache: std::sync::Arc<std::sync::Mutex<Option<WeeklySample>>>,
+    done: std::sync::Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+impl WeeklyWorker {
+    pub(crate) fn start(
+        shutdown: std::sync::Arc<AtomicBool>,
+        interval: Duration,
+        mut query: impl FnMut() -> Option<WeeklySample> + Send + 'static,
+    ) -> io::Result<Self> {
+        let cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let shared = cache.clone();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = done.clone();
+        // Clients enforce their 60..=3600 second provider request cadence.
+        // The smaller loop floor also permits fast injected queries in tests.
+        let interval = interval.clamp(Duration::from_millis(100), Duration::from_secs(3600));
+        let handle = std::thread::Builder::new()
+            .name("lineup-weekly".into())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
+                    let result = query();
+                    if shutdown.load(Ordering::Acquire) || stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Ok(mut cache) = shared.lock() {
+                        *cache = result;
+                    }
+                    let next = Instant::now() + interval;
+                    while Instant::now() < next
+                        && !shutdown.load(Ordering::Acquire)
+                        && !stopped.load(Ordering::Acquire)
+                    {
+                        std::thread::park_timeout(
+                            next.saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(100)),
+                        );
+                    }
+                }
+            })
+            .map_err(|_| io::Error::other("cannot start weekly worker"))?;
+        Ok(Self {
+            cache,
+            done,
+            handle: Some(handle),
+        })
+    }
+
+    pub(crate) fn sample(&self, now: SystemTime) -> Option<WeeklySample> {
+        let sample = *self.cache.try_lock().ok()?;
+        sample.filter(|sample| {
+            sample.used_percent.is_finite()
+                && (0.0..=100.0).contains(&sample.used_percent)
+                && sample.resets_at.is_none_or(|reset| reset > now)
+        })
+    }
+}
+impl Drop for WeeklyWorker {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            // A pending HTTP request is bounded by its client's timeout. Do not
+            // extend daemon stop by joining it; process exit ends its I/O.
+            // Codex child processes have a separate synchronous QueryControl.
+        }
+    }
+}
+
 /// The caller's deadline covers discovery, reads and decompression, including stalled I/O.
 /// A timed-out job is not killed (Rust cannot safely cancel a blocked OS read), but its
 /// provider slot stays occupied until it finishes. Thus repeated polls cannot leak workers.
@@ -327,6 +407,56 @@ pub(crate) fn timestamp(value: &serde_json::Value) -> Option<SystemTime> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn weekly_worker_cache_never_waits_for_query_and_expires_during_query() {
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reset = SystemTime::now() + Duration::from_secs(60);
+        let mut calls = 0;
+        let mut worker = WeeklyWorker::start(shutdown.clone(), Duration::ZERO, move || {
+            calls += 1;
+            if calls == 2 {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            Some(WeeklySample {
+                used_percent: 27.0,
+                resets_at: Some(reset),
+            })
+        })
+        .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = Instant::now();
+        assert_eq!(worker.sample(SystemTime::now()).unwrap().used_percent, 27.0);
+        assert!(worker.sample(reset).is_none());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        shutdown.store(true, Ordering::Release);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.handle.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        worker.handle.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn weekly_worker_shutdown_ends_idle_wait_without_another_query() {
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut worker =
+            WeeklyWorker::start(shutdown.clone(), Duration::from_secs(3600), move || {
+                tx.send(()).unwrap();
+                None
+            })
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        shutdown.store(true, Ordering::Release);
+        worker.handle.as_ref().unwrap().thread().unpark();
+        worker.handle.take().unwrap().join().unwrap();
+        assert!(rx.try_recv().is_err());
+    }
     pub fn identity(provider: Provider) -> SessionIdentity {
         SessionIdentity {
             provider,

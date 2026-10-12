@@ -1,15 +1,23 @@
 # Security
 
-## Current scaffold
+## Runtime data boundaries
 
-Runtime local reads and explicit configuration actions are described in the
-README. The new standalone billing client below adds a narrow, separately
-authorized remote credential boundary; it is not connected to the runtime.
+Local usage reads and explicit configuration actions are described in the README.
+`allow_network` defaults to false. Only explicit `allow_network = true` enables
+one Codex account worker and one Grok billing worker for configured providers.
+Install/startup never edits this setting or the user's credentials. Quota queries
+run on background threads; refresh only reads their non-secret in-memory cache.
+
+On shutdown, no further queries are scheduled. Stop keeps its five-second
+deadline and does not join a pending Grok HTTP request; daemon process exit ends
+that I/O. Codex has a separate child process, so shutdown synchronously kills
+its process group and reaps the direct child through a spawn/stop synchronized
+owner. Error exits use the same cleanup, without touching the Herdr server.
 
 ## Local data read by the Grok billing client
 
-`quota_grok::Client` is implemented as a standalone client; the daemon and Grok
-reader do not call it yet. It resolves `GROK_AUTH_FILE`, then
+`quota_grok::Client` is polled by the dedicated daemon worker only with network
+opt-in. It resolves `GROK_AUTH_FILE`, then
 `GROK_HOME/auth.json`, then `~/.grok/auth.json`. It reads at most 64 KiB and
 retains only one unique `key` and optional `user_id`, including nested objects.
 Ambiguous multiple keys fail closed. It never writes or refreshes credentials.
@@ -34,28 +42,26 @@ timeout and 5xx failures keep the last successful weekly usage until its reset
 time. Authentication failures (401/403 or unreadable/invalid
 credentials), invalid responses, and failures without an earlier success return
 missing data. All failure paths are throttled; expired reset times clear cached
-usage. The synchronous client must be scheduled independently if a daemon tick
-must not wait. Keep a separate client per configured account and recreate it
-on account/profile changes before integration.
+usage. The synchronous client runs only on its worker. Its one configured auth
+source supplies weekly quota to all Grok panes independently of local context.
+Restart the Lineup daemon after account changes to discard cached quota.
 
 Development tests use only temporary fake credentials and loopback HTTP servers.
 Authenticated production provider requests are not run during development.
-The client is not connected to a runtime entry point in this change.
 
-## Planned local data access
+## Local usage data access
 
 Usage readers and the publisher have separate local-data boundaries. This
-section retains the scaffold's planned requirements: extract usage fields only,
+section describes the implemented contract: extract usage fields only,
 never log session contents or secrets, and publish display metadata only to the
 local Herdr socket. Plugin settings and state belong in Herdr plugin directories.
 Configuration writes require the explicit opt-in actions. See the README for
-implemented runtime behavior; no broader provider request permission is implied
-by the standalone Grok billing client.
+implemented runtime behavior. Other provider API access is outside this opt-in.
 
 ## Codex app-server quota client
 
-`src/quota_codex.rs` implements an explicit account-quota client, not yet
-connected to the daemon or the local Codex context reader. It starts
+`src/quota_codex.rs` implements the account-quota client called by the dedicated
+daemon worker when network access is explicitly enabled. It starts
 `codex app-server` with a caller-supplied absolute `CODEX_HOME` and exchanges
 stdio JSON-RPC: `initialize`, `initialized`, `account/read` (without requesting
 a token refresh), and `account/rateLimits/read`. It never requests threads or
@@ -72,15 +78,18 @@ monotonic deadline (at most 30 seconds), and every completion path kills the
 child process group and waits for the direct child. Overlapping public queries
 are rejected, so timed-out workers cannot accumulate.
 
-The optional in-memory `WeeklyClient` is bound to one caller-resolved profile;
-replace it when that profile changes. Its query interval is independent of
+The in-memory `WeeklyClient` is bound to the daemon's resolved `CODEX_HOME`.
+Only panes whose exact native session is verified by the local rollout reader
+in that home receive its quota. Snapshots do not identify pane-specific homes
+or profiles; different homes remain unavailable, and profiles sharing a home
+cannot be distinguished. Restart the Lineup daemon after auth/profile changes. Its query interval is independent of
 publication cadence: default five minutes, clamped to one minute through one
 hour. Successful observations are reused between queries. Transient failures
 retain the last success only until its known reset time. Authentication/account
 failures, absent subscription quota, unknown reset after failure, and passed
 reset times clear the cached value. Failure does not panic or stop a publication
-loop. Scheduling and opt-in configuration remain integration work; no daemon
-connection or user configuration change is made by this module.
+loop. The daemon owns one worker for this home and never queries once per pane.
+Lineup does not change user configuration or credentials.
 
 Development tests use synthetic app-server children and injected temporary
 homes only. No authenticated provider query is run during development; live

@@ -12,6 +12,8 @@ pub struct Config {
     pub logo_mode: String,
     pub non_first_pane_logo_indent: u8,
     pub providers: Vec<String>,
+    /// Opt in to Codex app-server account queries and authenticated Grok billing.
+    /// Local context/statusLine reads remain available when this is false.
     pub allow_network: bool,
 }
 impl Default for Config {

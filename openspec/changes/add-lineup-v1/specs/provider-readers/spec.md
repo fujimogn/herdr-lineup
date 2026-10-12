@@ -18,7 +18,8 @@ context and weekly outcomes. Each outcome SHALL be either `available` with a
 finite percentage in [0,100], or `unavailable` with a bounded reason code:
 `unsupported`, `not_found`, `permission_denied`, `unassociated`, `invalid`,
 `timeout`, `stale`, or `source_error`. Context available data SHALL mean current
-conversation tokens used divided by the active context window, not rate quota.
+conversation occupancy of the active context window, with Codex's explicit UI
+baseline convention below, not rate quota.
 Weekly available data SHALL mean **remaining** quota percentage over an explicit
 calendar-week or rolling-seven-day window; it SHALL include window kind and
 reset time when supplied by the source. A shorter or unidentified window SHALL
@@ -48,8 +49,8 @@ table is the contract for the outcomes each adapter obtains.
 | Reader | Context outcome | Weekly remaining outcome | Source detail status |
 | --- | --- | --- | --- |
 | `claude` | Validated statusLine context or unavailable | Session-bound seven-day remaining or unavailable | Implemented capture and local reader; hook opt-in required |
-| `codex` | Exact native-session rollout context (`total_tokens / model_context_window`) or unavailable | Unavailable (`unsupported`) | Implemented local reader; no app-server, auth file, or weekly quota |
-| `grok` | Exact native-session `signals.json` context or unavailable | Unavailable (`unsupported`) | Implemented local reader; no billing API or auth file |
+| `codex` | Exact native-session rollout context with the 12,000-token UI baseline or unavailable | Subscription seven-day remaining from the daemon home, with network opt-in | Implemented local context and background app-server quota; Lineup never opens Codex auth files |
+| `grok` | Exact native-session `signals.json` context or unavailable | Account-wide WEEKLY billing remaining with network opt-in | Implemented local context and background authenticated billing; MONTHLY is unavailable |
 | `agy` | Validated statusLine context or unavailable | Active-pool weekly remaining or unavailable | Implemented capture and local reader; hook opt-in required |
 | `kimi` | Unavailable in stage one | Unavailable in stage one | TBD; enable only after confirmed source |
 | `hermes` | Unavailable in stage one | Unavailable in stage one | TBD; enable only after confirmed source |
@@ -71,8 +72,9 @@ and show `—` on the next refresh.
 Samples whose timestamps are invalid/future or whose identity no longer matches
 the occupant SHALL be unavailable. Context SHALL retain the last valid exact
 session or statusLine-bound observation regardless of its age. Weekly samples
-with a reset time SHALL expire at that time; weekly samples without a reset time
-SHALL expire after `usage_max_age_ms`. The daemon SHALL replace expired or failed
+with a reset time SHALL expire at that time; statusLine weekly samples without a
+reset time SHALL expire after `usage_max_age_ms`. Codex quota without a reset
+SHALL follow the client interval and be cleared after a failed query. The daemon SHALL replace expired or failed
 fields with unavailable display and clear numeric values on the next refresh.
 
 Readers SHALL be read-only with respect to agent files and sessions. Network or
@@ -98,6 +100,63 @@ contain credential values, conversation contents, or personal account identifier
 - **WHEN** a confirmed reader needs an authenticated network call but network
   access is disabled in user configuration
 - **THEN** it returns unavailable and performs no network request
+
+### Requirement: Account quota queries run independently of refresh
+`allow_network` SHALL default to false. Only explicit true SHALL enable a
+single background worker per configured Codex/Grok provider. Refresh SHALL
+read quota memory without waiting for a provider request. Repeated refreshes
+and panes SHALL NOT spawn additional quota workers. The clients SHALL preserve
+their bounded 60..=3600 second query intervals, with a five-minute default,
+independently of publication. Missing initial quota SHALL display `—`.
+
+Transient failures SHALL retain the last successful sample only until its
+known reset. Authentication failures SHALL clear it. Passed reset times SHALL
+be unavailable even while another request is pending. Codex samples without a
+known reset SHALL be discarded after a failed query. Existing client outcome
+classification SHALL be preserved; MONTHLY Grok data SHALL NOT become weekly.
+
+Codex quota SHALL be attributed only to an exact native session verified in
+the daemon's `CODEX_HOME`. Snapshots do not expose pane-specific home/profile;
+different homes SHALL remain unavailable. Profiles sharing a home cannot be
+distinguished; authentication/profile changes require restarting Lineup to
+discard cached account quota. Grok has one configured auth source and SHALL
+share its weekly sample across all Grok panes, including those without context.
+Account quota SHALL NOT infer conversation context.
+
+Shutdown SHALL stop scheduling queries. Daemon exit SHALL NOT join a pending
+HTTP request; process exit ends that request. Shutdown SHALL kill the Codex
+app-server process group and reap the direct child, synchronized with spawn
+so a racing child cannot be orphaned. The existing five-second stop deadline
+SHALL remain unchanged. Error exits SHALL use the same worker cleanup.
+
+#### Scenario: Slow quota request does not delay sidebar refresh
+- **WHEN** both provider workers are inside pending requests
+- **THEN** refresh publishes cached weekly values without waiting for them
+- **AND** expired reset times clear weekly instead of retaining stale quota
+
+#### Scenario: Network access is not implicitly enabled
+- **WHEN** `allow_network` is omitted or false
+- **THEN** no quota worker queries the providers
+- **AND** Codex/Grok weekly is unavailable while local context remains enabled
+
+#### Scenario: Stop while a provider request is pending
+- **WHEN** shutdown is requested during HTTP or app-server I/O
+- **THEN** stop finishes within its five-second deadline without joining HTTP
+- **AND** no Codex app-server child remains after daemon exit
+
+### Requirement: Codex context matches its UI baseline
+Codex context SHALL calculate `max(total_tokens - 12000, 0) /
+(model_context_window - 12000) * 100`, matching the retired quota reader's
+12,000-token baseline in both numerator and denominator. Nonfinite or negative
+usage and windows of 12,000 tokens or less SHALL be unavailable. A valid window
+with usage at/below the baseline SHALL report 0%. Out-of-range final percentages
+SHALL be unavailable rather than clamped.
+
+#### Scenario: Baseline and capacity boundaries
+- **WHEN** usage is 26,000 and capacity is 212,000
+- **THEN** context is 7%
+- **AND** usage at/below 12,000 with that capacity is 0%
+- **AND** capacity at/below 12,000 is unavailable
 
 ### Requirement: Local statusLine capture and transparent chaining
 `herdr-lineup statusline <claude|agy>` SHALL accept at most 1 MiB for JSON

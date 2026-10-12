@@ -1,4 +1,4 @@
-//! Raw context occupancy from exact-session Codex rollout token_count observations.
+//! Codex UI context percentage from exact-session rollout token_count observations.
 use crate::model::*;
 use serde_json::Value;
 use std::path::Path;
@@ -70,12 +70,14 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime
                 let capacity = info["model_context_window"]
                     .as_f64()
                     .ok_or(MissingReason::Invalid)?;
-                if used < 0.0 || capacity <= 0.0 {
+                if !used.is_finite() || !capacity.is_finite() || used < 0.0 || capacity <= 12_000.0
+                {
                     return Err(MissingReason::Invalid);
                 }
-                // No quota-plugin baseline deduction: the contract requires raw occupancy.
+                // Match the retired herdr-agent-quota convention and Codex's UI:
+                // deduct the 12,000-token baseline from both used and capacity.
                 observation = Some((
-                    used / capacity * 100.0,
+                    (used - 12_000.0).max(0.0) / (capacity - 12_000.0) * 100.0,
                     timestamp(&value["timestamp"]).ok_or(MissingReason::Invalid)?,
                 ));
             }
@@ -89,6 +91,39 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_matches_codex_baseline_and_rejects_small_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        for (used, capacity, expected) in [
+            (26_000, 212_000, Some(7.0)),
+            (0, 212_000, Some(0.0)),
+            (11_999, 212_000, Some(0.0)),
+            (12_000, 212_000, Some(0.0)),
+            (212_000, 212_000, Some(100.0)),
+            (70, 12_000, None),
+            (70, 11_999, None),
+        ] {
+            fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", used);
+            let path = dir
+                .path()
+                .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+            let text = fs::read_to_string(&path).unwrap().replace(
+                "\"model_context_window\":212000",
+                &format!("\"model_context_window\":{capacity}"),
+            );
+            fs::write(path, text).unwrap();
+            let result = read_session(&r);
+            match expected {
+                Some(percent) => assert!(
+                    (result.unwrap().0 - percent).abs() < 1e-9,
+                    "used={used}, capacity={capacity}"
+                ),
+                None => assert_eq!(result, Err(MissingReason::Invalid)),
+            }
+        }
+    }
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn assert_percent(outcome: UsageOutcome) {
         let UsageOutcome::Available(percent) = outcome else {
@@ -102,7 +137,7 @@ mod tests {
     fn fixture(home: &Path, session: &str, time: &str, used: i64) {
         fs::create_dir_all(home.join("sessions/2026/10/12")).unwrap();
         let text = format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"{time}\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"total_tokens\":{used}}},\"model_context_window\":1000}}}}}}\n"
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"{time}\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"total_tokens\":{used}}},\"model_context_window\":212000}}}}}}\n"
         );
         fs::write(
             home.join("sessions/2026/10/12/rollout-test-session-1.jsonl"),
@@ -116,7 +151,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let r = request(&id, dir.path());
-        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 70);
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
         let path = dir
             .path()
             .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
@@ -143,7 +178,7 @@ mod tests {
             CodexReader.read(&r).context,
             UsageOutcome::Unavailable(MissingReason::NotFound)
         );
-        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 70);
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
         let reading = CodexReader.read(&r);
         assert_percent(reading.context);
         assert_eq!(
@@ -151,9 +186,9 @@ mod tests {
             UsageOutcome::Unavailable(MissingReason::Unsupported)
         );
         assert!(reading.weekly_resets_at.is_none());
-        fixture(dir.path(), "session-1", "2026-10-11T23:58:59Z", 70);
+        fixture(dir.path(), "session-1", "2026-10-11T23:58:59Z", 26_000);
         assert_percent(CodexReader.read(&r).context);
-        fixture(dir.path(), "session-2", "2026-10-12T00:00:00Z", 70);
+        fixture(dir.path(), "session-2", "2026-10-12T00:00:00Z", 26_000);
         assert_eq!(
             CodexReader.read(&r).context,
             UsageOutcome::Unavailable(MissingReason::Unassociated)
@@ -165,7 +200,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let r = request(&id, dir.path());
-        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 70);
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
         let original = dir
             .path()
             .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
@@ -191,7 +226,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let mut r = request(&id, dir.path());
-        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 1001);
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 212_001);
         assert_eq!(
             CodexReader.read(&r).context,
             UsageOutcome::Unavailable(MissingReason::Invalid)

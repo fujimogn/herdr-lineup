@@ -73,6 +73,9 @@ pub struct MetadataPublisher {
     request_seq: u64,
     refresh_ms: u64,
     shutdown: Option<Arc<AtomicBool>>,
+    codex_weekly: Option<model::WeeklyWorker>,
+    grok_weekly: Option<model::WeeklyWorker>,
+    codex_control: Arc<crate::quota_codex::QueryControl>,
 }
 impl MetadataPublisher {
     /// Construction performs no state I/O. The daemon acquires its session lock
@@ -94,7 +97,62 @@ impl MetadataPublisher {
             request_seq: 0,
             refresh_ms: 5000,
             shutdown: None,
+            codex_weekly: None,
+            grok_weekly: None,
+            codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
         })
+    }
+
+    fn start_weekly(&mut self, config: &Config) -> io::Result<()> {
+        if !config.allow_network {
+            return Ok(());
+        }
+        // Only the daemon holding the session lock receives a shutdown flag.
+        let Some(shutdown) = self.shutdown.clone() else {
+            return Ok(());
+        };
+        self.check_shutdown()?;
+        if self.codex_weekly.is_none()
+            && config.providers.iter().any(|id| id == "codex")
+            && let Some(home) = self.homes.codex.clone()
+        {
+            let mut client = crate::quota_codex::WeeklyClient::new(
+                home,
+                crate::quota_codex::DEFAULT_REFRESH_INTERVAL,
+                crate::quota_codex::DEFAULT_TIMEOUT,
+            );
+            let interval = client.interval();
+            let control = self.codex_control.clone();
+            self.codex_weekly = Some(model::WeeklyWorker::start(
+                shutdown.clone(),
+                interval,
+                move || {
+                    client
+                        .refresh_controlled(&control)
+                        .map(|weekly| model::WeeklySample {
+                            used_percent: weekly.used_percent,
+                            resets_at: weekly.resets_at,
+                        })
+                },
+            )?);
+        }
+        if self.grok_weekly.is_none() && config.providers.iter().any(|id| id == "grok") {
+            let settings = crate::quota_grok::Settings::default();
+            // Auth resolution and credential handling remain inside quota_grok.
+            let mut client = crate::quota_grok::Client::from_env(settings).ok();
+            self.grok_weekly = Some(model::WeeklyWorker::start(
+                shutdown,
+                settings.interval(),
+                move || match client.as_mut()?.poll() {
+                    crate::quota_grok::Outcome::Weekly(weekly) => Some(model::WeeklySample {
+                        used_percent: weekly.used_percent,
+                        resets_at: Some(weekly.resets_at),
+                    }),
+                    _ => None,
+                },
+            )?);
+        }
+        Ok(())
     }
 
     fn check_shutdown(&self) -> io::Result<()> {
@@ -317,6 +375,24 @@ impl MetadataPublisher {
         self.reconcile_missing(&snapshot);
         let now = SystemTime::now();
         let now_unix = unix(now);
+        // One nonblocking cache snapshot per cycle keeps all Grok panes on the
+        // same account observation even if a worker completes mid-refresh.
+        let codex_weekly = config
+            .allow_network
+            .then(|| {
+                self.codex_weekly
+                    .as_ref()
+                    .and_then(|worker| worker.sample(now))
+            })
+            .flatten();
+        let grok_weekly = config
+            .allow_network
+            .then(|| {
+                self.grok_weekly
+                    .as_ref()
+                    .and_then(|worker| worker.sample(now))
+            })
+            .flatten();
         let mode = match config.logo_mode.as_str() {
             "font" => tokens::LogoMode::Font,
             "text" => tokens::LogoMode::Text,
@@ -374,7 +450,7 @@ impl MetadataPublisher {
                     pane_id: pane.pane_id.clone(),
                 };
                 let native = match who.agent {
-                    Agent::Agy => who.native_session.clone().unwrap_or_default(),
+                    Agent::Agy | Agent::Grok => who.native_session.clone().unwrap_or_default(),
                     _ => who.native_session.clone()?,
                 };
                 let (provider, home, reader): (_, _, &dyn UsageReader) = match who.agent {
@@ -389,7 +465,11 @@ impl MetadataPublisher {
                         &agy,
                     ),
                     Agent::Codex => (model::Provider::Codex, self.homes.codex.as_ref()?, codex),
-                    Agent::Grok => (model::Provider::Grok, self.homes.grok.as_ref()?, grok),
+                    Agent::Grok => (
+                        model::Provider::Grok,
+                        self.homes.grok.as_ref().unwrap_or(&self.directory),
+                        grok,
+                    ),
                     _ => return None,
                 };
                 // Snapshot has no pane-specific home/profile. Only the injected daemon
@@ -407,9 +487,48 @@ impl MetadataPublisher {
                     max_age: Duration::from_millis(config.usage_max_age_ms),
                     timeout: deadline.saturating_duration_since(Instant::now()),
                 };
-                let reading = reader.read(&request);
+                let mut reading = if who.agent == Agent::Grok && self.homes.grok.is_none() {
+                    // Billing account attribution does not require a local session
+                    // home. Do not search plugin state as a substitute for context.
+                    model::UsageReading::missing(
+                        &request,
+                        model::SourceKind::GrokSignals,
+                        model::MissingReason::NotFound,
+                    )
+                } else {
+                    reader.read(&request)
+                };
                 if reading.identity != identity {
                     return None;
+                }
+                if config.allow_network {
+                    let weekly = match who.agent {
+                        // Herdr snapshots do not expose pane-specific CODEX_HOME or
+                        // profiles. Attribute the daemon home's quota only after its
+                        // rollout reader proves this exact native session belongs
+                        // there. Different homes remain unavailable; profiles sharing
+                        // a home cannot be distinguished, and auth changes require
+                        // restarting the daemon to discard the account cache.
+                        Agent::Codex
+                            if reading.binding
+                                == Some(model::UsageBinding::NativeSession(native.clone())) =>
+                        {
+                            codex_weekly
+                        }
+                        // Grok has one configured account, shared across all its
+                        // panes even when no local context/native id is available.
+                        Agent::Grok => grok_weekly,
+                        _ => None,
+                    };
+                    if let Some(weekly) = weekly {
+                        reading.weekly_remaining =
+                            model::UsageOutcome::Available(100.0 - weekly.used_percent);
+                        reading.weekly_window = Some(model::WeeklyWindow::RollingSevenDays);
+                        reading.weekly_resets_at = weekly.resets_at;
+                        if who.agent == Agent::Grok {
+                            reading.binding = Some(model::UsageBinding::Pane(pane.pane_id.clone()));
+                        }
+                    }
                 }
                 Some(tokens::Usage {
                     binding: reading.binding,
@@ -512,7 +631,14 @@ impl daemon::Publisher for MetadataPublisher {
         self.shutdown = Some(shutdown);
     }
     fn refresh(&mut self, transport: &mut Transport, config: &Config) -> io::Result<()> {
+        config.validate()?;
+        self.start_weekly(config)?;
         self.refresh_with_readers(transport, config, &CodexReader, &GrokReader)
+    }
+    fn shutdown(&mut self) {
+        self.codex_control.stop();
+        self.codex_weekly.take();
+        self.grok_weekly.take();
     }
     fn clear(&mut self, transport: &mut Transport) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -553,6 +679,13 @@ impl daemon::Publisher for MetadataPublisher {
     }
     fn reconnected(&mut self) {
         self.planner = tokens::Publisher::restore(self.planner.checkpoint());
+    }
+}
+
+impl Drop for MetadataPublisher {
+    fn drop(&mut self) {
+        // Also covers errors before/around daemon lifecycle initialization.
+        self.codex_control.stop();
     }
 }
 
@@ -612,6 +745,117 @@ mod tests {
         os::unix::net::UnixListener,
         time::Duration,
     };
+
+    #[test]
+    fn fake_socket_weekly_cache_publishes_without_waiting_for_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let request = receive(&mut stream);
+            let mut response = snapshot(&request["id"], true);
+            let panes = &mut response["result"]["snapshot"]["panes"];
+            *panes = json!([
+                {"pane_id":"w1:p1","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"agent":"codex","kind":"id","value":"synthetic-session"}},
+                {"pane_id":"w1:p2","workspace_id":"w1","agent":"grok","agent_status":"idle"},
+                {"pane_id":"w1:p3","workspace_id":"w1","agent":"grok","agent_status":"idle"},
+                {"pane_id":"w1:p4","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"agent":"codex","kind":"id","value":"foreign-session"}}
+            ]);
+            writeln!(stream.get_mut(), "{response}").unwrap();
+            let mut reports = Vec::new();
+            for _ in 0..5 {
+                let report = receive(&mut stream);
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":report["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+                reports.push(report);
+            }
+            reports
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut releases = Vec::new();
+        let mut workers = Vec::new();
+        for used_percent in [27.0, 42.0] {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mut calls = 0;
+            workers.push(
+                model::WeeklyWorker::start(shutdown.clone(), Duration::ZERO, move || {
+                    calls += 1;
+                    if calls == 2 {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    Some(model::WeeklySample {
+                        used_percent,
+                        resets_at: Some(SystemTime::now() + Duration::from_secs(86400)),
+                    })
+                })
+                .unwrap(),
+            );
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            releases.push(release_tx);
+        }
+        let mut publisher = MetadataPublisher::new(
+            dir.path().into(),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("codex")),
+                grok: None,
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        publisher.codex_weekly = Some(workers.remove(0));
+        publisher.grok_weekly = Some(workers.remove(0));
+        publisher.set_shutdown(shutdown.clone());
+        struct AssociatedReader;
+        impl UsageReader for AssociatedReader {
+            fn read(&self, r: &ReadRequest<'_>) -> UsageReading {
+                if r.identity.native_session_id == "synthetic-session" {
+                    UsageReading::sample(r, SourceKind::CodexRollout, 7.0, r.now)
+                } else {
+                    UsageReading::missing(r, SourceKind::CodexRollout, MissingReason::Unassociated)
+                }
+            }
+        }
+        let mut transport = Transport::connect(&socket).unwrap();
+        let started = Instant::now();
+        let result = publisher.refresh_with_readers(
+            &mut transport,
+            &Config {
+                allow_network: true,
+                ..Config::default()
+            },
+            &AssociatedReader,
+            &TimeoutReader,
+        );
+        let elapsed = started.elapsed();
+        shutdown.store(true, Ordering::Release);
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        result.unwrap();
+        let reports = server.join().unwrap();
+        assert!(elapsed < Duration::from_secs(1));
+        for (report, remaining) in reports[..3].iter().zip(["73", "58", "58"]) {
+            let tokens = &report["params"]["tokens"];
+            assert_eq!(tokens["lineup_weekly_pct"], remaining);
+            assert!(
+                tokens["lineup_weekly_text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("7d {remaining}% "))
+            );
+        }
+        assert_eq!(reports[0]["params"]["tokens"]["lineup_context_pct"], "7");
+        assert_eq!(reports[1]["params"]["tokens"]["lineup_context_text"], "—");
+        assert_eq!(reports[3]["params"]["tokens"]["lineup_weekly_text"], "—");
+    }
 
     #[test]
     fn group_heading_moves_with_snapshot_order_and_clears_without_repository() {

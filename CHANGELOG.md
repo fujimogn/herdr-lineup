@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in Codex account and Grok billing quota workers (`allow_network = true`).
+  Refresh reads memory without waiting for quota queries. Grok weekly is shared
+  across its panes; Codex weekly requires an exact session in the daemon home.
+  Shutdown stops scheduling, skips pending HTTP joins, and kills/reaps the Codex
+  app-server child group while preserving the five-second stop deadline.
+
 - First-pane repository heading tokens `lineup_group` and
   `lineup_group_ship_text`, sharing snapshot-order selection with logo
   indentation and clearing when pane order or repository availability changes.
@@ -40,10 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It records usage for the sidebar and prints nothing unless `--then` returns
   the existing command's display.
 - Claude and Antigravity usage readers. Context comes from Codex, Grok, Claude,
-  and Antigravity. Weekly remaining comes from Claude and Antigravity
-  observations only.
+  and Antigravity. Claude and Antigravity weekly remaining comes from local
+  observations; Codex and Grok account quota requires separate network opt-in.
 
 ### Fixed
+
+- Match Codex context UI percentages by subtracting the 12,000-token baseline
+  from both usage and capacity, returning unavailable for windows at/below it.
 
 - Bound the caller wait for stalled reader I/O and discard queued usage after
   the reader deadline.

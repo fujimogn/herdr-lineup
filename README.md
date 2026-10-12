@@ -4,8 +4,8 @@ One sidebar row per AI coding agent in [Herdr](https://herdr.dev): vendor logo,
 state, context, weekly quota, and when each repository last shipped.
 
 A per-session daemon publishes `lineup_` sidebar metadata. Usage numbers come
-from local session files and opt-in statusLine commands, not from provider
-APIs. `--help` and `--version` work.
+from local session files, opt-in statusLine commands, and explicitly enabled
+Codex/Grok account quota queries. `--help` and `--version` work.
 
 ## Install
 
@@ -107,9 +107,46 @@ quota for Claude, Codex, Grok, Antigravity, Kimi, and Hermes. Unavailable usage
 shows `—`. [Source research](docs/research/usage-sources.md) records where each
 number can come from.
 
-Context values come from Codex, Grok, Claude, and Antigravity. Weekly remaining
-comes from Claude and Antigravity. Kimi and Hermes stay unavailable, and Codex
-and Grok do not supply weekly quota.
+| Agent | Context | Weekly remaining |
+| --- | --- | --- |
+| Claude | Opt-in statusLine observation | Opt-in statusLine seven-day observation |
+| Codex | Exact-session local rollout, with the 12,000-token UI baseline | Account quota worker when `allow_network = true` |
+| Grok | Exact-session local `signals.json` | Shared billing worker when `allow_network = true`; WEEKLY only |
+| Antigravity | Opt-in statusLine observation | Active-model weekly pool from statusLine |
+| Kimi / Hermes | Unavailable | Unavailable |
+
+Network access defaults to disabled. To opt in, add this to the plugin's
+`$HERDR_PLUGIN_CONFIG_DIR/config.toml`, then stop/start only the Lineup daemon:
+
+```toml
+allow_network = true
+```
+
+This starts `codex app-server` for account limits using the daemon's `CODEX_HOME`
+and reads Grok's existing auth key (`GROK_AUTH_FILE`, then `GROK_HOME/auth.json`,
+then `~/.grok/auth.json`) for the authenticated HTTPS billing endpoint. No
+credentials are displayed or persisted by Lineup. Do not restart the Herdr server.
+
+One background worker per enabled provider polls its client every five minutes,
+independently of refresh. Client request intervals are bounded to 1..=60 minutes.
+Refresh reads memory only for quota and never waits for a provider request.
+Temporary failures retain the last success until its known reset; authentication
+failures clear it. Before the first successful query, after reset, and for Grok
+MONTHLY allowances, weekly stays `—`. Disabled network access also keeps Codex
+and Grok weekly at `—` while preserving local context.
+
+Codex context uses `max(total_tokens - 12000, 0) / (model_context_window - 12000)`.
+A window of 12,000 tokens or less is unavailable. The snapshot has no pane-specific
+home or profile, so Codex weekly is attributed only to a pane whose exact native
+session is verified in the daemon's home. Panes using a different home remain
+unavailable. Profiles sharing one home cannot be distinguished; stop/start the
+Lineup daemon after changing authentication or profiles to discard cached account
+quota. Grok has one configured auth source, so its weekly quota is shared by all
+Grok panes, even without local context.
+
+Workers stop scheduling queries on daemon shutdown. Stop does not join a pending
+Grok HTTP request (process exit ends it), and it kills/reaps the in-flight Codex
+app-server process group. The existing five-second stop deadline is preserved.
 
 Each agent row shows the vendor logo, a state dot, context use as a percentage,
 and a weekly quota triplet such as `7d 67% 6d9h`: the quota period, the share
@@ -195,8 +232,9 @@ export HERDR_PLUGIN_STATE_DIR="/path/to/herdr-lineup/state"
 
 Context stays `—` until an observation matches the pane, then retains the last
 valid value while that exact session or pane binding matches. Idle context does
-not expire by age. Weekly quota with a reset time expires at that time; weekly
-quota without a reset time uses the default maximum age of 60 seconds.
+not expire by age. Weekly quota with a reset time expires at that time. StatusLine
+weekly without a reset uses the default maximum age of 60 seconds; Codex quota
+without a reset follows its client interval and clears after a failed query.
 
 The repository heading reads the newest local `origin/main` commit without
 fetching: `HH:MM` for today, `M/D` for earlier dates. This is a commit-time label,
@@ -273,7 +311,7 @@ and [SECURITY.md](SECURITY.md).
   or use the planned text fallback.
 - **A build fails:** verify rustup can install the pinned toolchain and that Cargo
   can download the locked dependencies. No credentials or remote API setup are
-  required by the current executable.
+  required for local context; account quota queries need the explicit opt-in above.
 
 Do not stop or restart the Herdr server to troubleshoot this plugin.
 

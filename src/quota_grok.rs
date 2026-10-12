@@ -1,4 +1,4 @@
-//! Opt-in Grok billing client. Not connected to the daemon or reader yet.
+//! Opt-in Grok billing client, polled by the daemon's dedicated quota worker.
 //!
 //! Keep one client per configured account. Outcomes contain no credentials or
 //! upstream error text. No network request occurs until `Client::poll` is called.

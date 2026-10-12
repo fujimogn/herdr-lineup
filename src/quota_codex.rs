@@ -5,6 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,12 +28,20 @@ pub struct Weekly {
     pub resets_at: Option<SystemTime>,
 }
 
-/// An explicit authenticated query. This is not called by the current daemon/readers.
+/// An authenticated query, scheduled only by an explicitly enabled quota worker.
 /// Codex resolves its own credentials; Lineup never opens an authentication file.
 /// Errors contain only fixed diagnostics, never app-server output or account metadata.
 /// PermissionDenied means the cache must discard its prior account observation.
 /// Other errors are transient and may retain a prior value until its known reset.
 pub fn read_weekly(codex_home: &Path, timeout: Duration) -> io::Result<Option<Weekly>> {
+    read_weekly_controlled(codex_home, timeout, &QueryControl::default())
+}
+
+fn read_weekly_controlled(
+    codex_home: &Path,
+    timeout: Duration,
+    control: &QueryControl,
+) -> io::Result<Option<Weekly>> {
     if BUSY
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -49,13 +58,13 @@ pub fn read_weekly(codex_home: &Path, timeout: Duration) -> io::Result<Option<We
         }
     }
     let _permit = Permit;
-    read_with_command(codex_home, timeout, Command::new("codex"))
+    read_with_control(codex_home, timeout, Command::new("codex"), control)
 }
 
 /// A cache for a single caller-resolved Codex home/profile. Construct a new client
 /// when that profile changes. No cache files or raw account identities are stored.
-/// refresh() is synchronous and bounded; integration should schedule it independently
-/// of the daemon's publication cadence, once per profile rather than once per pane.
+/// refresh() is synchronous and bounded; the daemon schedules it on one worker,
+/// independently of publication, once per configured home rather than per pane.
 pub struct WeeklyClient {
     codex_home: PathBuf,
     interval: Duration,
@@ -82,10 +91,14 @@ impl WeeklyClient {
     /// Returns a cached value between attempts, including after transient errors.
     /// Authentication failures and absent subscriptions clear it immediately.
     pub fn refresh(&mut self) -> Option<Weekly> {
+        self.refresh_controlled(&QueryControl::default())
+    }
+
+    pub(crate) fn refresh_controlled(&mut self, control: &QueryControl) -> Option<Weekly> {
         let home = self.codex_home.clone();
         let timeout = self.timeout;
         self.refresh_with(Instant::now(), SystemTime::now(), || {
-            read_weekly(&home, timeout)
+            read_weekly_controlled(&home, timeout, control)
         });
         self.expire(SystemTime::now());
         self.cached
@@ -148,10 +161,52 @@ impl Drop for Server {
     }
 }
 
+/// Own the in-flight process independently of the query thread. Shutdown takes
+/// and drops the child under this lock, killing its group and reaping its PID.
+/// Spawn and stop use the same lock: even a shutdown/spawn race cannot orphan a
+/// newly started app-server or signal a recycled process-group ID.
+#[derive(Default)]
+pub(crate) struct QueryControl {
+    stopped: AtomicBool,
+    server: Mutex<Option<Server>>,
+}
+impl QueryControl {
+    pub(crate) fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        drop(server.take());
+    }
+}
+
+struct QueryGuard<'a>(&'a QueryControl);
+impl Drop for QueryGuard<'_> {
+    fn drop(&mut self) {
+        let mut server = self
+            .0
+            .server
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        drop(server.take());
+    }
+}
+
+#[cfg(test)]
 fn read_with_command(
     codex_home: &Path,
     timeout: Duration,
+    command: Command,
+) -> io::Result<Option<Weekly>> {
+    read_with_control(codex_home, timeout, command, &QueryControl::default())
+}
+
+fn read_with_control(
+    codex_home: &Path,
+    timeout: Duration,
     mut command: Command,
+    control: &QueryControl,
 ) -> io::Result<Option<Weekly>> {
     if timeout.is_zero() || !codex_home.is_absolute() {
         return Err(io::Error::new(
@@ -160,6 +215,16 @@ fn read_with_command(
         ));
     }
     let deadline = Instant::now() + timeout.min(MAX_TIMEOUT);
+    let mut active = control
+        .server
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if control.stopped.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Codex quota stopped",
+        ));
+    }
     let child = command
         .arg("app-server")
         .env("CODEX_HOME", codex_home)
@@ -180,6 +245,9 @@ fn read_with_command(
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("Missing Codex stdout"))?;
+    *active = Some(server);
+    drop(active);
+    let _guard = QueryGuard(control);
     nonblocking(input.as_raw_fd())?;
     nonblocking(output.as_raw_fd())?;
     let mut rpc = Rpc {
@@ -388,6 +456,48 @@ impl Rpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shutdown_reaps_inflight_app_server_without_waiting_for_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("blocked-codex");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho $$ > \"$CODEX_HOME/pid\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let control = std::sync::Arc::new(QueryControl::default());
+        let query_control = control.clone();
+        let home = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            read_with_control(&home, MAX_TIMEOUT, Command::new(script), &query_control)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !dir.path().join("pid").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let pid: i32 = fs::read_to_string(dir.path().join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let started = Instant::now();
+        control.stop();
+        assert!(handle.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        assert!(
+            read_with_control(
+                dir.path(),
+                MAX_TIMEOUT,
+                Command::new("must-not-run"),
+                &control
+            )
+            .is_err()
+        );
+    }
     use serde_json::json;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

@@ -55,6 +55,9 @@ impl Options {
 pub trait Publisher {
     /// Observe shutdown between bounded reader calls and complete metadata frames.
     fn set_shutdown(&mut self, _shutdown: Arc<AtomicBool>) {}
+    /// Stop owned background queries on every exit, without joining HTTP I/O.
+    /// Separate provider child processes must be killed and reaped here.
+    fn shutdown(&mut self) {}
     fn refresh(&mut self, transport: &mut Transport, config: &Config) -> io::Result<()>;
     fn clear(&mut self, transport: &mut Transport) -> io::Result<()>;
     /// Drop any cached pane associations before authoritative reconciliation.
@@ -262,66 +265,71 @@ fn run_locked(
     let started = Instant::now();
     let mut refresh_at = Instant::now();
     let mut reconnect = false;
-    loop {
-        if control.shutdown.load(Ordering::Acquire) {
-            // Finish the current bounded operation before clearing complete frames.
-            if transport.check_connection().is_ok() {
-                publisher.clear(&mut transport)?;
-            }
-            return Ok(());
-        }
-        if control
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.is_finished())
-        {
-            return Err(io::Error::other(
-                "daemon control worker exited unexpectedly",
-            ));
-        }
-        if reconnect || transport.check_connection().is_err() {
-            // Transport treats v0.9.3 EOF after a response as normal and opens
-            // each next request on the pinned dev/inode. This recovery path is
-            // for unexpected failures; a replaced server socket stops us.
-            let retrying_refresh = reconnect;
-            transport.reconnect_same_endpoint()?;
-            doctor::check_transport(&mut transport)?;
-            publisher.reconnected();
-            reconnect = false;
-            if !retrying_refresh {
-                refresh_at = Instant::now();
-            }
-        }
-        if Instant::now() >= refresh_at {
-            match publisher.refresh(&mut transport, &config) {
-                Ok(()) => {
-                    health.last_refresh_ms =
-                        Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
-                    health.refresh_failed = false;
+    let result = (|| {
+        loop {
+            if control.shutdown.load(Ordering::Acquire) {
+                // Finish the current bounded operation before clearing complete frames.
+                if transport.check_connection().is_ok() {
+                    publisher.clear(&mut transport)?;
                 }
-                Err(error) => {
-                    health.refresh_failed = true;
-                    reconnect = error.kind() != io::ErrorKind::InvalidInput;
-                    if error.kind() == io::ErrorKind::InvalidInput {
+                return Ok(());
+            }
+            if control
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                return Err(io::Error::other(
+                    "daemon control worker exited unexpectedly",
+                ));
+            }
+            if reconnect || transport.check_connection().is_err() {
+                // Transport treats v0.9.3 EOF after a response as normal and opens
+                // each next request on the pinned dev/inode. This recovery path is
+                // for unexpected failures; a replaced server socket stops us.
+                let retrying_refresh = reconnect;
+                transport.reconnect_same_endpoint()?;
+                doctor::check_transport(&mut transport)?;
+                publisher.reconnected();
+                reconnect = false;
+                if !retrying_refresh {
+                    refresh_at = Instant::now();
+                }
+            }
+            if Instant::now() >= refresh_at {
+                match publisher.refresh(&mut transport, &config) {
+                    Ok(()) => {
+                        health.last_refresh_ms =
+                            Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+                        health.refresh_failed = false;
+                    }
+                    Err(error) => {
+                        health.refresh_failed = true;
+                        reconnect = error.kind() != io::ErrorKind::InvalidInput;
+                        if error.kind() == io::ErrorKind::InvalidInput {
+                            let _ = writeln!(
+                                log,
+                                "Lineup metadata capacity exhausted; affected resources skipped"
+                            );
+                        }
                         let _ = writeln!(
                             log,
-                            "Lineup metadata capacity exhausted; affected resources skipped"
+                            "Lineup refresh failed; metadata will expire unless renewed"
                         );
                     }
-                    let _ = writeln!(
-                        log,
-                        "Lineup refresh failed; metadata will expire unless renewed"
-                    );
                 }
+                refresh_at = Instant::now() + Duration::from_millis(config.refresh_interval_ms);
             }
-            refresh_at = Instant::now() + Duration::from_millis(config.refresh_interval_ms);
+            *control.health.lock().unwrap() = health.clone();
+            if control.shutdown.load(Ordering::Acquire) {
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        *control.health.lock().unwrap() = health.clone();
-        if control.shutdown.load(Ordering::Acquire) {
-            continue;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    })();
+    control.shutdown.store(true, Ordering::Release);
+    publisher.shutdown();
+    result
 }
 /// Own the control listener independently of publication. Drop joins the worker
 /// before runtime paths are removed and session ownership is released.
@@ -642,6 +650,79 @@ mod tests {
                 fs::write(options.state.join("contended"), error.to_string()).unwrap();
                 std::process::exit(i32::from(crate::failure_exit_code(&error)));
             }
+            if std::env::var_os("LINEUP_TEST_QUOTA_STOP").is_some() {
+                struct QuotaPublisher {
+                    home: PathBuf,
+                    control: Arc<crate::quota_codex::QueryControl>,
+                    workers: Vec<crate::model::WeeklyWorker>,
+                }
+                impl Publisher for QuotaPublisher {
+                    fn set_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
+                        let mut client = crate::quota_codex::WeeklyClient::new(
+                            self.home.clone(),
+                            Duration::from_secs(60),
+                            Duration::from_secs(30),
+                        );
+                        let control = self.control.clone();
+                        self.workers.push(
+                            crate::model::WeeklyWorker::start(
+                                shutdown.clone(),
+                                Duration::from_secs(60),
+                                move || {
+                                    client.refresh_controlled(&control);
+                                    None
+                                },
+                            )
+                            .unwrap(),
+                        );
+                        let home = self.home.clone();
+                        self.workers.push(
+                            crate::model::WeeklyWorker::start(
+                                shutdown,
+                                Duration::from_secs(60),
+                                move || {
+                                    fs::write(home.join("http-entered"), "").unwrap();
+                                    std::thread::sleep(Duration::from_secs(30));
+                                    None
+                                },
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                        Ok(())
+                    }
+                    fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                        Ok(())
+                    }
+                    fn shutdown(&mut self) {
+                        self.control.stop();
+                        self.workers.clear();
+                    }
+                }
+                run_foreground(
+                    &options,
+                    true,
+                    &mut QuotaPublisher {
+                        home: options.state.clone(),
+                        control: Arc::new(crate::quota_codex::QueryControl::default()),
+                        workers: Vec::new(),
+                    },
+                )
+                .unwrap();
+                return;
+            }
+            if std::env::var_os("LINEUP_TEST_QUOTA_ONCE").is_some() {
+                let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+                let mut publisher = crate::publish::MetadataPublisher::new(
+                    paths.root,
+                    paths.key,
+                    crate::publish::Homes::from_env(),
+                )
+                .unwrap();
+                run_foreground(&options, true, &mut publisher).unwrap();
+                return;
+            }
             struct SlowRefresh(PathBuf, Option<Arc<AtomicBool>>);
             impl Publisher for SlowRefresh {
                 fn set_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
@@ -683,6 +764,74 @@ mod tests {
         while !condition() {
             assert!(Instant::now() < deadline, "test handshake timed out");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn stop_does_not_join_http_and_reaps_codex_app_server() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, options, done, server) = fixture();
+        let bin = options.config.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let script = bin.join("codex");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho $$ > \"$CODEX_HOME/app-server-pid\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_QUOTA_STOP", "1").env("PATH", &bin);
+        ensure_command(&options, command).unwrap();
+        wait_until(|| {
+            options.state.join("app-server-pid").exists()
+                && options.state.join("http-entered").exists()
+        });
+        let pid: i32 = fs::read_to_string(options.state.join("app-server-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let started = Instant::now();
+        let result = stop(&options);
+        let elapsed = started.elapsed();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        result.unwrap();
+        assert!(elapsed < Duration::from_secs(5));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn daemon_quota_is_opt_in_and_repeated_refreshes_keep_one_worker() {
+        use std::os::unix::fs::PermissionsExt;
+        for enabled in [false, true] {
+            let (_dir, options, done, server) = fixture();
+            fs::write(options.config.join("config.toml"), format!("allow_network = {enabled}\nproviders = ['codex']\nrefresh_interval_ms = 1000\nreader_timeout_ms = 100\n")).unwrap();
+            let bin = options.config.join("bin");
+            fs::create_dir(&bin).unwrap();
+            let script = bin.join("codex");
+            fs::write(
+                &script,
+                "#!/bin/sh\nprintf 'attempt\\n' >> \"$CODEX_HOME/attempts\"\nexit 0\n",
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut command = child_command();
+            command
+                .env("LINEUP_TEST_QUOTA_ONCE", "1")
+                .env("PATH", &bin)
+                .env("CODEX_HOME", &options.state);
+            ensure_command(&options, command).unwrap();
+            // The fake server rejects snapshots with a pong. Each bounded
+            // refresh retries/reconnects, exercising the actual startup guard.
+            std::thread::sleep(Duration::from_millis(2200));
+            stop(&options).unwrap();
+            done.store(true, Ordering::Relaxed);
+            server.join().unwrap();
+            let attempts = fs::read_to_string(options.state.join("attempts")).unwrap_or_default();
+            assert_eq!(attempts.lines().count(), usize::from(enabled));
         }
     }
 
