@@ -102,3 +102,40 @@ trap confirmed session deletion and temporary-directory removal. The optional
 token run failed as expected on that pre-publication baseline and still cleaned
 up its session and temporary directory. These results do not establish macOS
 runtime behavior or metadata publication; rerun against the wired checkout.
+
+## Publication evidence on the transport fix
+
+On Linux with Herdr 0.9.3, the isolated harness passed against
+`8ab7342` (the harness commit applied to transport fix
+`52f42f71f29d4d650fff728c6a1505c2808b93be`, before that fix landed on main).
+The private Git clone's local `origin/main` timestamp was `1791801285`.
+Only display tokens are reproduced below; no private paths or native sessions
+are included:
+
+```json
+{
+  "workspace": {
+    "lineup_repo": "lineup-e2e",
+    "lineup_ship_unix": "1791801285",
+    "lineup_ship_text": "19:34"
+  },
+  "synthetic_pane": {
+    "lineup_agent": "codex",
+    "lineup_logo": "Codex",
+    "lineup_state": "idle",
+    "lineup_state_idle": "●",
+    "lineup_context_text": "—",
+    "lineup_weekly_text": "—"
+  }
+}
+```
+
+After sixteen seconds, the second snapshot retained the expected values;
+workspace sequence advanced from `1` to `3` and pane sequence from `2` to `3`
+in the isolated checkpoint. `doctor` reported a healthy daemon, two `stop`
+calls passed, and the subsequent snapshot contained no `lineup_` tokens.
+The trap confirmed deletion of the isolated session and private temporary
+directory. Real-agent pane verification was `SKIP`: the isolated HOME had no
+provider authentication. The synthetic pane is publication evidence only.
+This does not establish macOS behavior, real-agent usage, sidebar rendering,
+or shipment of the transport fix; final main-based validation remains pending.
