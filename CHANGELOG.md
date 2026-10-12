@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `docs/testing.md`. Linux evidence covers workspace heading tokens arriving,
   remaining after a TTL window, and clearing after stop. Real agent panes stay
   skipped when the isolated home has no provider authentication.
+- `statusline` subcommand for opt-in Claude and Antigravity statusLine capture,
+  including `--then` to keep an existing statusLine command's display.
+- Claude and Antigravity usage readers. Context comes from Codex, Grok, Claude,
+  and Antigravity. Weekly remaining comes from Claude and Antigravity
+  observations only.
 
 ### Fixed
 

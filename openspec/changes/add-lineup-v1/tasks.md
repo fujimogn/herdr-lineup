@@ -24,6 +24,10 @@
 - [x] Accept usage-source research, prove session identity and unavailable/stale
   handling, then implement confirmed provider adapters; keep Kimi/Hermes missing
   until their sources are confirmed.
+- [x] Prove statusLine capture and `--then` chaining, then implement
+  `herdr-lineup statusline <claude|agy>` and the Claude and Antigravity readers.
+  Context values come from Codex, Grok, Claude, and Antigravity. Weekly values
+  come from Claude and Antigravity only. Kimi and Hermes stay unavailable.
 - [x] Bundle the icon font and implement owned opt-in install-font and
   uninstall-font, including attribution.
 - [x] Verify an isolated Herdr session end to end with `scripts/e2e-isolated.sh`
