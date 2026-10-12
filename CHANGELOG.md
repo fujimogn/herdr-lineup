@@ -11,5 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rust crate and command-line scaffold for the planned Lineup sidebar publisher.
 - Herdr manifest with startup, workspace-focus recovery, and explicit actions.
 - Linux and macOS build checks, weekly dependency audit, and public project documentation.
+- Release workflow for `v*` tags with version-consistency checks and release documentation.
 
 [Unreleased]: https://github.com/fujimogn/herdr-lineup/commits/main

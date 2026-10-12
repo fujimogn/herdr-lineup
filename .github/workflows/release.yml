@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned toolchain
+        id: rust
+        run: |
+          python3 -c 'import tomllib; print("channel=" + tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])' >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+      - name: Check version consistency
+        run: scripts/check-version.sh "${{ github.ref_name }}"
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Package artifact
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-latest) platform=linux ;;
+            macos-latest) platform=macos ;;
+            *) echo "unsupported runner: ${{ matrix.os }}" >&2; exit 1 ;;
+          esac
+          artifact="herdr-lineup-${GITHUB_REF_NAME}-${platform}"
+          mkdir -p dist
+          cp target/release/herdr-lineup "dist/${artifact}"
+          (cd dist && shasum -a 256 "${artifact}" > "SHA256SUMS-${platform}.txt")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: artifact-*
+          path: dist/
+          merge-multiple: true
+      - name: Assemble checksums and release notes
+        run: |
+          cat dist/SHA256SUMS-*.txt > dist/SHA256SUMS.txt
+          rm dist/SHA256SUMS-*.txt
+          version="${GITHUB_REF_NAME#v}"
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "error: CHANGELOG.md has no section for [${version}]" >&2
+            exit 1
+          fi
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          gh release create "${GITHUB_REF_NAME}"
+          --title "${GITHUB_REF_NAME}"
+          --notes-file RELEASE_NOTES.md
+          dist/*
