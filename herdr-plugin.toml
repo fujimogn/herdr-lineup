@@ -38,13 +38,13 @@ command = ["target/release/herdr-lineup", "doctor"]
 # Configuration changes are explicit actions, never startup or event hooks.
 [[actions]]
 id = "configure"
-title = "Configure Lineup sidebar (opt-in, planned)"
+title = "Configure Lineup sidebar (opt-in)"
 contexts = ["workspace"]
 command = ["target/release/herdr-lineup", "configure"]
 
 [[actions]]
 id = "unconfigure"
-title = "Remove Lineup sidebar configuration (opt-in, planned)"
+title = "Remove Lineup sidebar configuration (opt-in)"
 contexts = ["workspace"]
 command = ["target/release/herdr-lineup", "unconfigure"]
 

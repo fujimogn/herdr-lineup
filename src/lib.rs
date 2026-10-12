@@ -37,9 +37,9 @@ enum Command {
     Stop,
     /// Check local config, Herdr compatibility, and daemon health.
     Doctor,
-    /// Planned, opt-in: add sidebar rows to the user's Herdr configuration.
+    /// Opt in to adding sidebar rows to the user's Herdr configuration.
     Configure,
-    /// Planned, opt-in: remove only sidebar rows managed by this plugin.
+    /// Remove only unmodified sidebar rows managed by this plugin.
     Unconfigure,
     /// Opt in to installing the bundled icon font and terminal codepoint maps.
     InstallFont,
@@ -57,9 +57,29 @@ pub fn run() -> ExitCode {
         }
         Command::Stop => daemon::Options::from_env().and_then(|options| daemon::stop(&options)),
         Command::Doctor => daemon::Options::from_env().and_then(|options| doctor::run(&options)),
-        Command::Configure | Command::Unconfigure => Err(std::io::Error::other(
-            "Planned: this command is not implemented yet. No changes were made.",
-        )),
+        Command::Configure | Command::Unconfigure => {
+            let action = if matches!(cli.command, Command::Configure) {
+                configure::Action::Configure
+            } else {
+                configure::Action::Unconfigure
+            };
+            match configure::run(action) {
+                Ok(configure::Outcome::Unchanged) => {
+                    eprintln!("No configuration changes needed.");
+                    Ok(())
+                }
+                Ok(configure::Outcome::Changed { backup }) => {
+                    eprintln!(
+                        "Configuration updated and reloaded. Backup: {}",
+                        backup.display()
+                    );
+                    Ok(())
+                }
+                Err(error) => Err(std::io::Error::other(format!(
+                    "Configuration action failed: {error}"
+                ))),
+            }
+        }
         Command::InstallFont | Command::UninstallFont => {
             font::run(matches!(cli.command, Command::UninstallFont))
                 .map(|notes| {
