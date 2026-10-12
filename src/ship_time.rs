@@ -103,7 +103,6 @@ mod tests {
     use super::*;
     use chrono::FixedOffset;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn at(value: &str) -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339(value).unwrap()
@@ -180,25 +179,42 @@ mod tests {
         assert_eq!(resolve_workspace_cwd(None, &[]), None);
     }
 
-    // Fixtures contain only synthetic Git data. Keep their paths available for
-    // inspection rather than deleting repository trees recursively.
+    // The guard exclusively owns synthetic Git data and removes it on drop,
+    // including when a test assertion panics.
     struct Fixture {
         root: PathBuf,
         repo: PathBuf,
+        _cleanup: tempfile::TempDir,
+    }
+
+    #[test]
+    fn dropping_fixture_removes_its_git_tree() {
+        // Own the RED-test parent so a failed assertion still cleans its tree.
+        let parent = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new_in(parent.path());
+        let root = fixture.root.clone();
+        drop(fixture);
+        assert!(!root.exists(), "fixture tree must be removed on drop");
     }
 
     impl Fixture {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "herdr-lineup-ship-time-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&root).unwrap();
+            Self::new_in(&std::env::temp_dir())
+        }
+
+        fn new_in(parent: &Path) -> Self {
+            let cleanup = tempfile::Builder::new()
+                .prefix("herdr-lineup-ship-time-")
+                .tempdir_in(parent)
+                .unwrap();
+            let root = cleanup.path().to_owned();
             let repo = root.join("canonical-repo");
             std::fs::create_dir(&repo).unwrap();
-            let fixture = Self { root, repo };
+            let fixture = Self {
+                root,
+                repo,
+                _cleanup: cleanup,
+            };
             fixture.git(&["init", "--initial-branch=main"], None);
             fixture.commit("2024-01-01T00:00:00Z");
             fixture
