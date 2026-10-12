@@ -109,6 +109,7 @@ pub struct MetadataPublisher {
     grok_observed: Arc<std::sync::Mutex<Option<Instant>>>,
     codex_control: Arc<crate::quota_codex::QueryControl>,
     headings: BTreeMap<String, HeadingCache>,
+    local_readings: BTreeMap<String, model::UsageReading>,
 }
 impl MetadataPublisher {
     /// Construction performs no state I/O. The daemon acquires its session lock
@@ -136,6 +137,7 @@ impl MetadataPublisher {
             grok_observed: Arc::new(std::sync::Mutex::new(None)),
             codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
             headings: BTreeMap::new(),
+            local_readings: BTreeMap::new(),
         })
     }
 
@@ -495,6 +497,29 @@ impl MetadataPublisher {
         let snapshot = self.snapshot(transport)?;
         self.check_shutdown()?;
         self.reconcile_missing(&snapshot);
+        // Keep cached association only while the authoritative pane identity matches.
+        self.local_readings.retain(|id, reading| {
+            snapshot.panes.iter().any(|pane| {
+                pane.pane_id == *id
+                    && pane.occupant.as_ref().is_some_and(|who| {
+                        config
+                            .providers
+                            .iter()
+                            .any(|provider| provider == agent_id(who.agent))
+                            && matches!(
+                                (reading.identity.provider, who.agent),
+                                (model::Provider::Claude, Agent::Claude)
+                                    | (model::Provider::Codex, Agent::Codex)
+                                    | (model::Provider::Grok, Agent::Grok)
+                                    | (model::Provider::Agy, Agent::Agy)
+                            )
+                            && reading.identity.native_session_id
+                                == who.native_session.clone().unwrap_or_default()
+                            && reading.identity.repository_identity
+                                == pane.cwd.clone().unwrap_or_default()
+                    })
+            })
+        });
         let now = SystemTime::now();
         let now_unix = unix(now);
         // One nonblocking cache snapshot per cycle keeps all Grok panes on the
@@ -637,7 +662,45 @@ impl MetadataPublisher {
                     reader.read(&request)
                 };
                 if reading.identity != identity {
+                    self.local_readings.remove(&pane.pane_id);
                     return None;
+                }
+                // A shared cycle budget can expire before this pane gets a turn.
+                // Do not turn a transient read timeout into loss of proven identity.
+                // Cache local observations only; account workers retain their own
+                // reset/auth policy and are overlaid afresh below.
+                if reading.context
+                    == model::UsageOutcome::Unavailable(model::MissingReason::Timeout)
+                    && matches!(
+                        reading.weekly_remaining,
+                        model::UsageOutcome::Unavailable(_)
+                    )
+                    && let Some(previous) = self.local_readings.get(&pane.pane_id)
+                    && previous.identity == identity
+                    && previous.source_kind == reading.source_kind
+                {
+                    reading = previous.clone();
+                    let weekly_valid = reading.weekly_resets_at.map_or_else(
+                        || {
+                            reading.observed_at.is_some_and(|observed| {
+                                now.duration_since(observed)
+                                    .is_ok_and(|age| age <= request.max_age)
+                            })
+                        },
+                        |reset| reset > now,
+                    );
+                    if !weekly_valid {
+                        reading.weekly_remaining =
+                            model::UsageOutcome::Unavailable(model::MissingReason::Stale);
+                        reading.weekly_window = None;
+                        reading.weekly_resets_at = None;
+                    }
+                }
+                if reading.binding.is_some() {
+                    self.local_readings
+                        .insert(pane.pane_id.clone(), reading.clone());
+                } else {
+                    self.local_readings.remove(&pane.pane_id);
                 }
                 if config.allow_network {
                     let weekly = match who.agent {
@@ -883,6 +946,532 @@ mod tests {
         os::unix::net::UnixListener,
         time::Duration,
     };
+
+    fn remember_tokens(stored: &mut BTreeMap<String, Value>, report: &Value) {
+        let params = &report["params"];
+        let id = params["pane_id"]
+            .as_str()
+            .or_else(|| params["workspace_id"].as_str())
+            .unwrap();
+        let tokens = stored
+            .entry(id.into())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .unwrap();
+        for (key, value) in params["tokens"].as_object().unwrap() {
+            if value.is_null() {
+                tokens.remove(key);
+            } else {
+                tokens.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    fn with_stored_tokens(mut response: Value, stored: &BTreeMap<String, Value>) -> Value {
+        let snapshot = &mut response["result"]["snapshot"];
+        for (kind, id_key) in [("panes", "pane_id"), ("workspaces", "workspace_id")] {
+            for resource in snapshot[kind].as_array_mut().unwrap() {
+                if let Some(tokens) = stored.get(resource[id_key].as_str().unwrap()) {
+                    resource["tokens"] = tokens.clone();
+                }
+            }
+        }
+        response
+    }
+
+    // Implements Herdr's per-key TTL patch semantics, closing after each reply.
+    // Only synthetic session records and metadata are exchanged.
+    fn token_server(
+        listener: UnixListener,
+        clock: Arc<std::sync::atomic::AtomicU64>,
+    ) -> std::thread::JoinHandle<()> {
+        token_server_with_template(
+            listener,
+            clock,
+            Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true))),
+        )
+    }
+
+    fn token_server_with_template(
+        listener: UnixListener,
+        clock: Arc<std::sync::atomic::AtomicU64>,
+        template: Arc<std::sync::Mutex<Value>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let mut resources = BTreeMap::<String, BTreeMap<String, (Value, u64)>>::new();
+            loop {
+                let request = receive(&mut stream);
+                let now = clock.load(Ordering::Acquire);
+                for tokens in resources.values_mut() {
+                    tokens.retain(|_, (_, expires)| *expires > now);
+                }
+                let response = match request["method"].as_str().unwrap() {
+                    "session.snapshot" => {
+                        let mut response = template.lock().unwrap().clone();
+                        response["id"] = request["id"].clone();
+                        for (kind, id_key) in [("panes", "pane_id"), ("workspaces", "workspace_id")]
+                        {
+                            for resource in
+                                response["result"]["snapshot"][kind].as_array_mut().unwrap()
+                            {
+                                let tokens = resources
+                                    .entry(resource[id_key].as_str().unwrap().into())
+                                    .or_default();
+                                resource["tokens"] = Value::Object(
+                                    tokens
+                                        .iter()
+                                        .map(|(k, (v, _))| (k.clone(), v.clone()))
+                                        .collect(),
+                                );
+                            }
+                        }
+                        response
+                    }
+                    "pane.report_metadata" | "workspace.report_metadata" => {
+                        let params = &request["params"];
+                        let id = params["pane_id"]
+                            .as_str()
+                            .or_else(|| params["workspace_id"].as_str())
+                            .unwrap();
+                        let tokens = resources.entry(id.into()).or_default();
+                        let ttl = params["ttl_ms"].as_u64().unwrap();
+                        for (key, value) in params["tokens"].as_object().unwrap() {
+                            if value.is_null() {
+                                tokens.remove(key);
+                            } else {
+                                tokens.insert(key.clone(), (value.clone(), now + ttl));
+                            }
+                        }
+                        json!({"id":request["id"],"result":{"type":"ok"}})
+                    }
+                    "test.finish" => {
+                        writeln!(
+                            stream.get_mut(),
+                            "{}",
+                            json!({"id":request["id"],"result":{"type":"ok"}})
+                        )
+                        .unwrap();
+                        break;
+                    }
+                    other => panic!("unexpected fake method: {other}"),
+                };
+                writeln!(stream.get_mut(), "{response}").unwrap();
+            }
+        })
+    }
+
+    #[test]
+    fn fake_socket_renews_before_slow_cycle_crosses_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let server = token_server(UnixListener::bind(&socket).unwrap(), clock.clone());
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let desired = BTreeMap::from([
+            ("lineup_logo".into(), Some("Codex".into())),
+            ("lineup_weekly_text".into(), Some("—".into())),
+        ]);
+        // R = 5s, cycle work w = 3s: the daemon schedules from completion,
+        // so P = R + w = 8s. The old 2R threshold skips P, then renews at
+        // 2P = 16s > TTL = 3R = 15s. Check just before that next cycle.
+        for now in [0, 8000] {
+            clock.store(now, Ordering::Release);
+            publisher.started = Instant::now() - Duration::from_millis(now);
+            let snapshot = publisher.snapshot(&mut transport).unwrap();
+            let resource = publisher.resource(ResourceKind::Pane, "w1:p1");
+            publisher
+                .report(
+                    &mut transport,
+                    &resource,
+                    &snapshot.panes[0].stored_keys,
+                    None,
+                    &desired,
+                    None,
+                )
+                .unwrap();
+        }
+        clock.store(15999, Ordering::Release);
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+        let tokens = &response["result"]["snapshot"]["panes"][0]["tokens"];
+        assert_eq!(
+            tokens["lineup_logo"], "Codex",
+            "logo expired between healthy cycles"
+        );
+        assert_eq!(
+            tokens["lineup_weekly_text"], "—",
+            "missing usage must keep its key"
+        );
+    }
+
+    #[test]
+    fn fake_socket_repairs_missing_live_keys_before_cached_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let server = token_server(UnixListener::bind(&socket).unwrap(), clock.clone());
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let desired = BTreeMap::from([("lineup_weekly_text".into(), Some("—".into()))]);
+        let first = publisher.snapshot(&mut transport).unwrap();
+        let resource = publisher.resource(ResourceKind::Pane, "w1:p1");
+        publisher
+            .report(
+                &mut transport,
+                &resource,
+                &first.panes[0].stored_keys,
+                None,
+                &desired,
+                None,
+            )
+            .unwrap();
+        // Simulate a server-side expiry/removal while the planner still thinks
+        // the value is fresh. The authoritative snapshot must force repair.
+        clock.store(16000, Ordering::Release);
+        let missing = publisher.snapshot(&mut transport).unwrap();
+        assert!(!missing.panes[0].stored_keys.contains("lineup_weekly_text"));
+        publisher
+            .report(
+                &mut transport,
+                &resource,
+                &missing.panes[0].stored_keys,
+                None,
+                &desired,
+                None,
+            )
+            .unwrap();
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            response["result"]["snapshot"]["panes"][0]["tokens"]["lineup_weekly_text"],
+            "—"
+        );
+    }
+
+    #[test]
+    fn fake_socket_timeout_keeps_exact_codex_binding_for_account_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let server = token_server(UnixListener::bind(&socket).unwrap(), clock);
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().into(),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("empty-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut calls = 0;
+        publisher.codex_weekly = Some(
+            WeeklyWorker::start(shutdown.clone(), Duration::ZERO, move || {
+                calls += 1;
+                if calls == 2 {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                if calls >= 2 {
+                    return None;
+                }
+                Some(WeeklySample {
+                    used_percent: 27.0,
+                    resets_at: Some(SystemTime::now() + Duration::from_secs(3600)),
+                })
+            })
+            .unwrap(),
+        );
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let config = Config {
+            allow_network: true,
+            ..Config::default()
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &config, &SampleReader, &TimeoutReader)
+            .unwrap();
+        publisher
+            .refresh_with_readers(&mut transport, &config, &TimeoutReader, &TimeoutReader)
+            .unwrap();
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while publisher
+            .codex_weekly
+            .as_ref()
+            .unwrap()
+            .sample(SystemTime::now())
+            .is_some()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "fake account revocation did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        publisher
+            .refresh_with_readers(&mut transport, &config, &TimeoutReader, &TimeoutReader)
+            .unwrap();
+        let (_, revoked) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        publisher.request(&mut transport, "test.finish").unwrap();
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(
+            revoked["result"]["snapshot"]["panes"][0]["tokens"]["lineup_weekly_text"],
+            "—"
+        );
+        let tokens = &response["result"]["snapshot"]["panes"][0]["tokens"];
+        assert_eq!(tokens["lineup_context_text"], "42%");
+        assert!(
+            tokens["lineup_weekly_text"]
+                .as_str()
+                .unwrap()
+                .starts_with("7d 73% "),
+            "timeout discarded a verified home binding"
+        );
+    }
+
+    #[test]
+    fn fake_socket_shared_budget_preserves_claude_weekly_but_not_expired_or_rebound_usage() {
+        let _guard = crate::statusline::READER_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
+        template.lock().unwrap()["result"]["snapshot"]["panes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "pane_id":"w1:p2", "workspace_id":"w1", "agent":"claude", "agent_status":"idle",
+                "agent_session":{"agent":"claude", "kind":"id", "value":"synthetic-claude"}
+            }));
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let server = token_server_with_template(
+            UnixListener::bind(&socket).unwrap(),
+            clock,
+            template.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().into(),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("empty-home")),
+                statusline_state: Some(dir.path().into()),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("statusline")).unwrap();
+        let record = crate::statusline::Record {
+            version: 1,
+            agent: crate::statusline::Agent::Claude,
+            key: "synthetic-claude".into(),
+            observed_ms: (unix(SystemTime::now()) as u64) * 1000,
+            context: Some(23.0),
+            weekly_remaining: Some(73.0),
+            weekly_reset_ms: Some(((unix(SystemTime::now()) + 3600) as u64) * 1000),
+        };
+        std::fs::write(
+            crate::statusline::record_path(dir.path(), record.agent, &record.key),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        struct ExhaustBudget;
+        impl UsageReader for ExhaustBudget {
+            fn read(&self, r: &ReadRequest<'_>) -> UsageReading {
+                std::thread::sleep(r.timeout + Duration::from_millis(1));
+                TimeoutReader.read(r)
+            }
+        }
+        let config = Config {
+            reader_timeout_ms: 100,
+            ..Config::default()
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &config, &SampleReader, &TimeoutReader)
+            .unwrap();
+        publisher
+            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .unwrap();
+        let (_, retained) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        let cached = publisher.local_readings.get_mut("w1:p2").unwrap();
+        // Inject an elapsed reset into the prior observation without real waits.
+        cached.weekly_resets_at = Some(SystemTime::now() - Duration::from_secs(1));
+        publisher
+            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .unwrap();
+        let (_, expired) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        // No reset: an old observation must not gain a fresh age from a timeout.
+        let cached = publisher.local_readings.get_mut("w1:p2").unwrap();
+        cached.weekly_remaining = UsageOutcome::Available(73.0);
+        cached.weekly_window = Some(WeeklyWindow::RollingSevenDays);
+        cached.weekly_resets_at = None;
+        cached.observed_at = Some(SystemTime::now() - Duration::from_secs(61));
+        publisher
+            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .unwrap();
+        let (_, stale) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        template.lock().unwrap()["result"]["snapshot"]["panes"][1]["agent_session"]["value"] =
+            json!("other-session");
+        publisher
+            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .unwrap();
+        let (_, rebound) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+        let pane = |response: &Value| response["result"]["snapshot"]["panes"][1]["tokens"].clone();
+        assert_eq!(pane(&retained)["lineup_context_text"], "23%");
+        assert!(
+            pane(&retained)["lineup_weekly_text"]
+                .as_str()
+                .unwrap()
+                .starts_with("7d 73% ")
+        );
+        assert_eq!(pane(&expired)["lineup_context_text"], "23%");
+        assert_eq!(pane(&expired)["lineup_weekly_text"], "—");
+        assert_eq!(pane(&stale)["lineup_weekly_text"], "—");
+        assert_eq!(pane(&rebound)["lineup_context_text"], "—");
+        assert_eq!(pane(&rebound)["lineup_weekly_text"], "—");
+    }
+
+    #[test]
+    fn fake_socket_timeout_cache_does_not_cross_identity_or_authoritative_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let server = token_server_with_template(
+            UnixListener::bind(&socket).unwrap(),
+            clock,
+            template.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().into(),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("empty-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        let config = Config::default();
+        let mut observations = Vec::new();
+        for change in [
+            "session",
+            "cwd",
+            "provider",
+            "departure",
+            "invalid",
+            "missing",
+            "mismatch",
+        ] {
+            *template.lock().unwrap() = snapshot(&json!("template"), true);
+            publisher
+                .refresh_with_readers(&mut transport, &config, &SampleReader, &TimeoutReader)
+                .unwrap();
+            match change {
+                "session" => {
+                    template.lock().unwrap()["result"]["snapshot"]["panes"][0]["agent_session"]["value"] =
+                        json!("other-session")
+                }
+                "cwd" => {
+                    template.lock().unwrap()["result"]["snapshot"]["panes"][0]["cwd"] =
+                        json!("/synthetic-other-repo")
+                }
+                "provider" => {
+                    template.lock().unwrap()["result"]["snapshot"]["panes"][0]["agent"] =
+                        json!("grok")
+                }
+                "departure" => {
+                    template.lock().unwrap()["result"]["snapshot"]["panes"] = json!([]);
+                    publisher
+                        .refresh_with_readers(
+                            &mut transport,
+                            &config,
+                            &TimeoutReader,
+                            &TimeoutReader,
+                        )
+                        .unwrap();
+                    *template.lock().unwrap() = snapshot(&json!("template"), true);
+                }
+                "invalid" | "missing" | "mismatch" => {
+                    struct FailedReader(&'static str);
+                    impl UsageReader for FailedReader {
+                        fn read(&self, r: &ReadRequest<'_>) -> UsageReading {
+                            let reason = if self.0 == "missing" {
+                                MissingReason::NotFound
+                            } else {
+                                MissingReason::Invalid
+                            };
+                            let mut reading =
+                                UsageReading::missing(r, SourceKind::CodexRollout, reason);
+                            if self.0 == "mismatch" {
+                                reading.identity.native_session_id = "unrelated".into();
+                            }
+                            reading
+                        }
+                    }
+                    publisher
+                        .refresh_with_readers(
+                            &mut transport,
+                            &config,
+                            &FailedReader(change),
+                            &TimeoutReader,
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            publisher
+                .refresh_with_readers(&mut transport, &config, &TimeoutReader, &TimeoutReader)
+                .unwrap();
+            let (_, response) = publisher
+                .request(&mut transport, "session.snapshot")
+                .unwrap();
+            observations.push((
+                change,
+                response["result"]["snapshot"]["panes"][0]["tokens"].clone(),
+            ));
+        }
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+        for (change, tokens) in observations {
+            assert_eq!(
+                tokens["lineup_context_text"], "—",
+                "cached context survived {change}"
+            );
+            assert_eq!(
+                tokens["lineup_weekly_text"], "—",
+                "cached quota survived {change}"
+            );
+        }
+    }
 
     #[test]
     fn heading_timeout_retains_only_the_same_workspace_and_occupant() {
@@ -1224,6 +1813,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let mut stored = BTreeMap::new();
             let mut cycles = Vec::new();
             for (cycle, count) in [(0, 5), (1, 2), (2, 2)] {
                 let request = receive(&mut stream);
@@ -1243,12 +1833,15 @@ mod tests {
                 writeln!(
                     stream.get_mut(),
                     "{}",
-                    json!({"id":request["id"],"result":{
-                        "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
-                        "panes":panes,"workspaces":[
-                            {"workspace_id":"w1","worktree":{"checkout_path":checkout}},
-                            {"workspace_id":"w2"}]}
-                    }})
+                    with_stored_tokens(
+                        json!({"id":request["id"],"result":{
+                            "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                            "panes":panes,"workspaces":[
+                                {"workspace_id":"w1","worktree":{"checkout_path":checkout}},
+                                {"workspace_id":"w2"}]}
+                        }}),
+                        &stored
+                    )
                 )
                 .unwrap();
                 let mut reports = BTreeMap::new();
@@ -1260,6 +1853,7 @@ mod tests {
                         json!({"id":report["id"],"result":{"type":"ok"}})
                     )
                     .unwrap();
+                    remember_tokens(&mut stored, &report);
                     let params = &report["params"];
                     if cycle == 0 && params["pane_id"] == "w1:p10" {
                         assert_eq!(params["tokens"]["lineup_group"], "heading-repo");
@@ -1320,44 +1914,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let server =
-            std::thread::spawn(move || {
-                let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
-                let original = [
-                    ("w1:p10", "w1"),
-                    ("w2:p9", "w2"),
-                    ("w1:p2", "w1"),
-                    ("w2:p3", "w2"),
-                ];
-                let reordered = [original[2], original[1], original[0], original[3]];
-                let mut cycles = Vec::new();
-                for (order, count) in [(original, 6), (original, 2), (reordered, 2), (reordered, 2)]
-                {
-                    let request = receive(&mut stream);
-                    let panes: Vec<_> = order.iter().map(|(pane, workspace)| json!({
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let mut stored = BTreeMap::new();
+            let original = [
+                ("w1:p10", "w1"),
+                ("w2:p9", "w2"),
+                ("w1:p2", "w1"),
+                ("w2:p3", "w2"),
+            ];
+            let reordered = [original[2], original[1], original[0], original[3]];
+            let mut cycles = Vec::new();
+            for (order, count) in [(original, 6), (original, 2), (reordered, 2), (reordered, 2)] {
+                let request = receive(&mut stream);
+                let panes: Vec<_> = order.iter().map(|(pane, workspace)| json!({
                     "pane_id":pane, "workspace_id":workspace, "agent":"kimi", "agent_status":"idle"
                 })).collect();
-                    writeln!(stream.get_mut(), "{}", json!({"id":request["id"],"result":{
+                writeln!(stream.get_mut(), "{}", with_stored_tokens(json!({"id":request["id"],"result":{
                     "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
                     "panes":panes,"workspaces":[{"workspace_id":"w1"},{"workspace_id":"w2"}]}
-                }})).unwrap();
-                    let mut reports = BTreeMap::new();
-                    for _ in 0..count {
-                        let report = receive(&mut stream);
-                        writeln!(
-                            stream.get_mut(),
-                            "{}",
-                            json!({"id":report["id"],"result":{"type":"ok"}})
-                        )
-                        .unwrap();
-                        if let Some(pane) = report["params"]["pane_id"].as_str() {
-                            reports.insert(pane.to_owned(), report["params"]["tokens"].clone());
-                        }
+                }}), &stored)).unwrap();
+                let mut reports = BTreeMap::new();
+                for _ in 0..count {
+                    let report = receive(&mut stream);
+                    writeln!(
+                        stream.get_mut(),
+                        "{}",
+                        json!({"id":report["id"],"result":{"type":"ok"}})
+                    )
+                    .unwrap();
+                    remember_tokens(&mut stored, &report);
+                    if let Some(pane) = report["params"]["pane_id"].as_str() {
+                        reports.insert(pane.to_owned(), report["params"]["tokens"].clone());
                     }
-                    cycles.push(reports);
                 }
-                cycles
-            });
+                cycles.push(reports);
+            }
+            cycles
+        });
         let mut transport = Transport::connect(&socket).unwrap();
         let mut publisher =
             MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
@@ -2208,6 +2802,7 @@ mod tests {
         }
         let server = std::thread::spawn(move || {
             let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let mut stored = BTreeMap::new();
             let mut reports = Vec::new();
             for (agent, native) in [
                 ("claude", Some("synthetic-session")),
@@ -2221,6 +2816,7 @@ mod tests {
                 pane["agent_session"] = native
                     .map(|id| json!({"agent":agent,"kind":"id","value":id}))
                     .unwrap_or(Value::Null);
+                let response = with_stored_tokens(response, &stored);
                 writeln!(stream.get_mut(), "{response}").unwrap();
                 let report = receive(&mut stream);
                 assert_eq!(report["method"], "pane.report_metadata");
@@ -2230,9 +2826,11 @@ mod tests {
                     json!({"id":report["id"],"result":{"type":"ok"}})
                 )
                 .unwrap();
+                remember_tokens(&mut stored, &report);
                 reports.push(report);
                 if reports.len() == 1 {
                     let report = receive(&mut stream);
+                    remember_tokens(&mut stored, &report);
                     writeln!(
                         stream.get_mut(),
                         "{}",
@@ -2289,13 +2887,14 @@ mod tests {
         let server_checkpoint = checkpoint.clone();
         let server = std::thread::spawn(move || {
             let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let mut stored = BTreeMap::new();
             let mut reports = Vec::new();
             for cycle in 0..3 {
                 let mut line = String::new();
                 stream.read_line(&mut line).unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(request["method"], "session.snapshot");
-                let response = snapshot(&request["id"], cycle != 1);
+                let response = with_stored_tokens(snapshot(&request["id"], cycle != 1), &stored);
                 writeln!(stream.get_mut(), "{response}").unwrap();
                 let count = if cycle == 1 { 1 } else { 2 };
                 for _ in 0..count {
@@ -2314,6 +2913,7 @@ mod tests {
                         && row.seq == request["params"]["seq"]));
                     let response = json!({"id":request["id"], "result":{"type":"ok"}});
                     writeln!(stream.get_mut(), "{response}").unwrap();
+                    remember_tokens(&mut stored, &request);
                     reports.push(request);
                 }
             }

@@ -291,6 +291,8 @@ impl Publisher {
     /// `now_ms` is an injected monotonic clock; Unix time is only for displays.
     /// Missing resources never receive reports. Snapshot keys include all
     /// sources, so capacity failures never evict another plugin's metadata.
+    /// Renew after one interval to leave room for cycle duration and jitter.
+    /// Authoritatively missing live keys are repaired even before renewal.
     /// Omitted desired keys remain unchanged. Supply all fourteen pane keys from
     /// `pane_tokens` on reconciliation to clear departed occupants completely.
     pub fn prepare(
@@ -369,10 +371,11 @@ impl Publisher {
                 occupant_changed
                     || state.accepted.get(key) != Some(value)
                     || (value.is_some()
-                        && state
-                            .published_ms
-                            .get(key)
-                            .is_none_or(|last| now_ms < *last || now_ms - *last >= refresh_ms * 2))
+                        && (!snapshot.stored_keys.contains(key)
+                            || state
+                                .published_ms
+                                .get(key)
+                                .is_none_or(|last| now_ms < *last || now_ms - *last >= refresh_ms)))
             })
             .collect();
         if tokens.is_empty() {
@@ -824,16 +827,17 @@ mod tests {
         let resource = resource("p1");
         let row = row();
         let desired = pane_tokens(&row, LogoMode::Text, false, 0);
+        let live = ResourceSnapshot {
+            exists: true,
+            stored_keys: desired
+                .iter()
+                .filter(|(_, value)| value.is_some())
+                .map(|(key, _)| key.clone())
+                .collect(),
+        };
         let mut publisher = Publisher::default();
         let first = publisher
-            .prepare(
-                &resource,
-                &snapshot(0),
-                row.occupant.as_ref(),
-                &desired,
-                0,
-                5000,
-            )
+            .prepare(&resource, &live, row.occupant.as_ref(), &desired, 0, 5000)
             .unwrap()
             .unwrap();
         assert_eq!(first.tokens.len(), 14);
@@ -845,10 +849,10 @@ mod tests {
             publisher
                 .prepare(
                     &resource,
-                    &snapshot(0),
+                    &live,
                     row.occupant.as_ref(),
                     &desired,
-                    10999,
+                    5999,
                     5000
                 )
                 .unwrap()
@@ -857,10 +861,10 @@ mod tests {
         let renewal = publisher
             .prepare(
                 &resource,
-                &snapshot(0),
+                &live,
                 row.occupant.as_ref(),
                 &desired,
-                11000,
+                6000,
                 5000,
             )
             .unwrap()
@@ -869,19 +873,19 @@ mod tests {
         let retry = publisher
             .prepare(
                 &resource,
-                &snapshot(0),
+                &live,
                 row.occupant.as_ref(),
                 &desired,
-                11001,
+                6001,
                 5000,
             )
             .unwrap()
             .unwrap();
         assert_eq!(retry.tokens, renewal.tokens);
         assert!(retry.seq > renewal.seq);
-        publisher.acknowledge(&retry, 11001).unwrap();
+        publisher.acknowledge(&retry, 6001).unwrap();
         assert_eq!(
-            publisher.acknowledge(&renewal, 11002),
+            publisher.acknowledge(&renewal, 6002),
             Err(PatchError::UnreservedReport)
         );
         let mut changed = desired.clone();
@@ -890,10 +894,10 @@ mod tests {
         let patch = publisher
             .prepare(
                 &resource,
-                &snapshot(0),
+                &live,
                 row.occupant.as_ref(),
                 &changed,
-                12000,
+                7000,
                 5000,
             )
             .unwrap()
