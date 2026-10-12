@@ -571,7 +571,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let executable = dir.path().join("fake-codex");
             let script = format!(
-                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 10\n[ \"$HOME\" = \"$CODEX_HOME\" ] || exit 11\necho $$ > \"$HOME/pid\"\nIFS= read -r request\nprintf '%s\\n' \"$request\" >> \"$HOME/requests\"\nprintf '%s\\n' '{}'\nIFS= read -r request\nprintf '%s\\n' \"$request\" >> \"$HOME/requests\"\nIFS= read -r request\nprintf '%s\\n' \"$request\" >> \"$HOME/requests\"\nprintf '%s\\n' '{}'\nIFS= read -r request\nprintf '%s\\n' \"$request\" >> \"$HOME/requests\"\nprintf '%s\\n' '{}'\nexec sleep 30\n",
+                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 10\n[ \"$HOME\" = \"$CODEX_HOME\" ] || exit 11\necho $$ > \"$HOME/pid\"\nIFS= read -r request || exit 0\nprintf '%s\\n' \"$request\" >> \"$HOME/requests\"\nprintf '%s\\n' '{}'\nIFS= read -r request || exit 0\nprintf '%s\\n' \"$request\" >> \"$HOME/requests\"\nIFS= read -r request || exit 0\nprintf '%s\\n' \"$request\" >> \"$HOME/requests\"\nprintf '%s\\n' '{}'\nIFS= read -r request || exit 0\nprintf '%s\\n' \"$request\" >> \"$HOME/requests\"\nprintf '%s\\n' '{}'\nexec sleep 30\n",
                 json!({"id":1,"result":{"userAgent":"synthetic"}}),
                 json!({"id":2,"result":account}),
                 json!({"id":3,"result":limits}),
@@ -582,7 +582,9 @@ mod tests {
         }
 
         fn read(&self, timeout: Duration) -> io::Result<Option<Weekly>> {
-            let mut command = Command::new(&self.executable);
+            // Interpret the fixture to avoid ETXTBSY from concurrent forks retaining write FDs.
+            let mut command = Command::new("/bin/sh");
+            command.arg(&self.executable);
             command.env("HOME", self.dir.path());
             read_with_command(self.dir.path(), timeout, command)
         }
@@ -614,6 +616,53 @@ mod tests {
 
     fn window(minutes: u64, used: f64) -> Value {
         json!({"windowDurationMins":minutes,"usedPercent":used,"resetsAt":1792400000})
+    }
+
+    #[test]
+    fn fake_server_exits_on_eof_without_recording_empty_requests() {
+        let methods = ["initialize", "initialized", "account/read"];
+        for count in (0..=methods.len()).rev() {
+            let fake = Fake::new(subscription(), json!({}));
+            let mut child = Command::new("/bin/sh")
+                .arg(&fake.executable)
+                .arg("app-server")
+                .env("HOME", fake.dir.path())
+                .env("CODEX_HOME", fake.dir.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            for method in &methods[..count] {
+                writeln!(input, "{}", json!({"method":method})).unwrap();
+            }
+            // Close stdin before terminating the child to expose every EOF boundary.
+            drop(input);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let requests = fs::read_to_string(fake.dir.path().join("requests")).unwrap_or_default();
+            assert!(
+                requests.lines().all(|line| !line.is_empty()),
+                "fake recorded an empty request after {count} requests: {requests:?}"
+            );
+            assert!(status.is_some_and(|status| status.success()));
+            if count > 0 {
+                assert_eq!(fake.methods(), methods[..count]);
+            } else {
+                assert!(requests.is_empty());
+            }
+            fake.assert_reaped();
+        }
     }
 
     #[test]
