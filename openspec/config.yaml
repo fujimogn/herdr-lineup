@@ -1,0 +1,17 @@
+schema: spec-driven
+
+context: |
+  herdr-lineup is a single-crate Rust Herdr plugin for macOS and Linux.
+  It combines agent logos, semantic state, context usage, weekly remaining
+  quota, and the locally known origin/main commit time in sidebar metadata.
+  All repository documentation and comments are English.
+  Changes describe proposed behavior, not implemented features. Current specs
+  are populated only when implementation is accepted and the change is archived.
+  Fonts and terminal codepoint maps belong to the user's terminal setup.
+  Sidebar configuration is user-owned; changes to it are strictly opt-in.
+rules:
+  specs:
+    - Use testable SHALL requirements and WHEN/THEN scenarios.
+    - Keep missing usage distinct from a measured zero.
+  tasks:
+    - Keep implementation tasks unchecked until executable behavior is verified.
