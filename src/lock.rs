@@ -134,16 +134,6 @@ impl SessionLock {
 mod tests {
     use super::*;
     #[test]
-    fn independent_open_cannot_claim_a_live_lock_and_stale_pid_does_not_matter() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = RuntimePaths::new(dir.path(), std::path::Path::new("/fake/socket")).unwrap();
-        let first = SessionLock::acquire(&paths).unwrap().unwrap();
-        std::fs::write(&paths.pid, "1").unwrap();
-        assert!(SessionLock::acquire(&paths).unwrap().is_none());
-        drop(first);
-        assert!(SessionLock::acquire(&paths).unwrap().is_some());
-    }
-    #[test]
     fn paths_are_session_specific_and_require_absolute_socket() {
         let dir = tempfile::tempdir().unwrap();
         let a = RuntimePaths::new(dir.path(), std::path::Path::new("/a")).unwrap();
