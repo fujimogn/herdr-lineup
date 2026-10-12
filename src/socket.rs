@@ -45,8 +45,6 @@ impl Transport {
         }
         let identity = EndpointIdentity::read(path)?;
         let stream = connect_stream(path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
         let transport = Self {
             path: path.into(),
             identity,
@@ -59,8 +57,6 @@ impl Transport {
     pub fn reconnect_same_endpoint(&mut self) -> io::Result<()> {
         self.verify_endpoint()?;
         let stream = connect_stream(&self.path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
         self.verify_endpoint()?;
         self.reader = BufReader::new(stream);
         self.response_complete = false;
@@ -217,11 +213,49 @@ pub(crate) fn connect_stream(path: &Path) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// Wait against one monotonic deadline without changing socket options.
+fn wait_ready(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "socket frame deadline exceeded",
+            ));
+        }
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: descriptor is valid and only borrowed for this bounded poll.
+        let result = unsafe { libc::poll(&mut descriptor, 1, remaining.as_millis().max(1) as i32) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if result > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::other("invalid socket descriptor"));
+            }
+            // Let read/write observe buffered bytes, EOF, or the actual error.
+            return Ok(());
+        }
+    }
+}
+
 pub(crate) fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> io::Result<()> {
     let mut bytes = Vec::with_capacity(frame.len() + 1);
     bytes.extend_from_slice(frame);
     bytes.push(b'\n');
     let deadline = Instant::now() + Duration::from_millis(500);
+    // fcntl affects the local fd, unlike setsockopt which macOS rejects after
+    // peer shutdown (EINVAL). Nonblocking I/O plus poll preserves the deadline.
+    stream.set_nonblocking(true)?;
     let mut remaining_bytes = bytes.as_slice();
     while !remaining_bytes.is_empty() {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -231,7 +265,7 @@ pub(crate) fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> io::Result<(
                 "socket write deadline exceeded",
             ));
         }
-        stream.set_write_timeout(Some(remaining))?;
+        wait_ready(stream, libc::POLLOUT, deadline)?;
         match stream.write(remaining_bytes) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -240,7 +274,14 @@ pub(crate) fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> io::Result<(
                 ));
             }
             Ok(count) => remaining_bytes = &remaining_bytes[count..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -249,6 +290,7 @@ pub(crate) fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> io::Result<(
 
 pub(crate) fn read_frame(reader: &mut BufReader<UnixStream>, limit: usize) -> io::Result<Vec<u8>> {
     let deadline = Instant::now() + Duration::from_millis(500);
+    reader.get_mut().set_nonblocking(true)?;
     let mut frame = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -258,8 +300,23 @@ pub(crate) fn read_frame(reader: &mut BufReader<UnixStream>, limit: usize) -> io
                 "socket frame deadline exceeded",
             ));
         }
-        reader.get_mut().set_read_timeout(Some(remaining))?;
-        let buffer = reader.fill_buf()?;
+        // BufReader may already contain the next frame: do not wait for more
+        // kernel data before consuming it. Peer EOF still permits buffered data.
+        if reader.buffer().is_empty() {
+            wait_ready(reader.get_ref(), libc::POLLIN, deadline)?;
+        }
+        let buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if buffer.is_empty() {
             return Err(io::Error::other("socket frame is incomplete"));
         }
@@ -316,6 +373,45 @@ mod tests {
         replacement.set_nonblocking(true).unwrap();
         assert!(transport.send_line(b"next-request").is_err());
         assert!(replacement.accept().is_err());
+    }
+
+    #[test]
+    fn frame_deadlines_do_not_mutate_socket_timeout_options() {
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        let original = Some(Duration::from_secs(3));
+        client.set_read_timeout(original).unwrap();
+        client.set_write_timeout(original).unwrap();
+        write_frame(&mut client, b"request").unwrap();
+        assert_eq!(client.write_timeout().unwrap(), original);
+        let mut request = String::new();
+        BufReader::new(peer.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        peer.write_all(b"response\n").unwrap();
+        drop(peer);
+        let mut reader = BufReader::new(client);
+        assert_eq!(read_frame(&mut reader, 8192).unwrap(), b"response");
+        assert_eq!(reader.get_ref().read_timeout().unwrap(), original);
+    }
+
+    #[test]
+    fn frame_reader_consumes_buffered_frames_after_peer_eof() {
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"first\nsecond\n").unwrap();
+        drop(peer);
+        let mut reader = BufReader::new(client);
+        assert_eq!(read_frame(&mut reader, 8192).unwrap(), b"first");
+        assert_eq!(read_frame(&mut reader, 8192).unwrap(), b"second");
+        assert!(read_frame(&mut reader, 8192).is_err());
+    }
+
+    #[test]
+    fn stalled_peer_cannot_extend_write_deadline() {
+        let (mut client, _peer) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let error = write_frame(&mut client, &vec![b'x'; MAX_FRAME_BYTES]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
