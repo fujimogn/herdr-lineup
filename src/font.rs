@@ -16,6 +16,8 @@ const END: &str = "# END herdr-lineup font";
 #[derive(Debug)]
 pub struct Locations {
     font: PathBuf,
+    font_root: PathBuf,
+    config_root: PathBuf,
     config: PathBuf,
     home: PathBuf,
     state: PathBuf,
@@ -29,6 +31,17 @@ impl Locations {
         state: &Path,
         macos: bool,
     ) -> Self {
+        let font_root = if macos {
+            home.to_path_buf()
+        } else {
+            data.filter(|p| p.is_absolute())
+                .unwrap_or(home)
+                .to_path_buf()
+        };
+        let config_root = config
+            .filter(|p| p.is_absolute())
+            .unwrap_or(home)
+            .to_path_buf();
         let font_dir = if macos {
             home.join("Library/Fonts")
         } else {
@@ -39,6 +52,8 @@ impl Locations {
         };
         Self {
             font: font_dir.join(NAME),
+            font_root,
+            config_root,
             config: config
                 .filter(|p| p.is_absolute())
                 .map(Path::to_path_buf)
@@ -46,6 +61,28 @@ impl Locations {
             home: home.to_path_buf(),
             state: state.to_path_buf(),
         }
+    }
+
+    // Resolve only caller-selected roots. Descendants remain subject to link checks.
+    fn resolved(&self) -> io::Result<Self> {
+        let font_root = resolve_root(&self.font_root)?;
+        let config_root = resolve_root(&self.config_root)?;
+        Ok(Self {
+            font: font_root.join(
+                self.font
+                    .strip_prefix(&self.font_root)
+                    .map_err(io::Error::other)?,
+            ),
+            config: config_root.join(
+                self.config
+                    .strip_prefix(&self.config_root)
+                    .map_err(io::Error::other)?,
+            ),
+            home: resolve_root(&self.home)?,
+            state: resolve_root(&self.state)?,
+            font_root,
+            config_root,
+        })
     }
 
     fn terminals(&self) -> Vec<(PathBuf, &'static str)> {
@@ -73,7 +110,37 @@ fn conflict(message: &str) -> io::Error {
     io::Error::other(message)
 }
 
-// Reject links in every existing path component, including symlinked parents.
+// Missing roots are resolved via their nearest existing ancestor without creating them.
+fn resolve_root(root: &Path) -> io::Result<PathBuf> {
+    if !root.is_absolute() {
+        return Err(conflict("An absolute font action root is required"));
+    }
+    let mut existing = root;
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(
+                    existing
+                        .file_name()
+                        .ok_or_else(|| conflict("Invalid root component"))?,
+                );
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| conflict("Missing root ancestor"))?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut resolved = fs::canonicalize(existing)?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+// Paths use canonical roots; reject links introduced beneath those roots.
 fn check_path(path: &Path) -> io::Result<()> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
@@ -164,6 +231,7 @@ fn apply_with(
     removing: bool,
     mut writer: impl FnMut(&Path, &[u8]) -> io::Result<()>,
 ) -> io::Result<Vec<String>> {
+    let locations = locations.resolved()?;
     check_path(&locations.state)?;
     fs::create_dir_all(&locations.state)?;
     let lock_path = locations.state.join("font.lock");
@@ -186,6 +254,9 @@ fn apply_with(
         return Err(conflict("Installed font differs; leaving it unchanged"));
     }
     let terminals = locations.terminals();
+    for (path, _) in &terminals {
+        check_path(path)?;
+    }
     let mut changes = Vec::new();
     for entry in state["entries"].as_array().unwrap() {
         let path = PathBuf::from(
@@ -465,6 +536,117 @@ mod tests {
         assert!(install(&locations).is_err());
         assert_eq!(fs::read_to_string(outside).unwrap(), "untouched");
         assert!(!locations.font.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_home_ancestor_allows_install_and_uninstall() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir_all(real.join("home")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        for macos in [false, true] {
+            let home = alias.join("home");
+            let locations = Locations::new(&home, None, None, &home.join("state"), macos);
+            let config = locations.config.join("kitty/kitty.conf");
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            fs::write(&config, "# original\n").unwrap();
+            install(&locations).unwrap();
+            assert!(locations.font.exists());
+            uninstall(&locations).unwrap();
+            assert!(!locations.font.exists());
+            assert_eq!(fs::read_to_string(config).unwrap(), "# original\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_xdg_and_state_roots_resolve_links_without_creating_missing_configs() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let locations = Locations::new(
+            root.path(),
+            Some(&alias.join("data")),
+            Some(&alias.join("config")),
+            &alias.join("state"),
+            false,
+        );
+        install(&locations).unwrap();
+        assert!(real.join("data/fonts").join(NAME).exists());
+        assert!(!real.join("config").exists());
+        uninstall(&locations).unwrap();
+        assert!(!locations.font.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_target_replaced_by_symlink_is_preserved() {
+        for target in ["font", "config", "journal", "lock"] {
+            let (root, locations) = fixture();
+            let config = locations.config.join("kitty/kitty.conf");
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            fs::write(&config, "# original\n").unwrap();
+            install(&locations).unwrap();
+            let path = match target {
+                "font" => locations.font.clone(),
+                "config" => config.clone(),
+                "journal" => locations.state.join("font-ownership.json"),
+                _ => locations.state.join("font.lock"),
+            };
+            let outside = root.path().join("outside");
+            fs::rename(&path, &outside).unwrap();
+            let before = fs::read(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+            let font_before = fs::read(&locations.font).unwrap();
+            let config_before = fs::read(&config).unwrap();
+            assert!(uninstall(&locations).is_err(), "{target}");
+            assert!(install(&locations).is_err(), "{target}");
+            assert_eq!(fs::read(&outside).unwrap(), before);
+            assert_eq!(fs::read(&locations.font).unwrap(), font_before);
+            assert_eq!(fs::read(&config).unwrap(), config_before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_targets_and_directories_below_roots_are_rejected() {
+        for target in [
+            "font",
+            "config",
+            "journal",
+            "lock",
+            "font-parent",
+            "config-parent",
+        ] {
+            let (root, locations) = fixture();
+            let outside = root.path().join("outside");
+            let path = match target {
+                "font" => locations.font.clone(),
+                "config" => locations.config.join("kitty/kitty.conf"),
+                "journal" => locations.state.join("font-ownership.json"),
+                "lock" => locations.state.join("font.lock"),
+                "font-parent" => locations.font.parent().unwrap().to_path_buf(),
+                _ => locations.config.join("kitty"),
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if target.ends_with("parent") {
+                fs::create_dir(&outside).unwrap();
+            } else {
+                fs::write(&outside, "untouched").unwrap();
+            }
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+            assert!(install(&locations).is_err(), "{target}");
+            assert!(uninstall(&locations).is_err(), "{target}");
+            if outside.is_file() {
+                assert_eq!(fs::read_to_string(outside).unwrap(), "untouched");
+            } else {
+                assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+            }
+        }
     }
 
     #[test]
