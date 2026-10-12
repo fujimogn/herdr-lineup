@@ -184,8 +184,9 @@ The plugin SHALL use the following verified Herdr Agent Icons Max mapping.
 These vendor slots SHALL remain within U+E1A0–U+E1BA. U+E1C0–U+E1C5 belong to
 radar state glyphs and SHALL NOT be assigned to vendors; lineup v1 uses U+25CF
 `●` for its dots. The design records the inspected binary hash and range check.
-The plugin SHALL emit codepoints only, never install fonts or edit terminal
-maps. In `text` mode it SHALL emit the labels above. In `auto` mode it SHALL use
+The plugin SHALL bundle the verified HerdrAgentIconsMax icon font and SHALL
+install it or edit terminal maps only through explicit opt-in font actions.
+Those actions SHALL map U+E1A0–U+E1BA only, leaving U+E1C0–U+E1C5 reserved. In `text` mode it SHALL emit the labels above. In `auto` mode it SHALL use
 text unless usable terminal font rendering is affirmatively known; font presence
 alone SHALL NOT count as terminal-map verification. Explicit `font` mode SHALL
 emit the PUA glyph and doctor SHALL explain the required font/map setup.

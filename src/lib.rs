@@ -4,6 +4,7 @@ pub mod config;
 pub mod configure;
 pub mod daemon;
 pub mod doctor;
+pub mod font;
 pub mod lock;
 pub mod model;
 pub mod protocol;
@@ -40,11 +41,29 @@ enum Command {
     Configure,
     /// Planned, opt-in: remove only sidebar rows managed by this plugin.
     Unconfigure,
+    /// Opt in to installing the bundled icon font and terminal codepoint maps.
+    InstallFont,
+    /// Remove only the icon font and codepoint maps installed by Lineup.
+    UninstallFont,
 }
 
 /// Run the command-line scaffold.
 pub fn run() -> ExitCode {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
+    if matches!(cli.command, Command::InstallFont | Command::UninstallFont) {
+        return match font::run(matches!(cli.command, Command::UninstallFont)) {
+            Ok(notes) => {
+                for note in notes {
+                    println!("{note}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("font: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     eprintln!("Planned: this command is not implemented yet. No changes were made.");
     ExitCode::FAILURE
 }

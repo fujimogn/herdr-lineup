@@ -11,7 +11,7 @@ Rust plugin will publish a consistent metadata contract for six coding agents.
 - Introduce pane tokens for vendor identity, semantic state, context percentage,
   and weekly remaining quota, plus workspace tokens for repository name and the
   latest locally known `origin/main` commit time.
-- Reuse the documented radar font codepoints without installing fonts or
+- Bundle the verified radar icon font and provide explicit opt-in font actions, without automatically installing fonts or
   modifying terminal configuration; provide readable text fallback.
 - Define a per-Herdr-session daemon, start/stop/doctor actions, user config, and
   reversible opt-in sidebar configuration.
@@ -36,7 +36,7 @@ The initial change is specification-only. Future implementation affects the
 Rust crate, plugin manifest, tests, and public documentation. No `package.json`
 is introduced; OpenSpec is run with `bunx @fission-ai/openspec@1.14.1`.
 
-Out of scope: animation, font installation, terminal codepoint-map changes,
+Out of scope: animation, automatic font installation or terminal codepoint-map changes,
 automatic sidebar edits at startup, fetching Git refs, and establishing each
 provider's usage source. Kimi and Hermes readers remain unavailable in stage one
 until research confirms a source. The plugin does not report agent lifecycle

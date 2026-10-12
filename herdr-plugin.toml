@@ -47,3 +47,16 @@ id = "unconfigure"
 title = "Remove Lineup sidebar configuration (opt-in, planned)"
 contexts = ["workspace"]
 command = ["target/release/herdr-lineup", "unconfigure"]
+
+# Font setup is explicit opt-in and never part of startup.
+[[actions]]
+id = "install-font"
+title = "Install Lineup icon font (opt-in)"
+contexts = ["workspace"]
+command = ["target/release/herdr-lineup", "install-font"]
+
+[[actions]]
+id = "uninstall-font"
+title = "Remove Lineup-owned icon font (opt-in)"
+contexts = ["workspace"]
+command = ["target/release/herdr-lineup", "uninstall-font"]

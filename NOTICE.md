@@ -2,16 +2,28 @@
 
 ## HerdrAgentIconsMax
 
-The planned sidebar uses codepoints from **HerdrAgentIconsMax**. The font is
-available from [hhdebb/herdr-radar](https://github.com/hhdebb/herdr-radar),
-`dist/HerdrAgentIconsMax-Regular.ttf`, and originates in
-[qintmb/herdr-icon-agent-ui](https://github.com/qintmb/herdr-icon-agent-ui).
-See the upstream [third-party notices](https://github.com/hhdebb/herdr-radar/blob/main/THIRD_PARTY_NOTICES.md)
-for the SVG mark sources and their licenses.
+This plugin bundles `assets/fonts/HerdrAgentIconsMax-Regular.ttf`, copied from
+[hhdebb/herdr-radar](https://github.com/hhdebb/herdr-radar),
+`dist/HerdrAgentIconsMax-Regular.ttf` (SHA-256
+`1b8199496b223d0761fc3a49d5b2510bda38deab82cb3758bf3980495bf05272`).
+The font originates in
+[qintmb/herdr-icon-agent-ui](https://github.com/qintmb/herdr-icon-agent-ui)
+and herdr-kit contributors under the MIT license reproduced below.
+JetBrains Mono and JetBrainsMonoHerdr are not bundled; this icon font contains
+no JetBrains Mono outlines.
 
-This plugin does not bundle the font, SVG marks, or JetBrains Mono. Users must
-install the font and configure their terminal themselves. The planned codepoint
-ranges are U+E1A0–U+E1BA and U+E1C0–U+E1C5.
+The font includes U+E1A0–U+E1BA vendor marks and U+E1C0–U+E1C5 state glyphs.
+Lineup maps only U+E1A0–U+E1BA; the state glyphs remain reserved and unused.
+Installation and terminal mapping require the explicit opt-in `install-font`
+action. Startup never installs fonts or changes terminal configuration.
+
+Marks for Cursor, OpenCode, Hermes, Copilot, DeepSeek, Gemini, GPT, Qwen,
+Antigravity, Kiro, GLM, and Muse derive from
+[lobehub/lobe-icons](https://github.com/lobehub/lobe-icons) (MIT), re-normalized
+to bare SVG path geometry by upstream. Its MIT license covers the project's
+packaging, not the depicted brands' trademarks. Other mark sources and licenses
+are recorded in the upstream
+[third-party notices](https://github.com/hhdebb/herdr-radar/blob/main/THIRD_PARTY_NOTICES.md).
 
 Vendor names and logos are trademarks of their respective owners. Their use
 identifies supported products and does not imply affiliation, endorsement, or

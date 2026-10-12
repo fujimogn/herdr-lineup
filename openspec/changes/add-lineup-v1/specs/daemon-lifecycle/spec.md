@@ -132,3 +132,29 @@ actions. The plugin SHALL not edit terminal font configuration in either action.
 - **THEN** unconfigure refuses without writing
 - **AND WHEN** a newly configured layout is rejected on reload
 - **THEN** configure restores the exact pre-action file and reports failure
+
+### Requirement: Explicit owned font setup and removal
+The plugin SHALL bundle only `HerdrAgentIconsMax-Regular.ttf`, not
+JetBrainsMonoHerdr. Explicit `install-font` and `uninstall-font` actions SHALL
+install/remove the icon font in the Linux XDG data `fonts` directory or macOS
+`~/Library/Fonts`. Startup and event hooks SHALL NOT invoke these actions.
+Ownership records SHALL live under `HERDR_PLUGIN_STATE_DIR`.
+
+Install SHALL edit only existing Ghostty (`config` and `config.ghostty`) and
+kitty (`kitty.conf`) files, appending a marked U+E1A0–U+E1BA codepoint-map block.
+It SHALL preserve all existing bytes outside that block, including comments and
+trailing newlines. It SHALL NOT map the reserved U+E1C0–U+E1C5 range or change
+primary terminal fonts. Other terminals SHALL receive manual instructions in logs.
+Uninstall SHALL remove only recorded, unmodified blocks and newly installed,
+byte-identical font files; preexisting fonts SHALL remain. Modified blocks,
+unrecorded markers, or symlinked paths SHALL cause a conflict before writes.
+
+#### Scenario: Repeated opt-in font setup and removal
+- **WHEN** install-font runs twice then uninstall-font runs twice in a temporary HOME
+- **THEN** the second invocation of each action is a no-op for font/terminal bytes
+- **AND** unrelated terminal settings and edits made outside the managed block survive
+- **AND** missing terminal configuration files are never created
+
+#### Scenario: Preserve a manually changed managed block
+- **WHEN** an owned terminal block has been modified by the user
+- **THEN** install-font and uninstall-font refuse without changing font or terminal bytes

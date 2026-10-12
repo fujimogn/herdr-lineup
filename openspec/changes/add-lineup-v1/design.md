@@ -4,8 +4,8 @@
 
 This is a proposed implementation contract, not evidence of a running plugin.
 The daemon publishes presentation metadata only. Herdr owns pane identity and
-semantic lifecycle state. User terminal setup owns the font and its codepoint
-map; user sidebar configuration owns row order and colors. On managed machines,
+semantic lifecycle state. Explicit opt-in font actions install the bundled icon font and manage terminal
+codepoint maps; user sidebar configuration owns row order and colors. On managed machines,
 dotfiles owns that sidebar configuration and configure/unconfigure is not used.
 
 ## Verified protocol references
@@ -38,7 +38,8 @@ allow static per-token colors; only the active state's dot is nonempty. The
 numeric percentage tokens are intended for rows that use numeric color rules.
 The display tokens include `%` and must not be used with numeric rules. Context
 text uses a minimum two-digit decimal (`07%`, `42%`, `100%`) because Herdr trims
-leading spaces. Weekly text is remaining percentage (`42%`). Missing display
+leading spaces. Weekly text combines the period, remaining percentage, and reset countdown
+(`7d 67% 6d9h`); a missing reset omits the countdown (`7d 67%`). Missing display
 data is the em dash `—`; missing numeric data is cleared with JSON null.
 
 Only dirty keys are patched, except that unchanged live keys are renewed before
@@ -71,14 +72,28 @@ The sidebar spec records the exact vendor table. U+E1C0–U+E1C5 are radar lifec
 glyphs, reserved here; lineup v1 uses ordinary U+25CF `●` for state. No new PUA
 assignments are invented. The font originates in
 [hhdebb/herdr-radar](https://github.com/hhdebb/herdr-radar); the inspected install
-contains MIT license/third-party notices. Document attribution and vendor
-non-affiliation before release; this change copies no font binary or source.
+contains MIT license/third-party notices. The plugin bundles this exact icon font at
+`assets/fonts/HerdrAgentIconsMax-Regular.ttf`; NOTICE.md includes attribution,
+the MIT license, lobe-icons mark origins, and vendor non-affiliation.
+JetBrainsMonoHerdr is not bundled.
 
 Font presence is not proof of a terminal codepoint map. `logo_mode = "auto"`
 selects text unless terminal rendering support is affirmatively established;
 the initial implementation is allowed to remain conservative. Explicit `font`
 is the user's assertion that both font and terminal mapping are configured.
 Text fallback uses the ASCII labels in the spec rather than lookalike symbols.
+
+Explicit `install-font` and `uninstall-font` actions manage only the icon font
+and U+E1A0–U+E1BA maps; startup never invokes them. Linux uses the XDG data
+fonts directory and macOS uses `~/Library/Fonts`. Existing Ghostty configs
+(`config` or `config.ghostty`, including the macOS Application Support path)
+and kitty configs receive a marked block; missing configs are not created.
+A plugin-state ownership record distinguishes newly installed files from
+preexisting fonts. Uninstall removes only byte-identical owned files and
+unmodified owned blocks, preserving unrelated terminal bytes and later edits.
+Modified blocks or symlinked paths produce a conflict without writing.
+Other terminals receive manual codepoint-map instructions in logs. Managed
+machines use dotfiles for fonts and terminal settings instead of these actions.
 
 ## Daemon implementation outline
 
