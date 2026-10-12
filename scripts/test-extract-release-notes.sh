@@ -114,6 +114,12 @@ Release summary.
 NOTES
 check_output 1.2.3
 
+# Empty bodies fail closed, including bodies containing only whitespace.
+printf '## 1.2.3 (2026-10-13)\n' > "$fixture_dir/changelog"
+check_failure 1.2.3
+printf '\n   \n\n## 1.2.2 (2026-10-12)\nOlder release.\n' >> "$fixture_dir/changelog"
+check_failure 1.2.3
+
 rm "$fixture_dir/changelog"
 check_failure 1.2.3
 test -s "$fixture_dir/error"

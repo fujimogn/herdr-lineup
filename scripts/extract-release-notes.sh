@@ -21,7 +21,7 @@ awk -v version="$1" '
     if ($0 !~ /^[[:space:]]*$/) last = count
   }
   END {
-    if (!found) exit 1
+    if (!found || last <= 1) exit 1
     for (i = 1; i <= last; i++) print lines[i]
   }
 ' "${2:-CHANGELOG.md}" || {
