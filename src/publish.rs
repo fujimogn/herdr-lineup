@@ -86,6 +86,12 @@ struct CheckpointRow {
     seq: u64,
 }
 
+struct HeadingCache {
+    cwd: PathBuf,
+    occupants: Vec<(String, Option<tokens::Occupant>)>,
+    repository: ship_time::Repository,
+}
+
 pub struct MetadataPublisher {
     planner: tokens::Publisher,
     checkpoint_loaded: bool,
@@ -102,6 +108,7 @@ pub struct MetadataPublisher {
     weekly_diagnostics_initialized: bool,
     grok_observed: Arc<std::sync::Mutex<Option<Instant>>>,
     codex_control: Arc<crate::quota_codex::QueryControl>,
+    headings: BTreeMap<String, HeadingCache>,
 }
 impl MetadataPublisher {
     /// Construction performs no state I/O. The daemon acquires its session lock
@@ -128,7 +135,49 @@ impl MetadataPublisher {
             weekly_diagnostics_initialized: false,
             grok_observed: Arc::new(std::sync::Mutex::new(None)),
             codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
+            headings: BTreeMap::new(),
         })
+    }
+
+    fn heading_repository(
+        &mut self,
+        workspace: &str,
+        cwd: Option<&Path>,
+        occupants: &[(String, Option<tokens::Occupant>)],
+        reading: ship_time::RepositoryRead,
+    ) -> Option<ship_time::Repository> {
+        let Some(cwd) = cwd else {
+            self.headings.remove(workspace);
+            return None;
+        };
+        if self
+            .headings
+            .get(workspace)
+            .is_some_and(|previous| previous.cwd != cwd || previous.occupants != occupants)
+        {
+            self.headings.remove(workspace);
+        }
+        match reading {
+            ship_time::RepositoryRead::Interrupted => self
+                .headings
+                .get(workspace)
+                .map(|previous| previous.repository.clone()),
+            ship_time::RepositoryRead::Complete(Some(repository)) => {
+                self.headings.insert(
+                    workspace.into(),
+                    HeadingCache {
+                        cwd: cwd.to_owned(),
+                        occupants: occupants.to_vec(),
+                        repository: repository.clone(),
+                    },
+                );
+                Some(repository)
+            }
+            ship_time::RepositoryRead::Complete(None) => {
+                self.headings.remove(workspace);
+                None
+            }
+        }
     }
 
     fn start_weekly(&mut self, config: &Config) -> io::Result<()> {
@@ -402,6 +451,12 @@ impl MetadataPublisher {
     }
 
     fn reconcile_missing(&mut self, snapshot: &protocol::Snapshot) {
+        self.headings.retain(|id, _| {
+            snapshot
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.workspace_id == *id)
+        });
         let live: BTreeSet<_> =
             snapshot
                 .panes
@@ -486,7 +541,17 @@ impl MetadataPublisher {
                 workspace.checkout_path.as_deref().map(Path::new),
                 &panes,
             );
-            let repository = cwd.and_then(ship_time::read_repository);
+            let reading = cwd.map_or(ship_time::RepositoryRead::Complete(None), |cwd| {
+                ship_time::read_repository_controlled(cwd, self.shutdown.as_deref())
+            });
+            let occupants = snapshot
+                .panes
+                .iter()
+                .filter(|pane| pane.workspace_id == workspace.workspace_id)
+                .map(|pane| (pane.pane_id.clone(), pane.occupant.clone()))
+                .collect::<Vec<_>>();
+            let repository =
+                self.heading_repository(&workspace.workspace_id, cwd, &occupants, reading);
             let ship = repository.as_ref().and_then(|repo| repo.ship_unix);
             let resolved = repository.is_some();
             let desired = BTreeMap::from([
@@ -818,6 +883,121 @@ mod tests {
         os::unix::net::UnixListener,
         time::Duration,
     };
+
+    #[test]
+    fn heading_timeout_retains_only_the_same_workspace_and_occupant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().to_owned(), "fake".into(), Homes::default()).unwrap();
+        let cwd = Path::new("/synthetic/repo");
+        let repo = ship_time::Repository {
+            name: "repo".into(),
+            ship_unix: Some(123),
+        };
+        let occupant = vec![(
+            "p1".into(),
+            Some(tokens::Occupant {
+                agent: Agent::Codex,
+                native_session: Some("native-one".into()),
+            }),
+        )];
+        assert_eq!(
+            publisher.heading_repository(
+                "w1",
+                Some(cwd),
+                &occupant,
+                ship_time::RepositoryRead::Complete(Some(repo.clone()))
+            ),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            publisher.heading_repository(
+                "w1",
+                Some(cwd),
+                &occupant,
+                ship_time::RepositoryRead::Interrupted
+            ),
+            Some(repo)
+        );
+        assert_eq!(
+            publisher.heading_repository(
+                "w2",
+                Some(cwd),
+                &occupant,
+                ship_time::RepositoryRead::Interrupted
+            ),
+            None
+        );
+        let changed = vec![(
+            "p1".into(),
+            Some(tokens::Occupant {
+                agent: Agent::Codex,
+                native_session: Some("native-two".into()),
+            }),
+        )];
+        assert_eq!(
+            publisher.heading_repository(
+                "w1",
+                Some(cwd),
+                &changed,
+                ship_time::RepositoryRead::Interrupted
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_repository_removal_and_cwd_change_discard_cached_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().to_owned(), "fake".into(), Homes::default()).unwrap();
+        let cwd = Path::new("/synthetic/repo");
+        let repo = ship_time::Repository {
+            name: "repo".into(),
+            ship_unix: Some(123),
+        };
+        for replacement in [Some(Path::new("/synthetic/other")), None] {
+            publisher.heading_repository(
+                "w1",
+                Some(cwd),
+                &[],
+                ship_time::RepositoryRead::Complete(Some(repo.clone())),
+            );
+            assert_eq!(
+                publisher.heading_repository(
+                    "w1",
+                    replacement,
+                    &[],
+                    ship_time::RepositoryRead::Interrupted
+                ),
+                None
+            );
+        }
+        publisher.heading_repository(
+            "w1",
+            Some(cwd),
+            &[],
+            ship_time::RepositoryRead::Complete(Some(repo)),
+        );
+        assert_eq!(
+            publisher.heading_repository(
+                "w1",
+                Some(cwd),
+                &[],
+                ship_time::RepositoryRead::Complete(None)
+            ),
+            None
+        );
+        assert_eq!(
+            publisher.heading_repository(
+                "w1",
+                Some(cwd),
+                &[],
+                ship_time::RepositoryRead::Interrupted
+            ),
+            None
+        );
+    }
 
     #[test]
     fn missing_reset_weekly_expires_at_configured_freshness() {

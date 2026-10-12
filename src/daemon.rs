@@ -557,6 +557,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let done = Arc::new(AtomicBool::new(false));
         let flag = done.clone();
+        let workspace = options.state.clone();
         let handle = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -569,7 +570,27 @@ mod tests {
                         std::io::BufReader::new(stream.try_clone().unwrap())
                             .read_line(&mut line)
                             .unwrap();
-                        stream.write_all(b"{\"id\":\"lineup-health\",\"result\":{\"type\":\"pong\",\"version\":\"0.9.3\",\"protocol\":17}}\n").unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let result = if workspace.join("snapshot-workspace").exists()
+                            && request["method"] == "session.snapshot"
+                        {
+                            serde_json::json!({"type":"session_snapshot", "snapshot":{
+                                "version":"0.9.3", "protocol":17, "panes":[],
+                                "workspaces":[{"workspace_id":"fake", "worktree":{
+                                    "checkout_path":workspace
+                                }}]
+                            }})
+                        } else if request["method"] == "workspace.report_metadata" {
+                            serde_json::json!({"type":"ok"})
+                        } else {
+                            serde_json::json!({"type":"pong", "version":"0.9.3", "protocol":17})
+                        };
+                        writeln!(
+                            stream,
+                            "{}",
+                            serde_json::json!({"id":request["id"], "result":result})
+                        )
+                        .unwrap();
                         // Herdr v0.9.3 ends each ordinary JSON response with EOF.
                         drop(stream);
                     }
@@ -616,7 +637,9 @@ mod tests {
     #[test]
     #[ignore = "isolated daemon subprocess entry point"]
     fn child_entry() {
-        if std::env::var_os("LINEUP_INHERITED_LOCK").is_some() {
+        if std::env::var_os("LINEUP_INHERITED_LOCK").is_some()
+            || std::env::var_os("LINEUP_TEST_FOREGROUND").is_some()
+        {
             let options = Options::from_env().unwrap();
             if std::env::var_os("LINEUP_TEST_FAIL_STARTUP").is_some() {
                 let error = io::Error::new(io::ErrorKind::WouldBlock, "synthetic socket failure");
@@ -702,7 +725,7 @@ mod tests {
                 }
                 run_foreground(
                     &options,
-                    true,
+                    std::env::var_os("LINEUP_TEST_FOREGROUND").is_none(),
                     &mut QuotaPublisher {
                         home: options.state.clone(),
                         control: Arc::new(crate::quota_codex::QueryControl::default()),
@@ -720,7 +743,12 @@ mod tests {
                     crate::publish::Homes::from_env(),
                 )
                 .unwrap();
-                run_foreground(&options, true, &mut publisher).unwrap();
+                run_foreground(
+                    &options,
+                    std::env::var_os("LINEUP_TEST_FOREGROUND").is_none(),
+                    &mut publisher,
+                )
+                .unwrap();
                 return;
             }
             struct SlowRefresh(PathBuf, Option<Arc<AtomicBool>>);
@@ -777,6 +805,126 @@ mod tests {
             pid.is_some()
         });
         pid.unwrap()
+    }
+
+    #[test]
+    fn stop_interrupts_stalled_repository_query_before_process_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, options, done, server) = fixture();
+        fs::write(options.config.join("config.toml"), "providers = []\n").unwrap();
+        fs::create_dir(&options.state).unwrap();
+        fs::write(options.state.join("snapshot-workspace"), "").unwrap();
+        let bin = options.config.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let script = bin.join("git");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho $$ > \"$2/git-pid\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = child_command()
+            .env("LINEUP_TEST_FOREGROUND", "1")
+            .env("LINEUP_TEST_QUOTA_ONCE", "1")
+            .env("HERDR_SOCKET_PATH", &options.socket)
+            .env("HERDR_PLUGIN_STATE_DIR", &options.state)
+            .env("HERDR_PLUGIN_CONFIG_DIR", &options.config)
+            .env("PATH", &bin)
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| probe(&paths, &options.socket).ok().flatten().is_some());
+        let git_pid = wait_for_pid(&options.state.join("git-pid"));
+        let started = Instant::now();
+        let stopped = stop(&options);
+        let mut exited = None;
+        while started.elapsed() < Duration::from_secs(5) {
+            exited = child.try_wait().unwrap();
+            if exited.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let lock_released = !SessionLock::is_held(&paths).unwrap();
+        if exited.is_none() {
+            // Only the exact synthetic child group owned by this test is killed.
+            unsafe {
+                libc::killpg(git_pid, libc::SIGKILL);
+                libc::killpg(child.id() as i32, libc::SIGKILL);
+            }
+        }
+        child.wait().unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(
+            stopped.is_ok(),
+            "stop blocked on repository query: {stopped:?}"
+        );
+        assert!(exited.is_some_and(|status| status.success()));
+        assert!(lock_released);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(unsafe { libc::kill(git_pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn stop_waits_for_slow_quota_daemon_process_exit_and_releases_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, options, done, server) = fixture();
+        let bin = options.config.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let script = bin.join("codex");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho $$ > \"$CODEX_HOME/app-server-pid\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&options.state).unwrap();
+        let mut child = child_command()
+            .env("LINEUP_TEST_FOREGROUND", "1")
+            .env("LINEUP_TEST_QUOTA_STOP", "1")
+            .env("HERDR_SOCKET_PATH", &options.socket)
+            .env("HERDR_PLUGIN_STATE_DIR", &options.state)
+            .env("HERDR_PLUGIN_CONFIG_DIR", &options.config)
+            .env("PATH", &bin)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| probe(&paths, &options.socket).ok().flatten().is_some());
+        let app_server = wait_for_pid(&options.state.join("app-server-pid"));
+        wait_until(|| options.state.join("http-entered").exists());
+        assert!(SessionLock::acquire(&paths).unwrap().is_none());
+        let started = Instant::now();
+        let result = stop(&options);
+        let mut exited = None;
+        while started.elapsed() < Duration::from_secs(5) {
+            exited = child.try_wait().unwrap();
+            if exited.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Own/reap the exact child, including on a regression. PID absence alone
+        // would mistake a recycled PID or an unreaped zombie for a live daemon.
+        if exited.is_none() {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+        let lock_released = !SessionLock::is_held(&paths).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        result.unwrap();
+        assert!(exited.is_some_and(|status| status.success()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(lock_released);
+        assert_eq!(unsafe { libc::kill(app_server, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
     #[test]

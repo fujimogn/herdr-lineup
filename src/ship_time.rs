@@ -1,7 +1,13 @@
 //! Local repository identity and origin/main commit-time headings.
 
-use std::path::Path;
-use std::process::Command;
+use std::{
+    io::Read,
+    os::{fd::AsRawFd, unix::process::CommandExt},
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike};
 
@@ -16,21 +22,54 @@ pub struct Repository {
 /// Missing refs retain the repository name, while non-working repositories
 /// and failed identity queries return `None`.
 pub fn read_repository(cwd: &Path) -> Option<Repository> {
-    if git_output(cwd, &["rev-parse", "--is-inside-work-tree"])? != "true\n" {
+    match read_repository_controlled(cwd, None) {
+        RepositoryRead::Complete(repository) => repository,
+        RepositoryRead::Interrupted => None,
+    }
+}
+
+pub(crate) enum RepositoryRead {
+    Complete(Option<Repository>),
+    Interrupted,
+}
+
+/// Bound all Git commands for one heading and cancel them on daemon shutdown.
+/// Distinguish interruption from confirmed absence so publication can retain a
+/// previous heading only when its workspace identity is still authoritative.
+pub(crate) fn read_repository_controlled(
+    cwd: &Path,
+    shutdown: Option<&AtomicBool>,
+) -> RepositoryRead {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let repository = read_repository_before(cwd, shutdown, deadline);
+    if Instant::now() >= deadline || shutdown.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        RepositoryRead::Interrupted
+    } else {
+        RepositoryRead::Complete(repository)
+    }
+}
+
+fn read_repository_before(
+    cwd: &Path,
+    shutdown: Option<&AtomicBool>,
+    deadline: Instant,
+) -> Option<Repository> {
+    let output = |path: &Path, args: &[&str]| git_output(path, args, deadline, shutdown);
+    if output(cwd, &["rev-parse", "--is-inside-work-tree"])? != "true\n" {
         return None;
     }
-    let common = git_output(
+    let common = output(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let common = Path::new(common.strip_suffix('\n')?).canonicalize().ok()?;
     // The first worktree is the main working repository, even when cwd is a
     // linked worktree. Query its common directory, not the linked root name.
-    let worktrees = git_output(&common, &["worktree", "list", "--porcelain", "-z"])?;
+    let worktrees = output(&common, &["worktree", "list", "--porcelain", "-z"])?;
     let root = worktrees.split('\0').next()?.strip_prefix("worktree ")?;
     let root = Path::new(root).canonicalize().ok()?;
     let name = root.file_name()?.to_str()?.to_owned();
-    let ship_unix = git_output(
+    let ship_unix = output(
         cwd,
         &[
             "log",
@@ -90,12 +129,96 @@ fn git_command(cwd: &Path) -> Command {
     command
 }
 
-fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = git_command(cwd).args(args).output().ok()?;
-    if !output.status.success() {
+struct GitChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl Drop for GitChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // The unreaped child pins its PID; never signal a recycled group.
+            // SAFETY: process_group(0) creates this child's own process group.
+            unsafe {
+                libc::killpg(self.child.id() as i32, libc::SIGKILL);
+            }
+            let _ = self.child.kill();
+            loop {
+                match self.child.wait() {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
+fn git_output(
+    cwd: &Path,
+    args: &[&str],
+    deadline: Instant,
+    shutdown: Option<&AtomicBool>,
+) -> Option<String> {
+    let cancelled =
+        || Instant::now() >= deadline || shutdown.is_some_and(|flag| flag.load(Ordering::Acquire));
+    if cancelled() {
         return None;
     }
-    String::from_utf8(output.stdout).ok()
+    let child = git_command(cwd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let mut owned = GitChild {
+        child,
+        reaped: false,
+    };
+    let mut stdout = owned.child.stdout.take()?;
+    let fd = stdout.as_raw_fd();
+    // SAFETY: stdout owns fd, and only this reader changes its file flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut eof = false;
+    loop {
+        if cancelled() {
+            return None;
+        }
+        if !eof {
+            let mut buffer = [0u8; 8192];
+            match stdout.read(&mut buffer) {
+                Ok(0) => eof = true,
+                Ok(count) => {
+                    if bytes.len() + count > 4 * 1024 * 1024 {
+                        return None;
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                    continue;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => return None,
+            }
+        }
+        // Do not reap the group leader while a descendant still owns stdout:
+        // a timeout must be able to kill that exact group without PID reuse.
+        if eof && let Some(status) = owned.child.try_wait().ok()? {
+            owned.reaped = true;
+            return status
+                .success()
+                .then(|| String::from_utf8(bytes).ok())
+                .flatten();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +226,54 @@ mod tests {
     use super::*;
     use chrono::FixedOffset;
     use std::path::PathBuf;
+
+    #[test]
+    fn repository_deadline_reaps_stalled_git_without_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root) = std::env::var_os("LINEUP_TEST_GIT_DEADLINE") {
+            let root = PathBuf::from(root);
+            let started = Instant::now();
+            assert!(matches!(
+                read_repository_controlled(&root, None),
+                RepositoryRead::Interrupted
+            ));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            let pid: i32 = std::fs::read_to_string(root.join("git-pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let script = bin.join("git");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho $$ > \"$2/git-pid\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ship_time::tests::repository_deadline_reaps_stalled_git_without_shutdown",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", bin)
+            .env("LINEUP_TEST_GIT_DEADLINE", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     fn at(value: &str) -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339(value).unwrap()
