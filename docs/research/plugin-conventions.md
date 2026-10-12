@@ -310,9 +310,15 @@ behavior was not read.
 Lineup's `NOTICE.md` already attributes Herdr Agent Icons Max to
 `hhdebb/herdr-radar` and records `qintmb/herdr-icon-agent-ui` as a related
 source. The design note in `openspec/changes/add-lineup-v1/design.md` says
-this change copies no font binary. That policy matches the plugins doc's
-ownership split: the terminal owns the font. It does not match radar or
-icon-agent-ui, which install fonts for the user.
+this change copies no font binary. That earlier note matches the plugins
+doc's ownership split: the terminal owns the font. It does not match radar
+or icon-agent-ui, which install fonts for the user.
+
+Decision 2026-10-12: follow `hhdebb/herdr-radar`. Lineup bundles the sidebar
+icon font and adds opt-in `install-font` and `uninstall-font` actions. Startup
+still must not rewrite font setup. The earlier "do not bundle a font" adoption
+row is withdrawn. This document records the decision; another lane owns the
+asset and the actions.
 
 ## herdr-lineup at this commit
 
@@ -352,9 +358,9 @@ should not be rewritten toward a peer that does the opposite.
 | P1 | Keep the repository unpublished. Do not add the `herdr-plugin` topic until a human publishes it. When that happens, the existing required manifest fields are enough for the index parser. | `README.md` | Listing requires a public default branch plus the topic. The formation goal says the repository stays private. |
 | P1 | Ship `v*` tags whose version matches `Cargo.toml`, `Cargo.lock`, and `herdr-plugin.toml`, and attach `SHA256SUMS` for any downloaded binary. A cargo-only install does not need binary assets. | `.github/workflows/release.yml`, `scripts/check-version.sh`, `docs/releasing.md` | Checksums are the common contract of fetch-or-build plugins. Version drift showed up in `zoetrope` and `herdr-annotate`. Another lane owns the release workflow; do not duplicate it here. |
 | P2 | Keep `cargo build --release --locked` as the install build. Add a download-and-verify script only after release assets exist. The cookbook example omits `--locked`; lineup is stricter. | `herdr-plugin.toml`, a future `scripts/install.sh` | Locked builds match `herdr-projects`' fallback and this repo's CI. A fetch script is optional while install is still planned. |
-| P2 | Extend the README with three facts the plugins doc already states and several peers repeat: reinstall replaces `HERDR_PLUGIN_ROOT`; there is no `plugin update`; `herdr plugin install owner/repo --ref vX.Y.Z` pins a revision. Keep the existing planned-versus-implemented split, `config-dir` instructions, and the no-font rule. | `README.md` | Those three facts are how users avoid storing state in the managed checkout. Lineup's README does not say them yet. |
+| P2 | Extend the README with three facts the plugins doc already states and several peers repeat: reinstall replaces `HERDR_PLUGIN_ROOT`; there is no `plugin update`; `herdr plugin install owner/repo --ref vX.Y.Z` pins a revision. Keep the existing planned-versus-implemented split and `config-dir` instructions. Font policy is the P3 decision dated 2026-10-12. | `README.md` | Those three facts are how users avoid storing state in the managed checkout. Lineup's README does not say them yet. |
 | P3 | Keep opt-in `configure` / `unconfigure` actions. Do not copy radar or icon-agent-ui startup that rewrites sidebar or font setup. | `herdr-plugin.toml`, `README.md` | Lineup already refuses startup edits. Peers that edit config from startup are a different product choice, not a marketplace requirement. |
-| P3 | Keep emitting codepoints without bundling `HerdrAgentIconsMax`. Keep `NOTICE.md` attribution. Do not add `install-font` or a `dist/*.ttf`. | `NOTICE.md`, `README.md` | Radar and icon-agent-ui install fonts. Lineup's design and README already assign the font to the user terminal. |
+| P3 | Bundle the sidebar icon font, following `hhdebb/herdr-radar`, and add opt-in `install-font` and `uninstall-font` actions. Keep `NOTICE.md` attribution. Do not install or remove the font from startup. | `herdr-plugin.toml`, `README.md`, `NOTICE.md` | Decision 2026-10-12: follow herdr-radar. The earlier row told lineup not to bundle `HerdrAgentIconsMax` and to leave the font to the user terminal. That row is withdrawn. The user opts in through `install-font` and opts out through `uninstall-font`. Startup still must not rewrite font setup. |
 | P3 | Keep `id = "herdr-lineup"`. Dotted ids are common and legal. Change the id only if a public install collides. | `herdr-plugin.toml` | The plugins doc accepts both shapes. Renaming after install would orphan config directories. |
 | P4 | Keep the current CI checks. Add `actionlint` when a release workflow lands. `cargo audit` is already a job; `herdr-reviewr` uses a separate `audit.yml`, which is optional. | `.github/workflows/ci.yml` | Lineup's check matrix is already stricter than plugins that only ship `release.yml`. |
 | P4 | Do not add panes or link handlers to imitate review, file-viewer, or hunk-diff. Lineup publishes sidebar metadata. | `herdr-plugin.toml` | Those sections solve a different entrypoint. Copying them would invent UI the spec does not ask for. Leave this manifest without `[[panes]]` or `[[link_handlers]]`. |
