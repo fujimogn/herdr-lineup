@@ -54,6 +54,7 @@ struct CheckpointRow {
 
 pub struct MetadataPublisher {
     planner: tokens::Publisher,
+    checkpoint_loaded: bool,
     directory: PathBuf,
     socket_key: String,
     endpoint: Option<String>,
@@ -63,12 +64,35 @@ pub struct MetadataPublisher {
     refresh_ms: u64,
 }
 impl MetadataPublisher {
-    /// The daemon holds its session lock before any checkpoint mutation.
+    /// Construction performs no state I/O. The daemon acquires its session lock
+    /// before refresh/clear reads the latest checkpoint or mutates any sequence.
     pub fn new(directory: PathBuf, socket_key: String, homes: Homes) -> io::Result<Self> {
+        if !directory.is_absolute() || socket_key.is_empty() {
+            return Err(io::Error::other(
+                "absolute state directory and socket key required",
+            ));
+        }
+        Ok(Self {
+            planner: tokens::Publisher::default(),
+            checkpoint_loaded: false,
+            directory,
+            socket_key,
+            endpoint: None,
+            homes,
+            started: Instant::now(),
+            request_seq: 0,
+            refresh_ms: 5000,
+        })
+    }
+
+    fn load_checkpoint(&mut self) -> io::Result<()> {
+        if self.checkpoint_loaded {
+            return Ok(());
+        }
         let checkpoint = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(directory.join("sequences.json"))
+            .open(self.directory.join("sequences.json"))
         {
             Ok(file) => {
                 let rows: Vec<CheckpointRow> = serde_json::from_reader(file)
@@ -94,16 +118,9 @@ impl MetadataPublisher {
             Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             Err(_) => return Err(io::Error::other("cannot read sequence checkpoint")),
         };
-        Ok(Self {
-            planner: tokens::Publisher::restore(checkpoint),
-            directory,
-            socket_key,
-            endpoint: None,
-            homes,
-            started: Instant::now(),
-            request_seq: 0,
-            refresh_ms: 5000,
-        })
+        self.planner = tokens::Publisher::restore(checkpoint);
+        self.checkpoint_loaded = true;
+        Ok(())
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -142,6 +159,7 @@ impl MetadataPublisher {
     }
 
     fn snapshot(&mut self, transport: &mut Transport) -> io::Result<protocol::Snapshot> {
+        self.load_checkpoint()?;
         let identity = transport.identity();
         let endpoint = format!("{}:{}:{}", self.socket_key, identity.device, identity.inode);
         if self
@@ -419,7 +437,9 @@ impl daemon::Publisher for MetadataPublisher {
 }
 
 fn check_clear_deadline(deadline: Instant) -> io::Result<()> {
-    if Instant::now() >= deadline {
+    // Transport bounds write_frame and read_frame to 500 ms each. Do not
+    // start a report unless its entire worst-case socket round trip fits.
+    if deadline.saturating_duration_since(Instant::now()) < Duration::from_secs(1) {
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "metadata clear deadline reached; remaining keys will expire",
@@ -484,6 +504,110 @@ mod tests {
                 "agent_session": {"agent":"codex", "kind":"id", "value":"synthetic-session"},
                 "agent_status":"working", "tokens":{"lineup_context_pct":"old"}}]
         }}})
+    }
+
+    #[test]
+    fn checkpoint_is_loaded_after_construction_before_first_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let request = receive(&mut stream);
+            writeln!(stream.get_mut(), "{}", snapshot(&request["id"], true)).unwrap();
+            let mut reports = Vec::new();
+            for _ in 0..2 {
+                let request = receive(&mut stream);
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+                reports.push(request);
+            }
+            reports
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        // Model an older daemon completing its final reservation before our
+        // caller obtains the session lock. Construction must not cache old seq.
+        let identity = transport.identity();
+        std::fs::write(
+            dir.path().join("sequences.json"),
+            serde_json::to_vec(&vec![CheckpointRow {
+                endpoint: format!("fake:{}:{}", identity.device, identity.inode),
+                kind: "pane".into(),
+                id: "w1:p1".into(),
+                seq: 40,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        publisher
+            .refresh(&mut transport, &crate::config::Config::default())
+            .unwrap();
+        let reports = server.join().unwrap();
+        assert_eq!(reports[0]["params"]["seq"], 41);
+    }
+
+    #[test]
+    fn slow_clear_reserves_time_for_the_last_socket_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let request = receive(&mut stream);
+            let mut response = snapshot(&request["id"], false);
+            response["result"]["snapshot"]["panes"] = json!((0..9).map(|i| json!({
+                "pane_id":format!("w1:p{i}"),"workspace_id":"w1","agent_status":"idle","tokens":{}
+            })).collect::<Vec<_>>());
+            std::thread::sleep(Duration::from_millis(350));
+            writeln!(stream.get_mut(), "{response}").unwrap();
+            let mut count = 0;
+            loop {
+                let mut line = String::new();
+                match stream.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => (),
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                std::thread::sleep(Duration::from_millis(350));
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+                count += 1;
+            }
+            count
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let started = Instant::now();
+        assert!(publisher.clear(&mut transport).is_err());
+        let elapsed = started.elapsed();
+        drop(transport);
+        let reports = server.join().unwrap();
+        assert!(reports > 0);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "clear exceeded its socket budget: {elapsed:?}"
+        );
     }
 
     #[test]
