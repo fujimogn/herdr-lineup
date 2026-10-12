@@ -23,6 +23,115 @@ if expected != raw_expected or not inside(candidate, expected) or any(inside(can
 PY
 }
 
+# Validate only display tokens; never print snapshot paths or session contents.
+token_check() {
+    python3 - "$@" <<'PYTOK'
+import copy, datetime, json, sys
+
+def require(value):
+    if not value: raise ValueError('token mismatch')
+
+def check(snapshot, workspace, pane, ship):
+    rows = snapshot['result']['snapshot']
+    w = next(r for r in rows['workspaces'] if r['workspace_id'] == workspace)
+    tokens = w.get('tokens', {})
+    require(tokens.get('lineup_repo') == 'lineup-e2e')
+    require(tokens.get('lineup_ship_unix') == ship)
+    stamp = datetime.datetime.fromtimestamp(int(ship))
+    expected_text = stamp.strftime('%H:%M') if stamp.date() == datetime.datetime.now().date() else f'{stamp.month}/{stamp.day}'
+    require(tokens.get('lineup_ship_text') == expected_text)
+    if pane:
+        p = next(r for r in rows['panes'] if r['pane_id'] == pane)
+        tokens = p.get('tokens', {})
+        expected = {'lineup_agent': 'codex', 'lineup_logo': 'Codex',
+                    'lineup_state': 'idle', 'lineup_state_idle': '●',
+                    'lineup_context_text': '—', 'lineup_weekly_text': '—'}
+        require(all(tokens.get(k) == v for k, v in expected.items()))
+        require('lineup_context_pct' not in tokens and 'lineup_weekly_pct' not in tokens)
+
+def cleared(snapshot):
+    rows = snapshot['result']['snapshot']
+    require(all(not any(k.startswith('lineup_') for k in row.get('tokens', {}))
+               for kind in ('panes', 'workspaces') for row in rows[kind]))
+
+if sys.argv[1] == 'self-test':
+    fixture = {'result': {'snapshot': {'workspaces': [{
+        'workspace_id': 'w1', 'tokens': {'lineup_repo': 'lineup-e2e',
+        'lineup_ship_unix': '123', 'lineup_ship_text': '1/1'}}], 'panes': [{
+        'pane_id': 'w1:p1', 'tokens': {'lineup_agent': 'codex',
+        'lineup_logo': 'Codex', 'lineup_state': 'idle', 'lineup_state_idle': '●',
+        'lineup_context_text': '—', 'lineup_weekly_text': '—'}}]}}}
+    stamp = datetime.datetime.fromtimestamp(123)
+    fixture['result']['snapshot']['workspaces'][0]['tokens']['lineup_ship_text'] = stamp.strftime('%H:%M') if stamp.date() == datetime.datetime.now().date() else f'{stamp.month}/{stamp.day}'
+    check(fixture, 'w1', 'w1:p1', '123')
+    for kind, key, value in [('workspaces', 'lineup_repo', '—'),
+                             ('workspaces', 'lineup_ship_unix', '124'),
+                             ('panes', 'lineup_weekly_text', '7d 99%'),
+                             ('panes', 'lineup_context_pct', '12')]:
+        bad = copy.deepcopy(fixture)
+        bad['result']['snapshot'][kind][0]['tokens'][key] = value
+        try: check(bad, 'w1', 'w1:p1', '123')
+        except ValueError: pass
+        else: sys.exit('FAIL: incorrect tokens accepted')
+    for kind, key in [('workspaces', 'lineup_ship_unix'), ('panes', 'lineup_state')]:
+        bad = copy.deepcopy(fixture)
+        del bad['result']['snapshot'][kind][0]['tokens'][key]
+        try: check(bad, 'w1', 'w1:p1', '123')
+        except ValueError: pass
+        else: sys.exit('FAIL: missing token accepted')
+    try: cleared(fixture)
+    except ValueError: pass
+    else: sys.exit('FAIL: uncleared tokens accepted')
+    for kind in ('workspaces', 'panes'):
+        fixture['result']['snapshot'][kind][0]['tokens'] = {'other_plugin': 'kept'}
+    cleared(fixture)
+    print('PASS: token validation rejects wrong/missing values and uncleared tokens')
+else:
+    snapshot = json.load(open(sys.argv[2]))
+    try:
+        if sys.argv[1] == 'clear': cleared(snapshot)
+        else: check(snapshot, *sys.argv[3:])
+    except (ValueError, KeyError, StopIteration):
+        sys.exit(1)
+PYTOK
+}
+
+sequence_record() {
+    python3 - "$temp/state" "$workspace" "$pane" <<'PYSEQ'
+import glob, json, sys
+paths = glob.glob(sys.argv[1] + '/session-*/sequences.json')
+if len(paths) != 1: sys.exit('Expected one isolated sequence checkpoint')
+rows = json.load(open(paths[0]))
+result = {}
+for kind, target in [('workspace', sys.argv[2]), ('pane', sys.argv[3])]:
+    matches = [r['seq'] for r in rows if r['kind'] == kind and r['id'] == target]
+    if len(matches) != 1: sys.exit('Expected one checkpoint per tested resource')
+    result[kind] = matches[0]
+print(json.dumps(result, sort_keys=True))
+PYSEQ
+}
+
+sequence_check() {
+    python3 - "$@" <<'PYSEQCHECK'
+import json, sys
+
+def advanced(first, second):
+    return all(type(first.get(k)) is int and type(second.get(k)) is int
+               and second[k] > first[k] >= 1 for k in ('workspace', 'pane'))
+if sys.argv[1] == 'self-test':
+    first = {'workspace': 1, 'pane': 2}
+    if not advanced(first, {'workspace': 2, 'pane': 3}): sys.exit('FAIL: renewal rejected')
+    for bad in [first, {'workspace': 2, 'pane': 2}, {'workspace': 2},
+                {'workspace': True, 'pane': 3}]:
+        if advanced(first, bad): sys.exit('FAIL: invalid renewal accepted')
+    print('PASS: renewal validation rejects unchanged or missing sequences')
+else:
+    first, second = [json.load(open(p)) for p in sys.argv[1:]]
+    if not advanced(first, second): sys.exit('Sequences did not advance for both resources')
+    print('Sequence renewal: ' + json.dumps(first, sort_keys=True) + ' -> ' + json.dumps(second, sort_keys=True))
+PYSEQCHECK
+}
+
 # These tests never start Herdr or connect to a socket.
 self_test() {
     local root bad
@@ -43,6 +152,8 @@ self_test() {
     clean_env bash -c '[[ -z ${HERDR_SOCKET_PATH+x}${HERDR_SESSION+x}${HERDR_UNKNOWN_TEST+x} ]]'
     unlink "$root/sessions/lineup-e2e-test/redirect"
     rmdir "$root/sessions/lineup-e2e-test" "$root/sessions/main" "$root/sessions" "$root"
+    token_check self-test
+    sequence_check self-test
     echo 'PASS: main rejection, symlink rejection, safe path, all HERDR_* cleared'
 }
 
@@ -51,7 +162,7 @@ if [[ ${1:-} == --self-test ]]; then
     exit
 fi
 
-tokens=false
+tokens=true
 case ${1:-} in
     '') ;;
     --tokens) tokens=true ;;
@@ -143,7 +254,15 @@ PY
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir -p "$config/herdr" "$temp/state" "$temp/settings" "$temp/workspace"
+mkdir -p "$config/herdr" "$temp/state" "$temp/settings"
+# A private local clone gives the workspace a Git identity and origin/main.
+# No network, user configuration, hooks, or authenticated provider files copied.
+clean_env env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git clone --quiet --no-local "$repo" "$temp/lineup-e2e"
+ship_commit=$(git -C "$repo" rev-parse refs/remotes/origin/main)
+ship_unix=$(git -C "$repo" show -s --format=%ct "$ship_commit")
+clean_env env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git -C "$temp/lineup-e2e" update-ref refs/remotes/origin/main "$ship_commit"
 cat > "$config/herdr/config.toml" <<'TOML'
 [terminal]
 default_shell = "/bin/sh"
@@ -152,7 +271,7 @@ shell_mode = "non_login"
 version_check = false
 manifest_check = false
 TOML
-(cd "$temp/workspace" && herdr_cmd server) >"$temp/server.log" 2>&1 &
+(cd "$temp/lineup-e2e" && herdr_cmd server) >"$temp/server.log" 2>&1 &
 server_pid=$!
 server_started=true
 # Discover the socket from the private session directory, never inherited env.
@@ -173,7 +292,7 @@ PY
 done
 check_endpoint
 [[ -S $socket_path ]] || { echo 'Isolated server socket timed out' >&2; exit 1; }
-herdr_cmd workspace create --cwd "$temp/workspace" --label lineup-e2e --no-focus > "$temp/workspace.json"
+herdr_cmd workspace create --cwd "$temp/lineup-e2e" --label lineup-e2e --no-focus > "$temp/workspace.json"
 pane=$(python3 - "$temp/workspace.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1]))['result']['root_pane']['pane_id'])
@@ -198,35 +317,55 @@ ensure_pid=$!
 lineup_cmd ensure
 wait "$ensure_pid"
 [[ $(pid_record) == "$first_pid" ]] || { echo 'Daemon PID changed on repeated ensure' >&2; exit 1; }
-lineup_cmd doctor
-echo 'PASS: ensure, concurrent ensure single PID, doctor'
+echo 'PASS: ensure, concurrent ensure single PID'
 if $tokens; then
     # Explicit synthetic occupant: no real agent process or provider session.
     herdr_cmd pane report-agent "$pane" --source lineup-e2e --agent codex --state idle > "$temp/agent.json"
+    workspace=$(python3 - "$temp/workspace.json" <<'PYID'
+import json,sys
+r=json.load(open(sys.argv[1]))['result']
+print(r['workspace']['workspace_id'])
+PYID
+)
     found=false
-    deadline=$((SECONDS + 10))
+    deadline=$((SECONDS + 12))
     while ((SECONDS < deadline)); do
         herdr_cmd api snapshot > "$temp/snapshot.json"
-        if python3 - "$temp/snapshot.json" <<'PY'
-import json, sys
-def has_token(value):
-    if isinstance(value, dict):
-        return any(k.startswith('lineup_') or has_token(v) for k, v in value.items())
-    if isinstance(value, list):
-        return any(map(has_token, value))
-    return False
-sys.exit(0 if has_token(json.load(open(sys.argv[1]))) else 1)
-PY
-        then found=true; break; fi
-        sleep 0.1
+        if token_check present "$temp/snapshot.json" "$workspace" "$pane" "$ship_unix"; then
+            found=true; break
+        fi
+        sleep 0.2
     done
-    $found || { echo 'No lineup_ metadata in isolated snapshot' >&2; exit 1; }
-    echo 'PASS: lineup_ metadata received (snapshot contents not printed)'
+    $found || { echo 'Expected workspace/pane lineup_ tokens missing or incorrect' >&2; exit 1; }
+    python3 - "$temp/snapshot.json" "$workspace" "$pane" <<'PYVIEW'
+import json, sys
+rows=json.load(open(sys.argv[1]))['result']['snapshot']
+for kind, id_key, target in [('workspaces','workspace_id',sys.argv[2]),('panes','pane_id',sys.argv[3])]:
+    row=next(r for r in rows[kind] if r[id_key]==target)
+    print(kind + ': ' + json.dumps({k:v for k,v in row.get('tokens',{}).items() if k.startswith('lineup_')}, ensure_ascii=False, sort_keys=True))
+PYVIEW
+    echo 'PASS: workspace heading and synthetic pane display tokens received'
+    echo 'SKIP: real agent pane; isolated HOME has no provider authentication; synthetic occupant only'
+    sequence_record > "$temp/seq-first.json"
+    # The default TTL is 15 seconds; unchanged keys renew by 10 seconds.
+    # A second snapshot after 16 seconds plus a newer checkpoint proves renewal.
+    sleep 16
+    herdr_cmd api snapshot > "$temp/renewed.json"
+    token_check present "$temp/renewed.json" "$workspace" "$pane" "$ship_unix" || { echo 'Tokens expired before renewal' >&2; exit 1; }
+    sequence_record > "$temp/seq-second.json"
+    sequence_check "$temp/seq-first.json" "$temp/seq-second.json"
+    echo 'PASS: second snapshot after default TTL retains tokens with newer sequences'
 else
     echo 'SKIP: publication tokens; rerun with --tokens after publication wiring lands'
 fi
+lineup_cmd doctor
 lineup_cmd stop
 lineup_cmd stop
 daemon_started=false
 if pid_record > /dev/null 2>&1; then echo 'Daemon PID record remained after stop' >&2; exit 1; fi
 echo 'PASS: stop and idempotent stop'
+if $tokens; then
+    herdr_cmd api snapshot > "$temp/stopped.json"
+    token_check clear "$temp/stopped.json" || { echo 'lineup_ tokens remained after stop' >&2; exit 1; }
+    echo 'PASS: all lineup_ tokens removed after stop'
+fi
