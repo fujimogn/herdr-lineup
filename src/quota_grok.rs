@@ -260,16 +260,25 @@ impl<'de> Deserialize<'de> for AuthNode {
             ) -> Result<AuthNode, M::Error> {
                 let mut key = None;
                 let mut user_id = None;
+                let mut seen_key = false;
+                let mut seen_user_id = false;
                 let mut candidates = Vec::new();
                 while let Some(name) = map.next_key::<String>()? {
                     match name.as_str() {
                         "key" => {
-                            if key.is_some() {
+                            if seen_key {
                                 return Err(serde::de::Error::custom("duplicate key"));
                             }
+                            seen_key = true;
                             key = map.next_value::<Option<String>>()?;
                         }
-                        "user_id" => user_id = map.next_value::<Option<String>>()?,
+                        "user_id" => {
+                            if seen_user_id {
+                                return Err(serde::de::Error::custom("duplicate user_id"));
+                            }
+                            seen_user_id = true;
+                            user_id = map.next_value::<Option<String>>()?;
+                        }
                         _ => candidates.extend(map.next_value::<AuthNode>()?.0),
                     }
                 }
@@ -522,6 +531,21 @@ mod tests {
             r#"{"key":"bad\nheader"}"#,
             "{}",
             "not-json fake-key",
+        ] {
+            std::fs::write(&path, json).unwrap();
+            assert!(matches!(read_credentials(&path), Err(Failure::Credentials)));
+        }
+    }
+
+    #[test]
+    fn duplicate_auth_fields_fail_closed_even_when_first_value_is_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        for json in [
+            r#"{"key":null,"key":"fake-key"}"#,
+            r#"{"key":"fake-key","key":null}"#,
+            r#"{"key":"fake-key","user_id":"first","user_id":"second"}"#,
+            r#"{"key":"fake-key","user_id":null,"user_id":"second"}"#,
         ] {
             std::fs::write(&path, json).unwrap();
             assert!(matches!(read_credentials(&path), Err(Failure::Credentials)));
