@@ -749,51 +749,61 @@ mod tests {
     }
 
     #[test]
-    fn slow_clear_reserves_time_for_the_last_socket_round_trip() {
+    fn stalled_clear_response_times_out_without_replaying_the_report() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let mut stream = OneShotServer::new(listener, Duration::from_millis(500));
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(2));
             let request = receive(&mut stream);
             let mut response = snapshot(&request["id"], false);
             response["result"]["snapshot"]["panes"] = json!((0..9).map(|i| json!({
                 "pane_id":format!("w1:p{i}"),"workspace_id":"w1","agent_status":"idle","tokens":{}
             })).collect::<Vec<_>>());
-            std::thread::sleep(Duration::from_millis(350));
             writeln!(stream.get_mut(), "{response}").unwrap();
-            let mut count = 0;
-            loop {
-                let mut line = String::new();
-                match stream.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => (),
-                }
-                let request: Value = serde_json::from_str(&line).unwrap();
-                std::thread::sleep(Duration::from_millis(350));
-                writeln!(
-                    stream.get_mut(),
-                    "{}",
-                    json!({"id":request["id"],"result":{"type":"ok"}})
-                )
-                .unwrap();
-                count += 1;
-            }
-            count
+            let report = receive(&mut stream);
+            assert_eq!(report["method"], "pane.report_metadata");
+            // Hold the acknowledgement until clear actually finishes. No
+            // sleep races a 500 ms frame deadline or writes after peer close.
+            let error_kind = completed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let mut trailing = String::new();
+            assert_eq!(stream.stream.read_line(&mut trailing).unwrap(), 0);
+            assert!(trailing.is_empty());
+            assert_eq!(
+                stream.listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            error_kind
         });
         let mut transport = Transport::connect(&socket).unwrap();
         let mut publisher =
             MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
         let started = Instant::now();
-        assert!(publisher.clear(&mut transport).is_err());
-        let elapsed = started.elapsed();
+        let error = publisher.clear(&mut transport).unwrap_err();
         drop(transport);
-        let reports = server.join().unwrap();
-        assert!(reports > 0);
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "clear exceeded its socket budget: {elapsed:?}"
+        completed_tx.send(error.kind()).unwrap();
+        assert_eq!(server.join().unwrap(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let rows: Vec<CheckpointRow> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq, 1);
+    }
+
+    #[test]
+    fn clear_reserves_time_for_the_last_socket_round_trip() {
+        // Model the remaining budget directly. A fixed slow-response sleep
+        // leaves too little scheduling margin on loaded CI machines.
+        let now = Instant::now();
+        assert_eq!(
+            check_clear_deadline(now + Duration::from_millis(900))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
         );
+        assert!(check_clear_deadline(now).is_err());
     }
 
     #[test]

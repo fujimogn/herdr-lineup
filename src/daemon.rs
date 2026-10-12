@@ -126,7 +126,7 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
             // Close the parent's descriptor; never issue LOCK_UN on a transfer.
             drop(lock);
             loop {
-                if let Some(health) = probe(&paths, &options.socket)? {
+                if let Some(health) = probe_starting(&paths, &options.socket)? {
                     if health.endpoint == endpoint {
                         return Ok(());
                     }
@@ -145,7 +145,7 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        if let Some(health) = probe(&paths, &options.socket)? {
+        if let Some(health) = probe_starting(&paths, &options.socket)? {
             if health.endpoint == endpoint {
                 return Ok(());
             }
@@ -356,6 +356,25 @@ pub fn probe(paths: &RuntimePaths, socket: &std::path::Path) -> io::Result<Optio
     };
     read_identity(&mut stream, paths, socket).map(Some)
 }
+fn probe_starting(paths: &RuntimePaths, socket: &std::path::Path) -> io::Result<Option<Health>> {
+    match probe(paths, socket) {
+        // The serial handler may be busy with another probe/stop or refresh.
+        // A single frame deadline is not the five-second startup deadline.
+        // Retry only transient transport failures, never invalid identities.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
+}
 pub fn stop(options: &Options) -> io::Result<()> {
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let deadline = Instant::now() + STOP_DEADLINE;
@@ -514,6 +533,26 @@ mod tests {
             run_foreground(&options, true, &mut NoopPublisher).unwrap();
         }
     }
+    #[test]
+    fn ensure_waits_for_a_busy_control_endpoint_within_startup_deadline() {
+        let (_dir, options, done, server) = fixture();
+        ensure_command(&options, child_command()).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        // A client preparing stop can occupy the serial control handler for
+        // its entire frame deadline. Ensure must still wait for readiness.
+        let mut pending_stop = control_stream(&paths).unwrap().unwrap();
+        read_identity(&mut pending_stop, &paths, &options.socket).unwrap();
+        let result = ensure_command(&options, child_command());
+        drop(pending_stop);
+        stop(&options).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "busy healthy daemon rejected ensure: {result:?}"
+        );
+    }
+
     #[test]
     fn parallel_ensure_starts_one_daemon_and_stop_ignores_pid_record() {
         let (_dir, options, done, server) = fixture();

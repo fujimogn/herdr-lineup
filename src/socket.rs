@@ -318,7 +318,10 @@ pub(crate) fn read_frame(reader: &mut BufReader<UnixStream>, limit: usize) -> io
             Err(error) => return Err(error),
         };
         if buffer.is_empty() {
-            return Err(io::Error::other("socket frame is incomplete"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "socket frame is incomplete",
+            ));
         }
         let end = buffer.iter().position(|byte| *byte == b'\n');
         let count = end.map_or(buffer.len(), |end| end + 1);
