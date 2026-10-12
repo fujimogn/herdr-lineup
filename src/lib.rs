@@ -103,7 +103,7 @@ pub fn run() -> ExitCode {
 pub(crate) fn failure_exit_code(error: &std::io::Error) -> u8 {
     if error
         .get_ref()
-        .is_some_and(|source| source.is::<daemon::StartupLockContention>())
+        .is_some_and(|source| source.is::<lock::StartupLockContention>())
     {
         daemon::LOCK_CONTENDED_EXIT_CODE
     } else {

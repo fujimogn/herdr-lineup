@@ -11,6 +11,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Debug)]
+pub(crate) struct StartupLockContention;
+impl std::fmt::Display for StartupLockContention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("another daemon owns this session lock")
+    }
+}
+impl std::error::Error for StartupLockContention {}
+
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
     pub root: PathBuf,
@@ -98,7 +107,15 @@ impl SessionLock {
                 "inherited lock descriptor does not match session lock",
             ));
         }
-        file.try_lock_exclusive()?;
+        file.try_lock_exclusive().map_err(|error| {
+            // Only the acquisition attempt identifies contention. Metadata,
+            // descriptor validation, and later setup retain their own errors.
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(io::ErrorKind::WouldBlock, StartupLockContention)
+            } else {
+                error
+            }
+        })?;
         // Prevent later subprocesses from keeping this ownership alive.
         unsafe {
             if libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {

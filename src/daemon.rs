@@ -3,7 +3,7 @@
 use crate::{
     config::Config,
     doctor,
-    lock::{RuntimePaths, SessionLock},
+    lock::{RuntimePaths, SessionLock, StartupLockContention},
     socket::{EndpointIdentity, Transport, read_frame},
 };
 use serde::{Deserialize, Serialize};
@@ -24,23 +24,6 @@ pub const PLUGIN_ID: &str = "herdr-lineup";
 const START_DEADLINE: Duration = Duration::from_secs(5);
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) const LOCK_CONTENDED_EXIT_CODE: u8 = 75;
-
-#[derive(Debug)]
-pub(crate) struct StartupLockContention;
-impl std::fmt::Display for StartupLockContention {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("another daemon owns this session lock")
-    }
-}
-impl std::error::Error for StartupLockContention {}
-
-fn startup_lock_error(error: io::Error) -> io::Error {
-    if error.kind() == io::ErrorKind::WouldBlock {
-        io::Error::new(io::ErrorKind::WouldBlock, StartupLockContention)
-    } else {
-        error
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -208,12 +191,23 @@ pub fn run_foreground(
 ) -> io::Result<()> {
     let config = Config::load(&options.config)?;
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
-    let _lock = if inherited {
-        SessionLock::inherited(&paths).map_err(startup_lock_error)?
+    let lock = if inherited {
+        SessionLock::inherited(&paths)?
     } else {
         SessionLock::acquire(&paths)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, StartupLockContention))?
     };
+    run_locked(options, inherited, config, paths, lock, publisher)
+}
+
+fn run_locked(
+    options: &Options,
+    inherited: bool,
+    config: Config,
+    paths: RuntimePaths,
+    _lock: SessionLock,
+    publisher: &mut impl Publisher,
+) -> io::Result<()> {
     let mut transport = Transport::connect(&options.socket)?;
     if inherited {
         let parse = |key| {
@@ -622,8 +616,17 @@ mod tests {
             // Thus success cannot bypass the child-exit branch under test.
             wait_until(|| unsafe { libc::kill(pid, 0) } < 0
                 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
-            drop(lock);
-            run_foreground(&winning_options, false, &mut NoopPublisher).unwrap();
+            // Preserve this exact ownership even if another unit test's fork
+            // inherited a descriptor: dropping and reacquiring would race it.
+            run_locked(
+                &winning_options,
+                false,
+                Config::load(&winning_options.config).unwrap(),
+                paths,
+                lock.unwrap(),
+                &mut NoopPublisher,
+            )
+            .unwrap();
         });
         let mut command = child_command();
         command.env("LINEUP_TEST_CONTEND", "1");
