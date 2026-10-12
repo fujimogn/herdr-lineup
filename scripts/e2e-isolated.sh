@@ -3,11 +3,12 @@ set -euo pipefail
 
 clean_env() {
     local key
-    local -a unset_args=()
+    # A nonempty command array also works with macOS Bash 3.2 and nounset.
+    local -a env_command=(env -u ENV -u BASH_ENV)
     while IFS= read -r key; do
-        [[ $key == HERDR_* ]] && unset_args+=(-u "$key")
+        [[ $key == HERDR_* ]] && env_command+=(-u "$key")
     done < <(compgen -e)
-    env -u ENV -u BASH_ENV "${unset_args[@]}" "$@"
+    "${env_command[@]}" "$@"
 }
 
 guard_socket() {
@@ -60,7 +61,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd -P)
 herdr_bin=$(command -v herdr)
 real_home=${HOME:?}
 real_config=${XDG_CONFIG_HOME:-$real_home/.config}
-session="lineup-e2e-$(date -u +%Y%m%dT%H%M%S)-$$"
+session="lineup-e2e-$(date -u +%H%M%S)-$$"
 [[ $session == lineup-e2e-* && $session != main ]] || exit 1
 cargo build --release --locked --manifest-path "$repo/Cargo.toml"
 binary="$repo/target/release/herdr-lineup"
@@ -69,7 +70,7 @@ binary="$repo/target/release/herdr-lineup"
 temp=$(mktemp -d /tmp/lineup-e2e.XXXXXXXX)
 temp=$(cd "$temp" && pwd -P)
 chmod 700 "$temp"
-home="$temp/home"
+home="$temp/h"
 config="$home/.config"
 session_dir="$config/herdr/sessions/$session"
 socket_path="$session_dir/not-yet-created.sock"
