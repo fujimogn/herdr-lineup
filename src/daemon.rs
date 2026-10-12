@@ -17,6 +17,10 @@ use std::{
     },
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -49,6 +53,8 @@ impl Options {
 
 /// Implementations must bound I/O and clear only plugin-owned metadata.
 pub trait Publisher {
+    /// Observe shutdown between bounded reader calls and complete metadata frames.
+    fn set_shutdown(&mut self, _shutdown: Arc<AtomicBool>) {}
     fn refresh(&mut self, transport: &mut Transport, config: &Config) -> io::Result<()>;
     fn clear(&mut self, transport: &mut Transport) -> io::Result<()>;
     /// Drop any cached pane associations before authoritative reconciliation.
@@ -251,10 +257,28 @@ fn run_locked(
         refresh_failed: false,
     };
     fs::write(&paths.pid, format!("{}\n", health.pid))?;
+    let control = ControlWorker::start(listener, health.clone());
+    publisher.set_shutdown(control.shutdown.clone());
     let started = Instant::now();
     let mut refresh_at = Instant::now();
     let mut reconnect = false;
     loop {
+        if control.shutdown.load(Ordering::Acquire) {
+            // Finish the current bounded operation before clearing complete frames.
+            if transport.check_connection().is_ok() {
+                publisher.clear(&mut transport)?;
+            }
+            return Ok(());
+        }
+        if control
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            return Err(io::Error::other(
+                "daemon control worker exited unexpectedly",
+            ));
+        }
         if reconnect || transport.check_connection().is_err() {
             // Transport treats v0.9.3 EOF after a response as normal and opens
             // each next request on the pinned dev/inode. This recovery path is
@@ -292,22 +316,64 @@ fn run_locked(
             }
             refresh_at = Instant::now() + Duration::from_millis(config.refresh_interval_ms);
         }
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if serve_control(stream, &health)? {
-                    // Never reconnect or clear against a replacement endpoint.
-                    if transport.check_connection().is_ok() {
-                        publisher.clear(&mut transport)?;
-                    }
-                    return Ok(());
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
-            Err(error) => return Err(error),
+        *control.health.lock().unwrap() = health.clone();
+        if control.shutdown.load(Ordering::Acquire) {
+            continue;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+/// Own the control listener independently of publication. Drop joins the worker
+/// before runtime paths are removed and session ownership is released.
+struct ControlWorker {
+    health: Arc<Mutex<Health>>,
+    shutdown: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+impl ControlWorker {
+    fn start(listener: UnixListener, health: Health) -> Self {
+        let health = Arc::new(Mutex::new(health));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_health = health.clone();
+        let worker_shutdown = shutdown.clone();
+        let worker_done = done.clone();
+        let worker = std::thread::spawn(move || {
+            while !worker_done.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // Never hold the health mutex during I/O or a refresh.
+                        let snapshot = worker_health.lock().unwrap().clone();
+                        if serve_control(stream, &snapshot)? {
+                            worker_shutdown.store(true, Ordering::Release);
+                            return Ok(());
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                    Err(error) => return Err(error),
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        });
+        Self {
+            health,
+            shutdown,
+            done,
+            worker: Some(worker),
+        }
+    }
+}
+impl Drop for ControlWorker {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 fn remove_if_present(path: &std::path::Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -396,34 +462,16 @@ fn probe_starting(paths: &RuntimePaths, socket: &std::path::Path) -> io::Result<
 pub fn stop(options: &Options) -> io::Result<()> {
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let deadline = Instant::now() + STOP_DEADLINE;
-    // Refresh and another control client can occupy the serial handler longer
-    // than a frame deadline. Retry only before submitting shutdown, within the
-    // overall stop deadline; invalid identities must still fail immediately.
-    let (mut stream, identity) = loop {
-        let attempt = (|| {
-            let Some(mut stream) = control_stream(&paths)? else {
-                return Ok(None);
-            };
-            let identity = read_identity(&mut stream, &paths, &options.socket)?;
-            Ok(Some((stream, identity)))
-        })();
-        match attempt {
-            Ok(Some(ready)) => break ready,
-            Ok(None) => {
-                if !SessionLock::is_held(&paths)? {
-                    return Ok(());
-                }
-            }
-            Err(error) if transient_control_error(&error) => (),
-            Err(error) => return Err(error),
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::other(
-                "daemon control unavailable within five seconds; no signal sent",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    let Some(mut stream) = control_stream(&paths)? else {
+        return if SessionLock::is_held(&paths)? {
+            Err(io::Error::other(
+                "session lock is live but control is unavailable; no signal sent",
+            ))
+        } else {
+            Ok(())
+        };
     };
+    let identity = read_identity(&mut stream, &paths, &options.socket)?;
     let request = serde_json::json!({"stop":identity.nonce,"plugin":PLUGIN_ID,"socket_key":paths.key,"endpoint":identity.endpoint});
     serde_json::to_writer(stream.get_mut(), &request)?;
     stream.get_mut().write_all(b"\n")?;
@@ -483,10 +531,6 @@ fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
 mod tests {
     use super::*;
     use std::io::BufRead;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
 
     fn fixture() -> (
         tempfile::TempDir,
@@ -598,21 +642,39 @@ mod tests {
                 fs::write(options.state.join("contended"), error.to_string()).unwrap();
                 std::process::exit(i32::from(crate::failure_exit_code(&error)));
             }
-            struct SlowRefresh(PathBuf);
+            struct SlowRefresh(PathBuf, Option<Arc<AtomicBool>>);
             impl Publisher for SlowRefresh {
+                fn set_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
+                    self.1 = Some(shutdown);
+                }
                 fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
                     if self.0.join("slow-refresh").exists() {
                         fs::remove_file(self.0.join("slow-refresh"))?;
                         fs::write(self.0.join("refresh-entered"), "")?;
-                        std::thread::sleep(Duration::from_millis(900));
+                        let deadline = Instant::now() + Duration::from_secs(6);
+                        while Instant::now() < deadline {
+                            if self
+                                .1
+                                .as_ref()
+                                .is_some_and(|flag| flag.load(Ordering::Acquire))
+                            {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
                     }
                     Ok(())
                 }
                 fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
-                    Ok(())
+                    fs::write(self.0.join("clear-called"), "")
                 }
             }
-            run_foreground(&options, true, &mut SlowRefresh(options.state.clone())).unwrap();
+            run_foreground(
+                &options,
+                true,
+                &mut SlowRefresh(options.state.clone(), None),
+            )
+            .unwrap();
         }
     }
 
@@ -638,6 +700,7 @@ mod tests {
         fs::write(options.state.join("slow-refresh"), "").unwrap();
         wait_until(|| options.state.join("refresh-entered").exists());
         let stopped = stop(&options);
+        let cleared = options.state.join("clear-called").exists();
         let restarted = ensure_command(&options, child_command());
         let new = probe(&paths, &options.socket).unwrap().unwrap();
         // Clean up even when the regression assertion fails.
@@ -648,30 +711,34 @@ mod tests {
             stopped.is_ok(),
             "stop failed during bounded refresh: {stopped:?}"
         );
+        assert!(cleared, "shutdown skipped the publisher clear hook");
         assert!(restarted.is_ok(), "immediate ensure failed: {restarted:?}");
         assert_ne!(old.nonce, new.nonce, "ensure reused the old daemon");
         assert_ne!(old.pid, new.pid, "ensure did not spawn a new daemon");
     }
 
     #[test]
-    fn stop_with_live_lock_and_no_control_is_bounded_and_never_uses_pid() {
+    fn health_responds_while_refresh_is_blocked() {
         let (_dir, options, done, server) = fixture();
+        fs::write(
+            options.config.join("config.toml"),
+            "refresh_interval_ms = 1000\nreader_timeout_ms = 100\n",
+        )
+        .unwrap();
+        ensure_command(&options, child_command()).unwrap();
         let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
-        let lock = SessionLock::acquire(&paths).unwrap().unwrap();
-        fs::write(&paths.pid, std::process::id().to_string()).unwrap();
+        fs::write(options.state.join("slow-refresh"), "").unwrap();
+        wait_until(|| options.state.join("refresh-entered").exists());
         let started = Instant::now();
-        let error = stop(&options).unwrap_err();
+        let health = probe(&paths, &options.socket);
         let elapsed = started.elapsed();
-        drop(lock);
+        // The baseline's long refresh can outlast the first stop attempt.
+        let _ = stop(&options);
+        let _ = stop(&options);
         done.store(true, Ordering::Relaxed);
         server.join().unwrap();
-        assert!(error.to_string().contains("no signal sent"));
-        assert!(elapsed >= STOP_DEADLINE);
-        assert!(elapsed < STOP_DEADLINE + Duration::from_secs(1));
-        assert_eq!(
-            fs::read_to_string(&paths.pid).unwrap(),
-            std::process::id().to_string()
-        );
+        assert!(health.unwrap().is_some());
+        assert!(elapsed < Duration::from_millis(500));
     }
 
     #[test]

@@ -21,6 +21,10 @@ use std::{
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -68,6 +72,7 @@ pub struct MetadataPublisher {
     started: Instant,
     request_seq: u64,
     refresh_ms: u64,
+    shutdown: Option<Arc<AtomicBool>>,
 }
 impl MetadataPublisher {
     /// Construction performs no state I/O. The daemon acquires its session lock
@@ -88,7 +93,22 @@ impl MetadataPublisher {
             started: Instant::now(),
             request_seq: 0,
             refresh_ms: 5000,
+            shutdown: None,
         })
+    }
+
+    fn check_shutdown(&self) -> io::Result<()> {
+        if self
+            .shutdown
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "publication interrupted by shutdown",
+            ));
+        }
+        Ok(())
     }
 
     fn load_checkpoint(&mut self) -> io::Result<()> {
@@ -198,6 +218,9 @@ impl MetadataPublisher {
         desired: &tokens::Tokens,
         deadline: Option<Instant>,
     ) -> io::Result<()> {
+        if deadline.is_none() {
+            self.check_shutdown()?;
+        }
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let snapshot = tokens::ResourceSnapshot {
             exists: true,
@@ -236,6 +259,10 @@ impl MetadataPublisher {
         // at the last possible point before starting the bounded socket exchange.
         if let Some(deadline) = deadline {
             check_clear_deadline(deadline)?;
+        } else {
+            // Clear must still run after shutdown. Refresh finishes a complete
+            // in-flight exchange but does not begin a new metadata frame.
+            self.check_shutdown()?;
         }
         let response = exchange(transport, &request)?;
         let result = protocol::response_result(&id, &response)
@@ -282,9 +309,11 @@ impl MetadataPublisher {
         codex: &dyn UsageReader,
         grok: &dyn UsageReader,
     ) -> io::Result<()> {
+        self.check_shutdown()?;
         config.validate()?;
         self.refresh_ms = config.refresh_interval_ms;
         let snapshot = self.snapshot(transport)?;
+        self.check_shutdown()?;
         self.reconcile_missing(&snapshot);
         let now = SystemTime::now();
         let now_unix = unix(now);
@@ -297,6 +326,7 @@ impl MetadataPublisher {
         let local_now = chrono::Local::now();
         let mut headings = BTreeMap::new();
         for workspace in &snapshot.workspaces {
+            self.check_shutdown()?;
             let panes: Vec<_> = snapshot
                 .panes
                 .iter()
@@ -331,6 +361,7 @@ impl MetadataPublisher {
         let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
         let first_panes = first_pane_ids(&snapshot);
         for pane in &snapshot.panes {
+            self.check_shutdown()?;
             let first_pane = first_panes.contains(pane.pane_id.as_str());
             let occupant = pane.occupant.clone().filter(|who| {
                 config
@@ -401,6 +432,7 @@ impl MetadataPublisher {
                         .and_then(|age| i64::try_from(age.as_secs()).ok()),
                 })
             });
+            self.check_shutdown()?;
             let mut desired = tokens::pane_tokens(
                 &tokens::PaneInput {
                     pane_id: pane.pane_id.clone(),
@@ -447,6 +479,7 @@ impl MetadataPublisher {
             }
         }
         for workspace in &snapshot.workspaces {
+            self.check_shutdown()?;
             let desired = &headings[workspace.workspace_id.as_str()].1;
             let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
             if let Err(error) = self.report(
@@ -475,6 +508,9 @@ impl MetadataPublisher {
 }
 
 impl daemon::Publisher for MetadataPublisher {
+    fn set_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
+        self.shutdown = Some(shutdown);
+    }
     fn refresh(&mut self, transport: &mut Transport, config: &Config) -> io::Result<()> {
         self.refresh_with_readers(transport, config, &CodexReader, &GrokReader)
     }
@@ -1023,6 +1059,71 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             self.0.flush()
         }
+    }
+
+    #[test]
+    fn shutdown_during_reader_sends_no_refresh_metadata() {
+        struct StoppingReader(Arc<AtomicBool>);
+        impl UsageReader for StoppingReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                self.0.store(true, Ordering::Release);
+                TimeoutReader.read(request)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let socket = dir.path().join("cancel.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_millis(300));
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(stream.get_mut(), "{}", json!({"id":request["id"],"result":{
+                "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                "workspaces":[{"workspace_id":"w1"}],"panes":[{
+                "pane_id":"w1:p1","workspace_id":"w1","agent":"codex",
+                "agent_session":{"agent":"codex","kind":"id","value":"synthetic-native"},"agent_status":"idle"}]}
+            }})).unwrap();
+            let mut reports = 0;
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).is_err() {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                reports += 1;
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+            }
+            reports
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().join("state"),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("synthetic-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        publisher.set_shutdown(flag.clone());
+        let result = publisher.refresh_with_readers(
+            &mut transport,
+            &Config::default(),
+            &StoppingReader(flag.clone()),
+            &TimeoutReader,
+        );
+        let reports = server.join().unwrap();
+        assert!(flag.load(Ordering::Acquire), "fixture did not reach reader");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(reports, 0, "shutdown must not publish a partial refresh");
     }
 
     struct TimeoutReader;
