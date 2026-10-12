@@ -10,7 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Rust crate and command-line scaffold for the planned Lineup sidebar publisher.
 - Herdr manifest with startup, workspace-focus recovery, and explicit actions.
+- Library scaffold with declared runtime modules.
+- Pure sidebar token formatting and patch planning.
+- Local repository ship-time reading and workspace heading formatting.
+- Session-bound local usage readers.
+- Tag-triggered release workflow with version-consistency checks and release
+  documentation.
+- Research on public Herdr plugin conventions.
 - Linux and macOS build checks, weekly dependency audit, and public project documentation.
-- Release workflow for `v*` tags with version-consistency checks and release documentation.
+
+### Fixed
+
+- Bound the caller wait for stalled reader I/O and discard queued usage after
+  the reader deadline.
 
 [Unreleased]: https://github.com/fujimogn/herdr-lineup/commits/main

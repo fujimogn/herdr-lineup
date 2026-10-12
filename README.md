@@ -23,6 +23,16 @@ Herdr builds the plugin with `cargo build --release --locked` during installatio
 Installing this scaffold will not produce sidebar rows. See Development to
 build the current code locally.
 
+Three install facts from the Herdr plugin documentation, worth knowing before
+you rely on this plugin:
+
+- Reinstalling replaces the managed checkout (`HERDR_PLUGIN_ROOT`). Never store
+  state there; the plugin keeps runtime state in `HERDR_PLUGIN_STATE_DIR` and
+  user settings in `HERDR_PLUGIN_CONFIG_DIR`.
+- There is no `herdr plugin update`. To upgrade, install again.
+- Pin a version with a release tag:
+  `herdr plugin install fujimogn/herdr-lineup --ref vX.Y.Z`.
+
 ## Usage
 
 The current CLI exposes:
@@ -42,7 +52,8 @@ cargo run --locked -- doctor --help
 | `unconfigure` | Remove only the plugin-managed sidebar rows. |
 
 **Planned Herdr actions:** `herdr-lineup.start`, `herdr-lineup.stop`,
-`herdr-lineup.doctor`, `herdr-lineup.configure`, and `herdr-lineup.unconfigure`.
+`herdr-lineup.doctor`, `herdr-lineup.configure`, `herdr-lineup.unconfigure`,
+`herdr-lineup.install-font`, and `herdr-lineup.uninstall-font`.
 For example, once implemented:
 
 ```sh
@@ -66,10 +77,11 @@ user's Herdr configuration. Planned configuration edits use marker comments
 and a backup, preserving unrelated settings. `unconfigure` will remove only
 plugin-managed entries.
 
-The plugin will emit icon codepoints, but **will not bundle or install fonts**.
-Users install HerdrAgentIconsMax and configure their terminal's codepoint map
-themselves. A text fallback is planned. See [NOTICE.md](NOTICE.md) for sources
-and licensing.
+**Planned:** the plugin bundles the HerdrAgentIconsMax icon font and emits icon
+codepoints. The font is installed only through the explicit, opt-in
+`herdr-lineup.install-font` action and removed with
+`herdr-lineup.uninstall-font`; startup never touches font setup. A text
+fallback is planned. See [NOTICE.md](NOTICE.md) for sources and licensing.
 
 ## How it works
 
@@ -78,7 +90,17 @@ quota for Claude, Codex, Grok, Antigravity, Kimi, and Hermes. Unavailable usage
 shows `—`. [Source research](docs/research/usage-sources.md) records conditional
 availability; provider readers and account binding are not implemented yet.
 
-The repository heading will read the newest local `origin/main` commit without
+Each agent row shows the vendor logo, a state dot, context use as a percentage,
+and a weekly quota triplet such as `7d 67% 6d9h`: the quota period, the share
+remaining, and the time until the quota resets. Each workspace heading shows
+the repository name and the newest local `origin/main` commit time.
+
+In v1, only Codex and Grok context use produce values. Claude, Antigravity,
+Kimi, and Hermes context, and every agent's weekly quota, show `—`: those
+numbers need authenticated API calls or a statusLine hook integration that are
+not supported yet.
+
+The repository heading reads the newest local `origin/main` commit without
 fetching: `HH:MM` for today, `M/D` for earlier dates. This is a commit-time label,
 not proof of a deployment.
 
@@ -94,8 +116,9 @@ and [SECURITY.md](SECURITY.md). None of these runtime behaviors are implemented 
 - **A command says “Planned” and exits with status 1:** expected for this scaffold.
 - **No sidebar data after install or link:** the publisher is not implemented yet.
 - **Local link cannot find the binary:** build first; `herdr plugin link` does not build.
-- **Planned icon rendering shows boxes:** install HerdrAgentIconsMax and check
-  the terminal's codepoint map, or use the planned text fallback.
+- **Planned icon rendering shows boxes:** run the opt-in
+  `herdr-lineup.install-font` action and check the terminal's codepoint map,
+  or use the planned text fallback.
 - **A build fails:** verify rustup can install the pinned toolchain and that Cargo
   can download the locked dependencies. No credentials or remote API setup are
   required by the current executable.
