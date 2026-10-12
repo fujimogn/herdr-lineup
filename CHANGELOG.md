@@ -18,10 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documentation.
 - Research on public Herdr plugin conventions.
 - Linux and macOS build checks, weekly dependency audit, and public project documentation.
+- Pure Herdr metadata protocol and snapshot parsing.
+- Session-scoped daemon lifecycle, bounded configuration, and doctor checks.
+- Opt-in configure and unconfigure actions that preserve unrelated sidebar configuration.
+- Bundled icon font with owned opt-in install-font and uninstall-font actions.
 
 ### Fixed
 
 - Bound the caller wait for stalled reader I/O and discard queued usage after
   the reader deadline.
+- Resolve trusted font roots before rejecting descendant symlinks.
+- Serialize sidebar configuration transactions.
+- Keep accepted control sockets blocking on macOS, where accept inherits the
+  listener's O_NONBLOCK.
 
 [Unreleased]: https://github.com/fujimogn/herdr-lineup/commits/main

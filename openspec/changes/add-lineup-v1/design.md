@@ -103,9 +103,23 @@ runtime files to a hash of the absolute `HERDR_SOCKET_PATH` under
 detached `setsid` daemon. Transfer lock ownership without a release/reacquire
 gap. A PID file is diagnostic, never sufficient proof of ownership or a safe
 signal target. A session-local control endpoint answers identity/health probes
-and shutdown requests. Check socket identity (device/inode on Unix) and session
-handshake identity; replacement terminates this daemon instead of retargeting.
-Herdr startup on the new server starts a new ensure cycle.
+and shutdown requests authenticated by a control nonce.
+
+Herdr v0.9.3 `ping` and `snapshot` responses do not include a session ID, so
+the daemon does not add a session handshake. It identifies the connected server
+by the absolute socket path, that socket's device and inode, the persistent
+connection, and the control nonce. If the connection drops, the daemon
+reconnects only when the path's device and inode are unchanged. A changed
+device or inode is a replacement: the daemon stops instead of attaching to the
+new socket. A Herdr server restart is that replacement and stops this daemon.
+The startup `ensure` hook then starts a new daemon for the replacement server.
+
+The control listener is non-blocking so the refresh loop can poll it. An
+accepted control socket is set back to blocking before the identity and stop
+exchange. On macOS, `accept` inherits `O_NONBLOCK` from the listener, and a
+read timeout does not clear that flag. Leaving the accepted socket
+non-blocking makes the exchange return `WouldBlock` and close. Blocking mode
+makes the exchange wait for the next frame within its deadline.
 
 `[[startup]]` and `[[events]] on = "workspace.focused"` invoke one-shot `ensure`.
 Startup is not supervision and link/enable do not trigger it; the `start` action
@@ -115,10 +129,10 @@ ref changes. Disconnect does not justify using stale pane associations.
 
 Cache reader results by provider/session/repository identity and bound reads by
 timeout. Do not run the same reader once per pane when panes share a session.
-Provider-specific paths, credentials, APIs, and parsing are **TBD** until the
-parallel usage-source research is accepted. A missing adapter returns
-unavailable, never a synthetic zero. Existing tokens cannot outlive the occupant
-whose session produced them.
+Codex and Grok use the accepted local usage-source research. Kimi and Hermes
+stay unavailable until a trustworthy persistent source is confirmed. A missing
+adapter returns unavailable, never a synthetic zero. Existing tokens cannot
+outlive the occupant whose session produced them.
 
 ## Configuration and rollback
 
@@ -141,7 +155,8 @@ rolls back sidebar integration without changing fonts or other plugins.
 
 ## Open questions for implementation
 
-- Provider usage-source details and agent session association: TBD research.
+- Kimi and Hermes usage sources, and publication-time agent session association,
+  remain open. Codex and Grok local readers are implemented.
 - Affirmative terminal glyph capability detection: TBD; conservative text works.
 - Supported minimum Herdr version and config validation entry point: verify
   against the pinned protocol before implementation; no server is restarted
