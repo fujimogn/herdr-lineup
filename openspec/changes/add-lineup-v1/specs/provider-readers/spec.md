@@ -62,15 +62,21 @@ table is the contract for the outcomes each adapter obtains.
 
 ### Requirement: Freshness and failure do not retain misleading usage
 Reader calls SHALL obey `reader_timeout_ms`; a timeout SHALL not block other
-providers or daemon TTL renewal. Unavailable fields SHALL clear numeric keys
-and show `—` on the next refresh.
+providers or daemon TTL renewal. A sample that arrives after the deadline SHALL
+be discarded. When the read times out and a previous local observation exists
+for the same pane identity and source, that observation SHALL be kept, and its
+weekly fields SHALL still expire at their reset or `usage_max_age_ms`. Other
+unavailable fields SHALL clear numeric keys and show `—` on the next refresh.
 
 #### Scenario: Validate cached usage before renewal
 - **WHEN** a cached sample is considered for the current occupant
 - **THEN** it passes these age, identity, permission, and privacy constraints
 
-Samples whose timestamps are invalid/future or whose identity no longer matches
-the occupant SHALL be unavailable. Context SHALL retain the last valid exact
+Samples whose timestamps are invalid, or later than that read's comparison
+clock, or whose identity no longer matches the occupant SHALL be unavailable.
+The comparison clock SHALL be taken for the pane being read and advanced
+through the read, so an observation written while an earlier pane was processed
+is not future. Context SHALL retain the last valid exact
 session or statusLine-bound observation regardless of its age. Weekly samples
 with a reset time SHALL expire at that time; statusLine weekly samples without a
 reset time SHALL expire after `usage_max_age_ms`. Codex quota without a reset
@@ -150,7 +156,10 @@ Codex context SHALL calculate `max(total_tokens - 12000, 0) /
 12,000-token baseline in both numerator and denominator. Nonfinite or negative
 usage and windows of 12,000 tokens or less SHALL be unavailable. A valid window
 with usage at/below the baseline SHALL report 0%. Out-of-range final percentages
-SHALL be unavailable rather than clamped.
+SHALL be unavailable rather than clamped. An unfinished final rollout record,
+including a split UTF-8 sequence without a newline, SHALL NOT hide a completed
+observation earlier in the file. A completed malformed record SHALL make the
+source unavailable.
 
 #### Scenario: Baseline and capacity boundaries
 - **WHEN** usage is 26,000 and capacity is 212,000

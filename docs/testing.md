@@ -54,7 +54,8 @@ Within twelve seconds, snapshots from
 `herdr --session <unique name> api snapshot` must show the expected repository
 name, the exact local `origin/main` commit timestamp, its local date/time label,
 and the synthetic pane's logo, state, context, and weekly text. Missing context
-and weekly values must show `—`, with their numeric tokens absent. Output is
+text is `—` followed by two U+2800 cells; missing weekly text is an unpadded
+`—`. Numeric tokens are absent. Output is
 limited to `lineup_` display tokens; paths and full snapshots are not printed.
 
 A second snapshot is taken after sixteen seconds, longer than the default
@@ -102,6 +103,9 @@ trap confirmed session deletion and temporary-directory removal. The optional
 token run failed as expected on that pre-publication baseline and still cleaned
 up its session and temporary directory. These results do not establish macOS
 runtime behavior or metadata publication; rerun against the wired checkout.
+
+The recorded snapshots below predate context-column padding. Current missing
+context text is `—` followed by two U+2800 cells.
 
 ## Publication evidence on the transport fix
 

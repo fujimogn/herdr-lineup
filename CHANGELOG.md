@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the repository heading occupies the first pane's first row. Only later
   panes' `lineup_logo` values receive U+2800 padding, following snapshot order.
 
-- Rust crate and command-line scaffold for the planned Lineup sidebar publisher.
+- Rust crate and command-line scaffold for the Lineup sidebar publisher.
 - Herdr manifest with startup, workspace-focus recovery, and explicit actions.
 - Library scaffold with declared runtime modules.
 - Pure sidebar token formatting and patch planning.
@@ -60,6 +60,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cells after the dash, and zero-pad weekly remaining percentages to at least
   two digits. Rounded `100%` remains a four-cell context exception; numeric
   metadata stays unit-less and unchanged.
+- Wait for the previous daemon process to exit. When a live daemon accepts
+  shutdown, `stop` records that process before the request, returns only after
+  it exits, and fails at five seconds without signaling it. After `ensure`'s
+  own child loses the session lock, `ensure` waits for that child to exit
+  before treating another healthy daemon as ready.
+- Sample each pane's observation clock at that pane's read and advance it
+  through the read, so a record written while an earlier pane was processed is
+  not rejected as future. An unfinished final Codex rollout record does not
+  discard completed observations above it; a completed malformed record still
+  invalidates the file.
+- Republish unchanged live keys once their age reaches one refresh interval,
+  so a slow cycle cannot skip renewal until after the three-interval TTL.
+  Send keys missing from the authoritative snapshot again on that refresh.
+  A reader timeout keeps the previous local observation for the same pane
+  identity and source; a sample that arrives after the deadline is still
+  discarded.
+- Bound each repository heading's Git commands to one second and cancel them
+  when the daemon is stopping. Each Git child is its own process group; the
+  leader stays unreaped until its descendants are killed, including after
+  stdout closes. An interrupted read keeps the previous heading when the
+  workspace identity is unchanged.
+- Load sequence checkpoints under the session lock and reserve the next
+  sequence before any metadata byte is written. A shutdown clear rechecks its
+  deadline after that reservation so the last socket round trip still fits.
+- Retry transient control failures while probing readiness or a stop identity,
+  and serve the control listener while a refresh is in progress. After lock
+  contention, wait for the winning daemon instead of spawning another child.
+  Only lock acquisition counts as contention.
+- Keep the last bound Codex context when later token-count events have null
+  info, and discover Grok context only in the exact native-session directory.
+- When a pane exceeds Herdr's stored-key limit, clear optional tokens in
+  priority order so earlier values do not remain, while keeping required
+  context text.
+- Reject duplicate Grok `key` or `user_id` fields, including when the first
+  value is null.
+- Pass the release tag into the version check through the environment.
+- Keep isolated end-to-end socket paths within macOS length limits.
 
 - Match Codex context UI percentages by subtracting the 12,000-token baseline
   from both usage and capacity, returning unavailable for windows at/below it.

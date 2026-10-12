@@ -124,6 +124,13 @@ The plugin SHALL read the latest local `origin/main` commit's committer timestam
 or contacting a remote. It SHALL NOT substitute HEAD, mtime, author date, or
 another branch when that ref is absent. "Last ship" means this locally known
 commit time, not proof of deployment or remote freshness.
+All Git commands for one heading SHALL share a one-second deadline and SHALL
+stop when the daemon is shutting down. Each Git child SHALL run in its own
+process group. That group, including descendants, SHALL be killed and the
+leader reaped; the leader SHALL stay unreaped until descendants are killed,
+including when stdout has already closed. An interrupted read SHALL NOT be
+treated as a confirmed missing repository. The previous heading SHALL be kept
+when the workspace cwd and occupants are unchanged.
 
 Formatting SHALL use the daemon host's local timezone and date. `HH:MM` uses
 two digits per field; `M/D` has no leading zeros. All dates other than today,
@@ -196,9 +203,12 @@ The default refresh interval SHALL be 5,000 ms and TTL 15,000 ms. Events SHALL
 invalidate cached state and trigger authoritative reconciliation: bootstrap,
 pane agent/status/session or cwd changes, and workspace creation/focus/cwd
 changes. The periodic refresh SHALL check local refs, reader freshness, and
-reconcile missed changes. Send changed keys only except TTL renewal; unchanged
-live keys SHALL be re-published no later than two refresh intervals after their
-last successful publication. Missing or closed resources SHALL not be recreated.
+reconcile missed changes. Send changed keys only except TTL renewal and
+snapshot repair. Unchanged live keys SHALL be re-published once at least one
+refresh interval has elapsed since their last successful publication. A desired
+live key absent from the authoritative snapshot SHALL be sent again on that
+refresh even before the interval elapses. Missing or closed resources SHALL
+not be recreated.
 
 The contract uses **14** pane keys (longest name `lineup_group_ship_text`, 22
 characters) and **3** workspace keys (longest `lineup_ship_unix`/`lineup_ship_text`,
@@ -222,8 +232,8 @@ more than fourteen keys, including clears. It SHALL publish no undocumented v1 k
   update, and a restart republishes current values with newer sequences
 
 #### Scenario: No changes while alive
-- **WHEN** usage and state remain unchanged for 10 seconds after publication
-- **THEN** the daemon renews live keys before their 15-second deadline
+- **WHEN** usage and state remain unchanged for one refresh interval after publication
+- **THEN** the next refresh renews those live keys instead of waiting for a second interval
 
 #### Scenario: Other plugin consumes capacity
 - **WHEN** adding lineup keys would exceed 32 keys on a resource

@@ -38,13 +38,17 @@ allow static per-token colors; only the active state's dot is nonempty. The
 numeric percentage tokens are intended for rows that use numeric color rules.
 The display tokens include `%` and must not be used with numeric rules. Context
 text uses a minimum two-digit decimal (`07%`, `42%`, `100%`) because Herdr trims
-leading spaces. Weekly text combines the period, remaining percentage, and reset countdown
-(`7d 67% 6d9h`); a missing reset omits the countdown (`7d 67%`). Missing display
-data is the em dash `—`; missing numeric data is cleared with JSON null.
+leading spaces. Weekly text combines the period, a remaining percentage of at
+least two digits, and a reset countdown (`7d 67% 6d9h`, `7d 07% 12m`); a missing
+reset omits the countdown (`7d 67%`). Missing weekly text is the em dash `—`.
+Missing context text is that dash followed by two U+2800 cells. Rounded context
+`100%` stays four cells. Missing numeric data is cleared with JSON null.
 
-Only dirty keys are patched, except that unchanged live keys are renewed before
-expiry. With the default 5-second refresh, TTL is 15 seconds and renewal occurs
-no later than 10 seconds after the previous successful report. The daemon
+Only dirty keys are patched, except that unchanged live keys are renewed once
+their age reaches one refresh interval, and live keys missing from the
+authoritative snapshot are sent again on that refresh. With the default
+5-second refresh, TTL is 15 seconds, and the next cycle renews a key once its
+age has reached one interval. The daemon
 persists a per-resource sequence high-water mark under the session lock before
 sending each report; restart cannot reuse an accepted sequence number. Never
 use wall-clock time as the sole sequence source. Clear all owned keys for a
@@ -139,7 +143,10 @@ makes the exchange wait for the next frame within its deadline.
 Startup is not supervision and link/enable do not trigger it; the `start` action
 is another explicit ensure entry point. Subscribe before authoritative snapshot
 reconciliation, treat events as invalidations, and poll for TTL renewal and Git
-ref changes. Disconnect does not justify using stale pane associations.
+ref changes. Each heading's Git commands share a one-second deadline, cancel
+when the daemon is stopping, and reap the child's process group, including
+descendants. An interrupted read keeps the previous heading when the workspace
+identity is unchanged. Disconnect does not justify using stale pane associations.
 
 Cache reader results by provider/session/repository identity and bound reads by
 timeout. Do not run the same reader once per pane when panes share a session.
@@ -169,7 +176,11 @@ observing conversation/pane; cross-account sharing is deliberately absent.
 Readers use the injected plugin state root, not the daemon's session checkpoint
 subdirectory. They bound reads to 4 KiB and the common reader deadline, reject
 links/nonregular files, and validate version, provider, key, numeric ranges,
-receipt timestamps, and weekly reset expiry. Future observations yield `—`.
+receipt timestamps, and weekly reset expiry. The comparison clock is taken for
+the pane being read and advanced through that read, so an observation written
+while an earlier pane was processed is not future. Observations later than that
+clock yield `—`. A reader timeout keeps the previous local observation for the
+same pane identity and source.
 
 Context and weekly outcomes remain independent. Claude uses seven-day used
 percent and converts it to remaining. Agy selects the active model's weekly

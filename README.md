@@ -335,7 +335,8 @@ and [SECURITY.md](SECURITY.md).
   that Claude's `session_id` or Antigravity's `HERDR_PANE_ID` matches the pane.
 - **Icon rendering shows boxes:** run the opt-in
   `herdr-lineup.install-font` action and check the terminal's codepoint map,
-  or use the planned text fallback.
+  or set `logo_mode = "text"`. Automatic mode already uses those text labels
+  until terminal glyph support is known.
 - **A build fails:** verify rustup can install the pinned toolchain and that Cargo
   can download the locked dependencies. No credentials or remote API setup are
   required for local context; account quota queries need the explicit opt-in above.

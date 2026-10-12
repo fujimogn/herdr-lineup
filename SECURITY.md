@@ -10,7 +10,11 @@ run on background threads; refresh only reads their non-secret in-memory cache.
 
 On shutdown, no further queries are scheduled. Stop keeps its five-second
 deadline and does not join a pending Grok HTTP request; daemon process exit ends
-that I/O. Codex has a separate child process, so shutdown synchronously kills
+that I/O. When a live daemon accepts shutdown, stop records that process before
+the request and returns only after it has exited. It does not signal the
+process. If the process is still alive at five seconds, stop fails. After
+ensure's own child loses the session lock, ensure waits for that child to exit
+before treating another healthy daemon as ready. Codex has a separate child process, so shutdown synchronously kills
 its process group and reaps the direct child through a spawn/stop synchronized
 owner. Error exits use the same cleanup, without touching the Herdr server.
 

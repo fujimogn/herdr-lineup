@@ -59,6 +59,12 @@ read-only, report health and availability, and redact secrets.
 Shutdown SHALL clear only
 lineup-owned tokens when the original endpoint is reachable, release the lock,
 and exit within a bounded deadline of five seconds; failure SHALL be reported.
+When a live daemon accepts shutdown, `stop` SHALL register that process before
+sending the request and SHALL return only after the process has exited. It
+SHALL NOT signal the process. If the process is still alive at five seconds,
+stop SHALL fail. After `ensure`'s own child loses the session lock, `ensure`
+SHALL wait for that child to exit before treating a different healthy daemon as
+ready. The startup deadline still bounds that wait.
 If the endpoint is unreachable, TTL SHALL clear tokens without contacting a
 replacement. Stop on an already stopped daemon SHALL succeed as a no-op.
 Persistent sequence state SHALL remain available for a later restart.
