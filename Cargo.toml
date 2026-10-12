@@ -13,6 +13,8 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tempfile = { version = "3", default-features = false }
