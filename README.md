@@ -1,15 +1,64 @@
 # herdr-lineup
 
-One sidebar row per AI coding agent in [Herdr](https://herdr.dev): vendor logo,
-state, context, weekly quota, and when each repository last shipped.
+See each AI coding agent's state, context use, and weekly quota in one sidebar
+row in [Herdr](https://herdr.dev), alongside each repository's latest local
+`origin/main` commit time.
 
-A per-session daemon publishes `lineup_` sidebar metadata. Usage numbers come
-from local session files, opt-in statusLine commands, and explicitly enabled
-Codex/Grok account quota queries. `--help` and `--version` work.
+- **One row per agent.** Keep vendor logos, state, context, and weekly remaining quota together in the sidebar.
+- **Session-bound usage.** Read local Codex/Grok files and opt-in Claude/Antigravity statusLine observations for the matching pane.
+- **Account quota by choice.** Enable Codex/Grok account queries with `allow_network = true`; network access is off by default.
+
+> [!NOTE]
+> This repository is private. Public installation is **Planned**; the local
+> release build already publishes rows after `ensure`.
+
+## Documentation
+
+- [Releasing](docs/releasing.md) — version checks, release notes, and the private release workflow.
+- [Testing](docs/testing.md) — isolated lifecycle and metadata verification.
+- [Usage sources](docs/research/usage-sources.md) — provider inputs and availability.
+- [Codex context drift](docs/research/codex-context-drift.md) — evidence for the one-point display gap.
+- [Plugin conventions](docs/research/plugin-conventions.md) — packaging and installation research.
+- [Security](SECURITY.md) — local data, credentials, and network boundaries.
+- [Changelog](CHANGELOG.md) — user-visible changes.
+
+## What it does
+
+Lineup shows logos and Herdr state for Claude, Codex, Grok, Antigravity, Kimi,
+and Hermes. Context and weekly quota depend on each provider's available source;
+unavailable usage shows `—`. [Source research](docs/research/usage-sources.md)
+records where each number can come from.
+
+| Agent | Context | Weekly remaining |
+| --- | --- | --- |
+| Claude | Opt-in statusLine observation | Opt-in statusLine seven-day observation |
+| Codex | Exact-session local rollout, with the 12,000-token UI baseline | Account quota worker when `allow_network = true` |
+| Grok | Exact-session local `signals.json` | Shared billing worker when `allow_network = true`; WEEKLY only |
+| Antigravity | Opt-in statusLine observation | Active-model weekly pool from statusLine |
+| Kimi / Hermes | Unavailable | Unavailable |
+
+Each agent row shows the vendor logo, a state dot, context use as a percentage,
+and a weekly quota triplet such as `7d 67% 6d9h`: the quota period, the share
+remaining, and the time until the quota resets. Both displayed percentages use
+at least two digits (`07%`, `7d 07% 6d9h`). Missing context displays `—` followed
+by two U+2800 BRAILLE PATTERN BLANK characters, preserving the three terminal
+cells used by `00%` through `99%` after token whitespace normalization.
+Rounded `100%` (including values at or above 99.5%) stays four cells so full
+context use is visible; the following weekly column moves one cell to the right
+in that case. Weekly remaining `100%` similarly uses three digits; unavailable
+weekly data stays an unpadded `—` at the end of the row.
+
+Cell widths follow the narrow-ambiguous terminal policy: `—` (U+2014), U+2800,
+ASCII digits and `%` each occupy one cell. The
+[Unicode East Asian Width data](https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt)
+classifies U+2014 as Ambiguous (`A`) and U+2800 as Neutral (`N`). Terminals that
+render ambiguous characters as two cells can render `—` two cells wide, so the
+missing-context alignment assumes narrow ambiguous rendering. The tests use a
+fixed cell-width table for this policy, independent of the host locale.
 
 ## Install
 
-Requires macOS or Linux, Herdr 0.9.0 or later, and Rust/Cargo. The build uses the
+Requires macOS or Linux, Herdr 0.9.3 or later, and Rust/Cargo. The build uses the
 toolchain pinned in `rust-toolchain.toml` (Rust 1.99.0); install it with rustup.
 
 **Planned public installation**, after the repository is published:
@@ -22,8 +71,7 @@ Herdr builds the plugin with `cargo build --release --locked` during installatio
 A public install is not published yet. A local release build can publish rows
 after `ensure`. See Development to build the current code locally.
 
-Three install facts from the Herdr plugin documentation, worth knowing before
-you rely on this plugin:
+When installing or upgrading:
 
 - Reinstalling replaces the managed checkout (`HERDR_PLUGIN_ROOT`). Never store
   state there; the plugin keeps runtime state in `HERDR_PLUGIN_STATE_DIR` and
@@ -34,15 +82,18 @@ you rely on this plugin:
 
 ## Usage
 
-The current CLI exposes:
+Inspect the available commands:
 
 ```sh
 cargo run --locked -- --help
+cargo run --locked -- --version
 cargo run --locked -- doctor --help
 cargo run --locked -- statusline --help
 ```
 
-| Command | Behavior |
+### Common commands
+
+| Command | What it does |
 | --- | --- |
 | `ensure` | Start one detached publisher per Herdr session if needed. |
 | `daemon` | Run the publisher in the foreground. |
@@ -139,20 +190,7 @@ codepoints. The font is installed only through the explicit, opt-in
 remain available, and automatic mode stays on text until terminal glyph support
 is known. See [NOTICE.md](NOTICE.md) for sources and licensing.
 
-## How it works
-
-Rows combine vendor logos, agent state, context use, and weekly remaining
-quota for Claude, Codex, Grok, Antigravity, Kimi, and Hermes. Unavailable usage
-shows `—`. [Source research](docs/research/usage-sources.md) records where each
-number can come from.
-
-| Agent | Context | Weekly remaining |
-| --- | --- | --- |
-| Claude | Opt-in statusLine observation | Opt-in statusLine seven-day observation |
-| Codex | Exact-session local rollout, with the 12,000-token UI baseline | Account quota worker when `allow_network = true` |
-| Grok | Exact-session local `signals.json` | Shared billing worker when `allow_network = true`; WEEKLY only |
-| Antigravity | Opt-in statusLine observation | Active-model weekly pool from statusLine |
-| Kimi / Hermes | Unavailable | Unavailable |
+### Account quota (opt-in)
 
 Network access defaults to disabled. To opt in, add this to the plugin's
 `$HERDR_PLUGIN_CONFIG_DIR/config.toml`, then stop/start only the Lineup daemon:
@@ -166,58 +204,7 @@ and reads Grok's existing auth key (`GROK_AUTH_FILE`, then `GROK_HOME/auth.json`
 then `~/.grok/auth.json`) for the authenticated HTTPS billing endpoint. No
 credentials are displayed or persisted by Lineup. Do not restart the Herdr server.
 
-One background worker per enabled provider polls its client every five minutes,
-independently of refresh. Client request intervals are bounded to 1..=60 minutes.
-Refresh reads memory only for quota and never waits for a provider request.
-`doctor` reads the session state directory and prints the last saved Codex/Grok
-query categories (`ok`, `auth_missing`, `auth_io`, `auth_shape`,
-`auth_ambiguous`, `unauthorized`, `transient`, `invalid_response`, `request`,
-`non_weekly`, `disabled`, or `pending`). `not_observed` means no saved result;
-`invalid_diagnostic` means the local record cannot be safely decoded. These are
-last query results, not cache availability or a new provider query. Values,
-credentials, paths, response bodies and error text are never recorded.
-Temporary failures retain the last success until its known reset; authentication
-failures clear it. Before the first successful query, after reset, and for Grok
-MONTHLY allowances, weekly stays `—`. Period names containing `WEEKLY`
-(case-insensitive, including enum prefixes) supply weekly usage; `MONTHLY`
-periods remain unavailable for 7d. Without a reset, the remaining percentage
-is shown without a countdown and expires after `usage_max_age_ms` from the
-last successful query. Environment proxies are inherited; redirects stay disabled. Disabled network access also keeps Codex
-and Grok weekly at `—` while preserving local context.
-
-Codex context uses `max(total_tokens - 12000, 0) / (model_context_window - 12000)`.
-A window of 12,000 tokens or less is unavailable. The snapshot has no pane-specific
-home or profile, so Codex weekly is attributed only to a pane whose exact native
-session is verified in the daemon's home. Panes using a different home remain
-unavailable. Profiles sharing one home cannot be distinguished; stop/start the
-Lineup daemon after changing authentication or profiles to discard cached account
-quota. Grok has one configured auth source, so its weekly quota is shared by all
-Grok panes, even without local context.
-
-Workers stop scheduling queries on daemon shutdown. Stop does not join a pending
-Grok HTTP request (process exit ends it), and it kills/reaps the in-flight Codex
-app-server process group. The existing five-second stop deadline is preserved.
-
-Each agent row shows the vendor logo, a state dot, context use as a percentage,
-and a weekly quota triplet such as `7d 67% 6d9h`: the quota period, the share
-remaining, and the time until the quota resets. Both displayed percentages use
-at least two digits (`07%`, `7d 07% 6d9h`). Missing context displays `—` followed
-by two U+2800 BRAILLE PATTERN BLANK characters, preserving the three terminal
-cells used by `00%` through `99%` after token whitespace normalization.
-Rounded `100%` (including values at or above 99.5%) stays four cells so full
-context use is visible; the following weekly column moves one cell to the right
-in that case. Weekly remaining `100%` similarly uses three digits; unavailable
-weekly data stays an unpadded `—` at the end of the row.
-
-Cell widths follow the narrow-ambiguous terminal policy: `—` (U+2014), U+2800,
-ASCII digits and `%` each occupy one cell. The
-[Unicode East Asian Width data](https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt)
-classifies U+2014 as Ambiguous (`A`) and U+2800 as Neutral (`N`). Terminals that
-render ambiguous characters as two cells can render `—` two cells wide, so the
-missing-context alignment assumes narrow ambiguous rendering. The tests use a
-fixed cell-width table for this policy, independent of the host locale.
-
-Each workspace heading shows the repository name and the newest local `origin/main` commit time.
+### Claude and Antigravity statusLine (opt-in)
 
 Codex and Grok context are read from local session files for the pane's native
 session. Claude and Antigravity usage is not read from those agents' config or
@@ -302,9 +289,47 @@ not expire by age. Weekly quota with a reset time expires at that time. StatusLi
 weekly without a reset uses the default maximum age of 60 seconds; Codex quota
 without a reset follows its client interval and clears after a failed query.
 
+## How it works
+
 The repository heading reads the newest local `origin/main` commit without
 fetching: `HH:MM` for today, `M/D` for earlier dates. This is a commit-time label,
 not proof of a deployment.
+
+### Account quota behavior
+
+One background worker per enabled provider polls its client every five minutes,
+independently of refresh. Client request intervals are bounded to 1..=60 minutes.
+Refresh reads memory only for quota and never waits for a provider request.
+`doctor` reads the session state directory and prints the last saved Codex/Grok
+query categories (`ok`, `auth_missing`, `auth_io`, `auth_shape`,
+`auth_ambiguous`, `unauthorized`, `transient`, `invalid_response`, `request`,
+`non_weekly`, `disabled`, or `pending`). `not_observed` means no saved result;
+`invalid_diagnostic` means the local record cannot be safely decoded. These are
+last query results, not cache availability or a new provider query. Values,
+credentials, paths, response bodies and error text are never recorded.
+Temporary failures retain the last success until its known reset; authentication
+failures clear it. Before the first successful query, after reset, and for Grok
+MONTHLY allowances, weekly stays `—`. Period names containing `WEEKLY`
+(case-insensitive, including enum prefixes) supply weekly usage; `MONTHLY`
+periods remain unavailable for 7d. Without a reset, Grok's remaining percentage
+is shown without a countdown and expires after `usage_max_age_ms` from the
+last successful query. Codex quota without a reset follows its client interval
+and clears after a failed query. Environment proxies are inherited; redirects
+stay disabled. Disabled network access also keeps Codex and Grok weekly at `—`
+while preserving local context.
+
+Codex context uses `max(total_tokens - 12000, 0) / (model_context_window - 12000)`.
+A window of 12,000 tokens or less is unavailable. The snapshot has no pane-specific
+home or profile, so Codex weekly is attributed only to a pane whose exact native
+session is verified in the daemon's home. Panes using a different home remain
+unavailable. Profiles sharing one home cannot be distinguished; stop/start the
+Lineup daemon after changing authentication or profiles to discard cached account
+quota. Grok has one configured auth source, so its weekly quota is shared by all
+Grok panes, even without local context.
+
+Workers stop scheduling queries on daemon shutdown. Stop does not join a pending
+Grok HTTP request (process exit ends it), and it kills/reaps the in-flight Codex
+app-server process group. The existing five-second stop deadline is preserved.
 
 ### Sidebar tokens
 
@@ -345,6 +370,8 @@ and uses `—` for its ship-time text. The full pane contract has 14 keys, withi
 Herdr's 16 keys per report and 32 stored keys per resource; unrelated keys are
 preserved and counted before publication.
 
+### Per-session publisher
+
 Herdr startup hooks run once. Startup and `workspace.focused` therefore both
 invoke `ensure`; the per-session lock prevents duplicate daemons.
 The publisher keeps one daemon per Herdr session and stores state under
@@ -360,6 +387,27 @@ is not applied with `setsockopt`.
 See the [Herdr plugin documentation](https://herdr.dev/docs/plugins/)
 and [SECURITY.md](SECURITY.md).
 
+## Privacy
+
+Lineup reads usage fields from local session files and publishes display
+metadata to the local Herdr socket. It does not store conversation text,
+transcript paths, or credentials. StatusLine records contain only percentages,
+an optional reset time, the provider, an opaque binding key, and observation time.
+
+Network access stays disabled unless you set `allow_network = true`. That opt-in
+enables only the configured Codex account-quota and Grok billing workers.
+Lineup sends no conversation/session data or telemetry. Codex app-server uses
+its existing authentication and may maintain its own authentication state;
+Lineup never opens Codex `auth.json`. Grok reads its existing auth key without
+writing or refreshing credentials.
+
+Account-quota values stay in memory. For quota diagnostics, the daemon saves
+only fixed query-result categories for `doctor`, without values, account
+identities, credentials, paths, response bodies, or error text. Keep runtime state in `HERDR_PLUGIN_STATE_DIR` and user
+settings in `HERDR_PLUGIN_CONFIG_DIR`; reinstall replaces `HERDR_PLUGIN_ROOT`.
+Sidebar edits, font setup, and statusLine hooks all require explicit opt-in.
+See [SECURITY.md](SECURITY.md) for the full boundaries.
+
 ## Troubleshooting
 
 - **A command fails:** it prints an error and exits nonzero. `stop` leaves the
@@ -372,6 +420,10 @@ and [SECURITY.md](SECURITY.md).
   `herdr-lineup statusline claude` or `herdr-lineup statusline agy`, that
   `HERDR_PLUGIN_STATE_DIR` is the same absolute directory the daemon uses, and
   that Claude's `session_id` or Antigravity's `HERDR_PANE_ID` matches the pane.
+- **Codex or Grok weekly quota stays `—`:** check `allow_network = true`, the
+  selected `providers`, and the last query category with `herdr-lineup doctor`.
+  No successful query, an expired reset, or Grok MONTHLY data leaves weekly
+  unavailable. Restart only Lineup after authentication or profile changes.
 - **Icon rendering shows boxes:** run the opt-in
   `herdr-lineup.install-font` action and check the terminal's codepoint map,
   or set `logo_mode = "text"`. Automatic mode already uses those text labels
