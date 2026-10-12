@@ -59,6 +59,11 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime
             }
             Some("event_msg") if value["payload"]["type"] == "token_count" => {
                 let info = &value["payload"]["info"];
+                // Quota-only events have no context observation. In particular,
+                // resumed sessions can emit these before any valid token sample.
+                if info.is_null() {
+                    continue;
+                }
                 let used = info["last_token_usage"]["total_tokens"]
                     .as_f64()
                     .ok_or(MissingReason::Invalid)?;
@@ -104,6 +109,29 @@ mod tests {
             text,
         )
         .unwrap();
+    }
+    #[test]
+    fn null_info_events_do_not_hide_bound_context_observations() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 70);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let text = fs::read_to_string(&path).unwrap();
+        let (metadata, sample) = text.split_once('\n').unwrap();
+        let empty = "{\"type\":\"event_msg\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":null}}\n";
+        // Real resumed rollouts can begin with quota-only token_count events.
+        // Such events also occur after observations and contain no context sample.
+        fs::write(&path, format!("{metadata}\n{empty}{sample}{empty}")).unwrap();
+        assert_percent(CodexReader.read(&r).context);
+        fs::write(&path, format!("{metadata}\n{empty}")).unwrap();
+        assert_eq!(
+            CodexReader.read(&r).context,
+            UsageOutcome::Unavailable(MissingReason::NotFound)
+        );
     }
     #[test]
     fn normal_missing_idle_and_mismatch() {

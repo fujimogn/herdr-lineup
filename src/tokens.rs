@@ -23,6 +23,25 @@ pub const PANE_KEYS: [&str; 14] = [
 ];
 pub const WORKSPACE_KEYS: [&str; 3] = ["lineup_repo", "lineup_ship_unix", "lineup_ship_text"];
 
+// Visible sidebar fields are required whenever populated. Optional fields are
+// ranked from most to least preferred; capacity pressure drops them in reverse.
+const PANE_CAPACITY_PRIORITY: [(&str, bool); 14] = [
+    ("lineup_logo", true),
+    ("lineup_state_idle", true),
+    ("lineup_state_working", true),
+    ("lineup_state_blocked", true),
+    ("lineup_state_done", true),
+    ("lineup_state_unknown", true),
+    ("lineup_context_text", true),
+    ("lineup_weekly_text", true),
+    ("lineup_group", true),
+    ("lineup_group_ship_text", true),
+    ("lineup_agent", false),
+    ("lineup_state", false),
+    ("lineup_context_pct", false),
+    ("lineup_weekly_pct", false),
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Agent {
     Claude,
@@ -272,7 +291,7 @@ impl Publisher {
     /// `now_ms` is an injected monotonic clock; Unix time is only for displays.
     /// Missing resources never receive reports. Snapshot keys include all
     /// sources, so capacity failures never evict another plugin's metadata.
-    /// Omitted desired keys remain unchanged. Supply all twelve pane keys from
+    /// Omitted desired keys remain unchanged. Supply all fourteen pane keys from
     /// `pane_tokens` on reconciliation to clear departed occupants completely.
     pub fn prepare(
         &mut self,
@@ -324,6 +343,19 @@ impl Publisher {
                 stored_keys.insert(key.clone());
             } else {
                 stored_keys.remove(key);
+            }
+        }
+        if stored_keys.len() > 32 && resource.kind == ResourceKind::Pane {
+            for (key, required) in PANE_CAPACITY_PRIORITY.iter().rev() {
+                if stored_keys.len() <= 32 {
+                    break;
+                }
+                if !required && normalized.get(*key).is_some_and(Option::is_some) {
+                    // Keep the clear in the patch so earlier optional values do
+                    // not survive under pressure or after daemon restoration.
+                    normalized.insert((*key).into(), None);
+                    stored_keys.remove(*key);
+                }
             }
         }
         if stored_keys.len() > 32 {
@@ -647,6 +679,83 @@ mod tests {
     }
 
     #[test]
+    fn crowded_pane_preserves_visible_tokens_and_clears_optional_keys() {
+        let r = row();
+        let resource = resource("p1");
+        let desired = pane_tokens(&r, LogoMode::Text, false, 0);
+        let mut publisher = Publisher::default();
+        let first = publisher
+            .prepare(
+                &resource,
+                &snapshot(0),
+                r.occupant.as_ref(),
+                &desired,
+                0,
+                5000,
+            )
+            .unwrap()
+            .unwrap();
+        publisher.acknowledge(&first, 0).unwrap();
+        let mut crowded = snapshot(28);
+        crowded.stored_keys.extend(
+            desired
+                .iter()
+                .filter(|(_, v)| v.is_some())
+                .map(|(k, _)| k.clone()),
+        );
+        let fallback = publisher
+            .prepare(
+                &resource,
+                &crowded,
+                r.occupant.as_ref(),
+                &desired,
+                10000,
+                5000,
+            )
+            .unwrap()
+            .unwrap();
+        for key in [
+            "lineup_logo",
+            "lineup_state_working",
+            "lineup_context_text",
+            "lineup_weekly_text",
+        ] {
+            assert_eq!(fallback.tokens.get(key), desired.get(key));
+        }
+        for key in ["lineup_agent", "lineup_state", "lineup_context_pct"] {
+            assert_eq!(fallback.tokens.get(key), Some(&None));
+        }
+        assert!(fallback.tokens.keys().all(|k| k.starts_with("lineup_")));
+        assert!(fallback.tokens.len() <= 16);
+        publisher.acknowledge(&fallback, 10000).unwrap();
+        let recovered = publisher
+            .prepare(
+                &resource,
+                &snapshot(0),
+                r.occupant.as_ref(),
+                &desired,
+                10001,
+                5000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.tokens["lineup_context_pct"],
+            desired["lineup_context_pct"]
+        );
+        assert_eq!(
+            publisher.prepare(
+                &resource,
+                &snapshot(29),
+                r.occupant.as_ref(),
+                &desired,
+                11000,
+                5000
+            ),
+            Err(PatchError::ResourceCapacity)
+        );
+    }
+    #[test]
     fn group_heading_full_contract_respects_report_and_resource_capacity() {
         let mut r = row();
         r.usage.as_mut().unwrap().weekly_remaining_pct = Some(67.0);
@@ -670,10 +779,37 @@ mod tests {
         assert_eq!(report.tokens.len(), 14);
         assert!(report.tokens.len() <= 16);
         assert!(crate::protocol::metadata_request("full-heading", &report).is_ok());
+        let priority_names: BTreeSet<_> =
+            PANE_CAPACITY_PRIORITY.iter().map(|(key, _)| *key).collect();
+        assert_eq!(priority_names, PANE_KEYS.into_iter().collect());
+        for unrelated in (32 - live)..=26 {
+            let report = Publisher::default()
+                .prepare(
+                    &resource,
+                    &snapshot(unrelated),
+                    r.occupant.as_ref(),
+                    &desired,
+                    0,
+                    5000,
+                )
+                .unwrap()
+                .unwrap();
+            let published = report
+                .tokens
+                .values()
+                .filter(|value| value.is_some())
+                .count();
+            assert_eq!(unrelated + published, 32);
+            for (key, required) in PANE_CAPACITY_PRIORITY {
+                if required {
+                    assert_eq!(report.tokens.get(key), desired.get(key));
+                }
+            }
+        }
         assert_eq!(
             Publisher::default().prepare(
                 &resource,
-                &snapshot(33 - live),
+                &snapshot(27),
                 r.occupant.as_ref(),
                 &desired,
                 0,
@@ -903,7 +1039,7 @@ mod tests {
         let id = resource("p1");
         assert!(
             publisher
-                .prepare(&id, &snapshot(25), row.occupant.as_ref(), &desired, 0, 5000)
+                .prepare(&id, &snapshot(29), row.occupant.as_ref(), &desired, 0, 5000)
                 .is_err()
         );
         assert!(publisher.checkpoint().is_empty());

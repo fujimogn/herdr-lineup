@@ -1385,6 +1385,74 @@ mod tests {
     }
 
     #[test]
+    fn crowded_snapshot_publishes_visible_fields_and_clears_old_optional_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(2));
+            let request = receive(&mut stream);
+            let mut response = snapshot(&request["id"], true);
+            let pane = &mut response["result"]["snapshot"]["panes"][0];
+            pane["cwd"] = json!("/nonexistent-synthetic-repo");
+            // Names and source prefixes mirror snapshot metadata; no runtime
+            // values or session contents are copied into this fixture.
+            let mut stored: serde_json::Map<String, Value> = (0..28)
+                .map(|i| (format!("quota_fixture_{i}"), json!("synthetic")))
+                .collect();
+            for key in ["lineup_context_pct", "lineup_agent", "lineup_state"] {
+                stored.insert(key.into(), json!("old-synthetic"));
+            }
+            pane["tokens"] = Value::Object(stored);
+            writeln!(stream.get_mut(), "{response}").unwrap();
+            let report = receive(&mut stream);
+            assert_eq!(report["method"], "pane.report_metadata");
+            let tokens = report["params"]["tokens"].as_object().unwrap();
+            assert_eq!(tokens["lineup_context_text"], "42%");
+            for key in ["lineup_logo", "lineup_state_working", "lineup_weekly_text"] {
+                assert!(tokens[key].is_string());
+            }
+            for key in ["lineup_context_pct", "lineup_agent", "lineup_state"] {
+                assert!(tokens[key].is_null());
+            }
+            assert!(tokens.keys().all(|key| key.starts_with("lineup_")));
+            assert_eq!(tokens.values().filter(|value| value.is_string()).count(), 4);
+            writeln!(
+                stream.get_mut(),
+                "{}",
+                json!({"id":report["id"],"result":{"type":"ok"}})
+            )
+            .unwrap();
+            let workspace = receive(&mut stream);
+            assert_eq!(workspace["method"], "workspace.report_metadata");
+            writeln!(
+                stream.get_mut(),
+                "{}",
+                json!({"id":workspace["id"],"result":{"type":"ok"}})
+            )
+            .unwrap();
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().into(),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &Config::default(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        server.join().unwrap();
+    }
+    #[test]
     fn capacity_failure_skips_pane_and_still_publishes_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fake.sock");

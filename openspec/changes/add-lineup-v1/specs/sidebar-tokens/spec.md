@@ -178,8 +178,16 @@ The contract uses **14** pane keys (longest name `lineup_group_ship_text`, 22
 characters) and **3** workspace keys (longest `lineup_ship_unix`/`lineup_ship_text`,
 16 characters), each full patch fitting Herdr's **16 keys per report** and each
 resource fitting **32 stored keys**. The daemon SHALL count existing unrelated
-keys before adding new keys; insufficient capacity SHALL produce a diagnostic
-and skip that resource without evicting other sources. No state change needs
+keys before adding new keys. Pane publication SHALL first drop optional populated
+keys in reverse priority order: `lineup_weekly_pct`, `lineup_context_pct`,
+`lineup_state`, then `lineup_agent`. Dropped keys SHALL be cleared with JSON null
+so previously published values do not survive capacity pressure. Populated
+`lineup_logo`, the active state dot, `lineup_context_text`, `lineup_weekly_text`,
+and the first-pane `lineup_group`/`lineup_group_ship_text` SHALL be retained.
+Insufficient capacity for these required keys SHALL produce a diagnostic and
+skip that resource without evicting other sources. Workspace capacity exhaustion
+SHALL still skip the resource. Optional keys SHALL return when capacity permits.
+No state change needs
 more than fourteen keys, including clears. It SHALL publish no undocumented v1 keys.
 
 #### Scenario: Daemon disappears
@@ -193,8 +201,10 @@ more than fourteen keys, including clears. It SHALL publish no undocumented v1 k
 
 #### Scenario: Other plugin consumes capacity
 - **WHEN** adding lineup keys would exceed 32 keys on a resource
-- **THEN** the daemon reports capacity exhaustion and does not clear or replace
-  unrelated tokens to make room
+- **THEN** the daemon clears lower-priority optional pane keys until the patch
+  fits, preserving all populated required fields and all unrelated tokens
+- **AND** if required fields still do not fit, it reports capacity exhaustion
+  and skips that resource without clearing or replacing unrelated tokens
 
 ### Requirement: Vendor logo mapping and fallback
 The plugin SHALL use the following verified Herdr Agent Icons Max mapping.
