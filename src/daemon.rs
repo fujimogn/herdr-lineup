@@ -370,6 +370,10 @@ pub fn stop(options: &Options) -> io::Result<()> {
     }
 }
 fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
+    // BSD/macOS accept inherits O_NONBLOCK from our listener. A timeout does
+    // not clear that flag; explicitly block so the identity/stop exchange waits
+    // for the next frame within its deadline instead of closing on WouldBlock.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.set_write_timeout(Some(Duration::from_millis(500)))?;
     let mut reader = BufReader::new(stream);
@@ -433,6 +437,7 @@ mod tests {
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
@@ -527,6 +532,58 @@ mod tests {
         done.store(true, Ordering::Relaxed);
         server.join().unwrap();
     }
+    #[test]
+    fn inherited_nonblocking_control_stream_waits_for_shutdown_after_identity() {
+        let health = Health {
+            plugin: PLUGIN_ID.into(),
+            socket_path: PathBuf::from("/isolated/herdr.sock"),
+            socket_key: "isolated".into(),
+            endpoint: EndpointIdentity {
+                device: 1,
+                inode: 2,
+            },
+            nonce: "a".repeat(64),
+            pid: 1,
+            last_refresh_ms: Some(0),
+            refresh_failed: false,
+        };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        // BSD/macOS accept inherits the listener's O_NONBLOCK flag. Explicitly
+        // reproduce that state on Linux and queue health before starting I/O.
+        server.set_nonblocking(true).unwrap();
+        client.write_all(b"health\n").unwrap();
+        let server_health = health.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = serve_control(server, &server_health).unwrap();
+            completed_tx.send(result).unwrap();
+        });
+        let mut client = BufReader::new(client);
+        let identity: Health =
+            serde_json::from_slice(&read_frame(&mut client, 8192).unwrap()).unwrap();
+        assert_eq!(identity.nonce, health.nonce);
+        // Wait for the server's completion signal, rather than racing a write
+        // against close. A valid exchange must remain open while we prepare stop.
+        let early_completion = completed_rx.recv_timeout(Duration::from_millis(50));
+        let write_after_early_close = early_completion
+            .as_ref()
+            .ok()
+            .map(|_| client.get_mut().write_all(b"{\"stop\":\"pending\"}\n"));
+        assert!(
+            matches!(
+                early_completion,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "control closed after identity before shutdown was sent: {early_completion:?}, write after close: {write_after_early_close:?}"
+        );
+        let request = serde_json::json!({"stop": identity.nonce, "plugin": PLUGIN_ID, "socket_key": identity.socket_key, "endpoint": identity.endpoint});
+        crate::socket::write_frame(client.get_mut(), &serde_json::to_vec(&request).unwrap())
+            .unwrap();
+        assert_eq!(read_frame(&mut client, 8192).unwrap(), b"stopping");
+        assert!(completed_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+    }
+
     #[test]
     fn wrong_control_nonce_cannot_stop_live_daemon() {
         let (_dir, options, done, server) = fixture();
