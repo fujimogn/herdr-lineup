@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod lock;
 pub mod model;
+pub mod protocol;
 pub mod reader_codex;
 pub mod reader_grok;
 pub mod reader_hermes;
