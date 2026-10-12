@@ -208,6 +208,10 @@ mod tests {
                 .tempdir_in(parent)
                 .unwrap();
             let root = cleanup.path().to_owned();
+            // TMPDIR can be inside a real repository. This deliberately
+            // unresolved Git marker stops discovery at our fixture boundary,
+            // even though production commands discard GIT_CEILING_DIRECTORIES.
+            std::fs::write(root.join(".git"), "gitdir: unavailable-fixture-git-dir\n").unwrap();
             let repo = root.join("canonical-repo");
             std::fs::create_dir(&repo).unwrap();
             let fixture = Self {
