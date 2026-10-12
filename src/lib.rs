@@ -9,6 +9,7 @@ pub mod lock;
 pub mod model;
 pub mod protocol;
 pub mod publish;
+pub mod quota_codex;
 pub mod reader_agy;
 pub mod reader_claude;
 pub mod reader_codex;
