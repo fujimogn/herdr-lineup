@@ -68,11 +68,12 @@ and show `—` on the next refresh.
 - **WHEN** a cached sample is considered for the current occupant
 - **THEN** it passes these age, identity, permission, and privacy constraints
 
-Samples older than `usage_max_age_ms`, whose
-timestamps are invalid/future, or whose identity no longer matches the occupant
-SHALL be unavailable. The daemon SHALL replace expired or failed fields with
-unavailable display and clear numeric values on the next refresh. A fresh cached
-sample may be reused only while identity and age remain valid.
+Samples whose timestamps are invalid/future or whose identity no longer matches
+the occupant SHALL be unavailable. Context SHALL retain the last valid exact
+session or statusLine-bound observation regardless of its age. Weekly samples
+with a reset time SHALL expire at that time; weekly samples without a reset time
+SHALL expire after `usage_max_age_ms`. The daemon SHALL replace expired or failed
+fields with unavailable display and clear numeric values on the next refresh.
 
 Readers SHALL be read-only with respect to agent files and sessions. Network or
 credential requirements SHALL be explicit in accepted source research; readers
@@ -81,10 +82,17 @@ network access. With default `allow_network = false`, a network-dependent reader
 SHALL return unavailable. Reader results, metadata, and diagnostics SHALL NOT
 contain credential values, conversation contents, or personal account identifiers.
 
-#### Scenario: Source stops updating
-- **WHEN** the last sample exceeds the default 60-second maximum age
-- **THEN** the next refresh publishes `—` and clears the affected numeric key,
-  rather than renewing the old percentage indefinitely
+#### Scenario: Exact-session context stops updating while idle
+- **WHEN** the last valid context observation exceeds 60 seconds but its binding
+  still matches the current occupant
+- **THEN** context retains the last observed percentage
+- **AND** weekly without a reset time expires after its maximum age
+- **AND** weekly with a reset time remains available only until that reset
+
+#### Scenario: Unrelated Grok session artifacts accumulate
+- **WHEN** thousands of unrelated artifacts exist beneath session directories
+- **THEN** discovery probes only exact native-session directories for signals
+- **AND** duplicate exact matches remain unavailable without a cwd fallback
 
 #### Scenario: Network-disabled reader
 - **WHEN** a confirmed reader needs an authenticated network call but network
@@ -151,18 +159,22 @@ an association matching that pane's current native session or pane ID; they
 SHALL NOT branch on agent names to bypass session validation. Native-session
 association SHALL continue to require a nonempty exact native ID.
 
-Readers SHALL reject future observations, observations older than `max_age`,
-oversized or malformed records, nonregular files, and symlinked observation
+Readers SHALL reject future observations, oversized or malformed records,
+nonregular files, and symlinked observation
 roots/files. The read SHALL use the existing bounded timeout contract. An
 observation whose supplied weekly reset is at or before `now` SHALL have
-unavailable weekly data, while a fresh context observation may remain available.
+unavailable weekly data, while a bound context observation may remain available.
+Context SHALL NOT expire by `max_age`. Weekly without a reset SHALL still obey
+`max_age`; weekly with a reset SHALL use that reset as its expiry.
 Unavailable weekly SHALL clear window/reset values. A missing reset SHALL omit
 the countdown without inventing a timestamp. The publisher SHALL select both
 local adapters and propagate validated weekly remaining and reset values.
 
-#### Scenario: Idle callback expires
+#### Scenario: Idle callback retains context independently of weekly expiry
 - **WHEN** the last statusLine callback is older than the configured maximum age
-- **THEN** context and weekly display `—`, and numeric/reset values are absent
+- **THEN** its bound context remains available
+- **AND** weekly without a reset displays `—` with no numeric/reset values
+- **AND** weekly with a reset remains available until that reset
 
 #### Scenario: Receipt age and weekly reset differ
 - **WHEN** context is fresh but the supplied weekly reset has already passed

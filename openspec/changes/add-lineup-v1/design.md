@@ -169,13 +169,26 @@ observing conversation/pane; cross-account sharing is deliberately absent.
 Readers use the injected plugin state root, not the daemon's session checkpoint
 subdirectory. They bound reads to 4 KiB and the common reader deadline, reject
 links/nonregular files, and validate version, provider, key, numeric ranges,
-receipt age, and reset expiry. Future/expired observations yield `—`.
+receipt timestamps, and weekly reset expiry. Future observations yield `—`.
 
 Context and weekly outcomes remain independent. Claude uses seven-day used
 percent and converts it to remaining. Agy selects the active model's weekly
 pool (or the sole unambiguous pool) and determines remaining scale from field
 names, never magnitude. Reset timestamps/delays become absolute times; a
 passed reset invalidates weekly only. Missing reset suppresses the countdown.
+
+Decision 2026-10-12: Context retains the last valid observation for its exact
+native session or statusLine binding, without a receipt-age expiry. Idle context
+is not a heartbeat; replacing the occupant or binding clears the value. Weekly
+quota with a reset remains available only until that reset. Weekly quota without
+a reset still expires after `usage_max_age_ms`. Invalid, missing, inaccessible,
+or mismatched observations remain unavailable independently of this age policy.
+
+Grok discovery enumerates only working-directory keys under `sessions/` and
+probes each key's exact native-session directory for `signals.json`. It never
+enumerates unrelated sessions' artifacts, so accumulated conversation files do
+not exhaust the bounded discovery entry budget. Duplicate exact matches remain
+ambiguous; directory or file symlinks are not followed.
 
 The optional `--then` shell command receives byte-identical stdin and retains
 its stdout, stderr, and exit status. An oversized payload skips capture but is

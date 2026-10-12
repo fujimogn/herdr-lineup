@@ -279,9 +279,6 @@ pub(crate) fn read_record(
         Ok(age) => age,
         Err(_) => return missing(request, source, M::Invalid),
     };
-    if age > request.max_age {
-        return missing(request, source, M::Stale);
-    }
     let outcome = |value: Option<f64>| match value {
         Some(value) if value.is_finite() && (0.0..=100.0).contains(&value) => O::Available(value),
         Some(_) => O::Unavailable(M::Invalid),
@@ -299,7 +296,9 @@ pub(crate) fn read_record(
         .weekly_reset_ms
         .and_then(|v| UNIX_EPOCH.checked_add(Duration::from_millis(v)));
     if matches!(reading.weekly_remaining, O::Available(_)) {
-        if reset.is_some_and(|reset| reset <= request.now) {
+        if reset.is_some_and(|reset| reset <= request.now)
+            || (reset.is_none() && age > request.max_age)
+        {
             reading.weekly_remaining = O::Unavailable(M::Stale);
         } else {
             reading.weekly_window = Some(model::WeeklyWindow::RollingSevenDays);
@@ -398,7 +397,7 @@ mod tests {
         serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap()
     }
     #[test]
-    fn readers_bind_and_reject_stale_future_and_mismatched_records() {
+    fn readers_retain_idle_context_and_reject_future_and_mismatched_records() {
         let _guard = READER_TEST_LOCK.lock().unwrap();
         use crate::{model::*, reader_agy::AgyReader, reader_claude::ClaudeReader};
         for (agent, provider, key) in [
@@ -430,7 +429,12 @@ mod tests {
             assert!(r.weekly_resets_at.is_some());
             request.now += Duration::from_secs(61);
             let r = reader.read(&request);
-            assert_eq!(r.context, UsageOutcome::Unavailable(MissingReason::Stale));
+            assert_eq!(r.context, UsageOutcome::Available(23.5));
+            assert_eq!(r.weekly_remaining, UsageOutcome::Available(73.0));
+            assert!(r.weekly_resets_at.is_some());
+            request.now = now() + Duration::from_secs(36800);
+            let r = reader.read(&request);
+            assert_eq!(r.context, UsageOutcome::Available(23.5));
             assert_eq!(
                 r.weekly_remaining,
                 UsageOutcome::Unavailable(MissingReason::Stale)
@@ -455,6 +459,63 @@ mod tests {
                 reader.read(&request).context,
                 UsageOutcome::Unavailable(MissingReason::NotFound)
             );
+        }
+    }
+    #[test]
+    fn idle_context_survives_weekly_without_reset_expiring() {
+        let _guard = READER_TEST_LOCK.lock().unwrap();
+        use crate::{model::*, reader_agy::AgyReader, reader_claude::ClaudeReader};
+        for (agent, provider, key, value) in [
+            (
+                Agent::Claude,
+                Provider::Claude,
+                "session-1",
+                json!({
+                    "session_id":"session-1", "context_window":{"used_percentage":23.5},
+                    "rate_limits":{"seven_day":{"used_percentage":27}}
+                }),
+            ),
+            (
+                Agent::Agy,
+                Provider::Agy,
+                "w58:p3",
+                json!({
+                    "context_window":{"used_percentage":23.5},
+                    "quota":{"gemini-weekly":{"remaining_percent":73}}
+                }),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(capture(
+                agent,
+                value.to_string().as_bytes(),
+                dir.path(),
+                Some(key),
+                now()
+            ));
+            let id = crate::model::tests::identity(provider);
+            let mut request = crate::model::tests::request(&id, dir.path());
+            let agy = AgyReader {
+                pane_id: key.into(),
+            };
+            let reader: &dyn UsageReader = if agent == Agent::Claude {
+                &ClaudeReader
+            } else {
+                &agy
+            };
+            request.now += Duration::from_secs(60);
+            let r = reader.read(&request);
+            assert_eq!(r.context, UsageOutcome::Available(23.5));
+            assert_eq!(r.weekly_remaining, UsageOutcome::Available(73.0));
+            request.now += Duration::from_secs(1);
+            let r = reader.read(&request);
+            assert_eq!(r.context, UsageOutcome::Available(23.5));
+            assert_eq!(
+                r.weekly_remaining,
+                UsageOutcome::Unavailable(MissingReason::Stale)
+            );
+            assert!(r.weekly_window.is_none());
+            assert!(r.weekly_resets_at.is_none());
         }
     }
     #[test]

@@ -193,8 +193,10 @@ the plugin state directory the daemon already uses:
 export HERDR_PLUGIN_STATE_DIR="/path/to/herdr-lineup/state"
 ```
 
-Numbers stay `—` until a fresh observation matches the pane. The default
-maximum age is 60 seconds.
+Context stays `—` until an observation matches the pane, then retains the last
+valid value while that exact session or pane binding matches. Idle context does
+not expire by age. Weekly quota with a reset time expires at that time; weekly
+quota without a reset time uses the default maximum age of 60 seconds.
 
 The repository heading reads the newest local `origin/main` commit without
 fetching: `HH:MM` for today, `M/D` for earlier dates. This is a commit-time label,

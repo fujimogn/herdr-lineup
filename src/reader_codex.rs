@@ -106,7 +106,7 @@ mod tests {
         .unwrap();
     }
     #[test]
-    fn normal_missing_stale_and_mismatch() {
+    fn normal_missing_idle_and_mismatch() {
         let _serial = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
@@ -124,10 +124,7 @@ mod tests {
         );
         assert!(reading.weekly_resets_at.is_none());
         fixture(dir.path(), "session-1", "2026-10-11T23:58:59Z", 70);
-        assert_eq!(
-            CodexReader.read(&r).context,
-            UsageOutcome::Unavailable(MissingReason::Stale)
-        );
+        assert_percent(CodexReader.read(&r).context);
         fixture(dir.path(), "session-2", "2026-10-12T00:00:00Z", 70);
         assert_eq!(
             CodexReader.read(&r).context,

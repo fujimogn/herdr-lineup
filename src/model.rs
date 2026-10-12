@@ -206,7 +206,8 @@ impl UsageReading {
         }
         reading.context = match request.now.duration_since(observed_at) {
             Err(_) => UsageOutcome::Unavailable(MissingReason::Invalid),
-            Ok(age) if age > request.max_age => UsageOutcome::Unavailable(MissingReason::Stale),
+            // Exact-session context is the last known occupancy, not a heartbeat.
+            // Weekly observations apply their own age/reset policy independently.
             Ok(_) if percent.is_finite() && (0.0..=100.0).contains(&percent) => {
                 UsageOutcome::Available(percent)
             }
