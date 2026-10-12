@@ -1055,7 +1055,6 @@ mod tests {
 
     #[test]
     fn stop_interrupts_stalled_repository_query_before_process_exit() {
-        use std::os::unix::fs::PermissionsExt;
         let (_dir, options, done, server) = fixture();
         fs::write(options.config.join("config.toml"), "providers = []\n").unwrap();
         fs::create_dir(&options.state).unwrap();
@@ -1063,12 +1062,12 @@ mod tests {
         let bin = options.config.join("bin");
         fs::create_dir(&bin).unwrap();
         let script = bin.join("git");
-        fs::write(
+        crate::test_support::write_executable(
             &script,
             "#!/bin/sh\necho $$ > \"$2/git-pid\"\nexec /bin/sleep 30\n",
         )
         .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
         let mut child = child_command()
             .env("LINEUP_TEST_FOREGROUND", "1")
             .env("LINEUP_TEST_QUOTA_ONCE", "1")
@@ -1118,17 +1117,16 @@ mod tests {
 
     #[test]
     fn stop_waits_for_slow_quota_daemon_process_exit_and_releases_lock() {
-        use std::os::unix::fs::PermissionsExt;
         let (_dir, options, done, server) = fixture();
         let bin = options.config.join("bin");
         fs::create_dir(&bin).unwrap();
         let script = bin.join("codex");
-        fs::write(
+        crate::test_support::write_executable(
             &script,
             "#!/bin/sh\necho $$ > \"$CODEX_HOME/app-server-pid\"\nexec /bin/sleep 30\n",
         )
         .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
         fs::create_dir(&options.state).unwrap();
         let mut child = child_command()
             .env("LINEUP_TEST_FOREGROUND", "1")
@@ -1175,17 +1173,16 @@ mod tests {
 
     #[test]
     fn stop_does_not_join_http_and_reaps_codex_app_server() {
-        use std::os::unix::fs::PermissionsExt;
         let (_dir, options, done, server) = fixture();
         let bin = options.config.join("bin");
         fs::create_dir(&bin).unwrap();
         let script = bin.join("codex");
-        fs::write(
+        crate::test_support::write_executable(
             &script,
             "#!/bin/sh\n: > \"$CODEX_HOME/app-server-pid\"\n/bin/sleep 0.2\necho $$ > \"$CODEX_HOME/app-server-pid\"\nexec /bin/sleep 30\n",
         )
         .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
         let mut command = child_command();
         command.env("LINEUP_TEST_QUOTA_STOP", "1").env("PATH", &bin);
         ensure_command(&options, command).unwrap();
@@ -1204,19 +1201,18 @@ mod tests {
 
     #[test]
     fn daemon_quota_is_opt_in_and_repeated_refreshes_keep_one_worker() {
-        use std::os::unix::fs::PermissionsExt;
         for enabled in [false, true] {
             let (_dir, options, done, server) = fixture();
             fs::write(options.config.join("config.toml"), format!("allow_network = {enabled}\nproviders = ['codex']\nrefresh_interval_ms = 1000\nreader_timeout_ms = 100\n")).unwrap();
             let bin = options.config.join("bin");
             fs::create_dir(&bin).unwrap();
             let script = bin.join("codex");
-            fs::write(
+            crate::test_support::write_executable(
                 &script,
                 "#!/bin/sh\nprintf 'attempt\\n' >> \"$CODEX_HOME/attempts\"\nexit 0\n",
             )
             .unwrap();
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
             let mut command = child_command();
             command
                 .env("LINEUP_TEST_QUOTA_ONCE", "1")

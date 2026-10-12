@@ -254,7 +254,6 @@ mod tests {
 
     #[test]
     fn completed_git_kills_descendants_with_closed_stdout() {
-        use std::os::unix::fs::PermissionsExt;
         if let Some(root) = std::env::var_os("LINEUP_TEST_GIT_DESCENDANT") {
             let root = PathBuf::from(root);
             assert_eq!(read_repository(&root), None);
@@ -284,8 +283,8 @@ mod tests {
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let script = bin.join("git");
-        std::fs::write(&script, "#!/bin/sh\n/bin/sleep 30 >/dev/null 2>&1 &\necho $! > \"$2/descendant-pid\"\nprintf 'false\\n'\nexit 0\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_executable(&script, "#!/bin/sh\n/bin/sleep 30 >/dev/null 2>&1 &\necho $! > \"$2/descendant-pid\"\nprintf 'false\\n'\nexit 0\n").unwrap();
+
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -303,7 +302,6 @@ mod tests {
 
     #[test]
     fn repository_deadline_reaps_stalled_git_without_shutdown() {
-        use std::os::unix::fs::PermissionsExt;
         if let Some(root) = std::env::var_os("LINEUP_TEST_GIT_DEADLINE") {
             let root = PathBuf::from(root);
             let started = Instant::now();
@@ -328,12 +326,12 @@ mod tests {
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let script = bin.join("git");
-        std::fs::write(
+        crate::test_support::write_executable(
             &script,
             "#!/bin/sh\necho $$ > \"$2/git-pid\"\nexec /bin/sleep 30\n",
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
