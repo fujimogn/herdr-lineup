@@ -538,7 +538,10 @@ mod tests {
         let query_control = control.clone();
         let home = dir.path().to_path_buf();
         let handle = std::thread::spawn(move || {
-            read_with_control(&home, MAX_TIMEOUT, Command::new(script), &query_control)
+            // Interpret the fixture to avoid ETXTBSY from concurrent forks retaining write FDs.
+            let mut command = Command::new("/bin/sh");
+            command.arg(script);
+            read_with_control(&home, MAX_TIMEOUT, command, &query_control)
         });
         let pid = wait_for_pid(&dir.path().join("pid"));
         let started = Instant::now();
@@ -965,7 +968,8 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert!(!fake.dir.path().join("pid").exists());
-        let command = Command::new(&fake.executable);
+        let mut command = Command::new("/bin/sh");
+        command.arg(&fake.executable);
         assert_eq!(
             read_with_command(Path::new("relative"), DEFAULT_TIMEOUT, command)
                 .unwrap_err()
