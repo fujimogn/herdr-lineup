@@ -236,8 +236,9 @@ pub fn run_foreground(
     let mut reconnect = false;
     loop {
         if reconnect || transport.check_connection().is_err() {
-            // The JSON API has no session id. Reconnect only to the original
-            // dev/inode; a server restart replaces its socket and stops us.
+            // Transport treats v0.9.3 EOF after a response as normal and opens
+            // each next request on the pinned dev/inode. This recovery path is
+            // for unexpected failures; a replaced server socket stops us.
             let retrying_refresh = reconnect;
             transport.reconnect_same_endpoint()?;
             doctor::check_transport(&mut transport)?;
@@ -450,7 +451,6 @@ mod tests {
         let done = Arc::new(AtomicBool::new(false));
         let flag = done.clone();
         let handle = std::thread::spawn(move || {
-            let mut peers = Vec::new();
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -463,7 +463,8 @@ mod tests {
                             .read_line(&mut line)
                             .unwrap();
                         stream.write_all(b"{\"id\":\"lineup-health\",\"result\":{\"type\":\"pong\",\"version\":\"0.9.3\",\"protocol\":17}}\n").unwrap();
-                        peers.push(stream);
+                        // Herdr v0.9.3 ends each ordinary JSON response with EOF.
+                        drop(stream);
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(5)),
                 }
@@ -471,6 +472,27 @@ mod tests {
         });
         (dir, options, done, handle)
     }
+    #[test]
+    fn health_fixture_closes_after_one_json_response() {
+        let (_dir, options, done, server) = fixture();
+        let mut stream = std::os::unix::net::UnixStream::connect(&options.socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"{\"id\":\"lineup-health\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        crate::doctor::validate_pong(response.trim_end().as_bytes()).unwrap();
+        response.clear();
+        let eof = reader.read_line(&mut response);
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(eof.unwrap(), 0, "ordinary JSON responses must end in EOF");
+    }
+
     fn child_command() -> std::process::Command {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command.args([
