@@ -50,7 +50,7 @@ cargo run --locked -- statusline --help
 | `doctor` | Check local setup and explain missing data. |
 | `configure` | Opt in to adding plugin sidebar rows. |
 | `unconfigure` | Remove only the plugin-managed sidebar rows. |
-| `statusline` | Capture Claude or Antigravity statusLine usage. `--then` keeps the existing command's display. |
+| `statusline` | Record Claude or Antigravity usage for the sidebar. Prints nothing unless `--then` runs an existing command. |
 
 Herdr actions: `herdr-lineup.start`, `herdr-lineup.stop`,
 `herdr-lineup.doctor`, `herdr-lineup.configure`, `herdr-lineup.unconfigure`,
@@ -110,17 +110,18 @@ herdr-lineup statusline claude
 herdr-lineup statusline agy
 ```
 
-`herdr-lineup statusline --help` accepts `claude` or `agy`, plus
-`--then <command>`. The command reads one JSON object from stdin. It stores
-only the context percentage, the weekly remaining percentage, an optional reset
-time, the agent, an opaque binding key, and the observation time under
-`$HERDR_PLUGIN_STATE_DIR/statusline/`. It does not store conversation text,
-transcript paths, or credentials. Invalid JSON, an oversized payload, or a
-failed write does not stop the status line. With `--then`, the shell command
-receives the original stdin bytes, and its stdout and exit status are kept,
-including when the input is broken. Without `--then`, this command prints
-nothing and exits 0, so an existing status line is left unchanged only when
-`--then` names that command.
+Usage is shown in the sidebar only. `herdr-lineup statusline` does not render
+a status line and does not print a pace label. `herdr-lineup statusline --help`
+accepts `claude` or `agy`, plus `--then <command>`. The command reads one JSON
+object from stdin. It stores only the context percentage, the weekly remaining
+percentage, an optional reset time, the agent, an opaque binding key, and the
+observation time under `$HERDR_PLUGIN_STATE_DIR/statusline/`. It does not store
+conversation text, transcript paths, or credentials. Invalid JSON, an oversized
+payload, or a failed write does not stop the agent's status line. With
+`--then`, the shell command receives the original stdin bytes, and its stdout
+and exit status are kept, including when the input is broken. That stdout is
+the chained command's output alone. Without `--then`, this command prints
+nothing and exits 0.
 
 Claude's binding key is the stdin field `session_id`, matched to the pane's
 native session. Antigravity's binding key is `HERDR_PANE_ID`, matched to the
