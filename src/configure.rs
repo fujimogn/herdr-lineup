@@ -2,6 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -56,8 +57,19 @@ pub fn run(action: Action) -> Result<Outcome, String> {
     )?;
     eprintln!("Herdr configuration target: {}", path.display());
     let binary = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let state = match std::env::var_os("HERDR_PLUGIN_STATE_DIR") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => {
+            let home = std::env::var_os("HOME").ok_or("HOME is missing")?;
+            PathBuf::from(home).join(".local/state/herdr-lineup")
+        }
+    };
+    if !state.is_absolute() {
+        return Err("plugin state directory must be absolute".into());
+    }
     apply_validated(
         &path,
+        &state,
         action,
         |candidate| herdr_command(&binary, ["config", "check"], candidate),
         |target| herdr_command(&binary, ["server", "reload-config"], target),
@@ -87,19 +99,22 @@ fn herdr_command(binary: &OsStr, args: [&str; 2], target: &Path) -> Result<(), S
 /// transaction tests independent of the user's running Herdr session.
 pub fn apply(
     path: &Path,
+    state: &Path,
     action: Action,
     mut reload: impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<Outcome, String> {
-    apply_validated(path, action, |_| Ok(()), &mut reload)
+    apply_validated(path, state, action, |_| Ok(()), &mut reload)
 }
 
 /// Validate the staged candidate before creating a backup or replacing config.
 pub fn apply_validated(
     path: &Path,
+    state: &Path,
     action: Action,
     mut validate: impl FnMut(&Path) -> Result<(), String>,
     mut reload: impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<Outcome, String> {
+    let _guard = transaction_lock(path, state)?;
     let before = read_regular(path)?;
     let text = std::str::from_utf8(before.as_deref().unwrap_or_default())
         .map_err(|_| "Herdr config must be UTF-8".to_owned())?;
@@ -186,6 +201,57 @@ pub fn apply_validated(
         };
     }
     Ok(Outcome::Changed { backup })
+}
+
+struct TransactionLock(fs::File);
+
+impl Drop for TransactionLock {
+    fn drop(&mut self) {
+        // Explicit unlock also releases a descriptor briefly inherited by an
+        // unrelated concurrent fork before its close-on-exec takes effect.
+        let _ = self.0.unlock();
+    }
+}
+
+fn transaction_lock(path: &Path, state: &Path) -> Result<TransactionLock, String> {
+    if !path.is_absolute() || !state.is_absolute() {
+        return Err("config and state paths must be absolute".into());
+    }
+    // A stable sidecar inode survives config's atomic replacement and remains
+    // locked through validation, replacement, reload, and rollback. Never
+    // unlink it: doing so would split future callers across different locks.
+    // Advisory locks serialize Lineup actions. Non-cooperating external
+    // editors still require the optimistic byte checks around replacement.
+    // Canonicalize the nearest existing ancestor too, so an absent file keeps
+    // the same lock identity after creation (including symlinked parents).
+    let canonical = path
+        .ancestors()
+        .find_map(|ancestor| {
+            ancestor
+                .canonicalize()
+                .ok()
+                .map(|root| root.join(path.strip_prefix(ancestor).expect("path ancestor")))
+        })
+        .ok_or("cannot resolve config lock identity")?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hash);
+    fs::create_dir_all(state).map_err(|_| "cannot create plugin state directory")?;
+    let lock_path = state.join(format!("configure-{:016x}.lock", hash.finish()));
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+        && !metadata.is_file()
+    {
+        return Err("configuration lock must be a regular file".into());
+    }
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|_| "cannot open configuration lock")?;
+    lock.try_lock()
+        .map_err(|_| "another configuration action owns this target; retry later")?;
+    Ok(TransactionLock(lock))
 }
 
 fn read_regular(path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -355,6 +421,34 @@ mod tests {
 
     const ORIGINAL: &str = "# User comment\nonboarding = false\n\n[theme]\nname = 'catppuccin' # Keep me\n\n[ui]\npane_borders = 'off'\n";
 
+    fn test_state(path: &Path) -> PathBuf {
+        path.ancestors().find(|p| p.is_dir()).unwrap().join("state")
+    }
+
+    fn apply(
+        path: &Path,
+        action: Action,
+        reload: impl FnMut(&Path) -> Result<(), String>,
+    ) -> Result<Outcome, String> {
+        super::apply(path, &test_state(path), action, reload)
+    }
+
+    fn apply_validated(
+        path: &Path,
+        action: Action,
+        validate: impl FnMut(&Path) -> Result<(), String>,
+        reload: impl FnMut(&Path) -> Result<(), String>,
+    ) -> Result<Outcome, String> {
+        super::apply_validated(path, &test_state(path), action, validate, reload)
+    }
+
+    fn file_count(path: &Path) -> usize {
+        fs::read_dir(path)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_file())
+            .count()
+    }
+
     fn fixture(contents: &str) -> (TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -364,6 +458,44 @@ mod tests {
 
     fn ok_reload(_: &Path) -> Result<(), String> {
         Ok(())
+    }
+
+    #[test]
+    fn transaction_unlock_is_not_delayed_by_a_duplicated_descriptor() {
+        let (_dir, path) = fixture(ORIGINAL);
+        let state = test_state(&path);
+        let guard = transaction_lock(&path, &state).unwrap();
+        let inherited = guard.0.try_clone().unwrap();
+        assert!(transaction_lock(&path, &state).is_err());
+        drop(guard);
+        let next = transaction_lock(&path, &state).unwrap();
+        drop(inherited);
+        drop(next);
+    }
+
+    #[test]
+    fn concurrent_transaction_cannot_replace_config_during_validation_or_reload() {
+        let (_dir, path) = fixture(ORIGINAL);
+        let mut attempted = false;
+        let result = apply_validated(
+            &path,
+            Action::Configure,
+            |_| {
+                attempted = true;
+                let other = apply(&path, Action::Configure, ok_reload);
+                assert!(other.unwrap_err().contains("another configuration action"));
+                Ok(())
+            },
+            |_| {
+                let other = apply(&path, Action::Unconfigure, ok_reload);
+                assert!(other.unwrap_err().contains("another configuration action"));
+                Ok(())
+            },
+        );
+        assert!(attempted);
+        assert!(result.is_ok());
+        apply(&path, Action::Unconfigure, ok_reload).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), ORIGINAL);
     }
 
     #[test]
@@ -382,7 +514,7 @@ mod tests {
         assert!(proposed.contains("$lineup_logo"));
         assert!(result.unwrap_err().contains("invalid layout"));
         assert_eq!(fs::read_to_string(path).unwrap(), ORIGINAL);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(file_count(dir.path()), 1);
     }
 
     #[test]
@@ -505,20 +637,20 @@ mod tests {
         let (dir, path) = fixture(ORIGINAL);
         apply(&path, Action::Configure, ok_reload).unwrap();
         let configured = fs::read(&path).unwrap();
-        let count = fs::read_dir(dir.path()).unwrap().count();
+        let count = file_count(dir.path());
         assert_eq!(
             apply(&path, Action::Configure, |_| panic!("no reload")),
             Ok(Outcome::Unchanged)
         );
         assert_eq!(fs::read(&path).unwrap(), configured);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), count);
+        assert_eq!(file_count(dir.path()), count);
         apply(&path, Action::Unconfigure, ok_reload).unwrap();
-        let count = fs::read_dir(dir.path()).unwrap().count();
+        let count = file_count(dir.path());
         assert_eq!(
             apply(&path, Action::Unconfigure, |_| panic!("no reload")),
             Ok(Outcome::Unchanged)
         );
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), count);
+        assert_eq!(file_count(dir.path()), count);
     }
 
     #[test]
@@ -535,7 +667,7 @@ mod tests {
             let (dir, path) = fixture(contents);
             assert!(apply(&path, Action::Configure, |_| panic!("no reload")).is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), contents);
-            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+            assert_eq!(file_count(dir.path()), 1);
         }
     }
 
