@@ -84,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Load sequence checkpoints under the session lock and reserve the next
   sequence before any metadata byte is written. A shutdown clear rechecks its
   deadline after that reservation so the last socket round trip still fits.
-- Retry transient control failures while probing readiness or a stop identity,
+- Retry transient control failures while probing startup readiness,
   and serve the control listener while a refresh is in progress. After lock
   contention, wait for the winning daemon instead of spawning another child.
   Only lock acquisition counts as contention.
