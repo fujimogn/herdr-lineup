@@ -102,3 +102,12 @@ Copyright (c) 2026 Levi Qiao. The MIT license reproduced in the preceding
 herdr-agent-quota notice applies. Lineup adds bounded nonblocking I/O,
 subscription-only weekly selection, sanitized errors and a reset-bounded
 in-memory cache. Authentication-file and conversation readers were not copied.
+
+## herdr-agent-quota Grok billing schema
+
+The request headers and proto3 omitted-zero billing interpretation in
+`src/quota_grok.rs` are adapted from `src/providers/grok.rs` in
+[fujimogn/herdr-agent-quota](https://github.com/fujimogn/herdr-agent-quota),
+commit `d428889cd6d0dc675e0b4058dc5c5f172d979e5b`.
+Copyright (c) 2026 Levi Qiao. The MIT license reproduced in the preceding
+herdr-agent-quota notice applies.

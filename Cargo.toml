@@ -22,6 +22,10 @@ clap = { version = "4", features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 zstd = { version = "0.13", default-features = false }
 
+# Disable dependency wire logging: HTTP TRACE output can contain credentials.
+log = { version = "0.4", features = ["max_level_off"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+
 [dev-dependencies]
 tempfile = { version = "3", default-features = false }
 
