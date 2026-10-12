@@ -3,10 +3,9 @@
 One sidebar row per AI coding agent in [Herdr](https://herdr.dev): vendor logo,
 state, context, weekly quota, and when each repository last shipped.
 
-**Planned.** This repository currently contains a buildable command-line scaffold.
-It does not publish sidebar data or run a daemon. All subcommands print a
-not-implemented message and exit with status 1; `--help` and `--version` work.
-No release or runtime screenshot is available yet.
+A per-session daemon publishes `lineup_` sidebar metadata. Authenticated
+provider usage and a runtime screenshot are not available yet. `--help` and
+`--version` work.
 
 ## Install
 
@@ -20,8 +19,8 @@ herdr plugin install fujimogn/herdr-lineup
 ```
 
 Herdr builds the plugin with `cargo build --release --locked` during installation.
-Installing this scaffold will not produce sidebar rows. See Development to
-build the current code locally.
+A public install is not published yet. A local release build can publish rows
+after `ensure`. See Development to build the current code locally.
 
 Three install facts from the Herdr plugin documentation, worth knowing before
 you rely on this plugin:
@@ -42,7 +41,7 @@ cargo run --locked -- --help
 cargo run --locked -- doctor --help
 ```
 
-| Command | Planned behavior |
+| Command | Behavior |
 | --- | --- |
 | `ensure` | Start one detached publisher per Herdr session if needed. |
 | `daemon` | Run the publisher in the foreground. |
@@ -51,10 +50,10 @@ cargo run --locked -- doctor --help
 | `configure` | Opt in to adding plugin sidebar rows. |
 | `unconfigure` | Remove only the plugin-managed sidebar rows. |
 
-**Planned Herdr actions:** `herdr-lineup.start`, `herdr-lineup.stop`,
+Herdr actions: `herdr-lineup.start`, `herdr-lineup.stop`,
 `herdr-lineup.doctor`, `herdr-lineup.configure`, `herdr-lineup.unconfigure`,
 `herdr-lineup.install-font`, and `herdr-lineup.uninstall-font`.
-For example, once implemented:
+For example:
 
 ```sh
 herdr plugin action invoke herdr-lineup.start
@@ -63,32 +62,33 @@ herdr plugin action invoke herdr-lineup.doctor
 
 ## Configuration
 
-**Planned:** user settings will live in
-`$HERDR_PLUGIN_CONFIG_DIR/config.toml`, with defaults when the file is absent.
-Find the directory of an installed or linked plugin with:
+User settings live in `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. A missing file
+uses the built-in defaults and is not created. Find the directory of an
+installed or linked plugin with:
 
 ```sh
 herdr plugin config-dir herdr-lineup
 ```
 
-There are no implemented settings yet. Sidebar rows will be added by hand or
-through the explicit, opt-in `configure` action; startup will not edit the
-user's Herdr configuration. Planned configuration edits use marker comments
-and a backup, preserving unrelated settings. `unconfigure` will remove only
-plugin-managed entries.
+Sidebar rows are added by hand or through the explicit, opt-in `configure`
+action. Startup does not edit the user's Herdr configuration. Configuration
+edits use marker comments and a backup, preserving unrelated settings.
+`unconfigure` removes only an unmodified plugin-managed block.
 
-**Planned:** the plugin bundles the HerdrAgentIconsMax icon font and emits icon
+The plugin bundles the HerdrAgentIconsMax icon font and can emit its icon
 codepoints. The font is installed only through the explicit, opt-in
 `herdr-lineup.install-font` action and removed with
-`herdr-lineup.uninstall-font`; startup never touches font setup. A text
-fallback is planned. See [NOTICE.md](NOTICE.md) for sources and licensing.
+`herdr-lineup.uninstall-font`; startup never touches font setup. Text labels
+remain available, and automatic mode stays on text until terminal glyph support
+is known. See [NOTICE.md](NOTICE.md) for sources and licensing.
 
 ## How it works
 
-**Planned:** combine vendor logos, agent state, context use, and weekly remaining
+Rows combine vendor logos, agent state, context use, and weekly remaining
 quota for Claude, Codex, Grok, Antigravity, Kimi, and Hermes. Unavailable usage
 shows `—`. [Source research](docs/research/usage-sources.md) records conditional
-availability; provider readers and account binding are not implemented yet.
+availability. Codex and Grok context readers are implemented. The other agents,
+and every weekly quota, stay unavailable without an authenticated source.
 
 Each agent row shows the vendor logo, a state dot, context use as a percentage,
 and a weekly quota triplet such as `7d 67% 6d9h`: the quota period, the share
@@ -105,25 +105,36 @@ fetching: `HH:MM` for today, `M/D` for earlier dates. This is a commit-time labe
 not proof of a deployment.
 
 Herdr startup hooks run once. Startup and `workspace.focused` therefore both
-invoke `ensure`; the planned per-session lock prevents duplicate daemons.
-The publisher will use the local Herdr socket, send changed `lineup_` metadata
-with an expiry, and keep its state under `$HERDR_PLUGIN_STATE_DIR`.
+invoke `ensure`; the per-session lock prevents duplicate daemons.
+The publisher keeps one daemon per Herdr session and stores state under
+`$HERDR_PLUGIN_STATE_DIR`. Herdr v0.9.3 closes the socket after each
+`session.snapshot` and `report_metadata` JSON response. An isolated session
+confirmed that close, so the daemon connects again for every request. Before
+each connect it reads the socket's device and inode and stops without
+connecting if either value has changed since startup, so it does not attach
+to a replaced server. Deadlines use
+non-blocking I/O and `poll` against one monotonic deadline. On macOS,
+`setsockopt` on a socket the peer has closed returns `EINVAL`, so the deadline
+is not applied with `setsockopt`.
 See the [Herdr plugin documentation](https://herdr.dev/docs/plugins/)
-and [SECURITY.md](SECURITY.md). None of these runtime behaviors are implemented yet.
+and [SECURITY.md](SECURITY.md).
 
 ## Troubleshooting
 
-- **A command says “Planned” and exits with status 1:** expected for this scaffold.
-- **No sidebar data after install or link:** the publisher is not implemented yet.
+- **A command fails:** it prints an error and exits nonzero. `stop` leaves the
+  Herdr server running.
+- **No sidebar data after install or link:** confirm `ensure` is running for
+  that session's socket and that the socket device and inode still match the
+  daemon started against it. A replaced socket stops the old daemon.
 - **Local link cannot find the binary:** build first; `herdr plugin link` does not build.
-- **Planned icon rendering shows boxes:** run the opt-in
+- **Icon rendering shows boxes:** run the opt-in
   `herdr-lineup.install-font` action and check the terminal's codepoint map,
   or use the planned text fallback.
 - **A build fails:** verify rustup can install the pinned toolchain and that Cargo
   can download the locked dependencies. No credentials or remote API setup are
   required by the current executable.
 
-Do not stop or restart the Herdr server to troubleshoot this scaffold.
+Do not stop or restart the Herdr server to troubleshoot this plugin.
 
 ## Development
 
@@ -141,7 +152,8 @@ Optional local registration, after building:
 herdr plugin link .
 ```
 
-Linking registers the manifest but does not make the planned commands functional.
+Linking registers the manifest. Build the release binary before expecting
+commands to run.
 The CI workflow runs formatting, Clippy, tests, and release builds on Linux and
 macOS, with a dependency audit on pushes and weekly. Keep package versions in
 `Cargo.toml`, `Cargo.lock`, and `herdr-plugin.toml` aligned; release tags use `v*`.

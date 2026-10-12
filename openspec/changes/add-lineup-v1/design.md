@@ -97,22 +97,36 @@ machines use dotfiles for fonts and terminal settings instead of these actions.
 
 ## Daemon implementation outline
 
-Use synchronous Rust threads and a persistent local socket connection. Bind
-runtime files to a hash of the absolute `HERDR_SOCKET_PATH` under
-`HERDR_PLUGIN_STATE_DIR`; obtain an exclusive OS file lock before spawning a
-detached `setsid` daemon. Transfer lock ownership without a release/reacquire
-gap. A PID file is diagnostic, never sufficient proof of ownership or a safe
-signal target. A session-local control endpoint answers identity/health probes
-and shutdown requests authenticated by a control nonce.
+Use synchronous Rust threads. Herdr v0.9.3 (protocol 22) returns one JSON
+response for `session.snapshot` and for `report_metadata`, then closes the
+connection. An isolated session confirmed that close-after-response behavior,
+so the daemon does not keep one socket open across requests. It opens a new
+connection for each request and treats end-of-file after a complete response
+as normal.
+An unexpected drop uses the same reconnect path. Bind runtime files to a hash
+of the absolute `HERDR_SOCKET_PATH` under `HERDR_PLUGIN_STATE_DIR`; obtain an
+exclusive OS file lock before spawning a detached `setsid` daemon. Transfer
+lock ownership without a release/reacquire gap. A PID file is diagnostic,
+never sufficient proof of ownership or a safe signal target. A session-local
+control endpoint answers identity/health probes and shutdown requests
+authenticated by a control nonce.
 
 Herdr v0.9.3 `ping` and `snapshot` responses do not include a session ID, so
-the daemon does not add a session handshake. It identifies the connected server
-by the absolute socket path, that socket's device and inode, the persistent
-connection, and the control nonce. If the connection drops, the daemon
-reconnects only when the path's device and inode are unchanged. A changed
-device or inode is a replacement: the daemon stops instead of attaching to the
-new socket. A Herdr server restart is that replacement and stops this daemon.
-The startup `ensure` hook then starts a new daemon for the replacement server.
+the daemon does not add a session handshake. Before every connect, including
+the first and each reconnect, it reads the socket path's device and inode and
+compares them with the identity pinned at startup. If either value has
+changed, it does not connect and it stops. A changed device or inode is a
+replacement server, including a Herdr restart. The startup `ensure` hook then
+starts a new daemon for the replacement. The absolute path and the control
+nonce still name the session; they do not prove that the inode is the one
+pinned at startup.
+
+Frame deadlines use non-blocking I/O and `poll` against one monotonic instant.
+On macOS, `setsockopt` on a socket the peer has already closed returns
+`EINVAL`, so those deadlines are not applied with `setsockopt`. `fcntl`
+changes only the local descriptor. `poll` waits until the monotonic deadline,
+and the following read or write then observes buffered bytes, end-of-file, or
+the real error.
 
 The control listener is non-blocking so the refresh loop can poll it. An
 accepted control socket is set back to blocking before the identity and stop

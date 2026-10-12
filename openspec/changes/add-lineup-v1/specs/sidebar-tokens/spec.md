@@ -129,6 +129,13 @@ clear keys; omitted keys SHALL remain unchanged.
 - **THEN** its patch obeys the following expiry, sequencing, refresh, and capacity
   rules
 
+Publication SHALL use the daemon lifecycle connection rules: one new
+connection per `session.snapshot` or `report_metadata` request, because Herdr
+v0.9.3 closes after each JSON response, and no connect when the socket device
+or inode differs from the startup identity. Frame deadlines follow that same
+contract (non-blocking I/O and `poll`, not `setsockopt`, because macOS returns
+`EINVAL` after the peer closes the socket).
+
 Every live-key report SHALL
 carry `ttl_ms = 3 * refresh_interval_ms`, source `herdr-lineup`, and a strictly
 increasing per-resource `seq` persisted before sending. Clearing reports SHALL

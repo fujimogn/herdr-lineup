@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session-scoped daemon lifecycle, bounded configuration, and doctor checks.
 - Opt-in configure and unconfigure actions that preserve unrelated sidebar configuration.
 - Bundled icon font with owned opt-in install-font and uninstall-font actions.
+- Durable metadata publication from the session daemon, including sequence
+  checkpoints and TTL renewal.
+- Isolated Herdr lifecycle harness (`scripts/e2e-isolated.sh`) and the procedure
+  in `docs/testing.md`. Linux evidence covers workspace heading tokens arriving,
+  remaining after a TTL window, and clearing after stop. Real agent panes stay
+  skipped when the isolated home has no provider authentication.
 
 ### Fixed
 
@@ -31,5 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Serialize sidebar configuration transactions.
 - Keep accepted control sockets blocking on macOS, where accept inherits the
   listener's O_NONBLOCK.
+- Reconnect after each Herdr JSON response. Herdr v0.9.3 closes the socket
+  after `session.snapshot` and `report_metadata`.
+- Apply socket deadlines with non-blocking I/O and `poll`. On macOS,
+  `setsockopt` returns `EINVAL` after the peer closes the socket.
+- Unlock font action locks on drop so an inherited descriptor cannot keep
+  `flock` after the action returns.
+- Run the session lock-release check in its own test binary so a concurrent
+  fork cannot inherit that lock's file descriptor.
 
 [Unreleased]: https://github.com/fujimogn/herdr-lineup/commits/main

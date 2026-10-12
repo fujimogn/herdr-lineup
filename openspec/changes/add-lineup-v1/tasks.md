@@ -18,7 +18,7 @@
 
 - [x] Prove token budget, sequence restart, TTL renewal, occupant changes, and
   missing numeric clearing.
-- [ ] Implement metadata publication wiring from the daemon publisher hook.
+- [x] Implement metadata publication wiring from the daemon publisher hook.
 - [x] Prove each state, font/text mode, date boundary, and absent origin/main
   case, then implement presentation and headings without Git fetches.
 - [x] Accept usage-source research, prove session identity and unavailable/stale
@@ -26,5 +26,9 @@
   until their sources are confirmed.
 - [x] Bundle the icon font and implement owned opt-in install-font and
   uninstall-font, including attribution.
-- [ ] Verify an isolated Herdr session end to end, document remaining opt-in
-  examples, and archive only after the implementation tasks pass.
+- [x] Verify an isolated Herdr session end to end with `scripts/e2e-isolated.sh`
+  and `docs/testing.md`. Workspace heading tokens arrive, stay updated across
+  the TTL window, and are gone after stop. A real agent pane stays SKIP because
+  the isolated home has no provider authentication.
+- [ ] Document remaining opt-in examples, and archive only after the
+  implementation tasks pass.

@@ -19,6 +19,22 @@ startup. The daemon SHALL verify the socket endpoint and session identity before
 reading or publishing and SHALL terminate if that socket is replaced. It SHALL
 not silently connect to a replacement server or a different session.
 
+Herdr v0.9.3 closes the connection after each JSON response to
+`session.snapshot` and `report_metadata`. The daemon SHALL open a new
+connection for each of those requests and SHALL treat end-of-file after a
+complete response as normal. Before each connect it SHALL read the socket's
+device and inode and SHALL stop without connecting when either value differs
+from the identity pinned at startup. A changed device or inode is a replaced
+server, including a Herdr restart. The absolute path and control nonce name
+the session; they do not by themselves prove the pinned inode.
+
+Frame deadlines SHALL use non-blocking I/O and `poll` against one monotonic
+deadline. The daemon SHALL NOT apply those deadlines with `setsockopt`. On
+macOS, `setsockopt` on a socket the peer has closed returns `EINVAL`. `fcntl`
+SHALL be limited to the local descriptor, and the following read or write
+SHALL observe buffered bytes, end-of-file, or the real error after `poll`
+returns.
+
 #### Scenario: Startup and focus race
 - **WHEN** startup ensure, focus ensure, and start run concurrently for one socket
 - **THEN** one daemon retains the lock and the other calls succeed as no-ops
