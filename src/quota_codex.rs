@@ -456,13 +456,28 @@ impl Rpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn wait_for_pid(path: &std::path::Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(pid) = fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+                .filter(|pid| *pid > 0)
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "test PID handshake timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn shutdown_reaps_inflight_app_server_without_waiting_for_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("blocked-codex");
         fs::write(
             &script,
-            "#!/bin/sh\necho $$ > \"$CODEX_HOME/pid\"\nexec sleep 30\n",
+            "#!/bin/sh\n: > \"$CODEX_HOME/pid\"\n/bin/sleep 0.2\necho $$ > \"$CODEX_HOME/pid\"\nexec sleep 30\n",
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -472,16 +487,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             read_with_control(&home, MAX_TIMEOUT, Command::new(script), &query_control)
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !dir.path().join("pid").exists() {
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        let pid: i32 = fs::read_to_string(dir.path().join("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = wait_for_pid(&dir.path().join("pid"));
         let started = Instant::now();
         control.stop();
         assert!(handle.join().unwrap().is_err());
@@ -542,11 +548,7 @@ mod tests {
         }
 
         fn assert_reaped(&self) {
-            let pid: i32 = fs::read_to_string(self.dir.path().join("pid"))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            let pid = wait_for_pid(&self.dir.path().join("pid"));
             // SAFETY: signal zero only tests whether this synthetic child still exists.
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));

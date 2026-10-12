@@ -767,6 +767,18 @@ mod tests {
         }
     }
 
+    fn wait_for_pid(path: &std::path::Path) -> i32 {
+        let mut pid = None;
+        wait_until(|| {
+            pid = fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+                .filter(|pid| *pid > 0);
+            pid.is_some()
+        });
+        pid.unwrap()
+    }
+
     #[test]
     fn stop_does_not_join_http_and_reaps_codex_app_server() {
         use std::os::unix::fs::PermissionsExt;
@@ -776,22 +788,15 @@ mod tests {
         let script = bin.join("codex");
         fs::write(
             &script,
-            "#!/bin/sh\necho $$ > \"$CODEX_HOME/app-server-pid\"\nexec /bin/sleep 30\n",
+            "#!/bin/sh\n: > \"$CODEX_HOME/app-server-pid\"\n/bin/sleep 0.2\necho $$ > \"$CODEX_HOME/app-server-pid\"\nexec /bin/sleep 30\n",
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
         let mut command = child_command();
         command.env("LINEUP_TEST_QUOTA_STOP", "1").env("PATH", &bin);
         ensure_command(&options, command).unwrap();
-        wait_until(|| {
-            options.state.join("app-server-pid").exists()
-                && options.state.join("http-entered").exists()
-        });
-        let pid: i32 = fs::read_to_string(options.state.join("app-server-pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = wait_for_pid(&options.state.join("app-server-pid"));
+        wait_until(|| options.state.join("http-entered").exists());
         let started = Instant::now();
         let result = stop(&options);
         let elapsed = started.elapsed();
@@ -895,7 +900,7 @@ mod tests {
         let (_dir, options, done, server) = fixture();
         let winning_options = options.clone();
         let winner = std::thread::spawn(move || {
-            wait_until(|| winning_options.state.join("released").exists());
+            let pid = wait_for_pid(&winning_options.state.join("released"));
             let paths = RuntimePaths::new(&winning_options.state, &winning_options.socket).unwrap();
             let mut lock = None;
             wait_until(|| {
@@ -904,10 +909,6 @@ mod tests {
             });
             fs::write(winning_options.state.join("winner-locked"), "").unwrap();
             wait_until(|| winning_options.state.join("contended").exists());
-            let pid: i32 = fs::read_to_string(winning_options.state.join("released"))
-                .unwrap()
-                .parse()
-                .unwrap();
             // Readiness is withheld until ensure has reaped the losing child.
             // Thus success cannot bypass the child-exit branch under test.
             wait_until(|| unsafe { libc::kill(pid, 0) } < 0
