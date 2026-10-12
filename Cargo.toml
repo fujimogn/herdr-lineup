@@ -11,6 +11,7 @@ keywords = ["herdr", "plugin", "sidebar", "agents", "usage"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]
