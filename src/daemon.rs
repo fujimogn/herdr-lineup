@@ -23,6 +23,24 @@ use std::{
 pub const PLUGIN_ID: &str = "herdr-lineup";
 const START_DEADLINE: Duration = Duration::from_secs(5);
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const LOCK_CONTENDED_EXIT_CODE: u8 = 75;
+
+#[derive(Debug)]
+pub(crate) struct StartupLockContention;
+impl std::fmt::Display for StartupLockContention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("another daemon owns this session lock")
+    }
+}
+impl std::error::Error for StartupLockContention {}
+
+fn startup_lock_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        io::Error::new(io::ErrorKind::WouldBlock, StartupLockContention)
+    } else {
+        error
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -85,8 +103,9 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
     let endpoint = EndpointIdentity::read(&options.socket)?;
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let deadline = Instant::now() + START_DEADLINE;
+    let mut may_spawn = true;
     loop {
-        if let Some(lock) = SessionLock::acquire(&paths)? {
+        if may_spawn && let Some(lock) = SessionLock::acquire(&paths)? {
             // A reused PID record is never inspected or signalled. Stale control
             // paths are removed only after exclusive session ownership is acquired.
             let log = OpenOptions::new()
@@ -132,7 +151,14 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
                     }
                     return Err(io::Error::other("daemon endpoint identity mismatch"));
                 }
-                if child.try_wait()?.is_some() {
+                if let Some(status) = child.try_wait()? {
+                    if status.code() == Some(i32::from(LOCK_CONTENDED_EXIT_CODE)) {
+                        // Only the typed lock-acquisition failure uses this
+                        // status. Wait for the winner; do not spawn another
+                        // child or reuse pre_exec's transferred descriptor.
+                        may_spawn = false;
+                        break;
+                    }
                     return Err(io::Error::other(
                         "daemon exited before readiness; inspect session daemon.log",
                     ));
@@ -183,10 +209,10 @@ pub fn run_foreground(
     let config = Config::load(&options.config)?;
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let _lock = if inherited {
-        SessionLock::inherited(&paths)?
+        SessionLock::inherited(&paths).map_err(startup_lock_error)?
     } else {
         SessionLock::acquire(&paths)?
-            .ok_or_else(|| io::Error::other("daemon already owns this session"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, StartupLockContention))?
     };
     let mut transport = Transport::connect(&options.socket)?;
     if inherited {
@@ -530,8 +556,103 @@ mod tests {
     fn child_entry() {
         if std::env::var_os("LINEUP_INHERITED_LOCK").is_some() {
             let options = Options::from_env().unwrap();
+            if std::env::var_os("LINEUP_TEST_FAIL_STARTUP").is_some() {
+                let error = io::Error::new(io::ErrorKind::WouldBlock, "synthetic socket failure");
+                std::process::exit(i32::from(crate::failure_exit_code(&error)));
+            }
+            if std::env::var_os("LINEUP_TEST_CONTEND").is_some() {
+                // Reproduce a failed inherited-lock claim after a competitor
+                // wins the session. Every handshake is a bounded condition wait.
+                assert_eq!(unsafe { libc::close(3) }, 0);
+                fs::write(
+                    options.state.join("released"),
+                    std::process::id().to_string(),
+                )
+                .unwrap();
+                wait_until(|| options.state.join("winner-locked").exists());
+                // The path still matches, but this independent description
+                // cannot inherit ownership once the winner holds the flock.
+                let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&paths.lock)
+                    .unwrap();
+                use std::os::fd::IntoRawFd;
+                let descriptor = file.into_raw_fd();
+                if descriptor != 3 {
+                    assert_eq!(unsafe { libc::dup2(descriptor, 3) }, 3);
+                    assert_eq!(unsafe { libc::close(descriptor) }, 0);
+                }
+                let error = run_foreground(&options, true, &mut NoopPublisher).unwrap_err();
+                fs::write(options.state.join("contended"), error.to_string()).unwrap();
+                std::process::exit(i32::from(crate::failure_exit_code(&error)));
+            }
             run_foreground(&options, true, &mut NoopPublisher).unwrap();
         }
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + START_DEADLINE;
+        while !condition() {
+            assert!(Instant::now() < deadline, "test handshake timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn ensure_waits_for_winner_after_its_child_loses_the_session_lock() {
+        let (_dir, options, done, server) = fixture();
+        let winning_options = options.clone();
+        let winner = std::thread::spawn(move || {
+            wait_until(|| winning_options.state.join("released").exists());
+            let paths = RuntimePaths::new(&winning_options.state, &winning_options.socket).unwrap();
+            let mut lock = None;
+            wait_until(|| {
+                lock = SessionLock::acquire(&paths).unwrap();
+                lock.is_some()
+            });
+            fs::write(winning_options.state.join("winner-locked"), "").unwrap();
+            wait_until(|| winning_options.state.join("contended").exists());
+            let pid: i32 = fs::read_to_string(winning_options.state.join("released"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            // Readiness is withheld until ensure has reaped the losing child.
+            // Thus success cannot bypass the child-exit branch under test.
+            wait_until(|| unsafe { libc::kill(pid, 0) } < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+            drop(lock);
+            run_foreground(&winning_options, false, &mut NoopPublisher).unwrap();
+        });
+        let mut command = child_command();
+        command.env("LINEUP_TEST_CONTEND", "1");
+        let result = ensure_command(&options, command);
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| probe(&paths, &options.socket).ok().flatten().is_some());
+        stop(&options).unwrap();
+        winner.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "losing ensure rejected the winner: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_rejects_a_child_socket_failure_instead_of_waiting_for_a_winner() {
+        let (_dir, options, done, server) = fixture();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_FAIL_STARTUP", "1");
+        let error = ensure_command(&options, command).unwrap_err();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .starts_with("daemon exited before readiness")
+        );
     }
     #[test]
     fn ensure_waits_for_a_busy_control_endpoint_within_startup_deadline() {

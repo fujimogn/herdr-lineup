@@ -95,7 +95,33 @@ pub fn run() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
-            ExitCode::FAILURE
+            ExitCode::from(failure_exit_code(&error))
         }
+    }
+}
+
+pub(crate) fn failure_exit_code(error: &std::io::Error) -> u8 {
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<daemon::StartupLockContention>())
+    {
+        daemon::LOCK_CONTENDED_EXIT_CODE
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ordinary_socket_and_publisher_would_block_errors_are_not_lock_contention() {
+        for message in ["socket read stalled", "publisher write stalled"] {
+            let error = std::io::Error::new(std::io::ErrorKind::WouldBlock, message);
+            assert_eq!(super::failure_exit_code(&error), 1);
+        }
+        assert_eq!(
+            super::failure_exit_code(&std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            1
+        );
     }
 }
