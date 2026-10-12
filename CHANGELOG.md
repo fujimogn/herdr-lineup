@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in `non_first_pane_logo_indent` (0..=16, default 0) to align agent rows
+  when the repository heading occupies the first pane's first row. Only later
+  panes' `lineup_logo` values receive U+2800 padding, following snapshot order.
+
 - Rust crate and command-line scaffold for the planned Lineup sidebar publisher.
 - Herdr manifest with startup, workspace-focus recovery, and explicit actions.
 - Library scaffold with declared runtime modules.

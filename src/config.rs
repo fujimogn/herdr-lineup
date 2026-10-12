@@ -10,6 +10,7 @@ pub struct Config {
     pub reader_timeout_ms: u64,
     pub usage_max_age_ms: u64,
     pub logo_mode: String,
+    pub non_first_pane_logo_indent: u8,
     pub providers: Vec<String>,
     pub allow_network: bool,
 }
@@ -20,6 +21,7 @@ impl Default for Config {
             reader_timeout_ms: 2000,
             usage_max_age_ms: 60000,
             logo_mode: "auto".into(),
+            non_first_pane_logo_indent: 0,
             providers: ["claude", "codex", "grok", "agy", "kimi", "hermes"]
                 .map(String::from)
                 .to_vec(),
@@ -65,6 +67,9 @@ impl Config {
         if !["auto", "font", "text"].contains(&self.logo_mode.as_str()) {
             return invalid("logo_mode must be auto, font, or text");
         }
+        if self.non_first_pane_logo_indent > 16 {
+            return invalid("non_first_pane_logo_indent must be 0..=16");
+        }
         let mut unique = HashSet::new();
         if self.providers.iter().any(|p| {
             !["claude", "codex", "grok", "agy", "kimi", "hermes"].contains(&p.as_str())
@@ -82,6 +87,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logo_indent_is_opt_in_and_bounded() {
+        assert_eq!(Config::parse("").unwrap().non_first_pane_logo_indent, 0);
+        for count in [0, 2, 16] {
+            let config = Config::parse(&format!("non_first_pane_logo_indent = {count}")).unwrap();
+            assert_eq!(config.non_first_pane_logo_indent, count);
+        }
+        for value in ["-1", "17", "1.5", "'2'", "true"] {
+            assert!(Config::parse(&format!("non_first_pane_logo_indent = {value}")).is_err());
+        }
+    }
 
     #[test]
     fn absent_config_uses_defaults_without_creating_a_file() {

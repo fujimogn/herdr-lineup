@@ -72,6 +72,22 @@ installed or linked plugin with:
 herdr plugin config-dir herdr-lineup
 ```
 
+`non_first_pane_logo_indent` is an opt-in integer from 0 to 16 (default 0).
+It prefixes only `lineup_logo` on the second and later panes in each workspace
+with that many U+2800 BRAILLE PATTERN BLANK characters, each occupying one
+terminal column. Use this when your sidebar places the repository heading on
+the first pane's first row: Herdr v0.9.3 indents later entry rows two columns
+more deeply, so `2` aligns the agent rows:
+
+```toml
+non_first_pane_logo_indent = 2
+```
+
+The first pane follows the order in `session.snapshot`'s `panes` array within
+each workspace, including panes without a supported agent. Each refresh
+recomputes that order. A value of 0 preserves the original token bytes; no
+other token changes. Missing or unsupported logos remain cleared.
+
 Sidebar rows are added by hand or through the explicit, opt-in `configure`
 action. Startup does not edit the user's Herdr configuration. Configuration
 edits use marker comments and a backup, preserving unrelated settings.

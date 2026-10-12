@@ -296,7 +296,13 @@ impl MetadataPublisher {
             _ => tokens::LogoMode::Auto,
         };
         let mut failed = false;
+        let mut seen_workspaces = BTreeSet::new();
+        // parse_snapshot preserves the wire snapshot.panes array order. The first
+        // record for each workspace is its first pane, even if it has no supported
+        // agent. Do not sort pane IDs or filter occupants before this decision.
+        // Recompute on every snapshot so a pane reorder moves the indentation.
         for pane in &snapshot.panes {
+            let first_pane = seen_workspaces.insert(pane.workspace_id.as_str());
             let occupant = pane.occupant.clone().filter(|who| {
                 config
                     .providers
@@ -366,7 +372,7 @@ impl MetadataPublisher {
                         .and_then(|age| i64::try_from(age.as_secs()).ok()),
                 })
             });
-            let desired = tokens::pane_tokens(
+            let mut desired = tokens::pane_tokens(
                 &tokens::PaneInput {
                     pane_id: pane.pane_id.clone(),
                     occupant: occupant.clone(),
@@ -377,6 +383,15 @@ impl MetadataPublisher {
                 false,
                 now_unix,
             );
+            if !first_pane
+                && config.non_first_pane_logo_indent != 0
+                && let Some(Some(logo)) = desired.get_mut("lineup_logo")
+            {
+                logo.insert_str(
+                    0,
+                    &"\u{2800}".repeat(usize::from(config.non_first_pane_logo_indent)),
+                );
+            }
             let resource = self.resource(ResourceKind::Pane, &pane.pane_id);
             if let Err(error) = self.report(
                 transport,
@@ -541,6 +556,120 @@ mod tests {
     };
 
     #[test]
+    fn logo_indent_tracks_snapshot_order_and_changes_only_logos() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server =
+            std::thread::spawn(move || {
+                let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+                let original = [
+                    ("w1:p10", "w1"),
+                    ("w2:p9", "w2"),
+                    ("w1:p2", "w1"),
+                    ("w2:p3", "w2"),
+                ];
+                let reordered = [original[2], original[1], original[0], original[3]];
+                let mut cycles = Vec::new();
+                for (order, count) in [(original, 6), (original, 2), (reordered, 2), (reordered, 2)]
+                {
+                    let request = receive(&mut stream);
+                    let panes: Vec<_> = order.iter().map(|(pane, workspace)| json!({
+                    "pane_id":pane, "workspace_id":workspace, "agent":"kimi", "agent_status":"idle"
+                })).collect();
+                    writeln!(stream.get_mut(), "{}", json!({"id":request["id"],"result":{
+                    "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                    "panes":panes,"workspaces":[{"workspace_id":"w1"},{"workspace_id":"w2"}]}
+                }})).unwrap();
+                    let mut reports = BTreeMap::new();
+                    for _ in 0..count {
+                        let report = receive(&mut stream);
+                        writeln!(
+                            stream.get_mut(),
+                            "{}",
+                            json!({"id":report["id"],"result":{"type":"ok"}})
+                        )
+                        .unwrap();
+                        if let Some(pane) = report["params"]["pane_id"].as_str() {
+                            reports.insert(pane.to_owned(), report["params"]["tokens"].clone());
+                        }
+                    }
+                    cycles.push(reports);
+                }
+                cycles
+            });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let mut config = Config::default();
+        publisher.refresh(&mut transport, &config).unwrap();
+        config.non_first_pane_logo_indent = 2;
+        publisher.refresh(&mut transport, &config).unwrap();
+        publisher.refresh(&mut transport, &config).unwrap();
+        config.non_first_pane_logo_indent = 0;
+        publisher.refresh(&mut transport, &config).unwrap();
+        let cycles = server.join().unwrap();
+        let expected = tokens::pane_tokens(
+            &tokens::PaneInput {
+                occupant: Some(tokens::Occupant {
+                    agent: Agent::Kimi,
+                    native_session: None,
+                }),
+                state: Some("idle".into()),
+                ..Default::default()
+            },
+            tokens::LogoMode::Auto,
+            false,
+            0,
+        );
+        let baseline = protocol::metadata_request(
+            "baseline",
+            &tokens::Publisher::default()
+                .prepare(
+                    &ResourceId {
+                        endpoint_session: "fake".into(),
+                        kind: ResourceKind::Pane,
+                        id: "baseline".into(),
+                    },
+                    &tokens::ResourceSnapshot {
+                        exists: true,
+                        ..Default::default()
+                    },
+                    None,
+                    &expected,
+                    0,
+                    5000,
+                )
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()["params"]["tokens"]
+            .clone();
+        for report in cycles[0].values() {
+            assert_eq!(
+                serde_json::to_vec(report).unwrap(),
+                serde_json::to_vec(&baseline).unwrap()
+            );
+        }
+        for (cycle, expected_logos) in [
+            (
+                1,
+                [
+                    ("w1:p2", "\u{2800}\u{2800}Kimi"),
+                    ("w2:p3", "\u{2800}\u{2800}Kimi"),
+                ],
+            ),
+            (2, [("w1:p2", "Kimi"), ("w1:p10", "\u{2800}\u{2800}Kimi")]),
+            (3, [("w1:p10", "Kimi"), ("w2:p3", "Kimi")]),
+        ] {
+            assert_eq!(cycles[cycle].len(), 2);
+            for (pane, logo) in expected_logos {
+                assert_eq!(cycles[cycle][pane], json!({"lineup_logo":logo}));
+            }
+        }
+    }
+
+    #[test]
     fn real_herdr_one_response_per_connection_publishes_heading() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("herdr.sock");
@@ -602,6 +731,78 @@ mod tests {
         let report = report.unwrap();
         assert_eq!(report["method"], "workspace.report_metadata");
         assert_eq!(report["params"]["tokens"]["lineup_repo"], "—");
+    }
+
+    #[test]
+    fn logo_indent_counts_unidentified_panes_and_preserves_null_logos() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let request = receive(&mut stream);
+            let panes: Vec<_> = [
+                ("w1:p9", None),
+                ("w1:p2", Some("kimi")),
+                ("w1:p1", Some("unknown")),
+            ]
+            .iter()
+            .map(|(pane, agent)| {
+                json!({"pane_id":pane,"workspace_id":"w1",
+                    "agent":agent,"agent_status":"idle"})
+            })
+            .collect();
+            writeln!(
+                stream.get_mut(),
+                "{}",
+                json!({"id":request["id"],"result":{
+                    "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                    "panes":panes,"workspaces":[{"workspace_id":"w1"}]}
+                }})
+            )
+            .unwrap();
+            let mut reports = BTreeMap::new();
+            for _ in 0..4 {
+                let report = receive(&mut stream);
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":report["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+                if let Some(pane) = report["params"]["pane_id"].as_str() {
+                    reports.insert(pane.to_owned(), report["params"]["tokens"].clone());
+                }
+            }
+            reports
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        publisher
+            .refresh(
+                &mut transport,
+                &Config {
+                    logo_mode: "font".into(),
+                    non_first_pane_logo_indent: 16,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let reports = server.join().unwrap();
+        assert_eq!(
+            reports["w1:p2"]["lineup_logo"],
+            format!("{}\u{e1a6}", "\u{2800}".repeat(16))
+        );
+        for pane in ["w1:p9", "w1:p1"] {
+            assert!(
+                reports[pane]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(Value::is_null)
+            );
+        }
     }
 
     // Each ordinary Herdr JSON request uses a separate accepted connection.
