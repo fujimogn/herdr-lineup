@@ -43,6 +43,7 @@ pub struct Pane {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
     pub workspace_id: String,
+    pub checkout_path: Option<String>,
     pub stored_keys: BTreeSet<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,8 +148,16 @@ pub fn parse_snapshot(id: &str, response: &Value) -> Result<Snapshot, ProtocolEr
             if !workspace_ids.insert(workspace_id.clone()) {
                 return Err(ProtocolError::MalformedResponse);
             }
+            let checkout_path = match workspace.get("worktree") {
+                None | Some(Value::Null) => None,
+                Some(worktree) if worktree.is_object() => {
+                    Some(nonempty_string(worktree, "checkout_path")?.to_owned())
+                }
+                _ => return Err(ProtocolError::MalformedResponse),
+            };
             Ok(Workspace {
                 workspace_id,
+                checkout_path,
                 stored_keys: stored_keys(workspace)?,
             })
         })
@@ -258,6 +267,24 @@ mod tests {
 
     // Synthetic fixture: socket-api.mdx examples plus the v0.9.3 public
     // schema/session.rs and schema/panes.rs record structure. No live data.
+    #[test]
+    fn workspace_worktree_checkout_is_parsed_and_invalid_paths_rejected() {
+        let mut response = fixture();
+        response["result"]["snapshot"]["workspaces"][0]["worktree"] = json!({
+            "repo_root": "/example/repo", "checkout_path": "/example/checkout"
+        });
+        let parsed = parse_snapshot("snapshot-1", &response).unwrap();
+        assert_eq!(
+            parsed.workspaces[0].checkout_path.as_deref(),
+            Some("/example/checkout")
+        );
+        response["result"]["snapshot"]["workspaces"][0]["worktree"]["checkout_path"] = json!(42);
+        assert_eq!(
+            parse_snapshot("snapshot-1", &response),
+            Err(ProtocolError::MalformedResponse)
+        );
+    }
+
     fn fixture() -> Value {
         json!({"id":"snapshot-1","result":{"type":"session_snapshot","snapshot":{
             "version":"0.9.3","protocol":1,"focused_workspace_id":"w1",

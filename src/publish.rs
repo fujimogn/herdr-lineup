@@ -1,0 +1,829 @@
+//! Durable, session-scoped reconciliation from snapshots to owned metadata.
+
+use crate::{
+    config::Config,
+    daemon,
+    model::{self, UsageReader},
+    protocol,
+    reader_codex::CodexReader,
+    reader_grok::GrokReader,
+    ship_time,
+    socket::Transport,
+    tokens::{self, Agent, ResourceId, ResourceKind},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Clone, Default)]
+pub struct Homes {
+    pub codex: Option<PathBuf>,
+    pub grok: Option<PathBuf>,
+}
+impl Homes {
+    pub fn from_env() -> Self {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute());
+        let provider = |key, default| match std::env::var_os(key) {
+            Some(path) => Some(PathBuf::from(path)).filter(|p| p.is_absolute()),
+            None => home.as_ref().map(|home| home.join(default)),
+        };
+        Self {
+            codex: provider("CODEX_HOME", ".codex"),
+            grok: provider("GROK_HOME", ".grok"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRow {
+    endpoint: String,
+    kind: String,
+    id: String,
+    seq: u64,
+}
+
+pub struct MetadataPublisher {
+    planner: tokens::Publisher,
+    directory: PathBuf,
+    socket_key: String,
+    endpoint: Option<String>,
+    homes: Homes,
+    started: Instant,
+    request_seq: u64,
+    refresh_ms: u64,
+}
+impl MetadataPublisher {
+    /// The daemon holds its session lock before any checkpoint mutation.
+    pub fn new(directory: PathBuf, socket_key: String, homes: Homes) -> io::Result<Self> {
+        let checkpoint = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(directory.join("sequences.json"))
+        {
+            Ok(file) => {
+                let rows: Vec<CheckpointRow> = serde_json::from_reader(file)
+                    .map_err(|_| io::Error::other("invalid sequence checkpoint"))?;
+                let mut checkpoint = BTreeMap::new();
+                for row in rows {
+                    let kind = match row.kind.as_str() {
+                        "pane" => ResourceKind::Pane,
+                        "workspace" => ResourceKind::Workspace,
+                        _ => return Err(io::Error::other("invalid checkpoint resource kind")),
+                    };
+                    let resource = ResourceId {
+                        endpoint_session: row.endpoint,
+                        kind,
+                        id: row.id,
+                    };
+                    if checkpoint.insert(resource, row.seq).is_some() {
+                        return Err(io::Error::other("duplicate checkpoint resource"));
+                    }
+                }
+                checkpoint
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(_) => return Err(io::Error::other("cannot read sequence checkpoint")),
+        };
+        Ok(Self {
+            planner: tokens::Publisher::restore(checkpoint),
+            directory,
+            socket_key,
+            endpoint: None,
+            homes,
+            started: Instant::now(),
+            request_seq: 0,
+            refresh_ms: 5000,
+        })
+    }
+
+    fn persist(&self) -> io::Result<()> {
+        let rows: Vec<_> = self
+            .planner
+            .checkpoint()
+            .into_iter()
+            .map(|(resource, seq)| CheckpointRow {
+                endpoint: resource.endpoint_session,
+                kind: match resource.kind {
+                    ResourceKind::Pane => "pane",
+                    ResourceKind::Workspace => "workspace",
+                }
+                .into(),
+                id: resource.id,
+                seq,
+            })
+            .collect();
+        let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
+        serde_json::to_writer(file.as_file_mut(), &rows)?;
+        file.flush()?;
+        file.as_file().sync_all()?;
+        file.persist(self.directory.join("sequences.json"))
+            .map_err(|_| io::Error::other("cannot persist sequence checkpoint"))?;
+        File::open(&self.directory)?.sync_all()
+    }
+
+    fn request(&mut self, transport: &mut Transport, method: &str) -> io::Result<(String, Value)> {
+        self.request_seq = self
+            .request_seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("request sequence exhausted"))?;
+        let id = format!("lineup-{}", self.request_seq);
+        let response = exchange(transport, &json!({"id":id,"method":method,"params":{}}))?;
+        Ok((id, response))
+    }
+
+    fn snapshot(&mut self, transport: &mut Transport) -> io::Result<protocol::Snapshot> {
+        let identity = transport.identity();
+        let endpoint = format!("{}:{}:{}", self.socket_key, identity.device, identity.inode);
+        if self
+            .endpoint
+            .as_ref()
+            .is_some_and(|previous| previous != &endpoint)
+        {
+            return Err(io::Error::other("publisher endpoint changed"));
+        }
+        self.endpoint = Some(endpoint);
+        let (id, response) = self.request(transport, "session.snapshot")?;
+        protocol::parse_snapshot(&id, &response)
+            .map_err(|_| io::Error::other("invalid snapshot response"))
+    }
+
+    fn resource(&self, kind: ResourceKind, id: &str) -> ResourceId {
+        ResourceId {
+            endpoint_session: self.endpoint.clone().expect("snapshot binds endpoint"),
+            kind,
+            id: id.into(),
+        }
+    }
+
+    fn report(
+        &mut self,
+        transport: &mut Transport,
+        resource: &ResourceId,
+        keys: &BTreeSet<String>,
+        occupant: Option<&tokens::Occupant>,
+        desired: &tokens::Tokens,
+    ) -> io::Result<()> {
+        let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let snapshot = tokens::ResourceSnapshot {
+            exists: true,
+            stored_keys: keys.clone(),
+        };
+        let Some(report) = self
+            .planner
+            .prepare(
+                resource,
+                &snapshot,
+                occupant,
+                desired,
+                now_ms,
+                self.refresh_ms,
+            )
+            .map_err(|error| match error {
+                tokens::PatchError::ResourceCapacity | tokens::PatchError::ReportCapacity => {
+                    io::Error::new(io::ErrorKind::InvalidInput, "metadata capacity exhausted")
+                }
+                _ => io::Error::other("metadata planning failed"),
+            })?
+        else {
+            return Ok(());
+        };
+        // Reserve durably BEFORE the first byte can reach Herdr. Even an ambiguous
+        // response burns this seq; retry/restart must use a strictly newer one.
+        self.persist()?;
+        self.request_seq = self
+            .request_seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("request sequence exhausted"))?;
+        let id = format!("lineup-{}", self.request_seq);
+        let request = protocol::metadata_request(&id, &report)
+            .map_err(|_| io::Error::other("invalid metadata request"))?;
+        let response = exchange(transport, &request)?;
+        let result = protocol::response_result(&id, &response)
+            .map_err(|_| io::Error::other("metadata report rejected"))?;
+        if result.get("type").and_then(Value::as_str) != Some("ok") {
+            return Err(io::Error::other("invalid metadata acknowledgement"));
+        }
+        self.planner
+            .acknowledge(&report, now_ms)
+            .map_err(|_| io::Error::other("invalid metadata reservation"))?;
+        self.persist()
+    }
+
+    fn reconcile_missing(&mut self, snapshot: &protocol::Snapshot) {
+        let live: BTreeSet<_> =
+            snapshot
+                .panes
+                .iter()
+                .map(|pane| self.resource(ResourceKind::Pane, &pane.pane_id))
+                .chain(snapshot.workspaces.iter().map(|workspace| {
+                    self.resource(ResourceKind::Workspace, &workspace.workspace_id)
+                }))
+                .collect();
+        for resource in self.planner.checkpoint().keys() {
+            if resource.endpoint_session == self.endpoint.as_deref().unwrap_or("")
+                && !live.contains(resource)
+            {
+                let _ = self.planner.prepare(
+                    resource,
+                    &tokens::ResourceSnapshot::default(),
+                    None,
+                    &tokens::Tokens::new(),
+                    0,
+                    self.refresh_ms,
+                );
+            }
+        }
+    }
+
+    fn refresh_with_readers(
+        &mut self,
+        transport: &mut Transport,
+        config: &Config,
+        codex: &dyn UsageReader,
+        grok: &dyn UsageReader,
+    ) -> io::Result<()> {
+        config.validate()?;
+        self.refresh_ms = config.refresh_interval_ms;
+        let snapshot = self.snapshot(transport)?;
+        self.reconcile_missing(&snapshot);
+        let now = SystemTime::now();
+        let now_unix = unix(now);
+        // A single budget for the cycle prevents N panes multiplying the reader wait.
+        let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
+        let mode = match config.logo_mode.as_str() {
+            "font" => tokens::LogoMode::Font,
+            "text" => tokens::LogoMode::Text,
+            _ => tokens::LogoMode::Auto,
+        };
+        let mut failed = false;
+        for pane in &snapshot.panes {
+            let occupant = pane.occupant.clone().filter(|who| {
+                config
+                    .providers
+                    .iter()
+                    .any(|provider| provider == agent_id(who.agent))
+            });
+            let usage = occupant.as_ref().and_then(|who| {
+                let native = who.native_session.as_ref()?;
+                let (provider, home, reader) = match who.agent {
+                    Agent::Codex => (model::Provider::Codex, self.homes.codex.as_ref()?, codex),
+                    Agent::Grok => (model::Provider::Grok, self.homes.grok.as_ref()?, grok),
+                    _ => return None,
+                };
+                // Snapshot has no pane-specific home/profile. Only the injected daemon
+                // home is searched, with an exact native id; never infer by cwd or use
+                // another session when a different pane profile is inaccessible.
+                let identity = model::SessionIdentity {
+                    provider,
+                    native_session_id: native.clone(),
+                    repository_identity: pane.cwd.clone().unwrap_or_default(),
+                };
+                let request = model::ReadRequest {
+                    identity: &identity,
+                    home,
+                    now,
+                    max_age: Duration::from_millis(config.usage_max_age_ms),
+                    timeout: deadline.saturating_duration_since(Instant::now()),
+                };
+                let reading = reader.read(&request);
+                if reading.identity != identity {
+                    return None;
+                }
+                Some(tokens::Usage {
+                    occupant: who.clone(),
+                    context_pct: match reading.context {
+                        model::UsageOutcome::Available(value) => Some(value),
+                        _ => None,
+                    },
+                    // All weekly adapters remain unsupported in v1.
+                    weekly_remaining_pct: None,
+                    weekly_reset_unix: None,
+                })
+            });
+            let desired = tokens::pane_tokens(
+                &tokens::PaneInput {
+                    occupant: occupant.clone(),
+                    state: Some(pane.state.clone()),
+                    usage,
+                },
+                mode,
+                false,
+                now_unix,
+            );
+            let resource = self.resource(ResourceKind::Pane, &pane.pane_id);
+            if let Err(error) = self.report(
+                transport,
+                &resource,
+                &pane.stored_keys,
+                occupant.as_ref(),
+                &desired,
+            ) {
+                if error.kind() == io::ErrorKind::InvalidInput {
+                    failed = true;
+                    continue;
+                }
+                // Do not continue I/O after an ambiguous response: reconnect/reconcile.
+                return Err(error);
+            }
+        }
+        let local_now = chrono::Local::now();
+        for workspace in &snapshot.workspaces {
+            let panes: Vec<_> = snapshot
+                .panes
+                .iter()
+                .filter(|pane| pane.workspace_id == workspace.workspace_id)
+                .map(|pane| (pane.pane_id.as_str(), pane.cwd.as_deref().map(Path::new)))
+                .collect();
+            let cwd = ship_time::resolve_workspace_cwd(
+                workspace.checkout_path.as_deref().map(Path::new),
+                &panes,
+            );
+            let repository = cwd.and_then(ship_time::read_repository);
+            let ship = repository.as_ref().and_then(|repo| repo.ship_unix);
+            let desired = BTreeMap::from([
+                (
+                    "lineup_repo".into(),
+                    Some(
+                        repository
+                            .map(|repo| repo.name)
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                ),
+                ("lineup_ship_unix".into(), ship.map(|unix| unix.to_string())),
+                (
+                    "lineup_ship_text".into(),
+                    Some(ship_time::format_ship_time(ship, &local_now)),
+                ),
+            ]);
+            let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
+            if let Err(error) =
+                self.report(transport, &resource, &workspace.stored_keys, None, &desired)
+            {
+                if error.kind() != io::ErrorKind::InvalidInput {
+                    return Err(error);
+                }
+                failed = true;
+            }
+        }
+        if failed {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metadata capacity exhausted; affected resources skipped",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl daemon::Publisher for MetadataPublisher {
+    fn refresh(&mut self, transport: &mut Transport, config: &Config) -> io::Result<()> {
+        self.refresh_with_readers(transport, config, &CodexReader, &GrokReader)
+    }
+    fn clear(&mut self, transport: &mut Transport) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let snapshot = self.snapshot(transport)?;
+        for pane in snapshot.panes {
+            check_clear_deadline(deadline)?;
+            let resource = self.resource(ResourceKind::Pane, &pane.pane_id);
+            let desired = tokens::PANE_KEYS
+                .iter()
+                .map(|key| ((*key).into(), None))
+                .collect();
+            self.report(transport, &resource, &pane.stored_keys, None, &desired)?;
+        }
+        for workspace in snapshot.workspaces {
+            check_clear_deadline(deadline)?;
+            let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
+            let desired = tokens::WORKSPACE_KEYS
+                .iter()
+                .map(|key| ((*key).into(), None))
+                .collect();
+            self.report(transport, &resource, &workspace.stored_keys, None, &desired)?;
+        }
+        Ok(())
+    }
+    fn reconnected(&mut self) {
+        self.planner = tokens::Publisher::restore(self.planner.checkpoint());
+    }
+}
+
+fn check_clear_deadline(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "metadata clear deadline reached; remaining keys will expire",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn exchange(transport: &mut Transport, request: &Value) -> io::Result<Value> {
+    transport.send_line(&serde_json::to_vec(request)?)?;
+    serde_json::from_slice(&transport.receive_line()?)
+        .map_err(|_| io::Error::other("invalid Herdr JSON response"))
+}
+fn unix(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
+}
+fn agent_id(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Claude => "claude",
+        Agent::Codex => "codex",
+        Agent::Grok => "grok",
+        Agent::Agy => "agy",
+        Agent::Kimi => "kimi",
+        Agent::Hermes => "hermes",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{daemon::Publisher as _, model::*, socket::Transport};
+    use serde_json::{Value, json};
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+        time::Duration,
+    };
+
+    struct TimeoutReader;
+    impl UsageReader for TimeoutReader {
+        fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+            UsageReading::missing(request, SourceKind::CodexRollout, MissingReason::Timeout)
+        }
+    }
+
+    struct SampleReader;
+    impl UsageReader for SampleReader {
+        fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+            UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now)
+        }
+    }
+
+    fn snapshot(id: &Value, agent: bool) -> Value {
+        json!({"id": id, "result": {"type": "session_snapshot", "snapshot": {
+            "version": "0.9.3", "protocol": 17,
+            "workspaces": [{"workspace_id": "w1", "tokens": {}}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1",
+                "agent": if agent { Some("codex") } else { None },
+                "agent_session": {"agent":"codex", "kind":"id", "value":"synthetic-session"},
+                "agent_status":"working", "tokens":{"lineup_context_pct":"old"}}]
+        }}})
+    }
+
+    #[test]
+    fn daemon_hook_publishes_missing_usage_heading_and_clears_on_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::daemon::Options {
+            socket: dir.path().join("fake.sock"),
+            state: dir.path().join("state"),
+            config: dir.path().join("config"),
+        };
+        let repo = dir.path().join("synthetic-repository");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("HOME", dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00+00:00")
+                .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00+00:00")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "Synthetic fixture",
+        ]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let listener = UnixListener::bind(&options.socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut reports = Vec::new();
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let response = match request["method"].as_str().unwrap() {
+                    "ping" => {
+                        json!({"id":request["id"],"result":{"type":"pong","version":"0.9.3","protocol":17}})
+                    }
+                    "session.snapshot" => {
+                        let mut response = snapshot(&request["id"], true);
+                        response["result"]["snapshot"]["workspaces"][0]["worktree"] =
+                            json!({"checkout_path":repo,"repo_root":repo});
+                        response["result"]["snapshot"]["panes"][0]["cwd"] =
+                            json!("/nonexistent-synthetic-pane");
+                        response
+                    }
+                    "pane.report_metadata" | "workspace.report_metadata" => {
+                        reports.push(request.clone());
+                        json!({"id":request["id"],"result":{"type":"ok"}})
+                    }
+                    _ => panic!("unexpected synthetic request"),
+                };
+                writeln!(stream.get_mut(), "{response}").unwrap();
+            }
+            reports
+        });
+        let paths = crate::lock::RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let publisher = MetadataPublisher::new(
+            paths.root.clone(),
+            paths.key.clone(),
+            Homes {
+                codex: Some(dir.path().join("empty-codex-home")),
+                grok: Some(dir.path().join("empty-grok-home")),
+            },
+        )
+        .unwrap();
+        let daemon_options = options.clone();
+        let daemon = std::thread::spawn(move || {
+            let mut publisher = publisher;
+            crate::daemon::run_foreground(&daemon_options, false, &mut publisher).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if crate::daemon::probe(&paths, &options.socket)
+                .ok()
+                .flatten()
+                .is_some_and(|health| health.last_refresh_ms.is_some())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        crate::daemon::stop(&options).unwrap();
+        daemon.join().unwrap();
+        let reports = server.join().unwrap();
+        assert_eq!(reports.len(), 4);
+        assert_eq!(reports[0]["params"]["tokens"]["lineup_context_text"], "—");
+        assert_eq!(
+            reports[1]["params"]["tokens"]["lineup_repo"],
+            "synthetic-repository"
+        );
+        assert_eq!(
+            reports[1]["params"]["tokens"]["lineup_ship_unix"],
+            "1767225600"
+        );
+        assert!(reports[2..].iter().all(|request| {
+            request["params"]["tokens"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(Value::is_null)
+        }));
+        assert!(paths.root.join("sequences.json").exists());
+    }
+
+    #[test]
+    fn rejected_report_burns_sequence_and_clear_preserves_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut reports = Vec::new();
+            for cycle in 0..3 {
+                let request = receive(&mut stream);
+                let response = snapshot(&request["id"], true);
+                writeln!(stream.get_mut(), "{response}").unwrap();
+                for _ in 0..if cycle == 0 { 1 } else { 2 } {
+                    let request = receive(&mut stream);
+                    let response = if cycle == 0 {
+                        json!({"id":request["id"],"error":{"code":"rejected","message":"synthetic rejection"}})
+                    } else {
+                        json!({"id":request["id"],"result":{"type":"ok"}})
+                    };
+                    writeln!(stream.get_mut(), "{response}").unwrap();
+                    reports.push(request);
+                }
+            }
+            reports
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let config = crate::config::Config::default();
+        assert!(publisher.refresh(&mut transport, &config).is_err());
+        publisher.refresh(&mut transport, &config).unwrap();
+        publisher.clear(&mut transport).unwrap();
+        let reports = server.join().unwrap();
+        assert_eq!(reports[0]["params"]["seq"], 1);
+        assert_eq!(reports[1]["params"]["seq"], 2);
+        assert_eq!(reports[3]["params"]["seq"], 3);
+        for request in &reports[3..] {
+            let tokens = request["params"]["tokens"].as_object().unwrap();
+            assert!(tokens.values().all(Value::is_null));
+            assert!(tokens.keys().all(|key| key.starts_with("lineup_")));
+        }
+    }
+
+    #[test]
+    fn failed_reservation_persistence_sends_no_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let request = receive(&mut stream);
+            writeln!(stream.get_mut(), "{}", snapshot(&request["id"], true)).unwrap();
+            let mut line = String::new();
+            assert!(stream.read_line(&mut line).is_err());
+            assert!(line.is_empty());
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().join("missing-state"),
+            "fake".into(),
+            Homes::default(),
+        )
+        .unwrap();
+        assert!(
+            publisher
+                .refresh(&mut transport, &crate::config::Config::default())
+                .is_err()
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn capacity_failure_skips_pane_and_still_publishes_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let request = receive(&mut stream);
+            let mut response = snapshot(&request["id"], true);
+            response["result"]["snapshot"]["panes"][0]["tokens"] = Value::Object(
+                (0..32)
+                    .map(|i| (format!("other_{i}"), json!("preserve")))
+                    .collect(),
+            );
+            writeln!(stream.get_mut(), "{response}").unwrap();
+            let request = receive(&mut stream);
+            assert_eq!(request["method"], "workspace.report_metadata");
+            writeln!(
+                stream.get_mut(),
+                "{}",
+                json!({"id":request["id"],"result":{"type":"ok"}})
+            )
+            .unwrap();
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        assert!(
+            publisher
+                .refresh(&mut transport, &crate::config::Config::default())
+                .is_err()
+        );
+        server.join().unwrap();
+    }
+
+    fn receive(stream: &mut BufReader<std::os::unix::net::UnixStream>) -> Value {
+        let mut line = String::new();
+        stream.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn fake_socket_publishes_clears_and_restores_durable_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let home = dir.path().join("empty-home");
+        std::fs::create_dir(&home).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let checkpoint = state.join("sequences.json");
+        let server_checkpoint = checkpoint.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut reports = Vec::new();
+            for cycle in 0..3 {
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "session.snapshot");
+                let response = snapshot(&request["id"], cycle != 1);
+                writeln!(stream.get_mut(), "{response}").unwrap();
+                let count = if cycle == 1 { 1 } else { 2 };
+                for _ in 0..count {
+                    line.clear();
+                    stream.read_line(&mut line).unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let rows: Vec<CheckpointRow> =
+                        serde_json::from_slice(&std::fs::read(&server_checkpoint).unwrap())
+                            .unwrap();
+                    assert!(rows.iter().any(|row| row.id
+                        == request["params"][if request["method"] == "pane.report_metadata" {
+                            "pane_id"
+                        } else {
+                            "workspace_id"
+                        }]
+                        && row.seq == request["params"]["seq"]));
+                    let response = json!({"id":request["id"], "result":{"type":"ok"}});
+                    writeln!(stream.get_mut(), "{response}").unwrap();
+                    reports.push(request);
+                }
+            }
+            reports
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let homes = Homes {
+            codex: Some(home.clone()),
+            grok: Some(home),
+        };
+        let mut publisher =
+            MetadataPublisher::new(state.clone(), "fake-socket".into(), homes.clone()).unwrap();
+        let config = crate::config::Config::default();
+        publisher
+            .refresh_with_readers(&mut transport, &config, &SampleReader, &TimeoutReader)
+            .unwrap();
+        publisher
+            .refresh_with_readers(&mut transport, &config, &TimeoutReader, &TimeoutReader)
+            .unwrap();
+        let mut restarted = MetadataPublisher::new(state, "fake-socket".into(), homes).unwrap();
+        restarted
+            .refresh_with_readers(&mut transport, &config, &TimeoutReader, &TimeoutReader)
+            .unwrap();
+        let reports = server.join().unwrap();
+        assert_eq!(reports[0]["params"]["tokens"]["lineup_agent"], "codex");
+        assert_eq!(reports[0]["params"]["tokens"]["lineup_context_text"], "42%");
+        assert_eq!(reports[0]["params"]["tokens"]["lineup_context_pct"], "42");
+        assert!(reports[3]["params"]["tokens"]["lineup_context_pct"].is_null());
+        assert_eq!(reports[3]["params"]["tokens"]["lineup_context_text"], "—");
+        assert_eq!(reports[1]["method"], "workspace.report_metadata");
+        assert_eq!(
+            reports[2]["params"]["tokens"].as_object().unwrap().len(),
+            12
+        );
+        assert!(
+            reports[2]["params"]["tokens"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(Value::is_null)
+        );
+        assert_eq!(reports[3]["params"]["seq"], 3);
+        assert_eq!(reports[4]["params"]["seq"], 2);
+    }
+}

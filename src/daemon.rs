@@ -47,7 +47,6 @@ impl Options {
 }
 
 /// Implementations must bound I/O and clear only plugin-owned metadata.
-/// This lifecycle assignment intentionally supplies no metadata publisher yet.
 pub trait Publisher {
     fn refresh(&mut self, transport: &mut Transport, config: &Config) -> io::Result<()>;
     fn clear(&mut self, transport: &mut Transport) -> io::Result<()>;
@@ -164,10 +163,16 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
 }
 
 pub fn foreground(options: &Options) -> io::Result<()> {
+    let paths = RuntimePaths::new(&options.state, &options.socket)?;
+    let mut publisher = crate::publish::MetadataPublisher::new(
+        paths.root,
+        paths.key,
+        crate::publish::Homes::from_env(),
+    )?;
     run_foreground(
         options,
         std::env::var_os("LINEUP_INHERITED_LOCK").as_deref() == Some(std::ffi::OsStr::new("3")),
-        &mut NoopPublisher,
+        &mut publisher,
     )
 }
 pub fn run_foreground(
@@ -228,14 +233,19 @@ pub fn run_foreground(
     fs::write(&paths.pid, format!("{}\n", health.pid))?;
     let started = Instant::now();
     let mut refresh_at = Instant::now();
+    let mut reconnect = false;
     loop {
-        if transport.check_connection().is_err() {
+        if reconnect || transport.check_connection().is_err() {
             // The JSON API has no session id. Reconnect only to the original
             // dev/inode; a server restart replaces its socket and stops us.
+            let retrying_refresh = reconnect;
             transport.reconnect_same_endpoint()?;
             doctor::check_transport(&mut transport)?;
             publisher.reconnected();
-            refresh_at = Instant::now();
+            reconnect = false;
+            if !retrying_refresh {
+                refresh_at = Instant::now();
+            }
         }
         if Instant::now() >= refresh_at {
             match publisher.refresh(&mut transport, &config) {
@@ -244,8 +254,15 @@ pub fn run_foreground(
                         Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
                     health.refresh_failed = false;
                 }
-                Err(_) => {
+                Err(error) => {
                     health.refresh_failed = true;
+                    reconnect = error.kind() != io::ErrorKind::InvalidInput;
+                    if error.kind() == io::ErrorKind::InvalidInput {
+                        let _ = writeln!(
+                            log,
+                            "Lineup metadata capacity exhausted; affected resources skipped"
+                        );
+                    }
                     let _ = writeln!(
                         log,
                         "Lineup refresh failed; metadata will expire unless renewed"
