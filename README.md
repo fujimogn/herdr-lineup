@@ -24,10 +24,10 @@ row in [Herdr](https://herdr.dev), alongside each repository's latest local
 
 ## What it does
 
-Lineup shows logos and Herdr state for Claude, Codex, Grok, Antigravity, Kimi,
-and Hermes. Context and weekly quota depend on each provider's available source;
-unavailable usage shows `—`. [Source research](docs/research/usage-sources.md)
-records where each number can come from.
+Each agent row shows the vendor logo, a Herdr state dot, context use as a percentage,
+and weekly remaining quota for Claude, Codex, Grok, Antigravity, Kimi, and
+Hermes. A weekly triplet such as `7d 67% 6d9h` shows the quota period, the share
+remaining, and the time until reset. Unavailable usage shows `—`.
 
 | Agent | Context | Weekly remaining |
 | --- | --- | --- |
@@ -37,24 +37,8 @@ records where each number can come from.
 | Antigravity | Opt-in statusLine observation | Active-model weekly pool from statusLine |
 | Kimi / Hermes | Unavailable | Unavailable |
 
-Each agent row shows the vendor logo, a state dot, context use as a percentage,
-and a weekly quota triplet such as `7d 67% 6d9h`: the quota period, the share
-remaining, and the time until the quota resets. Both displayed percentages use
-at least two digits (`07%`, `7d 07% 6d9h`). Missing context displays `—` followed
-by two U+2800 BRAILLE PATTERN BLANK characters, preserving the three terminal
-cells used by `00%` through `99%` after token whitespace normalization.
-Rounded `100%` (including values at or above 99.5%) stays four cells so full
-context use is visible; the following weekly column moves one cell to the right
-in that case. Weekly remaining `100%` similarly uses three digits; unavailable
-weekly data stays an unpadded `—` at the end of the row.
-
-Cell widths follow the narrow-ambiguous terminal policy: `—` (U+2014), U+2800,
-ASCII digits and `%` each occupy one cell. The
-[Unicode East Asian Width data](https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt)
-classifies U+2014 as Ambiguous (`A`) and U+2800 as Neutral (`N`). Terminals that
-render ambiguous characters as two cells can render `—` two cells wide, so the
-missing-context alignment assumes narrow ambiguous rendering. The tests use a
-fixed cell-width table for this policy, independent of the host locale.
+See [Sidebar tokens](#sidebar-tokens) for display formatting and terminal-cell
+alignment, and [Source research](docs/research/usage-sources.md) for usage inputs.
 
 ## Install
 
@@ -332,6 +316,22 @@ Grok HTTP request (process exit ends it), and it kills/reaps the in-flight Codex
 app-server process group. The existing five-second stop deadline is preserved.
 
 ### Sidebar tokens
+
+Context and weekly remaining percentages use at least two digits (`07%`, `7d 07% 6d9h`). Missing context displays `—` followed
+by two U+2800 BRAILLE PATTERN BLANK characters, preserving the three terminal
+cells used by `00%` through `99%` after token whitespace normalization.
+Rounded `100%` (including values at or above 99.5%) stays four cells so full
+context use is visible; the following weekly column moves one cell to the right
+in that case. Weekly remaining `100%` similarly uses three digits; unavailable
+weekly data stays an unpadded `—` at the end of the row.
+
+Cell widths follow the narrow-ambiguous terminal policy: `—` (U+2014), U+2800,
+ASCII digits and `%` each occupy one cell. The
+[Unicode East Asian Width data](https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt)
+classifies U+2014 as Ambiguous (`A`) and U+2800 as Neutral (`N`). Terminals that
+render ambiguous characters as two cells can render `—` two cells wide, so the
+missing-context alignment assumes narrow ambiguous rendering. The tests use a
+fixed cell-width table for this policy, independent of the host locale.
 
 All tokens use source `herdr-lineup`. Pane reports explicitly target a pane;
 workspace reports explicitly target a workspace. Missing numeric values and
