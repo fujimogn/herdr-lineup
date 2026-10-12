@@ -23,7 +23,7 @@ support only `claude`, `codex`, `grok`, `agy`, `kimi`, and `hermes` in v1.
 | `lineup_context_pct` | Finite unit-less decimal in [0, 100], or cleared | Session-bound context reader |
 | `lineup_context_text` | Rounded integer with at least two digits plus `%`, or `—` | Context percentage |
 | `lineup_weekly_pct` | Finite unit-less remaining percentage in [0, 100], or cleared | Session-bound weekly reader |
-| `lineup_weekly_text` | Rounded integer remaining percentage plus `%`, or `—` | Weekly remaining percentage |
+| `lineup_weekly_text` | `7d` plus rounded remaining percentage and optional reset countdown, or `—` | Weekly remaining percentage and reset timestamp |
 
 Decimals SHALL use ASCII digits, optional decimal point, no whitespace or unit.
 Display rounding SHALL be nearest integer with halves rounded upward. Missing
@@ -33,6 +33,24 @@ consumers SHALL use separate static colors for the five dot token names or
 Herdr's semantic `state_icon`; numeric rules SHALL consume numeric tokens,
 not `%` display strings. Colors and row order are user configuration.
 
+Weekly display SHALL use `7d N%`, with the nearest integer remaining percentage
+and halves rounded upward. When a session-bound reset timestamp is available,
+append a space and the remaining duration: `XdYh` for at least one day, `XhYm`
+for at least one hour, otherwise `Xm`. Duration components SHALL be floored;
+past reset timestamps SHALL show `0m`. Examples are `7d 67% 6d9h`,
+`7d 67% 3h26m`, and `7d 67% 12m`. A missing reset timestamp SHALL omit the
+countdown (`7d 67%`); a missing remaining percentage SHALL show only `—`, even
+if a reset timestamp is available. Current Unix time SHALL be injected into
+formatting so date and duration boundaries can be tested deterministically.
+The separate weekly numeric token SHALL remain unit-less and contain no period
+label or countdown.
+
+#### Scenario: Weekly reset countdown
+- **WHEN** weekly remaining is 67% and reset is six days and nine hours away
+- **THEN** weekly numeric is `67` and weekly text is `7d 67% 6d9h`
+- **AND WHEN** the reset timestamp is unavailable
+- **THEN** weekly numeric remains `67` and weekly text is `7d 67%`
+
 #### Scenario: Partial usage availability
 - **WHEN** a Claude pane is working with context 7.2% and no readable weekly data
 - **THEN** context tokens are `7.2` and `07%`, weekly numeric is cleared, weekly
@@ -41,7 +59,8 @@ not `%` display strings. Colors and row order are user configuration.
 
 #### Scenario: Measured zero and full context
 - **WHEN** context is 100% and weekly remaining is a measured 0%
-- **THEN** context text is `100%` and weekly numeric/text are `0` and `0%`,
+- **THEN** context text is `100%` and weekly numeric/text are `0` and `7d 0%`
+  when the reset timestamp is unavailable,
   distinguishable from unavailable data
 
 #### Scenario: Occupant replacement
