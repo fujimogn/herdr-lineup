@@ -109,13 +109,14 @@ Permalink shape for a pinned row:
 | [speardragon/herdr-plugin-manager](https://github.com/speardragon/herdr-plugin-manager/tree/e4fef2693728) | Shell | 55 | `e4fef2693728` | `herdr-plugin.toml` | 2026-10-12 |
 | [eliasstravik/herdr-call](https://github.com/eliasstravik/herdr-call/tree/c722bcd58b1c) | TypeScript | 11 | `c722bcd58b1c` | `herdr-plugin.toml` | 2026-10-12 |
 | [BlockedPath/herdr-agent-icons](https://github.com/BlockedPath/herdr-agent-icons/tree/46d199492476) | Shell | 0 | `46d199492476` | `herdr-plugin.toml` | 2026-10-12 |
+| [ogulcancelik/herdr-plugin-examples `agent-telegram-notify`](https://github.com/ogulcancelik/herdr-plugin-examples/blob/main/agent-telegram-notify/herdr-plugin.toml) | JavaScript | not in index | raw `main`, SHA not pinned | `agent-telegram-notify/herdr-plugin.toml` | 2026-10-12 |
+| [ogulcancelik/herdr-plugin-examples `dev-layout-bootstrap`](https://github.com/ogulcancelik/herdr-plugin-examples/blob/main/dev-layout-bootstrap/herdr-plugin.toml) | Lua | not in index | raw `main`, SHA not pinned | `dev-layout-bootstrap/herdr-plugin.toml` | 2026-10-12 |
+| [ogulcancelik/herdr-plugin-examples `github-link-preview`](https://github.com/ogulcancelik/herdr-plugin-examples/blob/main/github-link-preview/herdr-plugin.toml) | Bash | not in index | raw `main`, SHA not pinned | `github-link-preview/herdr-plugin.toml` | 2026-10-12 |
 
-The examples repository also contains JavaScript
-(`agent-telegram-notify`), Lua (`dev-layout-bootstrap`), and Bash
-(`github-link-preview`) manifests. Those three were read from raw `main` on
-the same date. The cookbook README says Herdr does not maintain them as
-official plugins; the plugins doc points at the same repository as examples to
-copy.
+The three cookbook manifests above were read from raw `main` on 2026-10-12.
+The same URL shape was used for `rust-release-check`. The cookbook README says
+Herdr does not maintain them as official plugins; the plugins doc points at
+the same repository as examples to copy. Their commit SHA was not pinned.
 
 Stars are the index field `stars` at `generatedAt`, not a trust score.
 `herdr-plugin-examples` has no index star count because it was not listed.
@@ -356,7 +357,7 @@ should not be rewritten toward a peer that does the opposite.
 | P3 | Keep emitting codepoints without bundling `HerdrAgentIconsMax`. Keep `NOTICE.md` attribution. Do not add `install-font` or a `dist/*.ttf`. | `NOTICE.md`, `README.md` | Radar and icon-agent-ui install fonts. Lineup's design and README already assign the font to the user terminal. |
 | P3 | Keep `id = "herdr-lineup"`. Dotted ids are common and legal. Change the id only if a public install collides. | `herdr-plugin.toml` | The plugins doc accepts both shapes. Renaming after install would orphan config directories. |
 | P4 | Keep the current CI checks. Add `actionlint` when a release workflow lands. `cargo audit` is already a job; `herdr-reviewr` uses a separate `audit.yml`, which is optional. | `.github/workflows/ci.yml` | Lineup's check matrix is already stricter than plugins that only ship `release.yml`. |
-| P4 | Do not add panes or link handlers to imitate review, file-viewer, or hunk-diff. Lineup publishes sidebar metadata. | none | Those sections solve a different entrypoint. Copying them would invent UI the spec does not ask for. |
+| P4 | Do not add panes or link handlers to imitate review, file-viewer, or hunk-diff. Lineup publishes sidebar metadata. | `herdr-plugin.toml` | Those sections solve a different entrypoint. Copying them would invent UI the spec does not ask for. Leave this manifest without `[[panes]]` or `[[link_handlers]]`. |
 
 Items marked P1 that touch release files are listed so the release lane can
 see them. They are outside this assignment's touching path.
