@@ -50,6 +50,8 @@ cargo run --locked -- statusline --help
 | `doctor` | Check local setup and explain missing data. |
 | `configure` | Opt in to adding plugin sidebar rows. |
 | `unconfigure` | Remove only the plugin-managed sidebar rows. |
+| `install-font` | Opt in to installing the bundled icon font and Ghostty/kitty codepoint maps. |
+| `uninstall-font` | Remove only the icon font and codepoint maps that Lineup installed. |
 | `statusline` | Record Claude or Antigravity usage for the sidebar. Prints nothing unless `--then` runs an existing command. |
 
 Herdr actions: `herdr-lineup.start`, `herdr-lineup.stop`,
@@ -60,7 +62,15 @@ For example:
 ```sh
 herdr plugin action invoke herdr-lineup.start
 herdr plugin action invoke herdr-lineup.doctor
+herdr plugin action invoke herdr-lineup.configure
+herdr plugin action invoke herdr-lineup.unconfigure
+herdr plugin action invoke herdr-lineup.install-font
+herdr plugin action invoke herdr-lineup.uninstall-font
 ```
+
+The same commands run directly as `herdr-lineup configure`,
+`herdr-lineup unconfigure`, `herdr-lineup install-font`, and
+`herdr-lineup uninstall-font`. Startup and focus hooks never run them.
 
 ## Configuration
 
@@ -87,6 +97,35 @@ The first pane follows the order in `session.snapshot`'s `panes` array within
 each workspace, including panes without a supported agent. Each refresh
 recomputes that order. A value of 0 preserves the original token bytes; no
 other token changes. Missing or unsupported logos remain cleared.
+
+`logo_mode` chooses the logo bytes. The default is `auto`.
+
+```toml
+logo_mode = "text"
+```
+
+| Value | Logos |
+| --- | --- |
+| `auto` | Text labels until terminal glyph support is affirmatively known. The publisher does not treat font installation as that proof, so `auto` stays on text. |
+| `font` | Vendor glyphs (U+E1A0–U+E1BA). This asserts that the icon font and the terminal codepoint map are already configured. |
+| `text` | ASCII labels: `Claude`, `Codex`, `Grok`, `Antigravity`, `Kimi`, `Hermes`. |
+
+Any other value fails config validation. Stop and start only the Lineup daemon
+after changing it. Do not restart the Herdr server.
+
+These other keys are implemented and optional. Omit `config.toml` to keep the
+defaults. Unknown keys fail validation.
+
+| Key | Default | Bounds |
+| --- | --- | --- |
+| `refresh_interval_ms` | `5000` | Integer 1000–3600000. Sidebar TTL is three times this value. |
+| `reader_timeout_ms` | `2000` | Integer 100–30000, and no greater than `refresh_interval_ms`. |
+| `usage_max_age_ms` | `60000` | Integer at least `refresh_interval_ms` and at most 86400000. |
+| `providers` | `claude`, `codex`, `grok`, `agy`, `kimi`, `hermes` | Unique ids from that list. An empty list publishes no agent rows. Repository headings stay independent. |
+
+```toml
+providers = ["claude", "codex", "grok"]
+```
 
 Sidebar rows are added by hand or through the explicit, opt-in `configure`
 action. Startup does not edit the user's Herdr configuration. Configuration

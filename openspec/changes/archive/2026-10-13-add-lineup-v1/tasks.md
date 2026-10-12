@@ -34,5 +34,5 @@
   and `docs/testing.md`. Workspace heading tokens arrive, stay updated across
   the TTL window, and are gone after stop. A real agent pane stays SKIP because
   the isolated home has no provider authentication.
-- [ ] Document remaining opt-in examples, and archive only after the
+- [x] Document remaining opt-in examples, and archive only after the
   implementation tasks pass.
