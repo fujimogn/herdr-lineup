@@ -3,7 +3,7 @@
 use crate::{
     config::Config,
     doctor,
-    lock::{ProcessExit, RuntimePaths, SessionLock, StartupLockContention},
+    lock::{LifecycleLock, ProcessExit, RuntimePaths, SessionLock, StartupLockContention},
     socket::{EndpointIdentity, Transport, read_frame},
 };
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,7 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
     let endpoint = EndpointIdentity::read(&options.socket)?;
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let deadline = Instant::now() + START_DEADLINE;
+    let _lifecycle = LifecycleLock::acquire(&paths, deadline)?;
     let mut may_spawn = true;
     loop {
         if may_spawn && let Some(lock) = SessionLock::acquire(&paths)? {
@@ -473,8 +474,13 @@ fn probe_starting(paths: &RuntimePaths, socket: &std::path::Path) -> io::Result<
     }
 }
 pub fn stop(options: &Options) -> io::Result<()> {
+    stop_with_lock(options, || {})
+}
+fn stop_with_lock(options: &Options, after_lock: impl FnOnce()) -> io::Result<()> {
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let deadline = Instant::now() + STOP_DEADLINE;
+    let _lifecycle = LifecycleLock::acquire(&paths, deadline)?;
+    after_lock();
     let Some(mut stream) = control_stream(&paths)? else {
         return if SessionLock::is_held(&paths)? {
             Err(io::Error::other(
@@ -883,6 +889,59 @@ mod tests {
             pid.is_some()
         });
         pid.unwrap()
+    }
+
+    #[test]
+    fn ensure_during_pending_stop_starts_exactly_one_successor() {
+        let (_dir, options, done, server) = fixture();
+        ensure_command(&options, child_command()).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let old = probe(&paths, &options.socket).unwrap().unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let stop_options = options.clone();
+        let stopper = std::thread::spawn(move || {
+            stop_with_lock(&stop_options, || {
+                locked_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            })
+        });
+        locked_rx.recv_timeout(START_DEADLINE).unwrap();
+        // Pause stop before connecting so ensures can probe the old daemon.
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let options = options.clone();
+                std::thread::spawn(move || {
+                    let mut command = child_command();
+                    command.env("LINEUP_TEST_RECORD_START", "1");
+                    ensure_command(&options, command)
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+        resume_tx.send(()).unwrap();
+        let stopped = stopper.join().unwrap();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let successor = probe(&paths, &options.socket).ok().flatten();
+        let starts = fs::read_to_string(options.state.join("starts")).unwrap_or_default();
+        stop(&options).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        stopped.unwrap();
+        for result in results {
+            result.unwrap();
+        }
+        let successor = successor.expect("ensure returned but pending stop removed the daemon");
+        assert_ne!(old.pid, successor.pid);
+        assert_eq!(
+            starts.lines().count(),
+            1,
+            "parallel ensures spawned multiple successors"
+        );
+        assert_eq!(starts.trim(), successor.pid.to_string());
     }
 
     #[test]

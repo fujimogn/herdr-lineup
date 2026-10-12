@@ -9,6 +9,7 @@ use std::{
         io::{AsRawFd, FromRawFd},
     },
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 #[derive(Debug)]
@@ -78,6 +79,9 @@ pub struct SessionLock {
 impl SessionLock {
     pub fn acquire(paths: &RuntimePaths) -> io::Result<Option<Self>> {
         paths.create()?;
+        Self::acquire_file(&paths.lock)
+    }
+    fn acquire_file(path: &Path) -> io::Result<Option<Self>> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -85,7 +89,7 @@ impl SessionLock {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(&paths.lock)?;
+            .open(path)?;
         match file.try_lock_exclusive() {
             Ok(()) => Ok(Some(Self { file })),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -144,6 +148,39 @@ impl SessionLock {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(true),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Serialize lifecycle commands separately from the daemon's lifetime flock.
+/// Holding this through stop's process-exit wait prevents ensure from accepting
+/// the old daemon while a shutdown request is being prepared or processed.
+pub(crate) struct LifecycleLock {
+    _lock: SessionLock,
+}
+impl LifecycleLock {
+    pub(crate) fn acquire(paths: &RuntimePaths, deadline: Instant) -> io::Result<Self> {
+        paths.create()?;
+        let path = paths.root.join("lifecycle.lock");
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "daemon lifecycle operation timed out; no signal sent",
+                ));
+            }
+            if let Some(lock) = SessionLock::acquire_file(&path)? {
+                return Ok(Self { _lock: lock });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for LifecycleLock {
+    fn drop(&mut self) {
+        // This lock is never deliberately transferred to a daemon. Release it
+        // even if an unrelated concurrent fork inherited the descriptor.
+        let _ = FileExt::unlock(&self._lock.file);
     }
 }
 
@@ -256,6 +293,26 @@ impl ProcessExit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lifecycle_lock_wait_is_bounded_and_does_not_own_daemon_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path(), Path::new("/synthetic-herdr.sock")).unwrap();
+        let lifecycle =
+            LifecycleLock::acquire(&paths, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert!(SessionLock::acquire(&paths).unwrap().is_some());
+        let started = Instant::now();
+        let error = LifecycleLock::acquire(&paths, started + Duration::from_millis(40))
+            .err()
+            .expect("a concurrent lifecycle operation acquired the lock");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let inherited = lifecycle._lock.file.try_clone().unwrap();
+        drop(lifecycle);
+        LifecycleLock::acquire(&paths, Instant::now() + Duration::from_secs(1)).unwrap();
+        drop(inherited);
+    }
+
     #[test]
     fn paths_are_session_specific_and_require_absolute_socket() {
         let dir = tempfile::tempdir().unwrap();
