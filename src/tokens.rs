@@ -131,7 +131,7 @@ pub fn pane_tokens(row: &PaneInput, mode: LogoMode, font_verified: bool, now_uni
         Some(
             context
                 .map(|value| format!("{:02}%", value.round() as u8))
-                .unwrap_or_else(|| "—".into()),
+                .unwrap_or_else(|| "—\u{2800}\u{2800}".into()),
         ),
     );
     tokens.insert("lineup_weekly_pct".into(), weekly.map(decimal));
@@ -165,7 +165,7 @@ pub fn weekly_text(remaining: Option<f64>, reset_unix: Option<i64>, now_unix: i6
     let Some(remaining) = percentage(remaining) else {
         return "—".into();
     };
-    let mut text = format!("7d {}%", remaining.round() as u8);
+    let mut text = format!("7d {:02}%", remaining.round() as u8);
     if let Some(reset) = reset_unix {
         let seconds = reset.saturating_sub(now_unix).max(0);
         let duration = if seconds >= 86_400 {
@@ -469,6 +469,93 @@ mod tests {
         tokens.get(key).unwrap().as_deref()
     }
 
+    // Unicode 17 EastAsianWidth.txt: U+2014 is A (ambiguous), U+2800 is N
+    // (neutral), and ASCII digits/% are Na (narrow). Use the narrow-ambiguous
+    // terminal policy confirmed for the sidebar, independent of host locale.
+    // https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt
+    // This table covers our display alphabet, not arbitrary Unicode strings.
+    fn terminal_cells(text: &str) -> usize {
+        text.chars()
+            .map(|character| match character {
+                '—' | '\u{2800}' | '0'..='9' | '%' | ' ' | 'd' | 'h' | 'm' | 'e' => 1,
+                '界' => 2,
+                '\u{301}' => 0,
+                _ => panic!("character outside the cell-width fixture: {character:?}"),
+            })
+            .sum()
+    }
+
+    #[test]
+    fn context_missing_and_two_digit_values_have_equal_terminal_cells() {
+        assert_eq!(terminal_cells("—"), 1);
+        assert_eq!(terminal_cells("\u{2800}"), 1);
+        // Controls for the oracle: cell width is not Unicode scalar count.
+        assert_eq!(terminal_cells("界"), 2);
+        assert_eq!(terminal_cells("e\u{301}"), 1);
+        let mut missing_row = row();
+        missing_row.usage = None;
+        let missing = pane_tokens(&missing_row, LogoMode::Text, false, 0);
+        let text = value(&missing, "lineup_context_text").unwrap();
+        assert_eq!(terminal_cells(text), 3);
+        assert_eq!(text, "—\u{2800}\u{2800}");
+        let normalized = normalize_value(Some(text)).unwrap();
+        assert_eq!(normalized, text);
+        assert_eq!(terminal_cells(&normalized), 3);
+        for percent in [0.0, 7.2, 42.0, 99.49] {
+            let mut row = row();
+            row.usage.as_mut().unwrap().context_pct = Some(percent);
+            let tokens = pane_tokens(&row, LogoMode::Text, false, 0);
+            assert_eq!(
+                terminal_cells(value(&tokens, "lineup_context_text").unwrap()),
+                3
+            );
+            assert_eq!(
+                value(&tokens, "lineup_context_pct"),
+                Some(decimal(percent).as_str())
+            );
+        }
+        for percent in [99.5, 100.0] {
+            let mut row = row();
+            row.usage.as_mut().unwrap().context_pct = Some(percent);
+            let tokens = pane_tokens(&row, LogoMode::Text, false, 0);
+            assert_eq!(value(&tokens, "lineup_context_text"), Some("100%"));
+            assert_eq!(
+                terminal_cells(value(&tokens, "lineup_context_text").unwrap()),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn weekly_two_digit_remaining_aligns_countdown_and_preserves_numeric() {
+        for (percent, display) in [
+            (0.0, "00"),
+            (7.2, "07"),
+            (7.5, "08"),
+            (42.0, "42"),
+            (99.49, "99"),
+        ] {
+            let mut row = row();
+            let usage = row.usage.as_mut().unwrap();
+            usage.weekly_remaining_pct = Some(percent);
+            usage.weekly_reset_unix = Some(160);
+            let tokens = pane_tokens(&row, LogoMode::Text, false, 100);
+            let text = value(&tokens, "lineup_weekly_text").unwrap();
+            assert_eq!(text, format!("7d {display}% 1m"));
+            assert_eq!(terminal_cells(text.split("1m").next().unwrap()), 7);
+            assert_eq!(
+                value(&tokens, "lineup_weekly_pct"),
+                Some(decimal(percent).as_str())
+            );
+            assert_eq!(
+                weekly_text(Some(percent), None, 100),
+                format!("7d {display}%")
+            );
+        }
+        assert_eq!(weekly_text(Some(99.5), Some(160), 100), "7d 100% 1m");
+        assert_eq!(weekly_text(None, Some(160), 100), "—");
+    }
+
     #[test]
     fn partial_usage_and_numeric_null_contract() {
         let tokens = pane_tokens(&row(), LogoMode::Text, false, 0);
@@ -484,7 +571,7 @@ mod tests {
         let tokens = pane_tokens(&full, LogoMode::Text, false, 0);
         assert_eq!(value(&tokens, "lineup_context_text"), Some("100%"));
         assert_eq!(value(&tokens, "lineup_weekly_pct"), Some("0"));
-        assert_eq!(value(&tokens, "lineup_weekly_text"), Some("7d 0%"));
+        assert_eq!(value(&tokens, "lineup_weekly_text"), Some("7d 00%"));
     }
 
     #[test]
@@ -557,7 +644,10 @@ mod tests {
             for key in ["lineup_context_pct", "lineup_weekly_pct"] {
                 assert_eq!(value(&tokens, key), None);
             }
-            assert_eq!(value(&tokens, "lineup_context_text"), Some("—"));
+            assert_eq!(
+                value(&tokens, "lineup_context_text"),
+                Some("—\u{2800}\u{2800}")
+            );
         }
         for (percent, expected) in [(0.0, "00%"), (7.49, "07%"), (7.5, "08%"), (99.5, "100%")] {
             let mut row = row();
@@ -601,7 +691,7 @@ mod tests {
         }
         assert_eq!(weekly_text(Some(67.5), None, 100), "7d 68%");
         assert_eq!(weekly_text(None, Some(1000), 100), "—");
-        assert_eq!(weekly_text(Some(0.0), Some(99), 100), "7d 0% 0m");
+        assert_eq!(weekly_text(Some(0.0), Some(99), 100), "7d 00% 0m");
         assert_eq!(
             weekly_text(Some(100.0), Some(i64::MAX), i64::MIN),
             "7d 100% 106751991167300d15h"
@@ -663,7 +753,10 @@ mod tests {
         assert_eq!(value(&tokens, "lineup_state"), Some("working"));
         assert_eq!(value(&tokens, "lineup_context_pct"), None);
         assert_eq!(value(&tokens, "lineup_weekly_pct"), None);
-        assert_eq!(value(&tokens, "lineup_context_text"), Some("—"));
+        assert_eq!(
+            value(&tokens, "lineup_context_text"),
+            Some("—\u{2800}\u{2800}")
+        );
         assert_eq!(value(&tokens, "lineup_weekly_text"), Some("—"));
     }
 

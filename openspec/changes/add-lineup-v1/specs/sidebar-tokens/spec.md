@@ -21,9 +21,9 @@ support only `claude`, `codex`, `grok`, `agy`, `kimi`, and `hermes` in v1.
 | `lineup_state_done` | `●` only while done; otherwise cleared | Normalized state |
 | `lineup_state_unknown` | `●` only while unknown; otherwise cleared | Normalized state |
 | `lineup_context_pct` | Finite unit-less decimal in [0, 100], or cleared | Session-bound context reader |
-| `lineup_context_text` | Rounded integer with at least two digits plus `%`, or `—` | Context percentage |
+| `lineup_context_text` | Rounded integer with at least two digits plus `%`, or `—` followed by two U+2800 characters | Context percentage |
 | `lineup_weekly_pct` | Finite unit-less remaining percentage in [0, 100], or cleared | Session-bound weekly reader |
-| `lineup_weekly_text` | `7d` plus rounded remaining percentage and optional reset countdown, or `—` | Weekly remaining percentage and reset timestamp |
+| `lineup_weekly_text` | `7d` plus at least two-digit rounded remaining percentage and optional reset countdown, or `—` | Weekly remaining percentage and reset timestamp |
 | `lineup_group` | Repository name on the first pane only, otherwise cleared | Same value as workspace `lineup_repo` when a repository resolves |
 | `lineup_group_ship_text` | Ship-time text on the first pane only, otherwise cleared | Same value as workspace `lineup_ship_text` when a repository resolves |
 
@@ -35,8 +35,20 @@ consumers SHALL use separate static colors for the five dot token names or
 Herdr's semantic `state_icon`; numeric rules SHALL consume numeric tokens,
 not `%` display strings. Colors and row order are user configuration.
 
-Weekly display SHALL use `7d N%`, with the nearest integer remaining percentage
-and halves rounded upward. When a session-bound reset timestamp is available,
+Context unavailable text SHALL be U+2014 EM DASH followed by two U+2800
+BRAILLE PATTERN BLANK characters. Under the narrow-ambiguous terminal policy,
+these each occupy one cell, matching the three-cell `00%` through `99%` display.
+U+2800 padding SHALL survive token whitespace normalization. Cell widths SHALL
+be tested with a fixed table for this policy, independently of the host locale.
+[Unicode East Asian Width data](https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt)
+classifies U+2014 as Ambiguous (`A`) and U+2800 as Neutral (`N`); terminals with
+wide ambiguous rendering may display the dash as two cells, so the three-cell
+alignment contract assumes narrow ambiguous rendering. Rounded context `100%`,
+including values at or above 99.5%, SHALL remain a four-cell exception rather
+than hiding full usage. Its following weekly column moves one cell right.
+
+Weekly display SHALL use `7d NN%` with at least two digits (`00%`, `07%`, `100%`),
+with the nearest integer remaining percentage and halves rounded upward. When a session-bound reset timestamp is available,
 append a space and the remaining duration: `XdYh` for at least one day, `XhYm`
 for at least one hour, otherwise `Xm`. Duration components SHALL be floored;
 past reset timestamps SHALL show `0m`. Examples are `7d 67% 6d9h`,
@@ -46,6 +58,20 @@ if a reset timestamp is available. Current Unix time SHALL be injected into
 formatting so date and duration boundaries can be tested deterministically.
 The separate weekly numeric token SHALL remain unit-less and contain no period
 label or countdown.
+
+#### Scenario: Missing context preserves the weekly column
+- **WHEN** context is unavailable on a supported pane
+- **THEN** context numeric is cleared and context text is `—` followed by two
+  U+2800 characters, occupying three cells under narrow ambiguous rendering
+- **AND** `07%`, `42%`, and `99%` occupy the same three cells
+- **AND** context rounding to `100%` preserves all four cells as an exception
+
+#### Scenario: Single-digit weekly remaining preserves countdown position
+- **WHEN** weekly remaining is 7.2% and reset is twelve minutes away
+- **THEN** weekly numeric remains `7.2` and weekly text is `7d 07% 12m`
+- **AND** the countdown starts at the same cell as in `7d 67% 12m`
+- **AND WHEN** weekly data is unavailable
+- **THEN** weekly numeric is cleared and text stays the unpadded `—`
 
 #### Scenario: Weekly reset countdown
 - **WHEN** weekly remaining is 67% and reset is six days and nine hours away
@@ -61,7 +87,7 @@ label or countdown.
 
 #### Scenario: Measured zero and full context
 - **WHEN** context is 100% and weekly remaining is a measured 0%
-- **THEN** context text is `100%` and weekly numeric/text are `0` and `7d 0%`
+- **THEN** context text is `100%` and weekly numeric/text are `0` and `7d 00%`
   when the reset timestamp is unavailable,
   distinguishable from unavailable data
 

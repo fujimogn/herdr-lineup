@@ -56,6 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Align unavailable context with two-digit context displays using two U+2800
+  cells after the dash, and zero-pad weekly remaining percentages to at least
+  two digits. Rounded `100%` remains a four-cell context exception; numeric
+  metadata stays unit-less and unchanged.
+
 - Match Codex context UI percentages by subtracting the 12,000-token baseline
   from both usage and capacity, returning unavailable for windows at/below it.
 

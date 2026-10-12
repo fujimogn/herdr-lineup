@@ -1435,7 +1435,7 @@ mod tests {
         assert_eq!(pane(&expired)["lineup_context_text"], "23%");
         assert_eq!(pane(&expired)["lineup_weekly_text"], "—");
         assert_eq!(pane(&stale)["lineup_weekly_text"], "—");
-        assert_eq!(pane(&rebound)["lineup_context_text"], "—");
+        assert_eq!(pane(&rebound)["lineup_context_text"], "—\u{2800}\u{2800}");
         assert_eq!(pane(&rebound)["lineup_weekly_text"], "—");
     }
 
@@ -1543,7 +1543,7 @@ mod tests {
         server.join().unwrap();
         for (change, tokens) in observations {
             assert_eq!(
-                tokens["lineup_context_text"], "—",
+                tokens["lineup_context_text"], "—\u{2800}\u{2800}",
                 "cached context survived {change}"
             );
             assert_eq!(
@@ -1849,7 +1849,10 @@ mod tests {
             );
         }
         assert_eq!(reports[0]["params"]["tokens"]["lineup_context_pct"], "7");
-        assert_eq!(reports[1]["params"]["tokens"]["lineup_context_text"], "—");
+        assert_eq!(
+            reports[1]["params"]["tokens"]["lineup_context_text"],
+            "—\u{2800}\u{2800}"
+        );
         assert_eq!(reports[3]["params"]["tokens"]["lineup_weekly_text"], "—");
     }
 
@@ -2655,7 +2658,10 @@ mod tests {
         assert!(daemon.wait().unwrap().success());
         let reports = server.join().unwrap();
         assert_eq!(reports.len(), 4);
-        assert_eq!(reports[0]["params"]["tokens"]["lineup_context_text"], "—");
+        assert_eq!(
+            reports[0]["params"]["tokens"]["lineup_context_text"],
+            "—\u{2800}\u{2800}"
+        );
         assert_eq!(
             reports[1]["params"]["tokens"]["lineup_repo"],
             "synthetic-repository"
@@ -2964,7 +2970,7 @@ mod tests {
             );
         }
         let t = &reports[2]["params"]["tokens"];
-        assert_eq!(t["lineup_context_text"], "—");
+        assert_eq!(t["lineup_context_text"], "—\u{2800}\u{2800}");
         assert_eq!(t["lineup_weekly_text"], "—");
         assert!(t["lineup_weekly_pct"].is_null());
     }
@@ -3038,7 +3044,10 @@ mod tests {
         assert_eq!(reports[0]["params"]["tokens"]["lineup_context_text"], "42%");
         assert_eq!(reports[0]["params"]["tokens"]["lineup_context_pct"], "42");
         assert!(reports[3]["params"]["tokens"]["lineup_context_pct"].is_null());
-        assert_eq!(reports[3]["params"]["tokens"]["lineup_context_text"], "—");
+        assert_eq!(
+            reports[3]["params"]["tokens"]["lineup_context_text"],
+            "—\u{2800}\u{2800}"
+        );
         assert_eq!(reports[1]["method"], "workspace.report_metadata");
         assert_eq!(
             reports[2]["params"]["tokens"].as_object().unwrap().len(),

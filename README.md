@@ -161,8 +161,24 @@ app-server process group. The existing five-second stop deadline is preserved.
 
 Each agent row shows the vendor logo, a state dot, context use as a percentage,
 and a weekly quota triplet such as `7d 67% 6d9h`: the quota period, the share
-remaining, and the time until the quota resets. Each workspace heading shows
-the repository name and the newest local `origin/main` commit time.
+remaining, and the time until the quota resets. Both displayed percentages use
+at least two digits (`07%`, `7d 07% 6d9h`). Missing context displays `—` followed
+by two U+2800 BRAILLE PATTERN BLANK characters, preserving the three terminal
+cells used by `00%` through `99%` after token whitespace normalization.
+Rounded `100%` (including values at or above 99.5%) stays four cells so full
+context use is visible; the following weekly column moves one cell to the right
+in that case. Weekly remaining `100%` similarly uses three digits; unavailable
+weekly data stays an unpadded `—` at the end of the row.
+
+Cell widths follow the narrow-ambiguous terminal policy: `—` (U+2014), U+2800,
+ASCII digits and `%` each occupy one cell. The
+[Unicode East Asian Width data](https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt)
+classifies U+2014 as Ambiguous (`A`) and U+2800 as Neutral (`N`). Terminals that
+render ambiguous characters as two cells can render `—` two cells wide, so the
+missing-context alignment assumes narrow ambiguous rendering. The tests use a
+fixed cell-width table for this policy, independent of the host locale.
+
+Each workspace heading shows the repository name and the newest local `origin/main` commit time.
 
 Codex and Grok context are read from local session files for the pane's native
 session. Claude and Antigravity usage is not read from those agents' config or
@@ -268,9 +284,9 @@ inactive state dots are cleared with JSON null.
 | `lineup_state_done` | `●` while done, otherwise cleared |
 | `lineup_state_unknown` | `●` while unknown, otherwise cleared |
 | `lineup_context_pct` | Unit-less context percentage, or cleared |
-| `lineup_context_text` | Rounded context percentage, or `—` |
+| `lineup_context_text` | At least two-digit rounded context percentage, or `—` plus two U+2800 cells |
 | `lineup_weekly_pct` | Unit-less weekly remaining percentage, or cleared |
-| `lineup_weekly_text` | `7d N%` with optional reset countdown, or `—` |
+| `lineup_weekly_text` | `7d NN%` (at least two digits) with optional reset countdown, or `—` |
 | `lineup_group` | Workspace repository name on its first pane, otherwise cleared |
 | `lineup_group_ship_text` | Workspace ship-time text on its first pane, otherwise cleared |
 
