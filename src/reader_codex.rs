@@ -14,8 +14,15 @@ impl UsageReader for CodexReader {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
         bounded_read(request, source, &BUSY, move |request| {
+            let started = std::time::Instant::now();
             match read_session(request) {
-                Ok((percent, time)) => UsageReading::sample(request, source, percent, time),
+                Ok((percent, time)) => {
+                    let evaluated = ReadRequest {
+                        now: request.now_after(started),
+                        ..*request
+                    };
+                    UsageReading::sample(&evaluated, source, percent, time)
+                }
                 Err(reason) => UsageReading::missing(request, source, reason),
             }
         })
@@ -44,12 +51,19 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime
         return Err(MissingReason::Unassociated);
     }
     let path = paths.first().ok_or(MissingReason::NotFound)?;
-    let text = budget.text(path, path.extension().is_some_and(|e| e == "zst"))?;
+    let text = budget.jsonl_text(path, path.extension().is_some_and(|e| e == "zst"))?;
     let mut bound = false;
     let mut observation = None;
-    for line in text.lines() {
+    for line in text.split_inclusive('\n') {
         budget.check()?;
-        let value: Value = serde_json::from_str(line).map_err(|_| MissingReason::Invalid)?;
+        let value: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            // An append may be visible before its final bytes/newline arrive.
+            // Only an unfinished final record is transient; completed corruption
+            // and malformed syntax still invalidate the source.
+            Err(error) if !line.ends_with('\n') && error.is_eof() => continue,
+            Err(_) => return Err(MissingReason::Invalid),
+        };
         match value["type"].as_str() {
             Some("session_meta") => {
                 if value["payload"]["id"].as_str() != Some(id) || bound {
@@ -146,6 +160,49 @@ mod tests {
         .unwrap();
     }
     #[test]
+    fn active_append_split_utf8_does_not_hide_completed_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"text\":\"");
+        bytes.extend_from_slice(&[0xe3, 0x81]);
+        fs::write(&path, &bytes).unwrap();
+        assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::SourceError));
+    }
+
+    #[test]
+    fn active_append_preserves_completed_observation_and_rejects_completed_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let complete = fs::read_to_string(&path).unwrap();
+        for tail in [
+            "{\"type\":",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":",
+            "{\"text\":\"unfinished",
+        ] {
+            fs::write(&path, format!("{complete}{tail}")).unwrap();
+            assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
+        }
+        fs::write(&path, format!("{complete}{{\"type\":\n")).unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::Invalid));
+        fs::write(&path, format!("{complete}{{oops")).unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::Invalid));
+    }
+
+    #[test]
     fn null_info_events_do_not_hide_bound_context_observations() {
         let _serial = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -221,7 +278,7 @@ mod tests {
         assert_percent(CodexReader.read(&r).context);
     }
     #[test]
-    fn rejects_invalid_future_timeout_and_partial_tail() {
+    fn rejects_invalid_future_timeout_and_unbound_partial_tail() {
         let _serial = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
@@ -250,7 +307,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             CodexReader.read(&r).context,
-            UsageOutcome::Unavailable(MissingReason::Invalid)
+            UsageOutcome::Unavailable(MissingReason::Unassociated)
         );
     }
 }

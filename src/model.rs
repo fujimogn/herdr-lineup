@@ -87,6 +87,13 @@ pub struct ReadRequest<'a> {
     pub timeout: Duration,
 }
 
+impl ReadRequest<'_> {
+    /// Advance the injected clock through a read without trusting wall-clock jumps.
+    pub(crate) fn now_after(&self, started: Instant) -> SystemTime {
+        self.now.checked_add(started.elapsed()).unwrap_or(self.now)
+    }
+}
+
 pub trait UsageReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading;
 }
@@ -183,7 +190,8 @@ pub(crate) fn bounded_read<F>(
 where
     F: FnOnce(&ReadRequest<'_>) -> UsageReading + Send + 'static,
 {
-    let Some(deadline) = Instant::now().checked_add(request.timeout) else {
+    let started = Instant::now();
+    let Some(deadline) = started.checked_add(request.timeout) else {
         return UsageReading::missing(request, source, MissingReason::Invalid);
     };
     if request.timeout.is_zero()
@@ -211,7 +219,8 @@ where
             let owned = ReadRequest {
                 identity: &identity,
                 home: &home,
-                now,
+                // Include thread scheduling before the provider starts reading.
+                now: now.checked_add(started.elapsed()).unwrap_or(now),
                 max_age,
                 timeout: deadline.saturating_duration_since(Instant::now()),
             };
@@ -374,6 +383,28 @@ impl Budget {
         Ok(result)
     }
     pub(crate) fn text(&self, path: &Path, compressed: bool) -> Result<String, MissingReason> {
+        String::from_utf8(self.bytes(path, compressed)?).map_err(|_| MissingReason::SourceError)
+    }
+    /// Decode append-only JSONL while excluding a split final UTF-8 character.
+    pub(crate) fn jsonl_text(
+        &self,
+        path: &Path,
+        compressed: bool,
+    ) -> Result<String, MissingReason> {
+        let mut bytes = self.bytes(path, compressed)?;
+        if let Err(error) = std::str::from_utf8(&bytes) {
+            if error.error_len().is_some() {
+                return Err(MissingReason::SourceError);
+            }
+            let complete = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |i| i + 1);
+            bytes.truncate(complete);
+        }
+        String::from_utf8(bytes).map_err(|_| MissingReason::SourceError)
+    }
+    fn bytes(&self, path: &Path, compressed: bool) -> Result<Vec<u8>, MissingReason> {
         self.check()?;
         let meta = fs::symlink_metadata(path).map_err(|e| io_reason(&e))?;
         if !meta.is_file() || meta.file_type().is_symlink() {
@@ -385,10 +416,10 @@ impl Budget {
         } else {
             Box::new(file)
         };
-        let mut text = String::new();
+        let mut text = Vec::new();
         reader
             .take(16 * 1024 * 1024 + 1)
-            .read_to_string(&mut text)
+            .read_to_end(&mut text)
             .map_err(|e| io_reason(&e))?;
         self.check()?;
         if text.len() > 16 * 1024 * 1024 {

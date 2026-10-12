@@ -643,6 +643,9 @@ impl MetadataPublisher {
                     native_session_id: native.clone(),
                     repository_identity: pane.cwd.clone().unwrap_or_default(),
                 };
+                // Repository discovery and earlier panes may take seconds. A
+                // newly written observation must be compared to this read's clock.
+                let now = SystemTime::now();
                 let request = model::ReadRequest {
                     identity: &identity,
                     home,
@@ -1246,6 +1249,83 @@ mod tests {
                 .starts_with("7d 73% "),
             "timeout discarded a verified home binding"
         );
+    }
+
+    #[test]
+    fn fake_socket_observation_written_during_refresh_is_not_future() {
+        let _guard = crate::statusline::READER_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
+        template.lock().unwrap()["result"]["snapshot"]["panes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "pane_id":"w1:p2", "workspace_id":"w1", "agent":"claude", "agent_status":"working",
+                "agent_session":{"agent":"claude", "kind":"id", "value":"synthetic-claude"}
+            }));
+        let server = token_server_with_template(
+            UnixListener::bind(&socket).unwrap(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            template,
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().into(),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("empty-home")),
+                statusline_state: Some(dir.path().into()),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        struct WriteDuringEarlierPane(std::path::PathBuf);
+        impl UsageReader for WriteDuringEarlierPane {
+            fn read(&self, r: &ReadRequest<'_>) -> UsageReading {
+                std::thread::sleep(Duration::from_millis(20));
+                // The real hook stamps receipt time and atomically replaces its record.
+                let record = crate::statusline::Record {
+                    version: 1,
+                    agent: crate::statusline::Agent::Claude,
+                    key: "synthetic-claude".into(),
+                    observed_ms: SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64,
+                    context: Some(23.0),
+                    weekly_remaining: Some(73.0),
+                    weekly_reset_ms: None,
+                };
+                std::fs::create_dir_all(self.0.join("statusline")).unwrap();
+                let temporary = tempfile::NamedTempFile::new_in(self.0.join("statusline")).unwrap();
+                serde_json::to_writer(temporary.as_file(), &record).unwrap();
+                temporary
+                    .persist(crate::statusline::record_path(
+                        &self.0,
+                        record.agent,
+                        &record.key,
+                    ))
+                    .unwrap();
+                SampleReader.read(r)
+            }
+        }
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &Config::default(),
+                &WriteDuringEarlierPane(dir.path().into()),
+                &TimeoutReader,
+            )
+            .unwrap();
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+        let tokens = &response["result"]["snapshot"]["panes"][1]["tokens"];
+        assert_eq!(tokens["lineup_context_text"], "23%");
+        assert_eq!(tokens["lineup_weekly_text"], "7d 73%");
     }
 
     #[test]

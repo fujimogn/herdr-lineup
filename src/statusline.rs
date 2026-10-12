@@ -232,6 +232,7 @@ pub(crate) fn read_record(
 ) -> model::UsageReading {
     use model::{MissingReason as M, UsageOutcome as O};
     use std::os::unix::fs::OpenOptionsExt;
+    let started = std::time::Instant::now();
     let budget = model::Budget::new(request);
     let load = || -> Result<Record, M> {
         budget.check()?;
@@ -275,7 +276,9 @@ pub(crate) fn read_record(
     let Some(observed) = UNIX_EPOCH.checked_add(Duration::from_millis(record.observed_ms)) else {
         return missing(request, source, M::Invalid);
     };
-    let age = match request.now.duration_since(observed) {
+    // A hook can replace the record after the caller sampled its clock.
+    let now = request.now_after(started);
+    let age = match now.duration_since(observed) {
         Ok(age) => age,
         Err(_) => return missing(request, source, M::Invalid),
     };
@@ -296,9 +299,7 @@ pub(crate) fn read_record(
         .weekly_reset_ms
         .and_then(|v| UNIX_EPOCH.checked_add(Duration::from_millis(v)));
     if matches!(reading.weekly_remaining, O::Available(_)) {
-        if reset.is_some_and(|reset| reset <= request.now)
-            || (reset.is_none() && age > request.max_age)
-        {
+        if reset.is_some_and(|reset| reset <= now) || (reset.is_none() && age > request.max_age) {
             reading.weekly_remaining = O::Unavailable(M::Stale);
         } else {
             reading.weekly_window = Some(model::WeeklyWindow::RollingSevenDays);
@@ -503,11 +504,13 @@ mod tests {
             } else {
                 &agy
             };
-            request.now += Duration::from_secs(60);
+            // Validation advances the injected clock through the read, so stay
+            // below the exact expiry boundary for the available assertion.
+            request.now += Duration::from_secs(59);
             let r = reader.read(&request);
             assert_eq!(r.context, UsageOutcome::Available(23.5));
             assert_eq!(r.weekly_remaining, UsageOutcome::Available(73.0));
-            request.now += Duration::from_secs(1);
+            request.now += Duration::from_secs(2);
             let r = reader.read(&request);
             assert_eq!(r.context, UsageOutcome::Available(23.5));
             assert_eq!(
