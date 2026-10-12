@@ -138,4 +138,22 @@ The trap confirmed deletion of the isolated session and private temporary
 directory. Real-agent pane verification was `SKIP`: the isolated HOME had no
 provider authentication. The synthetic pane is publication evidence only.
 This does not establish macOS behavior, real-agent usage, sidebar rendering,
-or shipment of the transport fix; final main-based validation remains pending.
+or shipment of the transport fix. The main-based rerun is recorded below.
+
+## Main-based rerun
+
+The required single Linux runtime rerun passed against `c58799a1a18b0f7f52afa505d0bcf42fbc1c4735`,
+with the two harness/documentation commits applied to main
+`697daefe77733069e10a8aa54c504ff9eea05166`. Its workspace snapshot contained
+`lineup_repo="lineup-e2e"`, `lineup_ship_unix="1791802881"`, and
+`lineup_ship_text="20:01"`. Synthetic pane tokens matched the example above,
+including absent numeric usage tokens and `—` for context and weekly text.
+
+The snapshot after sixteen seconds retained the expected tokens. The isolated
+checkpoint advanced from workspace `1` / pane `2` to workspace `3` / pane `3`.
+Doctor, idempotent stop, and the post-stop snapshot with no `lineup_` keys all
+passed. The trap confirmed isolated session and temporary-directory removal.
+Real-agent verification remained `SKIP` for the unauthenticated isolated HOME;
+no credentials, real provider sessions, or authenticated API calls were used.
+This rerun establishes Linux metadata behavior; it adds no macOS runtime or
+visual rendering evidence.
