@@ -1,4 +1,4 @@
-//! Persistent newline-framed transport pinned to one Unix socket endpoint.
+//! Request-scoped newline-framed connections pinned to one Unix socket endpoint.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,6 +36,7 @@ pub struct Transport {
     path: PathBuf,
     identity: EndpointIdentity,
     reader: BufReader<UnixStream>,
+    response_complete: bool,
 }
 impl Transport {
     pub fn connect(path: &Path) -> io::Result<Self> {
@@ -50,6 +51,7 @@ impl Transport {
             path: path.into(),
             identity,
             reader: BufReader::new(stream),
+            response_complete: false,
         };
         transport.verify_endpoint()?;
         Ok(transport)
@@ -61,6 +63,7 @@ impl Transport {
         stream.set_write_timeout(Some(Duration::from_secs(1)))?;
         self.verify_endpoint()?;
         self.reader = BufReader::new(stream);
+        self.response_complete = false;
         Ok(())
     }
     pub fn identity(&self) -> EndpointIdentity {
@@ -79,6 +82,11 @@ impl Transport {
         if frame.len() > MAX_FRAME_BYTES || frame.contains(&b'\n') {
             return Err(io::Error::other("invalid outbound frame"));
         }
+        // Herdr's ordinary JSON API closes after one response. Never replay
+        // a possibly accepted request: open the next connection before sending.
+        if self.response_complete {
+            self.reconnect_same_endpoint()?;
+        }
         write_frame(self.reader.get_mut(), frame)?;
         self.verify_endpoint()
     }
@@ -86,12 +94,16 @@ impl Transport {
         self.verify_endpoint()?;
         let frame = read_frame(&mut self.reader, MAX_FRAME_BYTES)?;
         self.verify_endpoint()?;
+        self.response_complete = true;
         Ok(frame)
     }
-    /// Detect disconnect without consuming a protocol response or event.
+    /// Detect unexpected disconnect; EOF after a full response is normal.
     pub fn check_connection(&self) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         self.verify_endpoint()?;
+        if self.response_complete {
+            return Ok(());
+        }
         let mut byte = 0u8;
         // MSG_DONTWAIT avoids changing the shared stream's blocking mode.
         let result = unsafe {
@@ -286,6 +298,26 @@ mod tests {
         assert!(transport.reconnect_same_endpoint().is_err());
         assert!(replacement.accept().is_err());
     }
+    #[test]
+    fn completed_response_allows_eof_but_never_a_replacement_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut transport = Transport::connect(&path).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        transport.send_line(b"first-request").unwrap();
+        peer.write_all(b"complete-response\n").unwrap();
+        drop(peer);
+        assert_eq!(transport.receive_line().unwrap(), b"complete-response");
+        assert!(transport.check_connection().is_ok());
+        std::fs::remove_file(&path).unwrap();
+        // Keep the original listener alive so its inode cannot be reused.
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        assert!(transport.send_line(b"next-request").is_err());
+        assert!(replacement.accept().is_err());
+    }
+
     #[test]
     fn slow_trickle_cannot_extend_frame_deadline() {
         let (read, mut write) = UnixStream::pair().unwrap();

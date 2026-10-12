@@ -507,6 +507,137 @@ mod tests {
         time::Duration,
     };
 
+    #[test]
+    fn real_herdr_one_response_per_connection_publishes_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            // Captured in an isolated Herdr 0.9.3 session (protocol 22).
+            // Optional fields absent in that response stay absent here.
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = BufReader::new(stream);
+            let request = receive(&mut stream);
+            let response = json!({"id":request["id"],"result":{"type":"session_snapshot","snapshot":{
+                "version":"0.9.3","protocol":22,
+                "workspaces":[{"workspace_id":"w1","number":1,"label":"isolated","focused":true,
+                    "pane_count":1,"tab_count":1,"active_tab_id":"w1:t1","agent_status":"unknown"}],
+                "panes":[{"pane_id":"w1:p1","terminal_id":"isolated-terminal","workspace_id":"w1",
+                    "tab_id":"w1:t1","focused":true,"cwd":"/nonexistent-isolated-fixture",
+                    "foreground_cwd":"/nonexistent-isolated-fixture","agent_status":"unknown","revision":0}]
+            }}});
+            writeln!(stream.get_mut(), "{response}").unwrap();
+            drop(stream); // The real JSON API closes after every response.
+            listener.set_nonblocking(true).unwrap();
+            let mut report = None;
+            for _ in 0..2 {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            break BufReader::new(stream);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return None;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                let request = receive(&mut stream);
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+                report = Some(request);
+            }
+            report
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "isolated".into(), Homes::default()).unwrap();
+        let result = publisher.refresh(&mut transport, &Config::default());
+        let report = server.join().unwrap();
+        assert!(result.is_ok(), "real one-shot response failed: {result:?}");
+        let report = report.unwrap();
+        assert_eq!(report["method"], "workspace.report_metadata");
+        assert_eq!(report["params"]["tokens"]["lineup_repo"], "—");
+    }
+
+    // Each ordinary Herdr JSON request uses a separate accepted connection.
+    // Keep scenario logic sequential while exercising the real socket lifetime.
+    struct OneShotServer {
+        listener: UnixListener,
+        stream: BufReader<std::os::unix::net::UnixStream>,
+        read: bool,
+        timeout: Duration,
+    }
+    impl OneShotServer {
+        fn new(listener: UnixListener, timeout: Duration) -> Self {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(timeout)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            Self {
+                listener,
+                stream: BufReader::new(stream),
+                read: false,
+                timeout,
+            }
+        }
+        fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
+            if self.read {
+                let deadline = Instant::now() + self.timeout;
+                loop {
+                    match self.listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false)?;
+                            stream.set_read_timeout(Some(self.timeout))?;
+                            self.stream = BufReader::new(stream);
+                            break;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "no next request",
+                                ));
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            self.read = true;
+            self.stream.read_line(line)
+        }
+        fn get_mut(&mut self) -> ClosingResponse<'_> {
+            ClosingResponse(self.stream.get_mut())
+        }
+    }
+
+    struct ClosingResponse<'a>(&'a mut std::os::unix::net::UnixStream);
+    impl Write for ClosingResponse<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = self.0.write(bytes)?;
+            if bytes[..count].contains(&b'\n') {
+                self.0.shutdown(std::net::Shutdown::Both)?;
+            }
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
     struct TimeoutReader;
     impl UsageReader for TimeoutReader {
         fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
@@ -538,12 +669,7 @@ mod tests {
         let socket = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut stream = BufReader::new(stream);
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let request = receive(&mut stream);
             writeln!(stream.get_mut(), "{}", snapshot(&request["id"], true)).unwrap();
             let mut reports = Vec::new();
@@ -628,12 +754,7 @@ mod tests {
         let socket = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .unwrap();
-            let mut stream = BufReader::new(stream);
+            let mut stream = OneShotServer::new(listener, Duration::from_millis(500));
             let request = receive(&mut stream);
             let mut response = snapshot(&request["id"], false);
             response["result"]["snapshot"]["panes"] = json!((0..9).map(|i| json!({
@@ -716,16 +837,11 @@ mod tests {
         git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
         let listener = UnixListener::bind(&options.socket).unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut stream = BufReader::new(stream);
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let mut reports = Vec::new();
             loop {
                 let mut line = String::new();
-                if stream.read_line(&mut line).unwrap() == 0 {
+                if stream.read_line(&mut line).unwrap_or(0) == 0 {
                     break;
                 }
                 let request: Value = serde_json::from_str(&line).unwrap();
@@ -806,12 +922,7 @@ mod tests {
         let socket = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut stream = BufReader::new(stream);
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let mut reports = Vec::new();
             for cycle in 0..3 {
                 let request = receive(&mut stream);
@@ -854,12 +965,7 @@ mod tests {
         let socket = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .unwrap();
-            let mut stream = BufReader::new(stream);
+            let mut stream = OneShotServer::new(listener, Duration::from_millis(100));
             let request = receive(&mut stream);
             writeln!(stream.get_mut(), "{}", snapshot(&request["id"], true)).unwrap();
             let mut line = String::new();
@@ -887,12 +993,7 @@ mod tests {
         let socket = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut stream = BufReader::new(stream);
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(2));
             let request = receive(&mut stream);
             let mut response = snapshot(&request["id"], true);
             response["result"]["snapshot"]["panes"][0]["tokens"] = Value::Object(
@@ -921,9 +1022,22 @@ mod tests {
         server.join().unwrap();
     }
 
-    fn receive(stream: &mut BufReader<std::os::unix::net::UnixStream>) -> Value {
+    trait RequestReader {
+        fn request_line(&mut self, line: &mut String) -> io::Result<usize>;
+    }
+    impl RequestReader for OneShotServer {
+        fn request_line(&mut self, line: &mut String) -> io::Result<usize> {
+            self.read_line(line)
+        }
+    }
+    impl RequestReader for BufReader<std::os::unix::net::UnixStream> {
+        fn request_line(&mut self, line: &mut String) -> io::Result<usize> {
+            self.read_line(line)
+        }
+    }
+    fn receive(stream: &mut impl RequestReader) -> Value {
         let mut line = String::new();
-        stream.read_line(&mut line).unwrap();
+        stream.request_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap()
     }
 
@@ -939,12 +1053,7 @@ mod tests {
         let checkpoint = state.join("sequences.json");
         let server_checkpoint = checkpoint.clone();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut stream = BufReader::new(stream);
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let mut reports = Vec::new();
             for cycle in 0..3 {
                 let mut line = String::new();
