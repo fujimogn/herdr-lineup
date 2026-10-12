@@ -90,4 +90,32 @@ done
 check_failure '1x2x3'
 check_failure 'v1.2.3'
 
+# Lower-level headings belong to the selected release.
+cat > "$fixture_dir/changelog" <<'CHANGELOG'
+## 1.2.3 (2026-10-13)
+
+Release summary.
+
+### Fixes
+
+- Fix: **Release notes** retain subheadings.
+
+## Unreleased
+Future changes.
+CHANGELOG
+cat > "$fixture_dir/expected" <<'NOTES'
+## 1.2.3 (2026-10-13)
+
+Release summary.
+
+### Fixes
+
+- Fix: **Release notes** retain subheadings.
+NOTES
+check_output 1.2.3
+
+rm "$fixture_dir/changelog"
+check_failure 1.2.3
+test -s "$fixture_dir/error"
+
 echo 'release notes extraction tests passed'
