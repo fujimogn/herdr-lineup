@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub type Tokens = BTreeMap<String, Option<String>>;
 pub const SOURCE: &str = "herdr-lineup";
 pub const DEFAULT_REFRESH_MS: u64 = 5_000;
-pub const PANE_KEYS: [&str; 12] = [
+pub const PANE_KEYS: [&str; 14] = [
     "lineup_agent",
     "lineup_logo",
     "lineup_state",
@@ -18,6 +18,8 @@ pub const PANE_KEYS: [&str; 12] = [
     "lineup_context_text",
     "lineup_weekly_pct",
     "lineup_weekly_text",
+    "lineup_group",
+    "lineup_group_ship_text",
 ];
 pub const WORKSPACE_KEYS: [&str; 3] = ["lineup_repo", "lineup_ship_unix", "lineup_ship_text"];
 
@@ -435,7 +437,7 @@ mod tests {
     #[test]
     fn partial_usage_and_numeric_null_contract() {
         let tokens = pane_tokens(&row(), LogoMode::Text, false, 0);
-        assert_eq!(tokens.len(), 12);
+        assert_eq!(tokens.len(), 14);
         assert_eq!(value(&tokens, "lineup_context_pct"), Some("7.2"));
         assert_eq!(value(&tokens, "lineup_context_text"), Some("07%"));
         assert_eq!(value(&tokens, "lineup_weekly_pct"), None);
@@ -645,6 +647,43 @@ mod tests {
     }
 
     #[test]
+    fn group_heading_full_contract_respects_report_and_resource_capacity() {
+        let mut r = row();
+        r.usage.as_mut().unwrap().weekly_remaining_pct = Some(67.0);
+        let mut desired = pane_tokens(&r, LogoMode::Text, false, 0);
+        desired.insert("lineup_group".into(), Some("example-repo".into()));
+        desired.insert("lineup_group_ship_text".into(), Some("09:05".into()));
+        // The full fourteen-key report includes clears for inactive state dots.
+        let live = desired.values().filter(|v| v.is_some()).count();
+        let resource = resource("p1");
+        let report = Publisher::default()
+            .prepare(
+                &resource,
+                &snapshot(32 - live),
+                r.occupant.as_ref(),
+                &desired,
+                0,
+                5000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.tokens.len(), 14);
+        assert!(report.tokens.len() <= 16);
+        assert!(crate::protocol::metadata_request("full-heading", &report).is_ok());
+        assert_eq!(
+            Publisher::default().prepare(
+                &resource,
+                &snapshot(33 - live),
+                r.occupant.as_ref(),
+                &desired,
+                0,
+                5000
+            ),
+            Err(PatchError::ResourceCapacity)
+        );
+    }
+
+    #[test]
     fn dirty_keys_and_ttl_renewal_use_successful_publication_time() {
         let resource = resource("p1");
         let row = row();
@@ -661,7 +700,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(first.tokens.len(), 12);
+        assert_eq!(first.tokens.len(), 14);
         assert_eq!(first.seq, 1);
         assert_eq!(first.ttl_ms, 15000);
         assert_eq!(first.source, SOURCE);
@@ -756,7 +795,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(replacement.tokens.len(), 12);
+        assert_eq!(replacement.tokens.len(), 14);
         assert_eq!(value(&replacement.tokens, "lineup_context_pct"), None);
         publisher.acknowledge(&replacement, 1).unwrap();
         row.occupant = None;
@@ -771,7 +810,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(clear.tokens.len(), 12);
+        assert_eq!(clear.tokens.len(), 14);
         assert!(clear.tokens.values().all(Option::is_none));
         publisher.acknowledge(&clear, 2).unwrap();
         assert!(

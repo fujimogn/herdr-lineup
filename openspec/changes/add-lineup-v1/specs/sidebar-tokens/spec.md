@@ -24,6 +24,8 @@ support only `claude`, `codex`, `grok`, `agy`, `kimi`, and `hermes` in v1.
 | `lineup_context_text` | Rounded integer with at least two digits plus `%`, or `—` | Context percentage |
 | `lineup_weekly_pct` | Finite unit-less remaining percentage in [0, 100], or cleared | Session-bound weekly reader |
 | `lineup_weekly_text` | `7d` plus rounded remaining percentage and optional reset countdown, or `—` | Weekly remaining percentage and reset timestamp |
+| `lineup_group` | Repository name on the first pane only, otherwise cleared | Same value as workspace `lineup_repo` when a repository resolves |
+| `lineup_group_ship_text` | Ship-time text on the first pane only, otherwise cleared | Same value as workspace `lineup_ship_text` when a repository resolves |
 
 Decimals SHALL use ASCII digits, optional decimal point, no whitespace or unit.
 Display rounding SHALL be nearest integer with halves rounded upward. Missing
@@ -67,7 +69,8 @@ label or countdown.
 - **WHEN** a pane changes agent or native session, becomes unsupported, or loses
   its authoritative occupant identity
 - **THEN** all previous occupant usage is invalidated before publication; an
-  unsupported/unidentified pane has all twelve lineup keys cleared, and a new
+  unsupported/unidentified pane has all twelve agent keys cleared; its two
+  heading keys follow the workspace heading rules independently, and a new
   supported occupant receives its own logo/state with unavailable usage until read
 
 ### Requirement: Workspace heading contract
@@ -98,8 +101,29 @@ commit time, not proof of deployment or remote freshness.
 
 Formatting SHALL use the daemon host's local timezone and date. `HH:MM` uses
 two digits per field; `M/D` has no leading zeros. All dates other than today,
-including future dates, SHALL use `M/D`. Space rows SHALL render the workspace
-heading; no copy of heading keys is required on each pane.
+including future dates, SHALL use `M/D`.
+
+The plugin SHALL also publish `lineup_group` and `lineup_group_ship_text` on
+exactly the first pane of each workspace with a resolved repository, copying
+`lineup_repo` and `lineup_ship_text` respectively. First pane SHALL mean the
+first record for that workspace in the snapshot's `panes` array, including
+unsupported or unidentified occupants, without sorting pane IDs. One shared
+selection function SHALL drive both pane headings and logo indentation.
+Every refresh SHALL recompute this selection. Both heading keys SHALL be JSON
+null on later panes and on all panes of unresolved/non-Git workspaces.
+A resolved repository without a local `origin/main` SHALL retain its pane
+repository name and show `—` for its pane ship-time text.
+
+#### Scenario: Pane heading moves after reordering
+- **WHEN** the snapshot order changes from `w1:p10, w1:p2` to `w1:p2, w1:p10`
+- **THEN** `w1:p10` receives null for both heading keys and `w1:p2` receives
+  the workspace repository name and ship-time text, even if the old first
+  pane has no supported agent
+
+#### Scenario: Workspace loses its repository
+- **WHEN** a formerly resolved workspace becomes non-Git or unresolved
+- **THEN** both pane heading keys are cleared, while workspace `lineup_repo`
+  and `lineup_ship_text` show `—`
 
 #### Scenario: Today's shipment
 - **WHEN** the latest local origin/main commit is today at 09:05 local time
@@ -150,13 +174,13 @@ reconcile missed changes. Send changed keys only except TTL renewal; unchanged
 live keys SHALL be re-published no later than two refresh intervals after their
 last successful publication. Missing or closed resources SHALL not be recreated.
 
-The contract uses **12** pane keys (longest name `lineup_state_working`, 20
+The contract uses **14** pane keys (longest name `lineup_group_ship_text`, 22
 characters) and **3** workspace keys (longest `lineup_ship_unix`/`lineup_ship_text`,
 16 characters), each full patch fitting Herdr's **16 keys per report** and each
 resource fitting **32 stored keys**. The daemon SHALL count existing unrelated
 keys before adding new keys; insufficient capacity SHALL produce a diagnostic
 and skip that resource without evicting other sources. No state change needs
-more than twelve keys, including clears. It SHALL publish no undocumented v1 keys.
+more than fourteen keys, including clears. It SHALL publish no undocumented v1 keys.
 
 #### Scenario: Daemon disappears
 - **WHEN** the default daemon stops publishing without clearing tokens

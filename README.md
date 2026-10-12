@@ -200,6 +200,45 @@ The repository heading reads the newest local `origin/main` commit without
 fetching: `HH:MM` for today, `M/D` for earlier dates. This is a commit-time label,
 not proof of a deployment.
 
+### Sidebar tokens
+
+All tokens use source `herdr-lineup`. Pane reports explicitly target a pane;
+workspace reports explicitly target a workspace. Missing numeric values and
+inactive state dots are cleared with JSON null.
+
+| Pane token | Value |
+| --- | --- |
+| `lineup_agent` | Supported lowercase agent id |
+| `lineup_logo` | Vendor glyph or text label |
+| `lineup_state` | `idle`, `working`, `blocked`, `done`, or `unknown` |
+| `lineup_state_idle` | `●` while idle, otherwise cleared |
+| `lineup_state_working` | `●` while working, otherwise cleared |
+| `lineup_state_blocked` | `●` while blocked, otherwise cleared |
+| `lineup_state_done` | `●` while done, otherwise cleared |
+| `lineup_state_unknown` | `●` while unknown, otherwise cleared |
+| `lineup_context_pct` | Unit-less context percentage, or cleared |
+| `lineup_context_text` | Rounded context percentage, or `—` |
+| `lineup_weekly_pct` | Unit-less weekly remaining percentage, or cleared |
+| `lineup_weekly_text` | `7d N%` with optional reset countdown, or `—` |
+| `lineup_group` | Workspace repository name on its first pane, otherwise cleared |
+| `lineup_group_ship_text` | Workspace ship-time text on its first pane, otherwise cleared |
+
+| Workspace token | Value |
+| --- | --- |
+| `lineup_repo` | Repository name, or `—` outside Git |
+| `lineup_ship_unix` | Local `origin/main` commit timestamp, or cleared |
+| `lineup_ship_text` | `HH:MM` today, otherwise `M/D`, or `—` |
+
+The two `lineup_group` tokens copy the workspace heading onto its first pane
+for sidebar layouts that place repository headings in the Agents section.
+They use the same snapshot order as logo indentation, including panes without
+supported agents. Every refresh clears the old first pane and updates the new
+one after a reorder. Workspaces without a resolved repository clear both pane
+heading tokens. A resolved repository without `origin/main` keeps its name
+and uses `—` for its ship-time text. The full pane contract has 14 keys, within
+Herdr's 16 keys per report and 32 stored keys per resource; unrelated keys are
+preserved and counted before publication.
+
 Herdr startup hooks run once. Startup and `workspace.focused` therefore both
 invoke `ensure`; the per-session lock prevents duplicate daemons.
 The publisher keeps one daemon per Herdr session and stores state under

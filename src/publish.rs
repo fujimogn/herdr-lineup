@@ -288,21 +288,50 @@ impl MetadataPublisher {
         self.reconcile_missing(&snapshot);
         let now = SystemTime::now();
         let now_unix = unix(now);
-        // A single budget for the cycle prevents N panes multiplying the reader wait.
-        let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
         let mode = match config.logo_mode.as_str() {
             "font" => tokens::LogoMode::Font,
             "text" => tokens::LogoMode::Text,
             _ => tokens::LogoMode::Auto,
         };
         let mut failed = false;
-        let mut seen_workspaces = BTreeSet::new();
-        // parse_snapshot preserves the wire snapshot.panes array order. The first
-        // record for each workspace is its first pane, even if it has no supported
-        // agent. Do not sort pane IDs or filter occupants before this decision.
-        // Recompute on every snapshot so a pane reorder moves the indentation.
+        let local_now = chrono::Local::now();
+        let mut headings = BTreeMap::new();
+        for workspace in &snapshot.workspaces {
+            let panes: Vec<_> = snapshot
+                .panes
+                .iter()
+                .filter(|pane| pane.workspace_id == workspace.workspace_id)
+                .map(|pane| (pane.pane_id.as_str(), pane.cwd.as_deref().map(Path::new)))
+                .collect();
+            let cwd = ship_time::resolve_workspace_cwd(
+                workspace.checkout_path.as_deref().map(Path::new),
+                &panes,
+            );
+            let repository = cwd.and_then(ship_time::read_repository);
+            let ship = repository.as_ref().and_then(|repo| repo.ship_unix);
+            let resolved = repository.is_some();
+            let desired = BTreeMap::from([
+                (
+                    "lineup_repo".into(),
+                    Some(
+                        repository
+                            .map(|repo| repo.name)
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                ),
+                ("lineup_ship_unix".into(), ship.map(|unix| unix.to_string())),
+                (
+                    "lineup_ship_text".into(),
+                    Some(ship_time::format_ship_time(ship, &local_now)),
+                ),
+            ]);
+            headings.insert(workspace.workspace_id.as_str(), (resolved, desired));
+        }
+        // A single budget for the cycle prevents N panes multiplying the reader wait.
+        let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
+        let first_panes = first_pane_ids(&snapshot);
         for pane in &snapshot.panes {
-            let first_pane = seen_workspaces.insert(pane.workspace_id.as_str());
+            let first_pane = first_panes.contains(pane.pane_id.as_str());
             let occupant = pane.occupant.clone().filter(|who| {
                 config
                     .providers
@@ -383,6 +412,14 @@ impl MetadataPublisher {
                 false,
                 now_unix,
             );
+            let (resolved, heading) = &headings[pane.workspace_id.as_str()];
+            if first_pane && *resolved {
+                desired.insert("lineup_group".into(), heading["lineup_repo"].clone());
+                desired.insert(
+                    "lineup_group_ship_text".into(),
+                    heading["lineup_ship_text"].clone(),
+                );
+            }
             if !first_pane
                 && config.non_first_pane_logo_indent != 0
                 && let Some(Some(logo)) = desired.get_mut("lineup_logo")
@@ -409,42 +446,15 @@ impl MetadataPublisher {
                 return Err(error);
             }
         }
-        let local_now = chrono::Local::now();
         for workspace in &snapshot.workspaces {
-            let panes: Vec<_> = snapshot
-                .panes
-                .iter()
-                .filter(|pane| pane.workspace_id == workspace.workspace_id)
-                .map(|pane| (pane.pane_id.as_str(), pane.cwd.as_deref().map(Path::new)))
-                .collect();
-            let cwd = ship_time::resolve_workspace_cwd(
-                workspace.checkout_path.as_deref().map(Path::new),
-                &panes,
-            );
-            let repository = cwd.and_then(ship_time::read_repository);
-            let ship = repository.as_ref().and_then(|repo| repo.ship_unix);
-            let desired = BTreeMap::from([
-                (
-                    "lineup_repo".into(),
-                    Some(
-                        repository
-                            .map(|repo| repo.name)
-                            .unwrap_or_else(|| "—".into()),
-                    ),
-                ),
-                ("lineup_ship_unix".into(), ship.map(|unix| unix.to_string())),
-                (
-                    "lineup_ship_text".into(),
-                    Some(ship_time::format_ship_time(ship, &local_now)),
-                ),
-            ]);
+            let desired = &headings[workspace.workspace_id.as_str()].1;
             let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
             if let Err(error) = self.report(
                 transport,
                 &resource,
                 &workspace.stored_keys,
                 None,
-                &desired,
+                desired,
                 None,
             ) {
                 if error.kind() != io::ErrorKind::InvalidInput {
@@ -510,6 +520,18 @@ impl daemon::Publisher for MetadataPublisher {
     }
 }
 
+/// Preserve snapshot pane order, including panes without supported occupants.
+/// Recomputed each refresh so headings and logo indentation move together.
+fn first_pane_ids(snapshot: &protocol::Snapshot) -> BTreeSet<&str> {
+    let mut seen_workspaces = BTreeSet::new();
+    snapshot
+        .panes
+        .iter()
+        .filter(|pane| seen_workspaces.insert(pane.workspace_id.as_str()))
+        .map(|pane| pane.pane_id.as_str())
+        .collect()
+}
+
 fn check_clear_deadline(deadline: Instant) -> io::Result<()> {
     // Transport bounds write_frame and read_frame to 500 ms each. Do not
     // start a report unless its entire worst-case socket round trip fits.
@@ -554,6 +576,137 @@ mod tests {
         os::unix::net::UnixListener,
         time::Duration,
     };
+
+    #[test]
+    fn group_heading_moves_with_snapshot_order_and_clears_without_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("heading-repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .env("HOME", dir.path())
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_AUTHOR_DATE", "2024-01-01T00:00:00Z")
+                    .env("GIT_COMMITTER_DATE", "2024-01-01T00:00:00Z")
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "synthetic",
+        ]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let mut cycles = Vec::new();
+            for (cycle, count) in [(0, 5), (1, 2), (2, 2)] {
+                let request = receive(&mut stream);
+                let mut panes = vec![
+                    json!({"pane_id":"w1:p10","workspace_id":"w1","agent_status":"idle"}),
+                    json!({"pane_id":"w2:p1","workspace_id":"w2","agent":"kimi","agent_status":"idle"}),
+                    json!({"pane_id":"w1:p2","workspace_id":"w1","agent":"kimi","agent_status":"idle"}),
+                ];
+                if cycle > 0 {
+                    panes.swap(0, 2);
+                }
+                let checkout = if cycle < 2 {
+                    repo.to_str().unwrap()
+                } else {
+                    "/nonexistent-heading-fixture"
+                };
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"result":{
+                        "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                        "panes":panes,"workspaces":[
+                            {"workspace_id":"w1","worktree":{"checkout_path":checkout}},
+                            {"workspace_id":"w2"}]}
+                    }})
+                )
+                .unwrap();
+                let mut reports = BTreeMap::new();
+                for _ in 0..count {
+                    let report = receive(&mut stream);
+                    writeln!(
+                        stream.get_mut(),
+                        "{}",
+                        json!({"id":report["id"],"result":{"type":"ok"}})
+                    )
+                    .unwrap();
+                    let params = &report["params"];
+                    if cycle == 0 && params["pane_id"] == "w1:p10" {
+                        assert_eq!(params["tokens"]["lineup_group"], "heading-repo");
+                    }
+                    let id = params["pane_id"]
+                        .as_str()
+                        .or_else(|| params["workspace_id"].as_str())
+                        .unwrap();
+                    assert!(params["tokens"].as_object().unwrap().len() <= 16);
+                    reports.insert(id.to_owned(), params["tokens"].clone());
+                }
+                cycles.push(reports);
+            }
+            cycles
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        for _ in 0..3 {
+            publisher
+                .refresh(&mut transport, &Config::default())
+                .unwrap();
+        }
+        let cycles = server.join().unwrap();
+        assert_eq!(cycles[0]["w1:p10"]["lineup_group"], "heading-repo");
+        assert_eq!(
+            cycles[0]["w1:p10"]["lineup_group_ship_text"],
+            cycles[0]["w1"]["lineup_ship_text"]
+        );
+        for pane in ["w1:p2", "w2:p1"] {
+            assert!(
+                cycles[0][pane]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("lineup_group")
+            );
+            assert!(cycles[0][pane]["lineup_group"].is_null());
+            assert!(cycles[0][pane]["lineup_group_ship_text"].is_null());
+        }
+        assert_eq!(cycles[1]["w1:p2"]["lineup_group"], "heading-repo");
+        assert_eq!(
+            cycles[1]["w1:p2"]["lineup_group_ship_text"],
+            cycles[0]["w1"]["lineup_ship_text"]
+        );
+        assert_eq!(
+            cycles[1]["w1:p10"],
+            json!({"lineup_group":null,"lineup_group_ship_text":null})
+        );
+        assert_eq!(
+            cycles[2]["w1:p2"],
+            json!({"lineup_group":null,"lineup_group_ship_text":null})
+        );
+        assert_eq!(cycles[2]["w1"]["lineup_repo"], "—");
+    }
 
     #[test]
     fn logo_indent_tracks_snapshot_order_and_changes_only_logos() {
@@ -1454,7 +1607,7 @@ mod tests {
         assert_eq!(reports[1]["method"], "workspace.report_metadata");
         assert_eq!(
             reports[2]["params"]["tokens"].as_object().unwrap().len(),
-            12
+            14
         );
         assert!(
             reports[2]["params"]["tokens"]

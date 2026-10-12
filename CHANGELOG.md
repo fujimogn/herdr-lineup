@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- First-pane repository heading tokens `lineup_group` and
+  `lineup_group_ship_text`, sharing snapshot-order selection with logo
+  indentation and clearing when pane order or repository availability changes.
+
 - Opt-in `non_first_pane_logo_indent` (0..=16, default 0) to align agent rows
   when the repository heading occupies the first pane's first row. Only later
   panes' `lineup_logo` values receive U+2800 padding, following snapshot order.
