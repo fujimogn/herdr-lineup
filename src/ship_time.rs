@@ -210,7 +210,32 @@ fn git_output(
         }
         // Do not reap the group leader while a descendant still owns stdout:
         // a timeout must be able to kill that exact group without PID reuse.
-        if eof && let Some(status) = owned.child.try_wait().ok()? {
+        // WNOWAIT preserves the exited leader and therefore pins the process
+        // group ID until descendants have been killed, even after stdout EOF.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if eof {
+            // SAFETY: info is writable, and this unreaped PID belongs to owned.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    owned.child.id() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
+        }
+        if eof && info.si_signo == libc::SIGCHLD {
+            // SAFETY: WNOWAIT kept the group leader unreaped, preventing reuse.
+            unsafe {
+                libc::killpg(owned.child.id() as i32, libc::SIGKILL);
+            }
+            let status = owned.child.wait().ok()?;
             owned.reaped = true;
             return status
                 .success()
@@ -226,6 +251,55 @@ mod tests {
     use super::*;
     use chrono::FixedOffset;
     use std::path::PathBuf;
+
+    #[test]
+    fn completed_git_kills_descendants_with_closed_stdout() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root) = std::env::var_os("LINEUP_TEST_GIT_DESCENDANT") {
+            let root = PathBuf::from(root);
+            assert_eq!(read_repository(&root), None);
+            let pid: i32 = std::fs::read_to_string(root.join("descendant-pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut gone = false;
+            while Instant::now() < deadline {
+                if unsafe { libc::kill(pid, 0) } < 0 {
+                    gone = std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !gone {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            assert!(gone, "successful Git exit left a running descendant");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let script = bin.join("git");
+        std::fs::write(&script, "#!/bin/sh\n/bin/sleep 30 >/dev/null 2>&1 &\necho $! > \"$2/descendant-pid\"\nprintf 'false\\n'\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ship_time::tests::completed_git_kills_descendants_with_closed_stdout",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", bin)
+            .env("LINEUP_TEST_GIT_DESCENDANT", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn repository_deadline_reaps_stalled_git_without_shutdown() {
