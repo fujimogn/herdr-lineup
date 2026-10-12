@@ -15,6 +15,7 @@ pub mod reader_hermes;
 pub mod reader_kimi;
 pub mod ship_time;
 pub mod socket;
+pub mod statusline;
 pub mod tokens;
 
 use std::process::ExitCode;
