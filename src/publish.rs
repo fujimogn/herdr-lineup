@@ -5,6 +5,8 @@ use crate::{
     daemon,
     model::{self, UsageReader},
     protocol,
+    reader_agy::AgyReader,
+    reader_claude::ClaudeReader,
     reader_codex::CodexReader,
     reader_grok::GrokReader,
     ship_time,
@@ -26,6 +28,7 @@ use std::{
 pub struct Homes {
     pub codex: Option<PathBuf>,
     pub grok: Option<PathBuf>,
+    pub statusline_state: Option<PathBuf>,
 }
 impl Homes {
     pub fn from_env() -> Self {
@@ -39,6 +42,9 @@ impl Homes {
         Self {
             codex: provider("CODEX_HOME", ".codex"),
             grok: provider("GROK_HOME", ".grok"),
+            statusline_state: std::env::var_os("HERDR_PLUGIN_STATE_DIR")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute()),
         }
     }
 }
@@ -298,8 +304,24 @@ impl MetadataPublisher {
                     .any(|provider| provider == agent_id(who.agent))
             });
             let usage = occupant.as_ref().and_then(|who| {
-                let native = who.native_session.as_ref()?;
-                let (provider, home, reader) = match who.agent {
+                let agy = AgyReader {
+                    pane_id: pane.pane_id.clone(),
+                };
+                let native = match who.agent {
+                    Agent::Agy => who.native_session.clone().unwrap_or_default(),
+                    _ => who.native_session.clone()?,
+                };
+                let (provider, home, reader): (_, _, &dyn UsageReader) = match who.agent {
+                    Agent::Claude => (
+                        model::Provider::Claude,
+                        self.homes.statusline_state.as_ref()?,
+                        &ClaudeReader,
+                    ),
+                    Agent::Agy => (
+                        model::Provider::Agy,
+                        self.homes.statusline_state.as_ref()?,
+                        &agy,
+                    ),
                     Agent::Codex => (model::Provider::Codex, self.homes.codex.as_ref()?, codex),
                     Agent::Grok => (model::Provider::Grok, self.homes.grok.as_ref()?, grok),
                     _ => return None,
@@ -324,18 +346,29 @@ impl MetadataPublisher {
                     return None;
                 }
                 Some(tokens::Usage {
+                    binding: reading.binding,
                     occupant: who.clone(),
                     context_pct: match reading.context {
                         model::UsageOutcome::Available(value) => Some(value),
                         _ => None,
                     },
-                    // All weekly adapters remain unsupported in v1.
-                    weekly_remaining_pct: None,
-                    weekly_reset_unix: None,
+                    weekly_remaining_pct: match reading.weekly_remaining {
+                        model::UsageOutcome::Available(value)
+                            if reading.weekly_window.is_some() =>
+                        {
+                            Some(value)
+                        }
+                        _ => None,
+                    },
+                    weekly_reset_unix: reading
+                        .weekly_resets_at
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .and_then(|age| i64::try_from(age.as_secs()).ok()),
                 })
             });
             let desired = tokens::pane_tokens(
                 &tokens::PaneInput {
+                    pane_id: pane.pane_id.clone(),
                     occupant: occupant.clone(),
                     state: Some(pane.state.clone()),
                     usage,
@@ -1052,6 +1085,104 @@ mod tests {
     }
 
     #[test]
+    fn fake_socket_publishes_statusline_context_weekly_and_reset() {
+        let _guard = crate::statusline::READER_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let observations = dir.path().join("observations");
+        std::fs::create_dir_all(observations.join("statusline")).unwrap();
+        let reset = unix(SystemTime::now()) + 86400;
+        for (agent, key) in [
+            (crate::statusline::Agent::Claude, "synthetic-session"),
+            (crate::statusline::Agent::Agy, "w1:p1"),
+        ] {
+            let record = crate::statusline::Record {
+                version: 1,
+                agent,
+                key: key.into(),
+                observed_ms: (unix(SystemTime::now()) as u64) * 1000,
+                context: Some(23.0),
+                weekly_remaining: Some(73.0),
+                weekly_reset_ms: Some((reset as u64) * 1000),
+            };
+            std::fs::write(
+                crate::statusline::record_path(&observations, agent, key),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let mut reports = Vec::new();
+            for (agent, native) in [
+                ("claude", Some("synthetic-session")),
+                ("agy", None),
+                ("claude", Some("different")),
+            ] {
+                let req = receive(&mut stream);
+                let mut response = snapshot(&req["id"], true);
+                let pane = &mut response["result"]["snapshot"]["panes"][0];
+                pane["agent"] = json!(agent);
+                pane["agent_session"] = native
+                    .map(|id| json!({"agent":agent,"kind":"id","value":id}))
+                    .unwrap_or(Value::Null);
+                writeln!(stream.get_mut(), "{response}").unwrap();
+                let report = receive(&mut stream);
+                assert_eq!(report["method"], "pane.report_metadata");
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":report["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+                reports.push(report);
+                if reports.len() == 1 {
+                    let report = receive(&mut stream);
+                    writeln!(
+                        stream.get_mut(),
+                        "{}",
+                        json!({"id":report["id"],"result":{"type":"ok"}})
+                    )
+                    .unwrap();
+                }
+            }
+            reports
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().into(),
+            "fake".into(),
+            Homes {
+                statusline_state: Some(observations),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            publisher
+                .refresh(&mut transport, &Config::default())
+                .unwrap();
+        }
+        let reports = server.join().unwrap();
+        for report in &reports[..2] {
+            let t = &report["params"]["tokens"];
+            assert_eq!(t["lineup_context_pct"], "23");
+            assert_eq!(t["lineup_weekly_pct"], "73");
+            assert!(
+                t["lineup_weekly_text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("7d 73% ")
+            );
+        }
+        let t = &reports[2]["params"]["tokens"];
+        assert_eq!(t["lineup_context_text"], "—");
+        assert_eq!(t["lineup_weekly_text"], "—");
+        assert!(t["lineup_weekly_pct"].is_null());
+    }
+
+    #[test]
     fn fake_socket_publishes_clears_and_restores_durable_sequences() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fake.sock");
@@ -1098,6 +1229,7 @@ mod tests {
         let homes = Homes {
             codex: Some(home.clone()),
             grok: Some(home),
+            statusline_state: None,
         };
         let mut publisher =
             MetadataPublisher::new(state.clone(), "fake-socket".into(), homes.clone()).unwrap();

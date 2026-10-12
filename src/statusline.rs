@@ -34,7 +34,7 @@ pub(crate) struct Record {
 
 pub(crate) fn valid_key(key: &str) -> bool {
     !key.is_empty()
-        && key.len() <= 256
+        && key.len() <= 100
         && key
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
@@ -188,6 +188,16 @@ fn capture(agent: Agent, input: &[u8], state: &Path, pane: Option<&str>, now: Sy
 }
 fn persist(state: &Path, record: &Record) -> io::Result<()> {
     let directory = state.join("statusline");
+    // Refuse existing links before mkdir can create anything through them.
+    for path in [state, &directory] {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                return Err(io::Error::other("invalid observation directory"));
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
     let mut builder = DirBuilder::new();
     builder.recursive(true).mode(0o700).create(&directory)?;
     for path in [state, &directory] {
@@ -204,6 +214,104 @@ fn persist(state: &Path, record: &Record) -> io::Result<()> {
         .map_err(|_| io::Error::other("cannot persist observation"))?;
     File::open(directory)?.sync_all()
 }
+fn missing(
+    request: &model::ReadRequest<'_>,
+    source: model::SourceKind,
+    reason: model::MissingReason,
+) -> model::UsageReading {
+    let mut r = model::UsageReading::missing(request, source, reason);
+    r.weekly_remaining = model::UsageOutcome::Unavailable(reason);
+    r
+}
+/// The request's home is the injected plugin state directory, never an agent home.
+pub(crate) fn read_record(
+    request: &model::ReadRequest<'_>,
+    agent: Agent,
+    key: &str,
+    source: model::SourceKind,
+) -> model::UsageReading {
+    use model::{MissingReason as M, UsageOutcome as O};
+    use std::os::unix::fs::OpenOptionsExt;
+    let budget = model::Budget::new(request);
+    let load = || -> Result<Record, M> {
+        budget.check()?;
+        if !request.home.is_absolute() || !valid_key(key) {
+            return Err(M::Unassociated);
+        }
+        for path in [request.home.to_path_buf(), request.home.join("statusline")] {
+            let meta = fs::symlink_metadata(path).map_err(|e| model::io_reason(&e))?;
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                return Err(M::Invalid);
+            }
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(record_path(request.home, agent, key))
+            .map_err(|e| model::io_reason(&e))?;
+        if !file.metadata().map_err(|e| model::io_reason(&e))?.is_file() {
+            return Err(M::Invalid);
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_RECORD + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| model::io_reason(&e))?;
+        budget.check()?;
+        if bytes.len() as u64 > MAX_RECORD {
+            return Err(M::Invalid);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| M::Invalid)
+    };
+    let record = match load() {
+        Ok(record) => record,
+        Err(reason) => return missing(request, source, reason),
+    };
+    if record.version != 1 {
+        return missing(request, source, M::Invalid);
+    }
+    if record.agent != agent || record.key != key {
+        return missing(request, source, M::Unassociated);
+    }
+    let Some(observed) = UNIX_EPOCH.checked_add(Duration::from_millis(record.observed_ms)) else {
+        return missing(request, source, M::Invalid);
+    };
+    let age = match request.now.duration_since(observed) {
+        Ok(age) => age,
+        Err(_) => return missing(request, source, M::Invalid),
+    };
+    if age > request.max_age {
+        return missing(request, source, M::Stale);
+    }
+    let outcome = |value: Option<f64>| match value {
+        Some(value) if value.is_finite() && (0.0..=100.0).contains(&value) => O::Available(value),
+        Some(_) => O::Unavailable(M::Invalid),
+        None => O::Unavailable(M::NotFound),
+    };
+    let mut reading = missing(request, source, M::NotFound);
+    reading.observed_at = Some(observed);
+    reading.binding = Some(match agent {
+        Agent::Claude => model::UsageBinding::NativeSession(key.into()),
+        Agent::Agy => model::UsageBinding::Pane(key.into()),
+    });
+    reading.context = outcome(record.context);
+    reading.weekly_remaining = outcome(record.weekly_remaining);
+    let reset = record
+        .weekly_reset_ms
+        .and_then(|v| UNIX_EPOCH.checked_add(Duration::from_millis(v)));
+    if matches!(reading.weekly_remaining, O::Available(_)) {
+        if reset.is_some_and(|reset| reset <= request.now) {
+            reading.weekly_remaining = O::Unavailable(M::Stale);
+        } else {
+            reading.weekly_window = Some(model::WeeklyWindow::RollingSevenDays);
+            reading.weekly_resets_at = reset;
+        }
+    }
+    reading
+}
+
+#[cfg(test)]
+pub(crate) static READER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A record failure is silent and successful. With --then, stdout is copied byte
 /// for byte and the child status wins (signals become 128 + signal, capped at 255).
 pub fn run(agent: Agent, then: Option<&str>) -> u8 {
@@ -288,6 +396,141 @@ mod tests {
             .collect();
         assert_eq!(files.len(), 1);
         serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap()
+    }
+    #[test]
+    fn readers_bind_and_reject_stale_future_and_mismatched_records() {
+        let _guard = READER_TEST_LOCK.lock().unwrap();
+        use crate::{model::*, reader_agy::AgyReader, reader_claude::ClaudeReader};
+        for (agent, provider, key) in [
+            (Agent::Claude, Provider::Claude, "session-1"),
+            (Agent::Agy, Provider::Agy, "w58:p3"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let v = if agent == Agent::Claude {
+                input()
+            } else {
+                serde_json::to_vec(&json!({"context_window":{"used_percentage":23.5},"quota":{"gemini-weekly":{"remaining_percent":73,"reset_in_seconds":3600}}})).unwrap()
+            };
+            assert!(capture(agent, &v, dir.path(), Some(key), now()));
+            let id = crate::model::tests::identity(provider);
+            let mut request = crate::model::tests::request(&id, dir.path());
+            let agy = AgyReader {
+                pane_id: key.into(),
+            };
+            let reader: &dyn UsageReader = if agent == Agent::Claude {
+                &ClaudeReader
+            } else {
+                &agy
+            };
+            let r = reader.read(&request);
+            assert_eq!(r.identity, id);
+            assert_eq!(r.context, UsageOutcome::Available(23.5));
+            assert_eq!(r.weekly_remaining, UsageOutcome::Available(73.0));
+            assert_eq!(r.weekly_window, Some(WeeklyWindow::RollingSevenDays));
+            assert!(r.weekly_resets_at.is_some());
+            request.now += Duration::from_secs(61);
+            let r = reader.read(&request);
+            assert_eq!(r.context, UsageOutcome::Unavailable(MissingReason::Stale));
+            assert_eq!(
+                r.weekly_remaining,
+                UsageOutcome::Unavailable(MissingReason::Stale)
+            );
+            assert!(r.weekly_resets_at.is_none());
+            request.now = now() - Duration::from_secs(1);
+            assert_eq!(
+                reader.read(&request).context,
+                UsageOutcome::Unavailable(MissingReason::Invalid)
+            );
+            let path = record_path(dir.path(), agent, key);
+            let mut r = record(dir.path());
+            r["key"] = json!("different");
+            std::fs::write(&path, r.to_string()).unwrap();
+            request.now = now();
+            assert_eq!(
+                reader.read(&request).context,
+                UsageOutcome::Unavailable(MissingReason::Unassociated)
+            );
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(
+                reader.read(&request).context,
+                UsageOutcome::Unavailable(MissingReason::NotFound)
+            );
+        }
+    }
+    #[test]
+    fn missing_context_does_not_hide_weekly_and_expired_reset_is_missing() {
+        let _guard = READER_TEST_LOCK.lock().unwrap();
+        use crate::{model::*, reader_claude::ClaudeReader};
+        let dir = tempfile::tempdir().unwrap();
+        let v = json!({"session_id":"session-1","rate_limits":{"seven_day":{"used_percentage":0,"resets_at":1791763201}}});
+        assert!(capture(
+            Agent::Claude,
+            v.to_string().as_bytes(),
+            dir.path(),
+            None,
+            now()
+        ));
+        let id = crate::model::tests::identity(Provider::Claude);
+        let mut request = crate::model::tests::request(&id, dir.path());
+        let r = ClaudeReader.read(&request);
+        assert!(matches!(r.context, UsageOutcome::Unavailable(_)));
+        assert_eq!(r.weekly_remaining, UsageOutcome::Available(100.0));
+        request.now += Duration::from_secs(1);
+        let r = ClaudeReader.read(&request);
+        assert_eq!(
+            r.weekly_remaining,
+            UsageOutcome::Unavailable(MissingReason::Stale)
+        );
+        assert!(r.weekly_resets_at.is_none());
+    }
+    #[test]
+    fn symlinked_state_is_rejected_before_any_write() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = root.path().join("state");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!capture(Agent::Claude, &input(), &link, None, now()));
+        assert!(!target.join("statusline").exists());
+    }
+    #[test]
+    fn readers_reject_oversized_symlinked_fifo_and_invalid_records() {
+        let _guard = READER_TEST_LOCK.lock().unwrap();
+        use crate::{model::*, reader_claude::ClaudeReader};
+        let dir = tempfile::tempdir().unwrap();
+        assert!(capture(Agent::Claude, &input(), dir.path(), None, now()));
+        let id = crate::model::tests::identity(Provider::Claude);
+        let mut request = crate::model::tests::request(&id, dir.path());
+        let path = record_path(dir.path(), Agent::Claude, "session-1");
+        for bytes in [b"{broken".to_vec(), vec![b' '; MAX_RECORD as usize + 1]] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                ClaudeReader.read(&request).context,
+                UsageOutcome::Unavailable(MissingReason::Invalid)
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        let source = dir.path().join("outside");
+        std::fs::write(&source, "{}").unwrap();
+        std::os::unix::fs::symlink(&source, &path).unwrap();
+        assert!(matches!(
+            ClaudeReader.read(&request).context,
+            UsageOutcome::Unavailable(_)
+        ));
+        std::fs::remove_file(&path).unwrap();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the NUL-terminated path is owned and valid for this call.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            ClaudeReader.read(&request).context,
+            UsageOutcome::Unavailable(MissingReason::Invalid)
+        );
+        request.timeout = Duration::ZERO;
+        let r = ClaudeReader.read(&request);
+        assert_eq!(
+            r.weekly_remaining,
+            UsageOutcome::Unavailable(MissingReason::Timeout)
+        );
     }
     #[test]
     fn claude_allowlisted_atomic_record() {

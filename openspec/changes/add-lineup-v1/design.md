@@ -148,6 +148,46 @@ stay unavailable until a trustworthy persistent source is confirmed. A missing
 adapter returns unavailable, never a synthetic zero. Existing tokens cannot
 outlive the occupant whose session produced them.
 
+## Local statusLine observations (implemented adapter, opt-in hook)
+
+Decision 2026-10-12: Lineup owns the local receiving command rather than relying
+on the retired quota plugin's cache. `statusline claude` associates stdin
+`session_id` with a pane's native session. `statusline agy` associates inherited
+`HERDR_PANE_ID` with the snapshot pane, preserving the original stdin even when
+its conversation ID differs. `UsageReading.binding` carries the association
+kind and exact value through publication. The pure token layer validates that
+value against the current pane or native session, independently of agent names.
+Codex/Grok samples retain their exact native-session association.
+
+Each callback parses at most 1 MiB and atomically replaces an allowlisted JSON
+record under `$HERDR_PLUGIN_STATE_DIR/statusline/`, using a private temporary
+file, file sync, rename, and directory sync. The filename encodes the bounded
+opaque key. Receipt time is recorded without copying raw input, model names,
+transcript paths, prompts, account IDs, counters, or credentials. No agent-home
+configuration or authenticated provider API is read. Quota stays bound to the
+observing conversation/pane; cross-account sharing is deliberately absent.
+Readers use the injected plugin state root, not the daemon's session checkpoint
+subdirectory. They bound reads to 4 KiB and the common reader deadline, reject
+links/nonregular files, and validate version, provider, key, numeric ranges,
+receipt age, and reset expiry. Future/expired observations yield `—`.
+
+Context and weekly outcomes remain independent. Claude uses seven-day used
+percent and converts it to remaining. Agy selects the active model's weekly
+pool (or the sole unambiguous pool) and determines remaining scale from field
+names, never magnitude. Reset timestamps/delays become absolute times; a
+passed reset invalidates weekly only. Missing reset suppresses the countdown.
+
+The optional `--then` shell command receives byte-identical stdin and retains
+its stdout, stderr, and exit status. An oversized payload skips capture but is
+streamed to the child. Concurrent stdin feeding/stdout copying avoids pipe
+buffer deadlock when a child writes before reading. Recording and parse failures
+are silent; no chained command means no output and exit 0. Command launch/wait
+or output-copy failures return 1; child signals return 128 plus the signal.
+Hook installation and dotfiles/agent-room configuration are separate opt-in
+work and have not been performed by this implementation. Receipt TTL limits
+pane reuse risk; it does not prove a pane lifetime or account profile beyond
+the supplied opaque key. Live account accuracy remains unverified.
+
 ## Configuration and rollback
 
 User config lives in `$HERDR_PLUGIN_CONFIG_DIR/config.toml`; defaults and bounds

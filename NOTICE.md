@@ -56,3 +56,38 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## herdr-agent-quota statusLine schema handling
+
+The active-model quota-pool detection and statusLine field interpretation in
+`src/statusline.rs` are adapted from the MIT-licensed
+[fujimogn/herdr-agent-quota](https://github.com/fujimogn/herdr-agent-quota),
+commit `d428889cd6d0dc675e0b4058dc5c5f172d979e5b`, particularly
+`src/providers/agy.rs`, `src/providers/claude.rs`, and the shared parser.
+The Lineup implementation adds bounded capture, independent missing outcomes,
+exact session/pane associations, and rejects invalid ranges rather than
+clamping them. Credential/account readers were not copied or enabled.
+
+```text
+MIT License
+
+Copyright (c) 2026 Levi Qiao
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

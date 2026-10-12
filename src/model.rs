@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
+    Claude,
+    Agy,
     Codex,
     Grok,
     Hermes,
@@ -42,6 +44,8 @@ pub enum UsageOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
+    ClaudeStatusline,
+    AgyStatusline,
     CodexRollout,
     GrokSignals,
     HermesUnsupported,
@@ -54,9 +58,17 @@ pub enum WeeklyWindow {
     RollingSevenDays,
 }
 
+/// Exact association established by a reader, independently of the provider name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UsageBinding {
+    NativeSession(String),
+    Pane(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageReading {
     pub identity: SessionIdentity,
+    pub binding: Option<UsageBinding>,
     pub observed_at: Option<SystemTime>,
     pub source_kind: SourceKind,
     pub context: UsageOutcome,
@@ -161,10 +173,20 @@ impl UsageReading {
     ) -> Self {
         Self {
             identity: request.identity.clone(),
+            binding: None,
             observed_at: None,
             source_kind: source,
             context: UsageOutcome::Unavailable(reason),
-            weekly_remaining: UsageOutcome::Unavailable(MissingReason::Unsupported),
+            weekly_remaining: UsageOutcome::Unavailable(
+                if matches!(
+                    source,
+                    SourceKind::ClaudeStatusline | SourceKind::AgyStatusline
+                ) {
+                    reason
+                } else {
+                    MissingReason::Unsupported
+                },
+            ),
             weekly_window: None,
             weekly_resets_at: None,
         }
@@ -177,6 +199,11 @@ impl UsageReading {
     ) -> Self {
         let mut reading = Self::missing(request, source, MissingReason::Invalid);
         reading.observed_at = Some(observed_at);
+        if !request.identity.native_session_id.trim().is_empty() {
+            reading.binding = Some(UsageBinding::NativeSession(
+                request.identity.native_session_id.clone(),
+            ));
+        }
         reading.context = match request.now.duration_since(observed_at) {
             Err(_) => UsageOutcome::Unavailable(MissingReason::Invalid),
             Ok(age) if age > request.max_age => UsageOutcome::Unavailable(MissingReason::Stale),

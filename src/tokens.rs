@@ -44,6 +44,7 @@ pub struct Occupant {
 }
 #[derive(Clone, Debug)]
 pub struct Usage {
+    pub binding: Option<crate::model::UsageBinding>,
     pub occupant: Occupant,
     pub context_pct: Option<f64>,
     pub weekly_remaining_pct: Option<f64>,
@@ -51,14 +52,15 @@ pub struct Usage {
 }
 #[derive(Clone, Debug, Default)]
 pub struct PaneInput {
+    pub pane_id: String,
     pub occupant: Option<Occupant>,
     pub state: Option<String>,
     pub usage: Option<Usage>,
 }
 
 /// Unsupported or unidentified occupants are represented by `None`.
-/// Usage is accepted only when bound to this exact agent and a known native
-/// session. `font_verified` means affirmative terminal rendering verification,
+/// Usage is accepted only when bound to this exact occupant and a matching
+/// native session or pane ID. `font_verified` means affirmative terminal rendering verification,
 /// never mere font presence. Provider readers must remove stale/invalid samples
 /// before supplying usage; this module does not read or assess reader freshness.
 pub fn pane_tokens(row: &PaneInput, mode: LogoMode, font_verified: bool, now_unix: i64) -> Tokens {
@@ -90,10 +92,15 @@ pub fn pane_tokens(row: &PaneInput, mode: LogoMode, font_verified: bool, now_uni
     tokens.insert(format!("lineup_state_{state}"), Some("●".into()));
     let usage = row.usage.as_ref().filter(|usage| {
         usage.occupant == *occupant
-            && occupant
-                .native_session
-                .as_deref()
-                .is_some_and(|id| !id.trim().is_empty())
+            && match usage.binding.as_ref() {
+                Some(crate::model::UsageBinding::NativeSession(id)) => {
+                    !id.trim().is_empty() && occupant.native_session.as_ref() == Some(id)
+                }
+                Some(crate::model::UsageBinding::Pane(id)) => {
+                    !id.trim().is_empty() && row.pane_id == *id
+                }
+                None => false,
+            }
     });
     let context = percentage(usage.and_then(|usage| usage.context_pct));
     let weekly = percentage(usage.and_then(|usage| usage.weekly_remaining_pct));
@@ -396,9 +403,11 @@ mod tests {
     fn row() -> PaneInput {
         let who = occupant(Agent::Claude, "s1");
         PaneInput {
+            pane_id: "pane-1".into(),
             occupant: Some(who.clone()),
             state: Some("working".into()),
             usage: Some(Usage {
+                binding: Some(crate::model::UsageBinding::NativeSession("s1".into())),
                 occupant: who,
                 context_pct: Some(7.2),
                 weekly_remaining_pct: None,
@@ -574,6 +583,33 @@ mod tests {
             pane_tokens(&row, LogoMode::Text, false, 0)
                 .values()
                 .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn pane_binding_accepts_exact_pane_without_native_session() {
+        let mut r = row();
+        r.occupant.as_mut().unwrap().native_session = None;
+        r.usage.as_mut().unwrap().occupant = r.occupant.clone().unwrap();
+        r.usage.as_mut().unwrap().binding =
+            Some(crate::model::UsageBinding::Pane(r.pane_id.clone()));
+        let t = pane_tokens(&r, LogoMode::Text, false, 0);
+        assert_eq!(t["lineup_context_pct"], Some("7.2".into()));
+        r.usage.as_mut().unwrap().binding =
+            Some(crate::model::UsageBinding::Pane("different".into()));
+        assert_eq!(
+            pane_tokens(&r, LogoMode::Text, false, 0)["lineup_context_pct"],
+            None
+        );
+    }
+    #[test]
+    fn native_binding_requires_exact_nonempty_native_session() {
+        let mut r = row();
+        r.usage.as_mut().unwrap().binding =
+            Some(crate::model::UsageBinding::NativeSession("other".into()));
+        assert_eq!(
+            pane_tokens(&r, LogoMode::Text, false, 0)["lineup_context_pct"],
+            None
         );
     }
 

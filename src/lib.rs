@@ -9,6 +9,8 @@ pub mod lock;
 pub mod model;
 pub mod protocol;
 pub mod publish;
+pub mod reader_agy;
+pub mod reader_claude;
 pub mod reader_codex;
 pub mod reader_grok;
 pub mod reader_hermes;
@@ -31,6 +33,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Capture local usage without changing the existing statusLine display.
+    Statusline {
+        #[arg(value_enum)]
+        agent: statusline::Agent,
+        /// Run a shell command with the original stdin and preserve its stdout/status.
+        #[arg(long)]
+        then: Option<String>,
+    },
     /// Ensure one detached daemon is running for this Herdr session.
     Ensure,
     /// Run the daemon in the foreground.
@@ -53,6 +63,9 @@ enum Command {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        Command::Statusline { agent, then } => {
+            return ExitCode::from(statusline::run(agent, then.as_deref()));
+        }
         Command::Ensure => daemon::Options::from_env().and_then(|options| daemon::ensure(&options)),
         Command::Daemon => {
             daemon::Options::from_env().and_then(|options| daemon::foreground(&options))
@@ -114,6 +127,22 @@ pub(crate) fn failure_exit_code(error: &std::io::Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+    #[test]
+    fn statusline_cli_accepts_provider_and_chained_command() {
+        for provider in ["claude", "agy"] {
+            assert!(
+                super::Cli::try_parse_from([
+                    "herdr-lineup",
+                    "statusline",
+                    provider,
+                    "--then",
+                    "cat"
+                ])
+                .is_ok()
+            );
+        }
+    }
     #[test]
     fn ordinary_socket_and_publisher_would_block_errors_are_not_lock_contention() {
         for message in ["socket read stalled", "publisher write stalled"] {
