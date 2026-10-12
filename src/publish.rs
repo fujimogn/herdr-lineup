@@ -190,6 +190,7 @@ impl MetadataPublisher {
         keys: &BTreeSet<String>,
         occupant: Option<&tokens::Occupant>,
         desired: &tokens::Tokens,
+        deadline: Option<Instant>,
     ) -> io::Result<()> {
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let snapshot = tokens::ResourceSnapshot {
@@ -225,6 +226,11 @@ impl MetadataPublisher {
         let id = format!("lineup-{}", self.request_seq);
         let request = protocol::metadata_request(&id, &report)
             .map_err(|_| io::Error::other("invalid metadata request"))?;
+        // Persistence may consume the budget checked by clear's caller. Recheck
+        // at the last possible point before starting the bounded socket exchange.
+        if let Some(deadline) = deadline {
+            check_clear_deadline(deadline)?;
+        }
         let response = exchange(transport, &request)?;
         let result = protocol::response_result(&id, &response)
             .map_err(|_| io::Error::other("metadata report rejected"))?;
@@ -345,6 +351,7 @@ impl MetadataPublisher {
                 &pane.stored_keys,
                 occupant.as_ref(),
                 &desired,
+                None,
             ) {
                 if error.kind() == io::ErrorKind::InvalidInput {
                     failed = true;
@@ -384,9 +391,14 @@ impl MetadataPublisher {
                 ),
             ]);
             let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
-            if let Err(error) =
-                self.report(transport, &resource, &workspace.stored_keys, None, &desired)
-            {
+            if let Err(error) = self.report(
+                transport,
+                &resource,
+                &workspace.stored_keys,
+                None,
+                &desired,
+                None,
+            ) {
                 if error.kind() != io::ErrorKind::InvalidInput {
                     return Err(error);
                 }
@@ -418,7 +430,14 @@ impl daemon::Publisher for MetadataPublisher {
                 .iter()
                 .map(|key| ((*key).into(), None))
                 .collect();
-            self.report(transport, &resource, &pane.stored_keys, None, &desired)?;
+            self.report(
+                transport,
+                &resource,
+                &pane.stored_keys,
+                None,
+                &desired,
+                Some(deadline),
+            )?;
         }
         for workspace in snapshot.workspaces {
             check_clear_deadline(deadline)?;
@@ -427,7 +446,14 @@ impl daemon::Publisher for MetadataPublisher {
                 .iter()
                 .map(|key| ((*key).into(), None))
                 .collect();
-            self.report(transport, &resource, &workspace.stored_keys, None, &desired)?;
+            self.report(
+                transport,
+                &resource,
+                &workspace.stored_keys,
+                None,
+                &desired,
+                Some(deadline),
+            )?;
         }
         Ok(())
     }
@@ -555,6 +581,45 @@ mod tests {
             .unwrap();
         let reports = server.join().unwrap();
         assert_eq!(reports[0]["params"]["seq"], 41);
+    }
+
+    #[test]
+    fn clear_rechecks_budget_after_reservation_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut transport = Transport::connect(&socket).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut stream = BufReader::new(stream);
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let resource = ResourceId {
+            endpoint_session: "fake".into(),
+            kind: ResourceKind::Pane,
+            id: "w1:p1".into(),
+        };
+        let desired = BTreeMap::from([("lineup_agent".into(), None)]);
+        // Reproduce the budget remaining after slow checkpoint persistence.
+        let result = publisher.report(
+            &mut transport,
+            &resource,
+            &BTreeSet::new(),
+            None,
+            &desired,
+            Some(Instant::now() + Duration::from_millis(900)),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let rows: Vec<CheckpointRow> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
+                .unwrap();
+        assert_eq!(rows[0].seq, 1);
+        let mut line = String::new();
+        assert!(stream.read_line(&mut line).is_err());
+        assert!(line.is_empty());
     }
 
     #[test]
@@ -690,10 +755,9 @@ mod tests {
         let publisher = MetadataPublisher::new(
             paths.root.clone(),
             paths.key.clone(),
-            Homes {
-                codex: Some(dir.path().join("empty-codex-home")),
-                grok: Some(dir.path().join("empty-grok-home")),
-            },
+            // Missing homes exercise unavailable usage without competing with
+            // the reader modules' separately serialized process-wide workers.
+            Homes::default(),
         )
         .unwrap();
         let daemon_options = options.clone();
