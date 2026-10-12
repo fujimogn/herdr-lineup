@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::path::Path;
 
 pub struct CodexReader;
+static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 impl UsageReader for CodexReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
         let source = SourceKind::CodexRollout;
@@ -12,10 +13,12 @@ impl UsageReader for CodexReader {
         {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
-        match read_session(request) {
-            Ok((percent, time)) => UsageReading::sample(request, source, percent, time),
-            Err(reason) => UsageReading::missing(request, source, reason),
-        }
+        bounded_read(request, source, &BUSY, move |request| {
+            match read_session(request) {
+                Ok((percent, time)) => UsageReading::sample(request, source, percent, time),
+                Err(reason) => UsageReading::missing(request, source, reason),
+            }
+        })
     }
 }
 fn rollout(path: &Path) -> bool {
@@ -81,6 +84,7 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime
 }
 #[cfg(test)]
 mod tests {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn assert_percent(outcome: UsageOutcome) {
         let UsageOutcome::Available(percent) = outcome else {
             panic!("context unavailable");
@@ -103,6 +107,7 @@ mod tests {
     }
     #[test]
     fn normal_missing_stale_and_mismatch() {
+        let _serial = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let r = request(&id, dir.path());
@@ -131,6 +136,7 @@ mod tests {
     }
     #[test]
     fn compressed_archive_and_ambiguous_duplicate() {
+        let _serial = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let r = request(&id, dir.path());
@@ -156,6 +162,7 @@ mod tests {
     }
     #[test]
     fn rejects_invalid_future_timeout_and_partial_tail() {
+        let _serial = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let mut r = request(&id, dir.path());

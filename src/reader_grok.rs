@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::path::Path;
 
 pub struct GrokReader;
+static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 impl UsageReader for GrokReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
         let source = SourceKind::GrokSignals;
@@ -12,10 +13,12 @@ impl UsageReader for GrokReader {
         {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
-        match read_session(request) {
-            Ok((percent, observed)) => UsageReading::sample(request, source, percent, observed),
-            Err(reason) => UsageReading::missing(request, source, reason),
-        }
+        bounded_read(request, source, &BUSY, move |request| {
+            match read_session(request) {
+                Ok((percent, observed)) => UsageReading::sample(request, source, percent, observed),
+                Err(reason) => UsageReading::missing(request, source, reason),
+            }
+        })
     }
 }
 fn signals(path: &Path) -> bool {
@@ -74,6 +77,7 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime
 }
 #[cfg(test)]
 mod tests {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn assert_percent(outcome: UsageOutcome) {
         let UsageOutcome::Available(percent) = outcome else {
             panic!("context unavailable");
@@ -97,6 +101,7 @@ mod tests {
     }
     #[test]
     fn normal_missing_stale_and_mismatch() {
+        let _serial = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Grok);
         let r = request(&id, dir.path());
@@ -137,6 +142,7 @@ mod tests {
     }
     #[test]
     fn rejects_invalid_future_ambiguous_and_timeout() {
+        let _serial = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Grok);
         let mut r = request(&id, dir.path());
@@ -186,6 +192,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn never_follows_session_or_file_symlinks() {
+        let _serial = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Grok);
         let r = request(&id, dir.path());

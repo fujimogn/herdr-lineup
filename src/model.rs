@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +77,69 @@ pub struct ReadRequest<'a> {
 
 pub trait UsageReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading;
+}
+
+/// The caller's deadline covers discovery, reads and decompression, including stalled I/O.
+/// A timed-out job is not killed (Rust cannot safely cancel a blocked OS read), but its
+/// provider slot stays occupied until it finishes. Thus repeated polls cannot leak workers.
+pub(crate) fn bounded_read<F>(
+    request: &ReadRequest<'_>,
+    source: SourceKind,
+    busy: &'static AtomicBool,
+    job: F,
+) -> UsageReading
+where
+    F: FnOnce(&ReadRequest<'_>) -> UsageReading + Send + 'static,
+{
+    let Some(deadline) = Instant::now().checked_add(request.timeout) else {
+        return UsageReading::missing(request, source, MissingReason::Invalid);
+    };
+    if request.timeout.is_zero()
+        || busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return UsageReading::missing(request, source, MissingReason::Timeout);
+    }
+    struct Permit(&'static AtomicBool);
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let permit = Permit(busy);
+    let identity = request.identity.clone();
+    let home = request.home.to_path_buf();
+    let now = request.now;
+    let max_age = request.max_age;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("lineup-reader".into())
+        .spawn(move || {
+            let owned = ReadRequest {
+                identity: &identity,
+                home: &home,
+                now,
+                max_age,
+                timeout: deadline.saturating_duration_since(Instant::now()),
+            };
+            let result = job(&owned);
+            drop(permit);
+            // Late results are discarded after the caller returns unavailable.
+            let _ = sender.send(result);
+        });
+    if worker.is_err() {
+        return UsageReading::missing(request, source, MissingReason::SourceError);
+    }
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            UsageReading::missing(request, source, MissingReason::Timeout)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            UsageReading::missing(request, source, MissingReason::SourceError)
+        }
+    }
 }
 
 impl UsageReading {
@@ -239,6 +303,50 @@ pub(crate) mod tests {
             max_age: Duration::from_secs(60),
             timeout: Duration::from_secs(2),
         }
+    }
+    #[test]
+    fn stalled_io_returns_by_deadline_without_spawning_repeated_workers() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        static OTHER_PROVIDER: AtomicBool = AtomicBool::new(false);
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let mut r = request(&id, dir.path());
+        r.timeout = Duration::from_millis(20);
+        let (release, blocked) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        let result = bounded_read(&r, SourceKind::CodexRollout, &BUSY, move |request| {
+            // Simulate an OS read that does not respond to cooperative Budget checks.
+            blocked.recv().unwrap();
+            UsageReading::sample(request, SourceKind::CodexRollout, 7.0, request.now)
+        });
+        assert_eq!(
+            result.context,
+            UsageOutcome::Unavailable(MissingReason::Timeout)
+        );
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(BUSY.load(Ordering::Acquire));
+        let retry = bounded_read(&r, SourceKind::CodexRollout, &BUSY, |_| {
+            panic!("a timed-out job must retain its provider slot")
+        });
+        assert_eq!(
+            retry.context,
+            UsageOutcome::Unavailable(MissingReason::Timeout)
+        );
+        r.timeout = Duration::from_secs(2);
+        let other = bounded_read(&r, SourceKind::GrokSignals, &OTHER_PROVIDER, |request| {
+            UsageReading::sample(request, SourceKind::GrokSignals, 7.0, request.now)
+        });
+        assert_eq!(other.context, UsageOutcome::Available(7.0));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while BUSY.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!BUSY.load(Ordering::Acquire));
+        let recovered = bounded_read(&r, SourceKind::CodexRollout, &BUSY, |request| {
+            UsageReading::sample(request, SourceKind::CodexRollout, 8.0, request.now)
+        });
+        assert_eq!(recovered.context, UsageOutcome::Available(8.0));
     }
     #[test]
     fn sample_validation() {
