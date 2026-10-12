@@ -376,38 +376,54 @@ pub fn probe(paths: &RuntimePaths, socket: &std::path::Path) -> io::Result<Optio
     };
     read_identity(&mut stream, paths, socket).map(Some)
 }
+fn transient_control_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+    )
+}
 fn probe_starting(paths: &RuntimePaths, socket: &std::path::Path) -> io::Result<Option<Health>> {
     match probe(paths, socket) {
         // The serial handler may be busy with another probe/stop or refresh.
-        // A single frame deadline is not the five-second startup deadline.
         // Retry only transient transport failures, never invalid identities.
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::TimedOut
-                    | io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::ConnectionReset
-            ) =>
-        {
-            Ok(None)
-        }
+        Err(error) if transient_control_error(&error) => Ok(None),
         result => result,
     }
 }
 pub fn stop(options: &Options) -> io::Result<()> {
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let deadline = Instant::now() + STOP_DEADLINE;
-    let Some(mut stream) = control_stream(&paths)? else {
-        return if SessionLock::is_held(&paths)? {
-            Err(io::Error::other(
-                "session lock is live but control is unavailable; no signal sent",
-            ))
-        } else {
-            Ok(())
-        };
+    // Refresh and another control client can occupy the serial handler longer
+    // than a frame deadline. Retry only before submitting shutdown, within the
+    // overall stop deadline; invalid identities must still fail immediately.
+    let (mut stream, identity) = loop {
+        let attempt = (|| {
+            let Some(mut stream) = control_stream(&paths)? else {
+                return Ok(None);
+            };
+            let identity = read_identity(&mut stream, &paths, &options.socket)?;
+            Ok(Some((stream, identity)))
+        })();
+        match attempt {
+            Ok(Some(ready)) => break ready,
+            Ok(None) => {
+                if !SessionLock::is_held(&paths)? {
+                    return Ok(());
+                }
+            }
+            Err(error) if transient_control_error(&error) => (),
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "daemon control unavailable within five seconds; no signal sent",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     };
-    let identity = read_identity(&mut stream, &paths, &options.socket)?;
     let request = serde_json::json!({"stop":identity.nonce,"plugin":PLUGIN_ID,"socket_key":paths.key,"endpoint":identity.endpoint});
     serde_json::to_writer(stream.get_mut(), &request)?;
     stream.get_mut().write_all(b"\n")?;
@@ -582,7 +598,21 @@ mod tests {
                 fs::write(options.state.join("contended"), error.to_string()).unwrap();
                 std::process::exit(i32::from(crate::failure_exit_code(&error)));
             }
-            run_foreground(&options, true, &mut NoopPublisher).unwrap();
+            struct SlowRefresh(PathBuf);
+            impl Publisher for SlowRefresh {
+                fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                    if self.0.join("slow-refresh").exists() {
+                        fs::remove_file(self.0.join("slow-refresh"))?;
+                        fs::write(self.0.join("refresh-entered"), "")?;
+                        std::thread::sleep(Duration::from_millis(900));
+                    }
+                    Ok(())
+                }
+                fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+            run_foreground(&options, true, &mut SlowRefresh(options.state.clone())).unwrap();
         }
     }
 
@@ -592,6 +622,56 @@ mod tests {
             assert!(Instant::now() < deadline, "test handshake timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn stop_during_refresh_then_immediate_ensure_replaces_daemon() {
+        let (_dir, options, done, server) = fixture();
+        fs::write(
+            options.config.join("config.toml"),
+            "refresh_interval_ms = 1000\nreader_timeout_ms = 100\n",
+        )
+        .unwrap();
+        ensure_command(&options, child_command()).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let old = probe(&paths, &options.socket).unwrap().unwrap();
+        fs::write(options.state.join("slow-refresh"), "").unwrap();
+        wait_until(|| options.state.join("refresh-entered").exists());
+        let stopped = stop(&options);
+        let restarted = ensure_command(&options, child_command());
+        let new = probe(&paths, &options.socket).unwrap().unwrap();
+        // Clean up even when the regression assertion fails.
+        stop(&options).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(
+            stopped.is_ok(),
+            "stop failed during bounded refresh: {stopped:?}"
+        );
+        assert!(restarted.is_ok(), "immediate ensure failed: {restarted:?}");
+        assert_ne!(old.nonce, new.nonce, "ensure reused the old daemon");
+        assert_ne!(old.pid, new.pid, "ensure did not spawn a new daemon");
+    }
+
+    #[test]
+    fn stop_with_live_lock_and_no_control_is_bounded_and_never_uses_pid() {
+        let (_dir, options, done, server) = fixture();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let lock = SessionLock::acquire(&paths).unwrap().unwrap();
+        fs::write(&paths.pid, std::process::id().to_string()).unwrap();
+        let started = Instant::now();
+        let error = stop(&options).unwrap_err();
+        let elapsed = started.elapsed();
+        drop(lock);
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(error.to_string().contains("no signal sent"));
+        assert!(elapsed >= STOP_DEADLINE);
+        assert!(elapsed < STOP_DEADLINE + Duration::from_secs(1));
+        assert_eq!(
+            fs::read_to_string(&paths.pid).unwrap(),
+            std::process::id().to_string()
+        );
     }
 
     #[test]
