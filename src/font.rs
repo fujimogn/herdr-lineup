@@ -226,6 +226,16 @@ fn apply(locations: &Locations, removing: bool) -> io::Result<Vec<String>> {
     apply_with(locations, removing, write_atomic)
 }
 
+struct FontLock(fs::File);
+
+impl Drop for FontLock {
+    fn drop(&mut self) {
+        // Close alone can leave flock held by an unrelated fork until exec.
+        // Explicit unlock releases the shared open-file description on every exit.
+        let _ = self.0.unlock();
+    }
+}
+
 fn apply_with(
     locations: &Locations,
     removing: bool,
@@ -242,6 +252,7 @@ fn apply_with(
         .write(true)
         .open(lock_path)?;
     lock.try_lock().map_err(io::Error::other)?;
+    let _lock = FontLock(lock);
     let journal = locations.state.join("font-ownership.json");
     let mut state = load(&journal)?;
     check_path(&locations.font)?;
@@ -423,6 +434,114 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let locations = Locations::new(root.path(), None, None, &root.path().join("state"), false);
         (root, locations)
+    }
+
+    #[cfg(unix)]
+    struct ForkedLockHolder {
+        pid: libc::pid_t,
+        release: std::os::unix::net::UnixStream,
+    }
+
+    #[cfg(unix)]
+    impl ForkedLockHolder {
+        fn spawn() -> Self {
+            use std::os::fd::AsRawFd;
+            let (release, child) = std::os::unix::net::UnixStream::pair().unwrap();
+            let parent_fd = release.as_raw_fd();
+            let child_fd = child.as_raw_fd();
+            // SAFETY: the child uses only async-signal-safe calls and never
+            // returns to Rust. A bounded poll prevents an orphaned test child.
+            let pid = unsafe {
+                let pid = libc::fork();
+                if pid == 0 {
+                    libc::close(parent_fd);
+                    let mut ready = libc::pollfd {
+                        fd: child_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    libc::poll(&mut ready, 1, 5_000);
+                    libc::_exit(0);
+                }
+                pid
+            };
+            assert!(pid > 0, "fork failed: {}", io::Error::last_os_error());
+            Self { pid, release }
+        }
+
+        fn assert_running(&self) {
+            // SAFETY: query only this helper's child without blocking.
+            let status = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), libc::WNOHANG) };
+            assert_eq!(status, 0, "fork holder exited before the lock check");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ForkedLockHolder {
+        fn drop(&mut self) {
+            let _ = self.release.shutdown(std::net::Shutdown::Both);
+            // SAFETY: wait only for the child created by this helper.
+            while unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) } < 0 {
+                if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_actions_release_locks_inherited_by_an_unrelated_fork() {
+        for removing in [false, true] {
+            for fail_write in [false, true] {
+                let (_root, locations) = fixture();
+                let config = locations.config.join("kitty/kitty.conf");
+                fs::create_dir_all(config.parent().unwrap()).unwrap();
+                fs::write(&config, "# original\n").unwrap();
+                if removing {
+                    install(&locations).unwrap();
+                }
+                let mut child = None;
+                let result = apply_with(&locations, removing, |path, bytes| {
+                    // Fork on another thread while the real action owns its lock.
+                    child = Some(std::thread::spawn(ForkedLockHolder::spawn).join().unwrap());
+                    if fail_write {
+                        Err(conflict("injected write failure"))
+                    } else {
+                        write_atomic(path, bytes)
+                    }
+                });
+                assert_eq!(result.is_err(), fail_write);
+                let child = child.unwrap();
+                child.assert_running();
+                // The child still has the descriptor open after the action ends.
+                let next = install(&locations);
+                child.assert_running();
+                drop(child);
+                next.unwrap();
+                uninstall(&locations).unwrap();
+                assert_eq!(fs::read_to_string(config).unwrap(), "# original\n");
+            }
+        }
+    }
+
+    #[test]
+    fn active_font_action_refuses_competing_actions_without_writes() {
+        let (_root, locations) = fixture();
+        let config = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "# original\n").unwrap();
+        apply_with(&locations, false, |path, bytes| {
+            let before = fs::read(path).unwrap();
+            assert!(install(&locations).is_err());
+            assert!(uninstall(&locations).is_err());
+            assert_eq!(fs::read(path).unwrap(), before);
+            assert!(!locations.state.join("font-ownership.json").exists());
+            write_atomic(path, bytes)
+        })
+        .unwrap();
+        uninstall(&locations).unwrap();
+        assert_eq!(fs::read_to_string(config).unwrap(), "# original\n");
     }
 
     #[test]
