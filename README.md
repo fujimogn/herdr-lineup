@@ -944,6 +944,9 @@ They open the current `main` branch, which may differ from an older archive.
 - [Usage sources](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/usage-sources.md) — provider inputs and availability.
 - [Codex context drift](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/codex-context-drift.md) — evidence for the one-point display gap.
 - [Plugin conventions](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/plugin-conventions.md) — packaging and installation research.
+- [Kimi usage](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/kimi-usage.md) — local context evidence, and why weekly quota stays unavailable.
+- [Plugin directory](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/plugin-directory.md) — 2026-10-13 marketplace listing notes, with the v0.1.1 status at the top.
+- [Code review](https://github.com/fujimogn/herdr-lineup/blob/main/docs/reviews/code-review-2026-10-13.md) — 2026-10-13 ballot and the status of each finding.
 - [Security](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md) — local data, credentials, and network boundaries.
 - [Changelog](https://github.com/fujimogn/herdr-lineup/blob/main/CHANGELOG.md) — user-visible changes.
 

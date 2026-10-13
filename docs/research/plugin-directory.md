@@ -3,6 +3,8 @@
 Checked 2026-10-13. Repository files are from `origin/main`
 `47c181f18a8b876d38b3acbacdd828dfbfb3aab6`.
 
+As of tag v0.1.1 (`cacef43efab070cd17e5a5f6448aabc5bdb039dc`, 2026-10-14), this repository is public and the README documents `herdr plugin install fujimogn/herdr-lineup`. The gap and owner notes below are that 2026-10-13 snapshot, including wording that was private or planned at `47c181f`.
+
 ## Conclusion
 
 Listing is adding the GitHub topic `herdr-plugin` to this public
@@ -89,8 +91,8 @@ commands: install, uninstall, link, unlink, enable, disable,
 
 GitHub reports the license SPDX id `MIT` (`LICENSE:1-21`).
 
-These lines still say the repository is private or that public
-installation is planned: `README.md:14-15`, `README.md:19`,
+At `47c181f`, these lines said the repository was private or that public
+installation was planned: `README.md:14-15`, `README.md:19`,
 `README.md:48`, `README.md:94-103`, `docs/releasing.md:7-8`,
 `CHANGELOG.md:25`. Finding 10 in
 `docs/reviews/code-review-2026-10-13.md` left that planned wording
@@ -114,7 +116,8 @@ Outside the repository: add the topic `herdr-plugin` on
 <https://github.com/fujimogn/herdr-lineup>, then wait for the
 30-minute refresh or push a new `main` head.
 
-Inside the repository, and not part of that listing procedure: update
-the private-repository sentences in the gap section, including
-`CHANGELOG.md:25`. Editing the changelog does not replace the Release
-already published.
+Inside the repository, and not part of that listing procedure, the
+private-repository sentences named above, including `CHANGELOG.md:25`
+at that commit, were the follow-up. v0.1.1 replaced that install wording.
+Editing a changelog does not replace a Release already published; the
+v0.1.0 Release body was not fetched again for this note.

@@ -2,7 +2,7 @@
 
 Record of the first agent-versus-agent review of herdr-lineup. This file records the ballots. It does not change the product.
 
-Line numbers are the ones in the ballots and refer to reviewed commit `fca5bbcbdb06627534726f03099831061d4ac77f` (`main` at review time). Later status uses `git log fca5bbc..origin/main` as of `623a126ab65f0bcd9044fd1d3e20e115c66ee7d5`.
+Line numbers are the ones in the ballots and refer to reviewed commit `fca5bbcbdb06627534726f03099831061d4ac77f` (`main` at review time). Later status uses `git log fca5bbc..origin/main` as of tag `v0.1.1` `cacef43efab070cd17e5a5f6448aabc5bdb039dc`.
 
 ## Summary
 
@@ -14,10 +14,10 @@ Line numbers are the ones in the ballots and refer to reviewed commit `fca5bbcbd
 | Agreement | Counted as n/2. Agy submitted no ballot, so the denominator is 2. Dedup key is file:line plus kind. No pair shared both, so every finding below is 1/2. Overlapping substance with a different kind or line range is kept separate and called out under Differences. |
 | Counts | 6 High, 15 Medium, 1 Low–Medium, 21 Low. 43 findings after the dedup key. |
 | Highest priority before a tag | The ballots' pre-tag priorities (C1–C8, the Codex uninstall and manifest notes, and Codex `account/read` failure classes) were addressed by v0.1.0. Remaining follow-ups are identified in the statuses below. |
-| Status at this main | 33 findings addressed, 2 deferred, 7 with shipped and deferred parts, and 1 with a shipped record and an investigation in progress; ballot severity and agreement counts above are unchanged. |
+| Status at this main | 34 findings addressed, 2 deferred, and 7 with shipped and deferred parts; ballot severity and agreement counts above are unchanged. |
 | Agy | Absent for both rounds. agent-room rejected the runs with `headless_payload_malformed` and `headless_payload_invalid_terminal` before a ballot existed. Those format errors are recorded here and are not treated as a review of the repository. |
 
-Status vocabulary: **Shipped** plus a short sha names a commit on `main` that addresses the finding or the named part. **Already fixed in** names an earlier commit whose behavior was confirmed later. **Deferred** names a remaining part and gives the reason. **In progress** identifies the isolated end-to-end rerun being investigated for finding 37. A mixed status lists each part separately. Status describes the implementation and documentation, not a new ballot.
+Status vocabulary: **Shipped** plus a short sha names a commit on `main` that addresses the finding or the named part. **Already fixed in** names an earlier commit whose behavior was confirmed later. **Deferred** names a remaining part and gives the reason. A mixed status lists each part separately. Status describes the implementation and documentation, not a new ballot.
 
 ## Reviewer cost
 
@@ -521,7 +521,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The testing document does not show a run at the reviewed commit.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: Shipped `c72e242` for the refreshed testing record. In progress: the isolated end-to-end rerun stopped at the publication check and is under investigation.
+- Status: Shipped `c72e242`, `86cb4c2` (testing record, and the isolated harness from publication through post-stop deletion).
 
 #### 38. `fs2` is unmaintained
 
@@ -649,4 +649,4 @@ The first pass stayed on the release documents and finished in about a minute, s
 
 Absent. Both rounds failed in agent-room before a ballot, with `headless_payload_malformed` and `headless_payload_invalid_terminal`.
 
-Status last updated: 2026-10-13 at main `623a126ab65f0bcd9044fd1d3e20e115c66ee7d5`.
+Status last updated: 2026-10-14 at tag `v0.1.1` `cacef43efab070cd17e5a5f6448aabc5bdb039dc`.
