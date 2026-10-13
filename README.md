@@ -17,22 +17,26 @@
 
 ## What it does
 
-Each agent row shows the vendor logo, a Herdr state dot, context use as a percentage,
-and weekly remaining quota for Claude, Codex, Grok, Antigravity, Kimi, and
-Hermes. A weekly triplet such as `7d 67% 6d9h` shows the quota period, the share
-remaining, and the time until reset. Unavailable usage shows `—`.
+Each agent row shows the vendor logo, a state dot, context use as a percentage,
+and weekly remaining quota. Which of those values can appear depends on the
+agent, and a value Lineup cannot show is `—`. A weekly triplet such as
+`7d 67% 6d9h` shows the quota period, the share remaining, and the time until
+reset.
 
 | Agent | Context | Weekly remaining |
 | --- | --- | --- |
-| Claude | Opt-in statusLine observation | Opt-in statusLine seven-day observation |
-| Codex | Exact-session local rollout, with the 12,000-token UI baseline | Account quota worker when `allow_network = true` |
-| Grok | Exact-session local `signals.json` | Shared billing worker when `allow_network = true`; WEEKLY only |
-| Antigravity | Opt-in statusLine observation | Active-model weekly pool from statusLine |
-| Kimi | Local session file | Unavailable |
-| Hermes | Unavailable | Unavailable |
+| Claude | Shown after statusLine setup (opt-in) | Shown after statusLine setup (opt-in) |
+| Codex | Shown without setup | Shown with `allow_network = true` (opt-in) |
+| Grok | Shown without setup | Shown with `allow_network = true` (opt-in); weekly window only |
+| Antigravity | Shown after statusLine setup (opt-in) | Shown after statusLine setup (opt-in) |
+| Kimi | Shown without setup (value at the completed turn) | Not available |
+| Hermes | Not available | Not available |
 
-See [Sidebar tokens](#sidebar-tokens) for display formatting and terminal-cell
-alignment, and [Source research](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/usage-sources.md) for usage inputs.
+`Shown without setup` requires that agent's pane to be bound to its native
+session. See [Account quota](#account-quota-opt-in) to enable Codex and Grok
+weekly quota, and [statusLine setup](#claude-and-antigravity-statusline-opt-in)
+for Claude and Antigravity. See [Sidebar tokens](#sidebar-tokens) for display
+formatting and terminal-cell alignment, and [Source research](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/usage-sources.md) for usage inputs.
 
 ## Install
 
@@ -556,7 +560,10 @@ nothing and exits 0.
 Claude's binding key is the stdin field `session_id`, matched to the pane's
 native session. Antigravity's binding key is `HERDR_PANE_ID`, matched to the
 pane. Antigravity ignores any conversation id in the JSON. Herdr panes provide
-`HERDR_PANE_ID`.
+`HERDR_PANE_ID`. Claude's weekly remaining is the seven-day rate limit in that
+observation. Antigravity's weekly remaining is the active model's weekly quota
+pool. When the model does not select a pool, the only pool present is used; two
+pools leave weekly unavailable.
 
 Context stays `—` until an observation matches the pane, then retains the last
 valid value while that exact session or pane binding matches. Idle Claude,
@@ -716,12 +723,14 @@ and Grok weekly at `—`
 while preserving local context.
 
 Codex context uses `max(total_tokens - 12000, 0) / (model_context_window - 12000)`.
-A window of 12,000 tokens or less is unavailable. The snapshot has no pane-specific
+A window of 12,000 tokens or less is unavailable. That percentage is read from
+the exact native session's local rollout file. The snapshot has no pane-specific
 home or profile, so Codex weekly is attributed only to a pane whose exact native
 session is verified in the daemon's home. Panes using a different home remain
 unavailable. Profiles sharing one home cannot be distinguished; stop/start the
 Lineup daemon after changing authentication or profiles to discard cached account
-quota. Grok has one configured auth source, so its weekly quota is shared by all
+quota. Grok context is read from the exact native session's `signals.json`.
+Grok has one configured auth source, so its weekly quota is shared by all
 Grok panes, even without local context.
 
 Kimi context uses one regular, nonsymlinked `state.json` under `KIMI_CODE_HOME`
