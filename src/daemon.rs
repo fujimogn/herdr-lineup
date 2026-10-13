@@ -1017,7 +1017,7 @@ mod tests {
         done.store(true, Ordering::Relaxed);
         server.join().unwrap();
         assert!(log.contains("reason=shutdown"), "{log}");
-        assert!(!log.contains("refresh failed"), "{log}");
+        assert!(!log.contains("event=refresh_failed"), "{log}");
         assert!(
             log.lines()
                 .all(|line| line.starts_with("20") && line.contains('Z')),
@@ -1070,8 +1070,9 @@ mod tests {
         ensure_command(&options, command).unwrap();
         wait_until(|| options.state.join("daemon-cwd").exists());
         assert_eq!(
-            PathBuf::from(fs::read_to_string(options.state.join("daemon-cwd")).unwrap()),
-            paths.root
+            fs::canonicalize(fs::read_to_string(options.state.join("daemon-cwd")).unwrap())
+                .unwrap(),
+            fs::canonicalize(&paths.root).unwrap()
         );
         assert_eq!(
             fs::metadata(paths.root.join("daemon.log.1")).unwrap().len(),
