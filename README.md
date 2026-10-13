@@ -82,8 +82,11 @@ Requires macOS or Linux, Herdr 0.9.3 or later, Git, and
    ```
 
    Look for the completed `doctor` command, its exit status, and the diagnostic
-   output. Healthy output includes `daemon/control/lock healthy`. Missing optional
-   usage is expected. Next, [configure the sidebar](#sidebar) to display the rows.
+   output. Healthy output includes `daemon/control/lock healthy`. If doctor says
+   `daemon is starting; the first refresh has not completed yet`, wait a few
+   seconds and run the doctor action again. This initial exit 1 is not a refresh
+   failure. Missing optional usage is expected. Next, [configure the sidebar](#sidebar)
+   to display the rows.
 
 Release archives contain a built binary, `LICENSE`, `NOTICE.md`, and `README.md`.
 Plugin installation assumes building from a checkout as above.
@@ -127,7 +130,7 @@ it to your `PATH` as shown in [statusLine setup](#claude-and-antigravity-statusl
 | `ensure` | Start one detached publisher per Herdr session if needed. |
 | `daemon` | Run the publisher in the foreground. |
 | `stop` | Stop the plugin publisher, leaving the Herdr server running. |
-| `doctor` | Check local setup and explain missing data. |
+| `doctor` | Check local setup, distinguish startup from refresh failure, and explain missing data. |
 | `configure` | Opt in to adding plugin sidebar rows. |
 | `unconfigure` | Remove only the plugin-managed sidebar rows. |
 | `install-font` | Opt in to installing the bundled icon font and Ghostty/kitty codepoint maps. |
@@ -730,6 +733,10 @@ See [SECURITY.md](SECURITY.md) for the full boundaries.
 
 ## Troubleshooting
 
+- **Doctor reports that the first refresh has not completed yet:** Lineup is
+  starting. Wait a few seconds, then run `herdr plugin action invoke
+  herdr-lineup.doctor` again. A failed refresh is reported separately as
+  `daemon refresh is unhealthy`.
 - **A command fails:** it prints an error and exits nonzero. `stop` leaves the
   Herdr server running.
 - **No sidebar data after install or link:** confirm `ensure` is running for

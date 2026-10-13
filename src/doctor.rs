@@ -2,7 +2,7 @@
 
 use crate::{
     config::Config,
-    daemon::{Options, probe},
+    daemon::{Health, Options, probe},
     lock::{RuntimePaths, SessionLock},
     socket::Transport,
 };
@@ -274,6 +274,15 @@ pub fn validate_pong(frame: &[u8]) -> io::Result<()> {
     // would incorrectly reject a compatible newer server (official stability contract).
     Ok(())
 }
+fn refresh_diagnostic(health: &Health) -> io::Result<u64> {
+    if health.refresh_failed {
+        return Err(io::Error::other("daemon refresh is unhealthy"));
+    }
+    health.last_refresh_ms.ok_or_else(|| {
+        io::Error::other("daemon is starting; the first refresh has not completed yet")
+    })
+}
+
 pub fn run(options: &Options) -> io::Result<()> {
     let config = Config::load(&options.config)?;
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
@@ -283,12 +292,10 @@ pub fn run(options: &Options) -> io::Result<()> {
     check_transport(&mut transport)?;
     let health = probe(&paths, &options.socket)?;
     if let Some(health) = health {
-        if health.refresh_failed || health.last_refresh_ms.is_none() {
-            return Err(io::Error::other("daemon refresh is unhealthy"));
-        }
+        let last_refresh_ms = refresh_diagnostic(&health)?;
         println!(
             "Herdr JSON API compatible; config valid; daemon/control/lock healthy; last refresh {} ms after startup",
-            health.last_refresh_ms.unwrap_or(0)
+            last_refresh_ms
         );
     } else {
         if SessionLock::is_held(&paths)? {
@@ -313,6 +320,37 @@ pub fn run(options: &Options) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::socket::EndpointIdentity;
+
+    #[test]
+    fn first_refresh_pending_has_distinct_diagnostic_from_refresh_failure() {
+        let mut health = Health {
+            plugin: "herdr-lineup".into(),
+            socket_path: "/tmp/lineup-test.sock".into(),
+            socket_key: "test".into(),
+            endpoint: EndpointIdentity {
+                device: 1,
+                inode: 1,
+            },
+            nonce: "test".into(),
+            pid: 1,
+            last_refresh_ms: None,
+            refresh_failed: false,
+        };
+        let pending = refresh_diagnostic(&health).unwrap_err().to_string();
+        assert!(pending.contains("first refresh has not completed yet"));
+        assert!(!pending.contains("unhealthy"));
+
+        health.refresh_failed = true;
+        assert_eq!(
+            refresh_diagnostic(&health).unwrap_err().to_string(),
+            "daemon refresh is unhealthy"
+        );
+        health.refresh_failed = false;
+        health.last_refresh_ms = Some(9);
+        assert_eq!(refresh_diagnostic(&health).unwrap(), 9);
+    }
+
     #[test]
     fn weekly_diagnostics_round_trip_only_fixed_categories() {
         let dir = tempfile::tempdir().unwrap();
