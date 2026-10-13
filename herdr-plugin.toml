@@ -4,7 +4,7 @@ version = "0.1.0"
 # Minimum Herdr version for the sidebar metadata publisher and agent integrations.
 # Startup is one-shot; ensure must also recover after workspace.focused.
 min_herdr_version = "0.9.3"
-description = "Agent status, context, quota, and repository ship times in the sidebar."
+description = "Agent status, context, quota, and local origin/main commit times in the sidebar."
 platforms = ["macos", "linux"]
 
 [[build]]
@@ -44,7 +44,7 @@ command = ["target/release/herdr-lineup", "configure"]
 
 [[actions]]
 id = "unconfigure"
-title = "Remove Lineup sidebar configuration (opt-in)"
+title = "Remove Lineup-managed sidebar rows"
 contexts = ["workspace"]
 command = ["target/release/herdr-lineup", "unconfigure"]
 

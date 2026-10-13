@@ -26,8 +26,10 @@ uses the authenticated control request, not SIGTERM.
 The detached daemon runs with its private session state directory as its working
 directory. Its session log contains only UTC timestamps and fixed event/reason
 categories; it never includes error text, paths, credentials, or conversation
-data. At 1 MiB, the current log is renamed to one `daemon.log.1` generation
-before the next event is written. Child stdout and stderr are discarded.
+data. Before an event would take the log past 1 MiB, the current log is renamed
+to one `daemon.log.1` generation. The detached daemon's stdout and stderr are
+discarded. Git and Codex children discard stderr; their bounded stdout is
+parsed for local commit metadata and quota results, respectively.
 
 ## Local data read by the Grok billing client
 

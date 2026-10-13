@@ -55,8 +55,9 @@ Within twelve seconds, snapshots from
 name, the exact local `origin/main` commit timestamp, its local date/time label,
 and the synthetic pane's logo, state, context, and weekly text. Missing context
 text is `—` followed by two U+2800 cells; missing weekly text is an unpadded
-`—`. Numeric tokens are absent. Output is
-limited to `lineup_` display tokens; paths and full snapshots are not printed.
+`—`. Numeric tokens are absent. Token validation prints only `lineup_` display
+tokens, never full snapshots. Lifecycle and doctor diagnostics can print paths
+inside the private temporary session.
 
 A second snapshot is taken after sixteen seconds, longer than the default
 15,000 ms TTL. It must still contain the expected tokens. The isolated plugin
@@ -114,7 +115,8 @@ On Linux with Herdr 0.9.3, the isolated harness passed against
 `52f42f71f29d4d650fff728c6a1505c2808b93be`, before that fix landed on main).
 The private Git clone's local `origin/main` timestamp was `1791801285`.
 Only display tokens are reproduced below; no private paths or native sessions
-are included:
+are included. This historical snapshot has the old bare `—` context value;
+current publication includes two U+2800 cells after it:
 
 ```json
 {

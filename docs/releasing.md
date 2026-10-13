@@ -40,7 +40,19 @@ pushes the tag. The workflow never tags or pushes on its own.
    cargo test --locked
    cargo build --release --locked
    target/release/herdr-lineup --help
+   python3 scripts/generate-third-party-licenses.py --check
    ```
+   Run the isolated lifecycle and metadata harness on Linux with Herdr 0.9.3
+   or later:
+   ```sh
+   bash scripts/e2e-isolated.sh --self-test
+   bash scripts/e2e-isolated.sh
+   ```
+   It creates its own session and does not attach to a user's session;
+   `--tokens` is an alias for the default metadata check. Check the archive
+   license file on the final lockfile even when dependency versions did not
+   change. See [Testing](testing.md) for the harness requirements and limits;
+   the Linux run does not establish macOS runtime behavior.
    Do not stop or restart the Herdr server or attach a client to a user's
    running session during verification.
 5. **Land the release preparation.** Commit the version, changelog, and lockfile
@@ -63,6 +75,12 @@ pushes the tag. The workflow never tags or pushes on its own.
 7. **Verify the release.** Confirm the workflow succeeded and the GitHub Release
    has the expected title, dated notes, both platform archives, and checksums.
    Compare the downloaded artifacts with `SHA256SUMS.txt` before using them.
+   Confirm that the public repository still has the `herdr-plugin` GitHub topic
+   and that its default branch contains the released manifest. Then check
+   [Herdr's marketplace](https://herdr.dev/plugins/) for the repository and
+   plugin version. Its unreviewed index refreshes every 30 minutes and rescans
+   when the default-branch head changes; allow for that interval before treating
+   an absent or old listing as a publication problem.
 
 ## Release artifacts
 
@@ -81,11 +99,11 @@ every architecture combination. Each archive contains these files at its root:
   attribution for both release platforms.
 - `README.md` — usage and installation instructions.
 
-When `Cargo.lock` changes, run
-`python3 scripts/generate-third-party-licenses.py` with Python 3.11+ and the pinned
-Rust toolchain, then review the generated text. The release build runs the same
-script with `--check`; CI also runs it before tagging. Either fails if the file
-differs from the locked crate sources.
+When `Cargo.lock` changes, regenerate the file with
+`python3 scripts/generate-third-party-licenses.py` using Python 3.11+ and the pinned
+Rust toolchain, then review the generated text. Always run the script with
+`--check` on the final release commit. The release workflow and CI run that
+check too. It fails if the file differs from the locked crate sources.
 Cargo may fetch missing pinned crate sources; the script installs no additional tool.
 
 `SHA256SUMS.txt` covers every `.tar.gz` archive. From the download directory,
