@@ -31,7 +31,7 @@ static TEST_GATE: Mutex<()> = Mutex::new(());
 impl UsageReader for KimiReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
         #[cfg(test)]
-        let _gate = TEST_GATE.lock().unwrap();
+        let _gate = TEST_GATE.lock().unwrap_or_else(|error| error.into_inner());
         let source = SourceKind::KimiSession;
         if !associated(request, Provider::Kimi) {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
@@ -923,7 +923,7 @@ mod tests {
 
     #[test]
     fn unchanged_wire_does_not_read_content_again() {
-        let _gate = TEST_GATE.lock().unwrap();
+        let _gate = TEST_GATE.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut id = identity(Provider::Kimi);
         id.repository_identity = "/synthetic/repo".into();

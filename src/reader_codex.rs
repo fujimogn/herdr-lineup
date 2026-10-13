@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn null_info_events_do_not_hide_bound_context_observations() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let r = request(&id, dir.path());
@@ -668,7 +668,7 @@ mod tests {
     }
     #[test]
     fn normal_missing_idle_and_mismatch() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let r = request(&id, dir.path());
@@ -694,7 +694,7 @@ mod tests {
     }
     #[test]
     fn compressed_archive_and_ambiguous_duplicate() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let r = request(&id, dir.path());
@@ -720,7 +720,7 @@ mod tests {
     }
     #[test]
     fn rejects_invalid_future_timeout_and_unbound_partial_tail() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let mut r = request(&id, dir.path());

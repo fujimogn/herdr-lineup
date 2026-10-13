@@ -400,7 +400,9 @@ mod tests {
     }
     #[test]
     fn readers_retain_idle_context_and_reject_future_and_mismatched_records() {
-        let _guard = READER_TEST_LOCK.lock().unwrap();
+        let _guard = READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         use crate::{model::*, reader_agy::AgyReader, reader_claude::ClaudeReader};
         for (agent, provider, key) in [
             (Agent::Claude, Provider::Claude, "session-1"),
@@ -465,7 +467,9 @@ mod tests {
     }
     #[test]
     fn idle_context_survives_weekly_without_reset_expiring() {
-        let _guard = READER_TEST_LOCK.lock().unwrap();
+        let _guard = READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         use crate::{model::*, reader_agy::AgyReader, reader_claude::ClaudeReader};
         for (agent, provider, key, value) in [
             (
@@ -524,7 +528,9 @@ mod tests {
     }
     #[test]
     fn missing_context_does_not_hide_weekly_and_expired_reset_is_missing() {
-        let _guard = READER_TEST_LOCK.lock().unwrap();
+        let _guard = READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         use crate::{model::*, reader_claude::ClaudeReader};
         let dir = tempfile::tempdir().unwrap();
         let v = json!({"session_id":"session-1","rate_limits":{"seven_day":{"used_percentage":0,"resets_at":1791763201}}});
@@ -560,7 +566,9 @@ mod tests {
     }
     #[test]
     fn readers_reject_oversized_symlinked_fifo_and_invalid_records() {
-        let _guard = READER_TEST_LOCK.lock().unwrap();
+        let _guard = READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         use crate::{model::*, reader_claude::ClaudeReader};
         let dir = tempfile::tempdir().unwrap();
         assert!(capture(Agent::Claude, &input(), dir.path(), None, now()));

@@ -1338,7 +1338,9 @@ mod tests {
 
     #[test]
     fn fake_socket_observation_written_during_refresh_is_not_future() {
-        let _guard = crate::statusline::READER_TEST_LOCK.lock().unwrap();
+        let _guard = crate::statusline::READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fake.sock");
         let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
@@ -1415,7 +1417,9 @@ mod tests {
 
     #[test]
     fn fake_socket_shared_budget_preserves_claude_weekly_but_not_expired_or_rebound_usage() {
-        let _guard = crate::statusline::READER_TEST_LOCK.lock().unwrap();
+        let _guard = crate::statusline::READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fake.sock");
         let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
@@ -1465,13 +1469,30 @@ mod tests {
                 TimeoutReader.read(r)
             }
         }
+        // Claude reads the statusline fixture on a worker thread. Seeding that
+        // observation inside the 100 ms budget the next refresh exhausts makes
+        // the first sample time out on a slow runner, and a timeout then has
+        // nothing to restore.
+        let seed = Config {
+            refresh_interval_ms: 5000,
+            reader_timeout_ms: 5000,
+            ..Config::default()
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &seed, &SampleReader, &TimeoutReader)
+            .unwrap();
+        assert!(publisher.local_readings.contains_key("w1:p2"));
+        let (_, seeded) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        assert_eq!(
+            seeded["result"]["snapshot"]["panes"][1]["tokens"]["lineup_context_text"],
+            "23%"
+        );
         let config = Config {
             reader_timeout_ms: 100,
             ..Config::default()
         };
-        publisher
-            .refresh_with_readers(&mut transport, &config, &SampleReader, &TimeoutReader)
-            .unwrap();
         publisher
             .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
             .unwrap();
@@ -3458,7 +3479,9 @@ mod tests {
 
     #[test]
     fn fake_socket_publishes_statusline_context_weekly_and_reset() {
-        let _guard = crate::statusline::READER_TEST_LOCK.lock().unwrap();
+        let _guard = crate::statusline::READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -3869,15 +3892,33 @@ mod tests {
             },
         )
         .unwrap();
+        // Codex is an in-memory reader. Kimi reads a fixture on a worker thread
+        // inside the same cycle budget. Seeding that observation with the 100 ms
+        // budget the next refresh exhausts makes the first sample time out on a
+        // slow runner, and a timeout then has nothing to restore.
+        let seed = Config {
+            refresh_interval_ms: 5000,
+            reader_timeout_ms: 5000,
+            usage_max_age_ms: 5000,
+            ..Config::default()
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &seed, &SampleReader, &TimeoutReader)
+            .unwrap();
+        let pane = |response: &Value, index: usize| {
+            response["result"]["snapshot"]["panes"][index]["tokens"].clone()
+        };
+        let (_, seeded) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        assert_eq!(pane(&seeded, 0)["lineup_context_text"], "42%");
+        assert_eq!(pane(&seeded, 1)["lineup_context_text"], "08%");
         let config = Config {
             refresh_interval_ms: 1000,
             reader_timeout_ms: 100,
             usage_max_age_ms: 1000,
             ..Config::default()
         };
-        publisher
-            .refresh_with_readers(&mut transport, &config, &SampleReader, &TimeoutReader)
-            .unwrap();
         struct ExhaustBudget;
         impl UsageReader for ExhaustBudget {
             fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
@@ -3891,9 +3932,6 @@ mod tests {
         let (_, fresh) = publisher
             .request(&mut transport, "session.snapshot")
             .unwrap();
-        let pane = |response: &Value, index: usize| {
-            response["result"]["snapshot"]["panes"][index]["tokens"].clone()
-        };
         assert_eq!(pane(&fresh, 0)["lineup_context_text"], "42%");
         assert_eq!(pane(&fresh, 1)["lineup_context_text"], "08%");
         let stale_at = SystemTime::now() - Duration::from_millis(config.usage_max_age_ms + 1);

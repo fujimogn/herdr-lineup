@@ -144,7 +144,7 @@ mod tests {
     use std::{fs, time::Duration};
     #[test]
     fn unrelated_session_files_do_not_exhaust_discovery() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Grok);
         let r = request(&id, dir.path());
@@ -174,7 +174,7 @@ mod tests {
     }
     #[test]
     fn normal_missing_idle_and_mismatch() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Grok);
         let r = request(&id, dir.path());
@@ -212,7 +212,7 @@ mod tests {
     }
     #[test]
     fn rejects_invalid_future_ambiguous_and_timeout() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Grok);
         let mut r = request(&id, dir.path());
@@ -262,7 +262,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn never_follows_session_or_file_symlinks() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Grok);
         let r = request(&id, dir.path());
@@ -278,7 +278,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discovery_does_not_follow_working_directory_or_session_links() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let id = identity(Provider::Grok);
@@ -303,7 +303,7 @@ mod tests {
     }
     #[test]
     fn session_directory_entry_cap_is_not_a_timeout() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
         fs::create_dir_all(&sessions).unwrap();
