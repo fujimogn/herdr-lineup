@@ -4,6 +4,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+## 0.1.1 (2026-10-14)
+
 Lineup reads Kimi context from the matching local session, keeps stop and doctor inside their existing limits, and ships dependency licenses with release archives.
 
 - Feature: **Kimi context** reads context from one matching regular, nonsymlinked local session's completed turn, and stays unavailable when that session is missing, duplicated, unreadable, or still in progress. A completed turn does not expire by age, including while the pane is idle, and weekly quota stays unavailable with no network I/O.
@@ -12,7 +14,7 @@ Lineup reads Kimi context from the matching local session, keeps stop and doctor
 - Fix: **Doctor** reports `daemon is starting; the first refresh has not completed yet` when no refresh has finished, separately from an unhealthy refresh. Capacity skips do not by themselves fail doctor; a real refresh failure still exits nonzero, and an overlong socket path is rejected before connect with its byte length and the platform maximum.
 - Fix: **Context** drops the previous local context when directory discovery passes 4,096 entries, unlike a read timeout, which keeps it; exactly 4,096 entries still succeeds. Without the proven session binding, that pane does not receive the Codex account-quota overlay, and Grok's shared weekly value is applied when network access is enabled.
 - Fix: **Grok quota** keeps a weekly percentage that has no reset time visible, without a countdown, for a bounded time after the last successful query. A later transient failure clears a value with no reset, a value with a known future reset is still kept until that reset, and monthly periods stay unavailable.
-- Fix: **Publisher** keeps each endpoint's highest reserved sequence when removing checkpoint rows for absent resources, so a reused id gets a newer sequence across restarts. Returning to 0.1.0 after 0.1.1 has written an endpoint floor into `sequences.json` fails refresh until that file is removed.
+- Fix: **Publisher** keeps each endpoint's highest reserved sequence when removing checkpoint rows for absent resources, so a reused id gets a newer sequence across restarts. If returning to 0.1.0 fails refresh because it cannot read an endpoint floor in `sequences.json`, keep the checkpoint and reinstall 0.1.1: deleting it restarts sequence numbers at 1 and can leave Herdr rejecting older updates until they surpass the previous high-water mark.
 - Fix: **Font setup** can be retried after a terminal write had started, and lists changed paths. Conflicts and symlinks leave bytes unchanged; uninstall removes only recorded byte-identical blocks and a font Lineup installed, still succeeds if nothing managed remains, and drops a stale ownership entry only when the whole block was removed by hand.
 - Fix: **StatusLine** runs `--then` with the fixed shell `/bin/sh -c`, so an entry on `PATH` cannot choose the shell. The chained command still receives the original stdin bytes unchanged, and its stdout and exit status are what that command itself returns.
 - Fix: **Daemon logs** record one UTC timestamp and fixed `event` and `reason` categories per line, never error text, paths, credentials, or conversation data. Past 1 MiB the log is renamed to one previous generation, and Git children for repository headings keep a reduced environment and Git safety settings without fetching or contacting a remote.
