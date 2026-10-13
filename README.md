@@ -4,6 +4,8 @@ See each AI coding agent's state, context use, and weekly quota in one sidebar
 row in [Herdr](https://herdr.dev), alongside each repository's latest local
 `origin/main` commit time.
 
+<img src="docs/images/sidebar-agents.png" alt="Herdr Agents sidebar showing Lineup agent rows, context use, and weekly quota" width="420">
+
 - **One row per agent.** Keep vendor logos, state, context, and weekly remaining quota together in the sidebar.
 - **Session-bound usage.** Read local Codex/Grok files and opt-in Claude/Antigravity statusLine observations for the matching pane.
 - **Account quota by choice.** Enable Codex/Grok account queries with `allow_network = true`; network access is off by default.
@@ -83,12 +85,12 @@ Requires macOS or Linux, Herdr 0.9.3 or later, Git, and
    output. Healthy output includes `daemon/control/lock healthy`. Missing optional
    usage is expected. Next, [configure the sidebar](#sidebar) to display the rows.
 
-Release archives contain a built binary, `LICENSE`, and `NOTICE.md`.
+Release archives contain a built binary, `LICENSE`, `NOTICE.md`, and `README.md`.
 Plugin installation assumes building from a checkout as above.
 
 ### Planned public installation
 
-**Planned public installation**, after the repository is published:
+After the repository is published:
 
 ```sh
 herdr plugin install fujimogn/herdr-lineup
@@ -149,7 +151,7 @@ Logs are JSON: find the relevant `command`, its completed `status` and
 log command again; continue to the next setup step only after success.
 Herdr supplies the plugin environment to action processes; an ordinary pane's
 shell does not receive `HERDR_PLUGIN_*`. Direct `install-font` and
-`uninstall-font` need an absolute `HERDR_PLUGIN_STATE_DIR` (and `HOME`).
+`uninstall-font` need absolute `HERDR_PLUGIN_STATE_DIR` and `HOME` paths.
 Direct `doctor`, `ensure`, `daemon`, and `stop` additionally need absolute
 `HERDR_SOCKET_PATH` and `HERDR_PLUGIN_CONFIG_DIR`.
 
@@ -160,6 +162,8 @@ Direct `doctor`, `ensure`, `daemon`, and `stop` additionally need absolute
 `HERDR_PLUGIN_STATE_DIR` is unset or empty. This fallback is for sidebar
 transactions, not the daemon's state directory. Startup and focus hooks never
 configure the sidebar or install fonts.
+Direct `configure` and `unconfigure` need an absolute `HOME` when either
+`HERDR_CONFIG_PATH` or `HERDR_PLUGIN_STATE_DIR` is unset.
 
 ## Configuration
 
@@ -301,11 +305,14 @@ terminal's machine; install the font and configure the terminal there too.
    ```sh
    herdr plugin action invoke herdr-lineup.stop
    herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   Wait for the stop command to finish successfully before starting again:
+
+   ```sh
    herdr plugin action invoke herdr-lineup.start
    herdr plugin log list --plugin herdr-lineup --limit 10
    ```
-
-   Wait for the stop command to finish successfully before starting again.
 
 4. Reload the terminal configuration or reopen the terminal. On Linux, run
    `fc-cache` if needed. The terminal must map **U+E1A0–U+E1BA** to
@@ -561,6 +568,10 @@ Herdr sessions, perform the daemon stop in each session before unregistering it.
 
 4. Unregister the linked checkout:
 
+   Avoid switching workspaces between stopping Lineup and unlinking it: the
+   `workspace.focused` hook can restart the daemon. If you switch, repeat step 3
+   before unlinking and verify the daemon remains stopped after unlinking.
+
    ```sh
    herdr plugin unlink herdr-lineup
    ```
@@ -585,6 +596,8 @@ Herdr sessions, perform the daemon stop in each session before unregistering it.
 The repository heading reads the newest local `origin/main` commit without
 fetching: `HH:MM` for today, `M/D` for earlier dates. This is a commit-time label,
 not proof of a deployment.
+
+<img src="docs/images/sidebar-spaces.png" alt="Herdr Spaces sidebar showing repository names and local last-ship times" width="420">
 
 ### Account quota behavior
 
@@ -734,8 +747,8 @@ See [SECURITY.md](SECURITY.md) for the full boundaries.
   unavailable. Restart only Lineup after authentication or profile changes.
 - **Icon rendering shows boxes:** run the opt-in
   `herdr-lineup.install-font` action and check the terminal's codepoint map,
-  or set `logo_mode = "text"`. Automatic mode already uses those text labels
-  until terminal glyph support is known.
+  or set `logo_mode = "text"`. `auto` currently uses the same text labels as
+  `text`, even after font installation.
 - **A build fails:** verify rustup can install the pinned toolchain and that Cargo
   can download the locked dependencies. No credentials or remote API setup are
   required for local context; account quota queries need the explicit opt-in above.
