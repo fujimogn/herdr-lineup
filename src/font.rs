@@ -209,10 +209,6 @@ fn load(path: &Path) -> io::Result<Value> {
     }
 }
 
-fn save(path: &Path, state: &Value) -> io::Result<()> {
-    write_atomic(path, &serde_json::to_vec(state).map_err(io::Error::other)?)
-}
-
 /// Install only after explicit opt-in. Records ownership separately from font presence.
 pub fn install(locations: &Locations) -> io::Result<Vec<String>> {
     apply(locations, false)
@@ -263,7 +259,10 @@ fn apply_with(
         ));
     }
     if locations.font.exists() && fs::read(&locations.font)? != FONT {
-        return Err(conflict("Installed font differs; leaving it unchanged"));
+        return Err(conflict(&format!(
+            "Installed font differs at {}; leaving it unchanged",
+            locations.font.display()
+        )));
     }
     let terminals = locations.terminals();
     for (path, _) in &terminals {
@@ -290,9 +289,7 @@ fn apply_with(
         }
         check_path(&path)?;
         if !path.exists() {
-            if !removing {
-                retained.push(entry.clone());
-            }
+            retained.push(entry.clone());
             continue;
         }
         let text = fs::read_to_string(&path)?;
@@ -303,11 +300,14 @@ fn apply_with(
             || text.matches(END).count() != 1
             || text.matches(owned).count() != 1
         {
-            return Err(conflict(
-                "Managed font block was modified; resolve it manually",
-            ));
+            return Err(conflict(&format!(
+                "Managed font block was modified at {}; resolve it manually",
+                path.display()
+            )));
         }
-        retained.push(entry.clone());
+        if !removing {
+            retained.push(entry.clone());
+        }
         if removing {
             changes.push((path, text.replacen(owned, "", 1)));
         }
@@ -327,9 +327,10 @@ fn apply_with(
             }
             let text = fs::read_to_string(&path)?;
             if text.contains(START) || text.contains(END) {
-                return Err(conflict(
-                    "Unrecorded font block exists; leaving it unchanged",
-                ));
+                return Err(conflict(&format!(
+                    "Unrecorded font block exists at {}; leaving it unchanged",
+                    path.display()
+                )));
             }
             let separator = if text.is_empty() || text.ends_with('\n') {
                 ""
@@ -364,9 +365,13 @@ fn apply_with(
                 fs::remove_file(&locations.font)?;
                 changed_paths.push(locations.font.clone());
             }
-            state = json!({"version":1,"font_owned":false,"entries":[]});
-            if old_journal.is_some() {
-                save(&journal, &state)?;
+            state = json!({"version":1,"font_owned":false,"entries":state["entries"]});
+            let next_journal = serde_json::to_vec(&state).map_err(io::Error::other)?;
+            if old_journal
+                .as_deref()
+                .is_some_and(|old| old != next_journal)
+            {
+                write_atomic(&journal, &next_journal)?;
                 changed_paths.push(journal.clone());
             }
         } else {
@@ -380,8 +385,11 @@ fn apply_with(
                 );
             }
             // A crash after a terminal write must leave its ownership record.
-            save(&journal, &state)?;
-            changed_paths.push(journal.clone());
+            let next_journal = serde_json::to_vec(&state).map_err(io::Error::other)?;
+            if old_journal.as_deref() != Some(next_journal.as_slice()) {
+                write_atomic(&journal, &next_journal)?;
+                changed_paths.push(journal.clone());
+            }
             if !font_existed {
                 fs::create_dir_all(locations.font.parent().unwrap())?;
                 let mut file = fs::OpenOptions::new()
@@ -430,10 +438,13 @@ fn apply_with(
             "Font action failed: {error}; rollback errors: {failures:?}"
         )));
     }
+    let removed_owned_file = changed_paths.iter().any(|path| path != &journal);
     let mut output = vec![format!(
         "font: {} {}",
-        if removing {
+        if removing && removed_owned_file {
             "removed owned installation from"
+        } else if removing {
+            "nothing managed was removed from"
         } else {
             "available at"
         },
@@ -479,6 +490,89 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let locations = Locations::new(root.path(), None, None, &root.path().join("state"), false);
         (root, locations)
+    }
+
+    #[test]
+    fn uninstall_without_owned_files_reports_no_installation() {
+        let (_root, locations) = fixture();
+        let output = uninstall(&locations).unwrap().join("\n");
+        assert!(output.contains("nothing managed"), "{output}");
+        assert!(!output.contains("removed owned installation"), "{output}");
+        assert!(!output.contains("changed:"), "{output}");
+    }
+
+    #[test]
+    fn repeated_actions_report_only_changed_bytes() {
+        let (_root, locations) = fixture();
+        assert!(install(&locations).unwrap().join("\n").contains("changed:"));
+        assert!(!install(&locations).unwrap().join("\n").contains("changed:"));
+        assert!(
+            uninstall(&locations)
+                .unwrap()
+                .join("\n")
+                .contains("changed:")
+        );
+        assert!(
+            !uninstall(&locations)
+                .unwrap()
+                .join("\n")
+                .contains("changed:")
+        );
+    }
+
+    #[test]
+    fn conflicts_identify_the_affected_path() {
+        let (_root, locations) = fixture();
+        fs::create_dir_all(locations.font.parent().unwrap()).unwrap();
+        fs::write(&locations.font, b"different font").unwrap();
+        assert!(
+            install(&locations)
+                .unwrap_err()
+                .to_string()
+                .contains(&locations.font.display().to_string())
+        );
+        fs::remove_file(&locations.font).unwrap();
+
+        let path = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{START}\nuser map\n{END}\n")).unwrap();
+        assert!(
+            install(&locations)
+                .unwrap_err()
+                .to_string()
+                .contains(&path.display().to_string())
+        );
+        fs::write(&path, "# original\n").unwrap();
+        install(&locations).unwrap();
+        fs::write(
+            &path,
+            fs::read_to_string(&path)
+                .unwrap()
+                .replace("Herdr Agent Icons Max", "Other Font"),
+        )
+        .unwrap();
+        assert!(
+            uninstall(&locations)
+                .unwrap_err()
+                .to_string()
+                .contains(&path.display().to_string())
+        );
+    }
+
+    #[test]
+    fn temporarily_missing_config_survives_uninstall_and_can_be_cleaned_later() {
+        let (_root, locations) = fixture();
+        let path = locations.config.join("kitty/kitty.conf");
+        let parked = locations.config.join("kitty/kitty.conf.parked");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "# original\n").unwrap();
+        install(&locations).unwrap();
+        fs::rename(&path, &parked).unwrap();
+        uninstall(&locations).unwrap();
+        fs::rename(&parked, &path).unwrap();
+        install(&locations).unwrap();
+        uninstall(&locations).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# original\n");
     }
 
     #[cfg(unix)]

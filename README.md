@@ -362,15 +362,19 @@ kitty, or `font-codepoint-map = U+E1A0-U+E1BA=Herdr Agent Icons Max` for Ghostty
 3. Reload or reopen your terminal (and run `fc-cache` on Linux if needed).
 
 Uninstall removes only recorded, byte-identical blocks and a font file that
-Lineup installed. A preexisting identical font is preserved. If you removed a
-whole managed block by hand, retry either font action: it drops the stale
+Lineup installed. If it removes no owned files, it reports that nothing managed
+was removed and still exits successfully. A preexisting identical font is
+preserved. If you removed a whole managed block by hand, retry either font
+action: it drops the stale
 ownership entry and continues. An install interrupted after a terminal write
 can also be retried because the ownership record is saved first. A partly
 removed or edited block still causes a conflict. Keep
 `$HERDR_PLUGIN_STATE_DIR/font-ownership.json`: each `entries` item contains the
 config `path` and exact `owned` text, including newlines. Restore that text
 exactly once in the matching file, preserving your unrelated edits, then retry
-uninstall. Keep the same home, XDG paths, and state directory used for install;
+uninstall. If a terminal config is temporarily missing during uninstall, its
+ownership entry is retained so its managed block can be removed after the file
+returns. Keep the same home, XDG paths, and state directory used for install;
 do not delete the ownership record to bypass a conflict.
 
 ### Account quota (opt-in)
