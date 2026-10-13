@@ -707,11 +707,24 @@ mod tests {
 
     #[test]
     fn api_key_and_signed_out_accounts_do_not_request_limits() {
-        for account in [
-            json!({"account":{"type":"apiKey"}}),
-            json!({"account":null}),
+        for (account, absent) in [
+            (json!({"account":{"type":"apiKey"}}), true),
+            (json!({"account":null}), true),
+            // An object without a string type is invalid, not an absent subscription.
+            (json!({"account":{}}), false),
         ] {
             let fake = Fake::new(account, json!({}));
+            if !absent {
+                let error = fake.read(Duration::from_secs(2)).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert_eq!(error.to_string(), "Invalid Codex account response");
+                assert_eq!(
+                    fake.methods(),
+                    ["initialize", "initialized", "account/read"]
+                );
+                fake.assert_reaped();
+                continue;
+            }
             assert_eq!(fake.read(Duration::from_secs(2)).unwrap(), None);
             let now = Instant::now();
             let wall = UNIX_EPOCH + Duration::from_secs(1792000000);
@@ -1008,28 +1021,34 @@ mod tests {
             used_percent: 12.0,
             resets_at: Some(wall + Duration::from_secs(180)),
         });
-        for (reply, expected_kind) in [
-            ("exec sleep 30", io::ErrorKind::TimedOut),
-            ("printf '%s\\n' 'not-json'", io::ErrorKind::Other),
-            ("exit 1", io::ErrorKind::Other),
+        for (reply, timeout, expected_kind) in [
+            (
+                "exec sleep 30",
+                Duration::from_millis(150),
+                io::ErrorKind::TimedOut,
+            ),
+            (
+                "printf '%s\\n' 'not-json'",
+                Duration::from_secs(2),
+                io::ErrorKind::Other,
+            ),
+            ("exit 1", Duration::from_secs(2), io::ErrorKind::Other),
             (
                 "printf '%s\\n' '{\"id\":2,\"result\":{}}'",
+                Duration::from_secs(2),
                 io::ErrorKind::Other,
             ),
         ] {
             fs::write(&fake.executable, original.replace(&account_line, reply)).unwrap();
-            let mut client = WeeklyClient::new(
-                fake.dir.path().to_owned(),
-                MIN_REFRESH_INTERVAL,
-                Duration::from_millis(150),
-            );
+            let mut client =
+                WeeklyClient::new(fake.dir.path().to_owned(), MIN_REFRESH_INTERVAL, timeout);
             assert_eq!(client.refresh_with(now, wall, || Ok(sample)), sample);
             assert_eq!(
                 client.refresh_with(
                     now + MIN_REFRESH_INTERVAL,
                     wall + MIN_REFRESH_INTERVAL,
                     || {
-                        let error = fake.read(Duration::from_millis(150)).unwrap_err();
+                        let error = fake.read(timeout).unwrap_err();
                         assert_eq!(error.kind(), expected_kind);
                         Err(error)
                     }
