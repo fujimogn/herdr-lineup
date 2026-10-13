@@ -88,9 +88,28 @@ script with `--check`; CI also runs it before tagging. Either fails if the file
 differs from the locked crate sources.
 Cargo may fetch missing pinned crate sources; the script installs no additional tool.
 
-`SHA256SUMS.txt` covers the `.tar.gz` archives. From the download directory, run
-`shasum -a 256 -c SHA256SUMS.txt` after downloading all listed archives. Only
-the publish job receives `contents: write`; builds use `contents: read`.
+`SHA256SUMS.txt` covers every `.tar.gz` archive. From the download directory,
+select the archive you downloaded and check only its entry (replace the example
+filename). On Linux:
+
+```sh
+ARCHIVE=herdr-lineup-v0.1.0-linux-x86_64.tar.gz
+CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
+  printf '%s\n' "$CHECKSUM_LINE" | sha256sum -c -
+```
+
+On macOS:
+
+```sh
+ARCHIVE=herdr-lineup-v0.1.0-macos-arm64.tar.gz
+CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
+  printf '%s\n' "$CHECKSUM_LINE" | shasum -a 256 -c -
+```
+
+Missing or duplicate entries fail the selection; use the archive only after the
+check prints `OK`. Selecting the exact entry also rejects a manifest that does
+not list the archive you chose. Only the publish job receives `contents: write`;
+builds use `contents: read`.
 
 Plugin installation builds from a checkout using the manifest's Cargo build
 command. The archives are not standalone plugin installations: they do not

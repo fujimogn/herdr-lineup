@@ -424,11 +424,11 @@ existing agent settings before changing them; startup does not edit them.
 
    ```sh
    LINEUP_ROOT="/absolute/plugin_root/from/plugin-list"
-   test -x "$LINEUP_ROOT/target/release/herdr-lineup"
-   mkdir -p "$HOME/.local/bin"
-   ln -s "$LINEUP_ROOT/target/release/herdr-lineup" "$HOME/.local/bin/herdr-lineup"
-   export PATH="$HOME/.local/bin:$PATH"
-   herdr-lineup --version
+   test -x "$LINEUP_ROOT/target/release/herdr-lineup" &&
+     mkdir -p "$HOME/.local/bin" &&
+     ln -s "$LINEUP_ROOT/target/release/herdr-lineup" "$HOME/.local/bin/herdr-lineup" &&
+     export PATH="$HOME/.local/bin:$PATH" &&
+     herdr-lineup --version
    ```
 
    Inspect an existing destination instead of overwriting it. Persist the `PATH`
@@ -440,10 +440,27 @@ existing agent settings before changing them; startup does not edit them.
 
    Alternatively, download the archive for your OS and architecture and
    `SHA256SUMS.txt` from the [release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.1.0).
-   Verify the archive as described in the
-   [release instructions](https://github.com/fujimogn/herdr-lineup/blob/v0.1.0/docs/releasing.md), extract it,
-   and put its `herdr-lineup` executable on `PATH` (replace the placeholder with
-   the extraction directory):
+   From the download directory, select the archive you downloaded and its
+   matching line in `SHA256SUMS.txt` (replace the example filename). On Linux:
+
+   ```sh
+   ARCHIVE=herdr-lineup-v0.1.0-linux-x86_64.tar.gz
+   CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
+     printf '%s\n' "$CHECKSUM_LINE" | sha256sum -c -
+   ```
+
+   On macOS, use the same selection with your downloaded macOS archive:
+
+   ```sh
+   ARCHIVE=herdr-lineup-v0.1.0-macos-arm64.tar.gz
+   CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
+     printf '%s\n' "$CHECKSUM_LINE" | shasum -a 256 -c -
+   ```
+
+   A missing or duplicate checksum entry stops the check; only extract an
+   archive after its check prints `OK`. See the [release instructions](docs/releasing.md)
+   for artifact details. Then extract it and put its `herdr-lineup` executable
+   on `PATH` (replace the placeholder with the extraction directory):
 
    ```sh
    mkdir -p "$HOME/.local/bin"
@@ -645,6 +662,12 @@ from a Herdr pane and check its completed `status`, `exit_code`, and output with
    development instead, use
    `herdr plugin unlink herdr-lineup`; it unregisters the plugin but leaves
    your checkout in place. Config and state are separate from either checkout.
+   The empty plugin list confirms removal, not daemon exit. Once uninstalled,
+   Lineup actions are unavailable, so the successful final stop command in
+   every session is the daemon-exit confirmation: `stop` returns successfully
+   only after that session's daemon process exits (or if none was running).
+   If any final stop fails, resolve it before uninstalling; there is no
+   supported post-uninstall Lineup action to check or stop a remaining daemon.
 
 6. After no session daemon or agent hook uses Lineup, inspect the saved plugin
    state/config paths and remove only the Lineup data you no longer need. Keep
