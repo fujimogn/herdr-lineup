@@ -6,19 +6,9 @@ row in [Herdr](https://herdr.dev), alongside each repository's latest local
 
 <img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/v0.1.0/docs/images/sidebar-agents.png" alt="Herdr Agents sidebar showing Lineup agent rows, context use, and weekly quota" width="420">
 
-- **One row per agent.** Keep vendor logos, state, context, and weekly remaining quota together in the sidebar.
+- **One row per agent pane.** Keep vendor logos, state, context, and weekly remaining quota together in the sidebar.
 - **Session-bound usage.** Read local Codex/Grok files and opt-in Claude/Antigravity statusLine observations for the matching pane.
 - **Account quota by choice.** Enable Codex/Grok account queries with `allow_network = true`; network access is off by default.
-
-## Documentation
-
-- [Releasing](docs/releasing.md) — version checks, release notes, and the release workflow.
-- [Testing](docs/testing.md) — isolated lifecycle and metadata verification.
-- [Usage sources](docs/research/usage-sources.md) — provider inputs and availability.
-- [Codex context drift](docs/research/codex-context-drift.md) — evidence for the one-point display gap.
-- [Plugin conventions](docs/research/plugin-conventions.md) — packaging and installation research.
-- [Security](SECURITY.md) — local data, credentials, and network boundaries.
-- [Changelog](CHANGELOG.md) — user-visible changes.
 
 ## What it does
 
@@ -37,7 +27,7 @@ remaining, and the time until reset. Unavailable usage shows `—`.
 | Hermes | Unavailable | Unavailable |
 
 See [Sidebar tokens](#sidebar-tokens) for display formatting and terminal-cell
-alignment, and [Source research](docs/research/usage-sources.md) for usage inputs.
+alignment, and [Source research](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/usage-sources.md) for usage inputs.
 
 ## Install
 
@@ -88,6 +78,12 @@ When installing or upgrading:
 - There is no `herdr plugin update`. To upgrade, install again.
 - Pin a version with a release tag:
   `herdr plugin install fujimogn/herdr-lineup --ref v0.1.0`.
+- Before downgrading, stop Lineup and preserve its state directory. Newer
+  releases may write `endpoint` rows to the per-session `sequences.json`
+  checkpoint when pruning absent resources. An older binary that does not
+  understand those rows can reject the checkpoint and fail to publish. Return
+  to the newer release rather than deleting the checkpoint: deleting it loses
+  the reserved sequence numbers used for safe metadata updates.
 
 The [Herdr marketplace](https://herdr.dev/docs/marketplace/) is an automatic,
 unreviewed index of public repositories, not an endorsement or code review.
@@ -111,17 +107,12 @@ licenses of Rust dependencies in the binary.
 
 ## Usage
 
-Inspect the built binary from the checkout (or use `herdr-lineup` after adding
-it to your `PATH` as shown in [statusLine setup](#claude-and-antigravity-statusline-opt-in)):
+For an installed plugin, invoke the Herdr actions from a pane. The installation
+steps above start Lineup and run its first doctor check.
+The commands below are the binary commands behind those actions; direct daemon
+commands require the absolute plugin environment paths described below.
 
-```sh
-./target/release/herdr-lineup --help
-./target/release/herdr-lineup --version
-./target/release/herdr-lineup doctor --help
-./target/release/herdr-lineup statusline --help
-```
-
-### Common commands
+### Commands and actions
 
 | Command | What it does |
 | --- | --- |
@@ -138,13 +129,6 @@ it to your `PATH` as shown in [statusLine setup](#claude-and-antigravity-statusl
 Herdr actions: `herdr-lineup.start`, `herdr-lineup.stop`,
 `herdr-lineup.doctor`, `herdr-lineup.configure`, `herdr-lineup.unconfigure`,
 `herdr-lineup.install-font`, and `herdr-lineup.uninstall-font`.
-For example, check the daemon and inspect its output:
-
-```sh
-herdr plugin action invoke herdr-lineup.doctor
-herdr plugin log list --plugin herdr-lineup --limit 10
-```
-
 Run these actions from a Herdr pane, and use
 `herdr plugin log list --plugin herdr-lineup --limit 10` to inspect their results.
 Logs are JSON: find the relevant `command`, its completed `status` and
@@ -165,6 +149,18 @@ transactions, not the daemon's state directory. Startup and focus hooks never
 configure the sidebar or install fonts.
 Direct `configure` and `unconfigure` need an absolute `HOME` when either
 `HERDR_CONFIG_PATH` or `HERDR_PLUGIN_STATE_DIR` is unset.
+
+For a development checkout, inspect the built binary directly:
+
+```sh
+./target/release/herdr-lineup --help
+./target/release/herdr-lineup --version
+./target/release/herdr-lineup doctor --help
+./target/release/herdr-lineup statusline --help
+```
+
+After [statusLine setup](#claude-and-antigravity-statusline-opt-in) puts the
+binary on `PATH`, use `herdr-lineup` in place of `./target/release/herdr-lineup`.
 
 ## Configuration
 
@@ -276,7 +272,7 @@ Neither setup method requires restarting the Herdr server.
 
 ### Icons
 
-The bundled font is **Herdr Agent Icons Max**. See [NOTICE.md](NOTICE.md) for
+The bundled font is **Herdr Agent Icons Max**. See [NOTICE.md](https://github.com/fujimogn/herdr-lineup/blob/main/NOTICE.md) for
 sources and licensing. Font actions install on the machine where they run.
 Over SSH, installing on the remote host does not install anything on your local
 terminal's machine; install the font and configure the terminal there too.
@@ -385,8 +381,9 @@ allow_network = true
 ```
 
 This starts `codex app-server` for account limits using the daemon's `CODEX_HOME`
-and reads Grok's existing auth key (`GROK_AUTH_FILE`, then `GROK_HOME/auth.json`,
-then `~/.grok/auth.json`) for the authenticated HTTPS billing endpoint. No
+and reads Grok's existing auth key from `GROK_AUTH_FILE` when set, otherwise
+`GROK_HOME/auth.json` when `GROK_HOME` is set, otherwise `~/.grok/auth.json`.
+It does not try another source if the selected file cannot be read. No
 credentials are displayed or persisted by Lineup. Do not restart the Herdr server.
 
 ### Claude and Antigravity statusLine (opt-in)
@@ -458,13 +455,15 @@ existing agent settings before changing them; startup does not edit them.
    ```
 
    A missing or duplicate checksum entry stops the check; only extract an
-   archive after its check prints `OK`. See the [release instructions](docs/releasing.md)
-   for artifact details. Then extract it and put its `herdr-lineup` executable
-   on `PATH` (replace the placeholder with the extraction directory):
+   archive after its check prints `OK`. See the [release instructions](https://github.com/fujimogn/herdr-lineup/blob/main/docs/releasing.md)
+   for artifact details. Extract the verified archive into a new empty directory,
+   then put its `herdr-lineup` executable on `PATH`:
 
    ```sh
+   EXTRACT_DIR=$(mktemp -d)
+   tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR"
    mkdir -p "$HOME/.local/bin"
-   install -m 755 /absolute/path/to/extracted/herdr-lineup "$HOME/.local/bin/herdr-lineup"
+   install -m 755 "$EXTRACT_DIR/herdr-lineup" "$HOME/.local/bin/herdr-lineup"
    export PATH="$HOME/.local/bin:$PATH"
    herdr-lineup --version
    ```
@@ -559,7 +558,7 @@ valid value while that exact session or pane binding matches. Idle Claude,
 Antigravity, Codex, Grok, and Kimi context does not expire by age. A timestamp
 later than that read's comparison clock is unavailable. Weekly quota with a
 reset time expires at that time.
-StatusLine weekly without a reset uses the default maximum age of 60 seconds;
+StatusLine weekly without a reset uses `usage_max_age_ms` (60 seconds by default);
 Codex quota without a reset follows its client interval and clears after a failed
 query.
 
@@ -582,7 +581,7 @@ paths for state, socket, config, and provider homes.
 | `CODEX_HOME` | Codex local session home and account-quota client home; defaults to `~/.codex`. A non-absolute override makes the local home unavailable. |
 | `GROK_HOME` | Grok local session home (default `~/.grok`) and fallback base for `auth.json`. A non-absolute override makes the local session home unavailable. |
 | `KIMI_CODE_HOME` | Kimi local session home; defaults to `~/.kimi-code`. An empty value uses that default. A non-absolute override makes the local home unavailable. |
-| `GROK_AUTH_FILE` | Explicit Grok billing auth file, before `GROK_HOME/auth.json` and `~/.grok/auth.json`; used only with network opt-in. |
+| `GROK_AUTH_FILE` | Explicit Grok billing auth file. When set, it takes precedence without retrying another file on read failure; used only with network opt-in. |
 
 `HOME` supplies the per-user defaults above and must be absolute for font
 actions. `HERDR_PLUGIN_ROOT` is the plugin checkout, never a destination for
@@ -663,9 +662,10 @@ from a Herdr pane and check its completed `status`, `exit_code`, and output with
    `herdr plugin unlink herdr-lineup`; it unregisters the plugin but leaves
    your checkout in place. Config and state are separate from either checkout.
    The empty plugin list confirms removal, not daemon exit. Once uninstalled,
-   Lineup actions are unavailable, so the successful final stop command in
-   every session is the daemon-exit confirmation: `stop` returns successfully
-   only after that session's daemon process exits (or if none was running).
+   Lineup actions are unavailable. A successful `stop` either observed the
+   controlled daemon exit or found no live control or lock; in the latter case,
+   a process may briefly finish teardown after releasing its lock. Allow a few
+   seconds after the final stops before uninstalling.
    If any final stop fails, resolve it before uninstalling; there is no
    supported post-uninstall Lineup action to check or stop a remaining daemon.
 
@@ -831,7 +831,7 @@ non-blocking I/O and `poll` against one monotonic deadline. On macOS,
 `setsockopt` on a socket the peer has closed returns `EINVAL`, so the deadline
 is not applied with `setsockopt`.
 See the [Herdr plugin documentation](https://herdr.dev/docs/plugins/)
-and [SECURITY.md](SECURITY.md).
+and [SECURITY.md](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md).
 
 ## Privacy
 
@@ -855,7 +855,7 @@ only fixed query-result categories for `doctor`, without values, account
 identities, credentials, paths, response bodies, or error text. Keep runtime state in `HERDR_PLUGIN_STATE_DIR` and user
 settings in `HERDR_PLUGIN_CONFIG_DIR`; reinstall replaces `HERDR_PLUGIN_ROOT`.
 Sidebar edits, font setup, and statusLine hooks all require explicit opt-in.
-See [SECURITY.md](SECURITY.md) for the full boundaries.
+See [SECURITY.md](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md) for the full boundaries.
 
 ## Troubleshooting
 
@@ -918,10 +918,23 @@ commands to run.
 The CI workflow runs formatting, Clippy, tests, and release builds on Linux and
 macOS, with a dependency audit on pushes and weekly. Keep package versions in
 `Cargo.toml`, `Cargo.lock`, and `herdr-plugin.toml` aligned; release tags use `v*`.
-Documents and comments are written in English. See [AGENTS.md](AGENTS.md).
+Documents and comments are written in English. See [AGENTS.md](https://github.com/fujimogn/herdr-lineup/blob/main/AGENTS.md).
+
+## Documentation
+
+These repository links also work from the README bundled in a release archive.
+They open the current `main` branch, which may differ from an older archive.
+
+- [Releasing](https://github.com/fujimogn/herdr-lineup/blob/main/docs/releasing.md) — version checks, release notes, and the release workflow.
+- [Testing](https://github.com/fujimogn/herdr-lineup/blob/main/docs/testing.md) — isolated lifecycle and metadata verification.
+- [Usage sources](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/usage-sources.md) — provider inputs and availability.
+- [Codex context drift](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/codex-context-drift.md) — evidence for the one-point display gap.
+- [Plugin conventions](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/plugin-conventions.md) — packaging and installation research.
+- [Security](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md) — local data, credentials, and network boundaries.
+- [Changelog](https://github.com/fujimogn/herdr-lineup/blob/main/CHANGELOG.md) — user-visible changes.
 
 ## License
 
-[MIT](LICENSE). Third-party font attribution is in [NOTICE.md](NOTICE.md).
+[MIT](https://github.com/fujimogn/herdr-lineup/blob/main/LICENSE). Third-party font attribution is in [NOTICE.md](https://github.com/fujimogn/herdr-lineup/blob/main/NOTICE.md).
 
 Not affiliated with Herdr or the supported AI providers.
