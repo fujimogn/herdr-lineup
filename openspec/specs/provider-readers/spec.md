@@ -96,11 +96,10 @@ Samples whose timestamps are invalid, or later than that read's comparison
 clock, or whose identity no longer matches the occupant SHALL be unavailable.
 The comparison clock SHALL be taken for the pane being read and advanced
 through the read, so an observation written while an earlier pane was processed
-is not future. Context for Claude, Antigravity, Codex, and Grok SHALL retain
+is not future. Context for Claude, Antigravity, Codex, Grok, and Kimi SHALL retain
 the last valid exact session or statusLine-bound observation regardless of its
-age. Kimi completed-turn context SHALL expire after `usage_max_age_ms`. Weekly samples
-with a reset time SHALL expire at that time; statusLine weekly samples without a
-reset time SHALL expire after `usage_max_age_ms`. Codex quota without a reset
+age. Weekly samples with a reset time SHALL expire at that time; statusLine weekly
+samples without a reset time SHALL expire after `usage_max_age_ms`. Codex quota without a reset
 SHALL follow the client interval and be cleared after a failed query. The daemon SHALL replace expired or failed
 fields with unavailable display and clear numeric values on the next refresh.
 
@@ -112,7 +111,7 @@ SHALL return unavailable. Reader results, metadata, and diagnostics SHALL NOT
 contain credential values, conversation contents, or personal account identifiers.
 
 #### Scenario: Exact-session context stops updating while idle
-- **WHEN** the last valid Claude, Antigravity, Codex, or Grok context observation
+- **WHEN** the last valid Claude, Antigravity, Codex, Grok, or Kimi context observation
   exceeds 60 seconds but its binding still matches the current occupant
 - **THEN** context retains the last observed percentage
 - **AND** weekly without a reset time expires after its maximum age
@@ -204,11 +203,13 @@ Kimi home MAY be a symlink, matching Codex resolution of its home. A symlink
 at `sessions/` or below SHALL NOT be followed. Unknown
 aliases, nonpositive windows, ambiguous model entries, and an input size
 greater than the context size SHALL be unavailable. The percentage SHALL be
-`100 * tokens / window`, bounded like the other context labels. An observation
-older than `usage_max_age_ms` SHALL be unavailable, including when a timeout
-restores the previous local reading through the same retention function as
-Codex and Grok. That function SHALL keep Codex and Grok context regardless of
-age.
+`100 * tokens / window`, bounded like the other context labels. A completed
+turn SHALL remain available regardless of age. A timestamp later than the
+read's comparison clock SHALL be unavailable. When a timeout restores the
+previous local reading, that restore SHALL use the same retention function as
+Codex and Grok and SHALL keep Kimi context regardless of age. An unchanged
+`wire.jsonl` SHALL NOT be reread; the reader SHALL use the same fingerprint
+cache as the Codex rollout reader.
 
 The reader SHALL NOT use the network. It SHALL parse `config.toml` with the
 `toml` crate and retain only `id`, `cwd`, event type, `agentId`, `tokens`,
@@ -220,7 +221,7 @@ weekly remaining SHALL stay unavailable.
 #### Scenario: Completed turn publishes context
 - **WHEN** one regular session matches the pane's native session id and cwd
 - **AND** its main-agent wire ends on a completed turn whose model window is positive
-- **AND** the observation is within `usage_max_age_ms`
+- **AND** the observation is older than `usage_max_age_ms` and not later than the comparison clock
 - **THEN** context is `100 * tokens / window`
 - **AND** weekly remaining is unavailable
 
@@ -241,8 +242,13 @@ weekly remaining SHALL stay unavailable.
   bound to alias B
 - **THEN** context uses alias B's window
 
-#### Scenario: Old Kimi observation expires
+#### Scenario: Old Kimi observation stays
 - **WHEN** the completed-turn observation is older than `usage_max_age_ms`
+- **AND** no later event changes context and the timestamp is not in the future
+- **THEN** context retains `100 * tokens / window`
+
+#### Scenario: Future Kimi observation is rejected
+- **WHEN** the completed-turn timestamp is later than the read's comparison clock
 - **THEN** context is unavailable
 
 ### Requirement: Codex context matches its UI baseline
@@ -369,10 +375,9 @@ Readers SHALL reject future observations, oversized or malformed records,
 nonregular files, and symlinked observation
 roots/files. The read SHALL use the existing bounded timeout contract. An
 observation whose supplied weekly reset is at or before `now` SHALL have
-unavailable weekly data, while a bound Claude, Antigravity, Codex, or Grok
+unavailable weekly data, while a bound Claude, Antigravity, Codex, Grok, or Kimi
 context observation may remain available.
-Those context observations SHALL NOT expire by `max_age`. Kimi completed-turn
-context SHALL expire after `usage_max_age_ms`. Weekly without a reset SHALL still obey
+Those context observations SHALL NOT expire by `max_age`. Weekly without a reset SHALL still obey
 `max_age`; weekly with a reset SHALL use that reset as its expiry.
 Unavailable weekly SHALL clear window/reset values. A missing reset SHALL omit
 the countdown without inventing a timestamp. The publisher SHALL select both

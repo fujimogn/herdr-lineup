@@ -341,15 +341,10 @@ impl UsageReading {
             ));
         }
         reading.context = match request.now.duration_since(observed_at) {
+            // A timestamp later than this read's clock is not a context sample.
             Err(_) => UsageOutcome::Unavailable(MissingReason::Invalid),
-            // Codex and Grok context do not expire by age. Kimi does, in this
-            // function, at the `request.now` the caller already chose. Codex
-            // and Kimi pass `now_after` the read. Grok passes the worker-start
-            // clock and does not take this branch.
-            Ok(age) if source == SourceKind::KimiSession && age > request.max_age => {
-                UsageOutcome::Unavailable(MissingReason::Stale)
-            }
             // Exact-session context is the last known occupancy, not a heartbeat.
+            // Claude, Antigravity, Codex, Grok, and Kimi do not expire by age.
             // Weekly observations apply their own age/reset policy independently.
             Ok(_) if percent.is_finite() && (0.0..=100.0).contains(&percent) => {
                 UsageOutcome::Available(percent)
@@ -774,7 +769,17 @@ pub(crate) mod tests {
         let stale_at = kimi_request.now - Duration::from_secs(61);
         assert_eq!(
             UsageReading::sample(&kimi_request, SourceKind::KimiSession, 7.5, stale_at).context,
-            UsageOutcome::Unavailable(MissingReason::Stale)
+            UsageOutcome::Available(7.5)
+        );
+        assert_eq!(
+            UsageReading::sample(
+                &kimi_request,
+                SourceKind::KimiSession,
+                7.5,
+                kimi_request.now + Duration::from_secs(1)
+            )
+            .context,
+            UsageOutcome::Unavailable(MissingReason::Invalid)
         );
         assert_eq!(
             UsageReading::sample(&r, SourceKind::CodexRollout, 7.5, stale_at).context,

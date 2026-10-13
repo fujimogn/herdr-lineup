@@ -102,8 +102,8 @@ fn observation_within_max_age(
 }
 
 /// Keep the previous local reading after a timeout. Weekly samples without a
-/// reset expire through `observation_within_max_age`. Codex and Grok context
-/// does not expire by age. Kimi context uses that same age check.
+/// reset expire through `observation_within_max_age`. Codex, Grok, and Kimi
+/// context does not expire by age.
 fn restore_local_after_timeout(
     previous: &model::UsageReading,
     now: SystemTime,
@@ -111,9 +111,6 @@ fn restore_local_after_timeout(
 ) -> model::UsageReading {
     let mut reading = previous.clone();
     let fresh = observation_within_max_age(reading.observed_at, now, max_age);
-    if reading.source_kind == model::SourceKind::KimiSession && !fresh {
-        reading.context = model::UsageOutcome::Unavailable(model::MissingReason::Stale);
-    }
     let weekly_valid = reading.weekly_resets_at.map_or(fresh, |reset| reset > now);
     if !weekly_valid {
         reading.weekly_remaining = model::UsageOutcome::Unavailable(model::MissingReason::Stale);
@@ -3736,7 +3733,80 @@ mod tests {
     }
 
     #[test]
-    fn timeout_restore_applies_usage_age_to_kimi_context_only() {
+    fn idle_kimi_context_from_twelve_hours_ago_publishes_numeric_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("kimi-home");
+        let session = home.join("sessions/wd_synthetic/session-1");
+        std::fs::create_dir_all(session.join("agents/main")).unwrap();
+        std::fs::write(
+            session.join("state.json"),
+            r#"{"id":"session-1","cwd":"/synthetic/repo"}"#,
+        )
+        .unwrap();
+        let observed_ms = (unix(SystemTime::now()) as u128) * 1000 - 12 * 60 * 60 * 1000;
+        std::fs::write(
+            session.join("agents/main/wire.jsonl"),
+            format!(
+                r#"{{"type":"profile.bind","agentId":"main","modelAlias":"synthetic-alias","time":{observed_ms}}}
+{{"type":"token_counting.turn_recorded","agentId":"main","tokens":75,"time":{observed_ms}}}
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[models.\"synthetic-alias\"]\nmax_input_size = 1000\nmax_context_size = 100000\n",
+        )
+        .unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = Arc::new(std::sync::Mutex::new(json!({
+            "id": "template",
+            "result": {"type":"session_snapshot","snapshot":{
+                "version":"0.9.3","protocol":22,
+                "workspaces":[{"workspace_id":"w1"}],
+                "panes":[{
+                    "pane_id":"w1:p1",
+                    "workspace_id":"w1",
+                    "agent":"kimi",
+                    "agent_session":{"agent":"kimi","kind":"id","value":"session-1"},
+                    "agent_status":"idle",
+                    "cwd":"/synthetic/repo"
+                }]
+            }}
+        })));
+        let server = token_server_with_template(
+            UnixListener::bind(&socket).unwrap(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            template,
+        );
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            state,
+            "fake".into(),
+            Homes {
+                kimi: Some(home),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        publisher
+            .refresh(&mut transport, &Config::default())
+            .unwrap();
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        let tokens = &response["result"]["snapshot"]["panes"][0]["tokens"];
+        assert_eq!(tokens["lineup_context_text"], "08%");
+        assert_eq!(tokens["lineup_context_pct"], "7.5");
+        assert_eq!(tokens["lineup_weekly_text"], "—");
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn timeout_restore_keeps_codex_and_kimi_context_past_max_age() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("kimi-home");
         let session = home.join("sessions/wd_synthetic/session-1");
@@ -3837,11 +3907,8 @@ mod tests {
             .request(&mut transport, "session.snapshot")
             .unwrap();
         assert_eq!(pane(&expired, 0)["lineup_context_text"], "42%");
-        assert_eq!(
-            pane(&expired, 1)["lineup_context_text"],
-            "—\u{2800}\u{2800}"
-        );
-        assert!(pane(&expired, 1)["lineup_context_pct"].is_null());
+        assert_eq!(pane(&expired, 1)["lineup_context_text"], "08%");
+        assert_eq!(pane(&expired, 1)["lineup_context_pct"], "7.5");
         publisher.request(&mut transport, "test.finish").unwrap();
         server.join().unwrap();
     }

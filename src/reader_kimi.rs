@@ -322,8 +322,9 @@ fn context_percent(
     if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
         return Err(MissingReason::Invalid);
     }
-    // Age and future timestamps are judged by `UsageReading::sample` at
-    // `request.now_after`, the same clock Codex uses for context.
+    // Future timestamps are judged by `UsageReading::sample` at
+    // `request.now_after`, the same clock Codex uses for context. A completed
+    // turn does not expire by age.
     Ok(percent)
 }
 
@@ -531,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatch_duplicate_symlink_turn_compaction_alias_and_age_hide_context() {
+    fn mismatch_duplicate_symlink_turn_compaction_and_alias_hide_context() {
         let bound = identity(Provider::Kimi);
         let now = fresh_ms(&request(&bound, std::path::Path::new(".")));
         type Case = (&'static str, fn(&std::path::Path, u128));
@@ -591,9 +592,6 @@ mod tests {
                     "[models.\"other-alias\"]\nmax_context_size = 1000\n",
                 )
                 .unwrap();
-            }),
-            ("stale", |home, now| {
-                install(home, "session-1", "/synthetic/repo", 75, now - 61_000, "");
             }),
         ];
         for (name, setup) in cases {
@@ -858,5 +856,95 @@ mod tests {
             ),
             "a sessions symlink under the home must not be followed"
         );
+    }
+
+    #[test]
+    fn idle_completed_turn_older_than_max_age_stays_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = identity(Provider::Kimi);
+        let base = request(&bound, dir.path());
+        let twelve_hours_ms = 12 * 60 * 60 * 1000;
+        install(
+            dir.path(),
+            "session-1",
+            "/synthetic/repo",
+            75,
+            fresh_ms(&base) - twelve_hours_ms,
+            "",
+        );
+        assert_eq!(
+            read_at(dir.path(), "session-1", "/synthetic/repo"),
+            UsageOutcome::Available(7.5)
+        );
+    }
+
+    #[test]
+    fn event_after_completed_turn_hides_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = identity(Provider::Kimi);
+        let now = fresh_ms(&request(&bound, dir.path()));
+        install(
+            dir.path(),
+            "session-1",
+            "/synthetic/repo",
+            75,
+            now,
+            &format!(
+                r#"{{"type":"context.apply_compaction","agentId":"main","summary":"synthetic","compactedCount":1,"time":{now}}}"#
+            ),
+        );
+        assert!(
+            !matches!(
+                read_at(dir.path(), "session-1", "/synthetic/repo"),
+                UsageOutcome::Available(_)
+            ),
+            "compaction after the completed turn must hide context"
+        );
+    }
+
+    #[test]
+    fn future_turn_timestamp_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = identity(Provider::Kimi);
+        let now = fresh_ms(&request(&bound, dir.path()));
+        install(
+            dir.path(),
+            "session-1",
+            "/synthetic/repo",
+            75,
+            now + 60_000,
+            "",
+        );
+        assert_eq!(
+            read_at(dir.path(), "session-1", "/synthetic/repo"),
+            UsageOutcome::Unavailable(MissingReason::Invalid)
+        );
+    }
+
+    #[test]
+    fn unchanged_wire_does_not_read_content_again() {
+        let _gate = TEST_GATE.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut id = identity(Provider::Kimi);
+        id.repository_identity = "/synthetic/repo".into();
+        let base = request(&id, dir.path());
+        install(
+            dir.path(),
+            "session-1",
+            "/synthetic/repo",
+            75,
+            fresh_ms(&base),
+            "",
+        );
+        crate::model::tests::CONTENT_READS.set(0);
+        let first = read_session(&base).unwrap();
+        let reads = crate::model::tests::CONTENT_READS.get();
+        assert!(
+            reads >= 2,
+            "state and wire are read on a cold cache: {reads}"
+        );
+        assert_eq!(read_session(&base).unwrap(), first);
+        // Binding and the model window are rechecked. The wire body is not.
+        assert_eq!(crate::model::tests::CONTENT_READS.get(), reads + 2);
     }
 }

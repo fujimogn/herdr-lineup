@@ -106,7 +106,11 @@ not retained or logged. The reader performs no network I/O and does not open
 credential stores. An unreadable `state.json` hides a match only when its
 session directory is named with the pane's native session id, because that
 file could be a duplicate. A window value that is not an integer of at least 1
-does not select the other window. Weekly
+does not select the other window. A completed turn stays available regardless
+of age, including when a timeout restores the previous local reading. A
+timestamp later than the comparison clock is unavailable. An unchanged
+`wire.jsonl` is not reread; the reader uses the same fingerprint cache as the
+Codex rollout reader. Weekly
 Kimi quota stays unavailable. Development tests use synthetic fixtures only.
 
 ## Repository heading Git queries

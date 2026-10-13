@@ -539,8 +539,9 @@ pane. Antigravity ignores any conversation id in the JSON. Herdr panes provide
 
 Context stays `—` until an observation matches the pane, then retains the last
 valid value while that exact session or pane binding matches. Idle Claude,
-Antigravity, Codex, and Grok context does not expire by age. Kimi context expires
-after `usage_max_age_ms`. Weekly quota with a reset time expires at that time.
+Antigravity, Codex, Grok, and Kimi context does not expire by age. A timestamp
+later than that read's comparison clock is unavailable. Weekly quota with a
+reset time expires at that time.
 StatusLine weekly without a reset uses the default maximum age of 60 seconds;
 Codex quota without a reset follows its client interval and clears after a failed
 query.
@@ -717,9 +718,11 @@ percentage is `100 * tokens / window`, and the sidebar rounds it like the other
 context labels. The reader does not use the network. The `toml` crate parses
 `config.toml` and the reader keeps only that alias's `max_input_size` and
 `max_context_size`; credential,
-token, and API-key values are not retained or logged. A timeout keeps a fresh
-Kimi context only until `usage_max_age_ms`, through the same retention path as
-Codex and Grok. Kimi weekly remains unavailable.
+token, and API-key values are not retained or logged. An unchanged
+`wire.jsonl` is not read again; the reader uses the same fingerprint cache as
+Codex. A completed turn stays available regardless of age. A timestamp later
+than the comparison clock is unavailable. A timeout keeps that context through
+the same retention path as Codex and Grok. Kimi weekly remains unavailable.
 
 Workers stop scheduling queries on daemon shutdown. Stop does not join a pending
 Grok HTTP request (process exit ends it), and it kills/reaps the in-flight Codex
