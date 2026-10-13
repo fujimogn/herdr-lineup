@@ -1,8 +1,7 @@
 //! Session-scoped OS lock with continuous descriptor transfer.
 
-use fs2::FileExt;
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     io,
     os::unix::{
         ffi::OsStrExt,
@@ -107,10 +106,10 @@ impl SessionLock {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => Ok(Some(Self { file })),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error),
         }
     }
     /// Adopt only the descriptor explicitly transferred by ensure's pre_exec.
@@ -128,15 +127,18 @@ impl SessionLock {
                 "inherited lock descriptor does not match session lock",
             ));
         }
-        file.try_lock_exclusive().map_err(|error| {
-            // Only the acquisition attempt identifies contention. Metadata,
-            // descriptor validation, and later setup retain their own errors.
-            if error.kind() == io::ErrorKind::WouldBlock {
-                io::Error::new(io::ErrorKind::WouldBlock, StartupLockContention)
-            } else {
-                error
+        // Only the acquisition attempt identifies contention. Metadata,
+        // descriptor validation, and later setup retain their own errors.
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    StartupLockContention,
+                ));
             }
-        })?;
+            Err(TryLockError::Error(error)) => return Err(error),
+        }
         // Prevent later subprocesses from keeping this ownership alive.
         unsafe {
             if libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
@@ -160,10 +162,10 @@ impl SessionLock {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => Ok(false),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(true),
-            Err(e) => Err(e),
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(error)) => Err(error),
         }
     }
 }
@@ -197,7 +199,7 @@ impl Drop for LifecycleLock {
     fn drop(&mut self) {
         // This lock is never deliberately transferred to a daemon. Release it
         // even if an unrelated concurrent fork inherited the descriptor.
-        let _ = FileExt::unlock(&self._lock.file);
+        let _ = self._lock.file.unlock();
     }
 }
 
@@ -310,6 +312,24 @@ impl ProcessExit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_lock_uses_std_file_locking() {
+        assert!(!include_str!("../Cargo.toml").contains("fs2 ="));
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path(), Path::new("/synthetic-herdr.sock")).unwrap();
+        let _lock = SessionLock::acquire(&paths).unwrap().unwrap();
+        let independent = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&paths.lock)
+            .unwrap();
+        assert!(matches!(
+            independent.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+    }
+
     #[test]
     fn lifecycle_lock_wait_is_bounded_and_does_not_own_daemon_lock() {
         let dir = tempfile::tempdir().unwrap();
