@@ -1,19 +1,15 @@
-# herdr-lineup
+<div align="center">
 
-<p align="center">
-  <a href="https://github.com/fujimogn/herdr-lineup/releases/latest"><img src="https://img.shields.io/github/v/release/fujimogn/herdr-lineup" alt="Latest release"></a>
-  <a href="https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml"><img src="https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue" alt="MIT license"></a>
-  <a href="https://herdr.dev/plugins/"><img src="https://img.shields.io/badge/Herdr_plugin-%E2%89%A5_0.9.3-blue" alt="Herdr plugin requires version 0.9.3 or later"></a>
-  <a href="https://github.com/fujimogn/herdr-lineup/blob/main/herdr-plugin.toml"><img src="https://img.shields.io/badge/Platform-macOS_%7C_Linux-blue" alt="Platform: macOS and Linux"></a>
-  <a href="https://github.com/fujimogn/herdr-lineup/blob/main/rust-toolchain.toml"><img src="https://img.shields.io/badge/Rust-1.99.0-blue" alt="Rust 1.99.0"></a>
-</p>
+<h1 align="center">herdr-lineup</h1>
 
-See each AI coding agent's state, context use, and weekly quota in one sidebar
-row in [Herdr](https://herdr.dev), alongside each repository's latest local
-`origin/main` commit time.
+[![Latest release](https://img.shields.io/github/v/release/fujimogn/herdr-lineup?logo=github&color=brightgreen)](https://github.com/fujimogn/herdr-lineup/releases/latest) [![CI](https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml) [![Rust 1.99.0](https://img.shields.io/badge/Rust-1.99.0-orange?logo=rust)](https://github.com/fujimogn/herdr-lineup/blob/main/rust-toolchain.toml)
+[![Herdr plugin requires version 0.9.3 or later](https://img.shields.io/badge/Herdr_plugin-%E2%89%A5_0.9.3-purple)](https://herdr.dev/plugins/) [![Platform: macOS and Linux](https://img.shields.io/badge/Platform-macOS_%7C_Linux-blue)](https://github.com/fujimogn/herdr-lineup/blob/main/herdr-plugin.toml) [![MIT license](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+
+**herdr-lineup** shows each AI coding agent's state, context use, and weekly quota in one sidebar row in [Herdr](https://herdr.dev), alongside each repository's latest local `origin/main` commit time.
 
 <img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/v0.1.0/docs/images/sidebar-agents.png" alt="Herdr Agents sidebar showing Lineup agent rows, context use, and weekly quota" width="420">
+
+</div>
 
 - **One row per agent pane.** Keep vendor logos, state, context, and weekly remaining quota together in the sidebar.
 - **Session-bound usage.** Read local Codex/Grok files and opt-in Claude/Antigravity statusLine observations for the matching pane.
