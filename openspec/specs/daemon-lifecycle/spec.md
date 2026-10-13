@@ -76,8 +76,11 @@ replacement. Stop on an already stopped daemon SHALL succeed as a no-op.
 Persistent sequence state SHALL remain available for a later restart.
 
 A `doctor` action SHALL be read-only and report config validity, endpoint/protocol
-compatibility, daemon/control/lock health, last refresh/error, token-capacity
-issues, font-mode caveats, and provider availability reasons. It SHALL report
+compatibility, daemon/control/lock health, last refresh health, font-mode
+caveats, bounded statusLine record counts, and the saved result categories of
+the last Codex and Grok weekly queries. Metadata capacity exhaustion SHALL be
+recorded in the session-local daemon log. Doctor SHALL give a generic warning
+for unavailable optional provider data. It SHALL report
 unhealthy configuration/daemon conditions with a nonzero exit status. Missing
 optional provider data alone SHALL be a warning, not a daemon health failure.
 Diagnostics SHALL redact credentials and conversation contents. Logs SHALL go
@@ -90,7 +93,7 @@ SHALL be written into `HERDR_PLUGIN_ROOT`.
 
 #### Scenario: Missing usage is expected
 - **WHEN** the daemon is healthy and Kimi usage is unsupported
-- **THEN** doctor succeeds with an availability warning, without starting a reader
+- **THEN** doctor succeeds with a generic optional-provider warning, without starting a reader
   network call, editing config, or restarting any server
 
 ### Requirement: Explicit user configuration with bounded defaults
@@ -109,6 +112,7 @@ outside these bounds SHALL fail validation before spawning or publishing.
 | `reader_timeout_ms` | `2000` | Integer 100–30000, and no greater than refresh interval |
 | `usage_max_age_ms` | `60000` | Integer at least refresh interval and at most 86400000 |
 | `logo_mode` | `"auto"` | `auto`, `font`, or `text`; conservative auto fallback |
+| `non_first_pane_logo_indent` | `0` | Integer 0–16; prefix later-pane logos with that many U+2800 cells |
 | `providers` | `["claude", "codex", "grok", "agy", "kimi", "hermes"]` | Unique supported ids; an empty list disables all lineup agent rows |
 | `allow_network` | `false` | No network-dependent reader runs unless true and its researched adapter is enabled |
 
@@ -119,7 +123,7 @@ No credentials or sidebar layout SHALL be stored in this plugin config.
 
 #### Scenario: Absent and invalid configuration
 - **WHEN** the user config is absent
-- **THEN** the daemon uses the six defaults above and never writes a config file
+- **THEN** the daemon uses the seven defaults above and never writes a config file
 - **AND WHEN** refresh interval is 1000 but reader timeout remains 2000
 - **THEN** config validation fails with an actionable bounded-value diagnostic
 

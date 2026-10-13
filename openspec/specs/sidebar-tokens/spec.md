@@ -215,14 +215,16 @@ endpoint SHALL use a sequence greater than that floor. Rows and floors for a
 different socket endpoint SHALL be removed once the current endpoint identity is
 verified; its metadata cannot be updated through the replaced endpoint.
 
-The default refresh interval SHALL be 5,000 ms and TTL 15,000 ms. Events SHALL
-invalidate cached state and trigger authoritative reconciliation: bootstrap,
-pane agent/status/session or cwd changes, and workspace creation/focus/cwd
-changes. The periodic refresh SHALL check local refs, reader freshness, and
-reconcile missed changes. Send changed keys only except TTL renewal and
-snapshot repair. Unchanged live keys SHALL be re-published once at least one
-refresh interval has elapsed since their last successful publication. A desired
-live key absent from the authoritative snapshot SHALL be sent again on that
+The default refresh interval SHALL be 5,000 ms and TTL 15,000 ms. Startup and
+workspace focus SHALL invoke `ensure`; the publisher SHALL NOT subscribe to
+pane or workspace change events. Each periodic refresh SHALL obtain an
+authoritative session snapshot, invalidate cached usage when pane identity or
+cwd changes, check local refs and reader freshness, and reconcile changes in
+pane agent/status/session, workspace membership, and cwd. Send changed keys
+only except TTL renewal and snapshot repair. Unchanged live keys SHALL be
+re-published once at least one refresh interval has elapsed since their last
+successful publication. A desired live key absent from the authoritative
+snapshot SHALL be sent again on that
 refresh even before the interval elapses. Missing or closed resources SHALL
 not be recreated.
 

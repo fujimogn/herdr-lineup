@@ -7,23 +7,29 @@ opt-in Codex and Grok account quota workers, including unavailable data.
 ## Requirements
 
 ### Requirement: Session-bound provider reader result
-Each supported provider SHALL implement the same reader contract, returning a
-result bound to `{provider, native_session_id, repository_identity}` obtained
-from authoritative Herdr pane/session information. A missing or ambiguous
-native-session association SHALL return unavailable without guessing a session
-from a globally newest file. Multiple panes for one identity SHALL share one
-bounded read per refresh cycle.
+Each invoked local provider reader SHALL return a result bound to the
+authoritative pane identity.
 
 #### Scenario: Return a validated session sample
 - **WHEN** an associated provider is read
 - **THEN** the reader result conforms to the independent outcome and measurement
   definitions below
 
+The result SHALL bind `{provider, native_session_id, repository_identity}` from
+authoritative Herdr pane/session information. A missing or ambiguous native
+session SHALL return unavailable without guessing from a globally newest file.
+The publisher SHALL evaluate each selected Claude, Codex, Grok, or Antigravity
+pane independently. When its required local source path and association are
+available, it SHALL invoke that pane's local reader even for an identity shared
+with another pane.
+Account quota worker samples MAY be shared across eligible panes.
+
 The result SHALL contain `observed_at`, a non-secret `source_kind`, and independent
 context and weekly outcomes. Each outcome SHALL be either `available` with a
 finite percentage in [0,100], or `unavailable` with a bounded reason code:
 `unsupported`, `not_found`, `permission_denied`, `unassociated`, `invalid`,
-`timeout`, `stale`, or `source_error`. Context available data SHALL mean current
+`timeout`, `entry_limit`, `stale`, or `source_error`. Context available data SHALL
+mean current
 conversation occupancy of the active context window, with Codex's explicit UI
 baseline convention below, not rate quota.
 Weekly available data SHALL mean **remaining** quota percentage over an explicit
@@ -43,14 +49,17 @@ not be mislabeled weekly. Used percentage SHALL be converted to remaining by
 - **THEN** that weekly result is unavailable and publishes `—` with no numeric key
 
 ### Requirement: Provider source availability remains explicit
-The plugin SHALL register these six reader slots and treat unimplemented or
-unconfirmed adapters as `unsupported`. Source implementation details SHALL be
-resolved by the usage-source research before enabling an adapter. The following
-table is the contract for the outcomes each adapter obtains.
+The plugin SHALL support six provider identities for pane rows and invoke
+local readers for the four implemented adapters only.
 
 #### Scenario: Enumerate reader availability
 - **WHEN** a supported provider is selected
 - **THEN** its adapter obeys the stage and source-detail status in this table
+
+The publisher SHALL invoke local readers only for Claude, Codex, Grok, and
+Antigravity. Kimi and Hermes SHALL retain unavailable usage without invoking
+their unsupported reader types. Source implementation details SHALL be
+resolved by the usage-source research before enabling another adapter.
 
 | Reader | Context outcome | Weekly remaining outcome | Source detail status |
 | --- | --- | --- | --- |
@@ -67,16 +76,22 @@ table is the contract for the outcomes each adapter obtains.
   are both `—` and their numeric keys are cleared
 
 ### Requirement: Freshness and failure do not retain misleading usage
-Reader calls SHALL obey `reader_timeout_ms`; a timeout SHALL not block other
-providers or daemon TTL renewal. A sample that arrives after the deadline SHALL
-be discarded. When the read times out and a previous local observation exists
-for the same pane identity and source, that observation SHALL be kept, and its
-weekly fields SHALL still expire at their reset or `usage_max_age_ms`. Other
-unavailable fields SHALL clear numeric keys and show `—` on the next refresh.
+Local reader calls SHALL share a bounded refresh-cycle deadline and retain only
+valid, identity-matched observations.
 
 #### Scenario: Validate cached usage before renewal
 - **WHEN** a cached sample is considered for the current occupant
 - **THEN** it passes these age, identity, permission, and privacy constraints
+
+Local reader calls in one refresh cycle SHALL share one `reader_timeout_ms`
+deadline. A slow read MAY exhaust the remaining budget for later panes,
+regardless of provider. Account quota queries SHALL run in background workers
+without blocking local refresh. A sample that arrives after the local deadline
+SHALL be discarded. When the read times out and a previous local observation
+exists for the same pane identity and source, that observation SHALL be kept,
+and its weekly fields SHALL still expire at their reset or `usage_max_age_ms`.
+Other unavailable fields SHALL clear numeric keys and show `—` on the next
+refresh.
 
 Samples whose timestamps are invalid, or later than that read's comparison
 clock, or whose identity no longer matches the occupant SHALL be unavailable.
