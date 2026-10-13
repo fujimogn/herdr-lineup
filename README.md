@@ -626,10 +626,12 @@ failures clear it. Before the first successful query, after reset, and for Grok
 MONTHLY allowances, weekly stays `—`. Period names containing `WEEKLY`
 (case-insensitive, including enum prefixes) supply weekly usage; `MONTHLY`
 periods remain unavailable for 7d. Without a reset, Grok's remaining percentage
-is shown without a countdown and expires after `usage_max_age_ms` from the
-last successful query. Codex quota without a reset follows its client interval
-and clears after a failed query. Environment proxies are inherited; redirects
-stay disabled. Disabled network access also keeps Codex and Grok weekly at `—`
+is shown without a countdown and expires after the greater of `usage_max_age_ms`
+and Grok's five-minute query interval plus its query timeout and one sidebar
+refresh interval from the last successful query. Codex quota without a reset
+follows its client interval and clears after a failed query. Environment proxies
+are inherited; redirects stay disabled. Disabled network access also keeps Codex
+and Grok weekly at `—`
 while preserving local context.
 
 Codex context uses `max(total_tokens - 12000, 0) / (model_context_window - 12000)`.

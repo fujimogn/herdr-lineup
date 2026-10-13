@@ -40,8 +40,9 @@ or conversation/session data is sent.
 Quota values are held only in memory. Case-insensitive period names containing
 `WEEKLY` expose used percent and optional reset time; `MONTHLY` returns
 `NonWeekly`, so weekly displays stay missing. Without a reset, publication
-expires the value at `usage_max_age_ms` after its last successful query;
-transient failures do not retain a value with an unknown reset.
+expires the value after the greater of `usage_max_age_ms` and the Grok query
+interval plus its timeout and one sidebar refresh interval from the last
+successful query. Transient failures do not retain a value with an unknown reset.
 The default request interval is five minutes, clamped to one minute through one
 hour, independent of the daemon cadence. The total HTTP timeout defaults to ten
 seconds and is clamped to one through thirty seconds. Transient connection,

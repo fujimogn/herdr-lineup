@@ -181,7 +181,7 @@ impl Client {
             self.next_request = Some(now + self.settings.interval);
             let fetched = self.fetch();
             if matches!(fetched, Ok(Outcome::Weekly(_))) {
-                self.last_success = Some(now);
+                self.last_success = Some(Instant::now());
             }
             self.last_result = match fetched {
                 Ok(Outcome::Weekly(_)) => crate::doctor::WeeklyResult::Ok,
@@ -549,6 +549,42 @@ mod tests {
             result
         );
         assert!(!format!("{result:?}").contains("fake-test-secret"));
+    }
+
+    #[test]
+    fn successful_query_timestamp_is_after_fetch() {
+        let (url, handle) = server(200, WEEK, Duration::from_millis(40));
+        let (_dir, mut client) = client(url, Duration::from_secs(1));
+        let started = Instant::now();
+        assert!(matches!(
+            client.poll_at(started, SystemTime::now()),
+            Outcome::Weekly(_)
+        ));
+        assert!(client.last_success().unwrap() >= started + Duration::from_millis(35));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn missing_reset_is_cleared_by_next_transient_failure() {
+        let (url, handle) = server(
+            200,
+            r#"{"config":{"creditUsagePercent":25,"currentPeriod":{"type":"WEEKLY"}}}"#,
+            Duration::ZERO,
+        );
+        let (_dir, mut client) = client(url, Duration::from_secs(1));
+        let now = Instant::now();
+        assert!(matches!(
+            client.poll_at(now, SystemTime::now()),
+            Outcome::Weekly(_)
+        ));
+        handle.join().unwrap();
+        let (url, handle) = server(500, "error", Duration::ZERO);
+        client.endpoint = url;
+        assert_eq!(
+            client.poll_at(now + client.settings.interval(), SystemTime::now()),
+            Outcome::Unavailable(Failure::Transient)
+        );
+        handle.join().unwrap();
     }
 
     #[test]

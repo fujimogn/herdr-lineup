@@ -91,12 +91,15 @@ fn fresh_grok_weekly(
     observed: Option<Instant>,
     now: Instant,
     max_age_ms: u64,
+    refresh_interval_ms: u64,
 ) -> Option<model::WeeklySample> {
+    let settings = crate::quota_grok::Settings::default();
+    let query_cycle =
+        settings.interval() + settings.timeout() + Duration::from_millis(refresh_interval_ms);
+    let max_age = Duration::from_millis(max_age_ms).max(query_cycle);
     sample.filter(|value| {
         value.resets_at.is_some()
-            || observed.is_some_and(|observed| {
-                now.saturating_duration_since(observed) <= Duration::from_millis(max_age_ms)
-            })
+            || observed.is_some_and(|observed| now.saturating_duration_since(observed) <= max_age)
     })
 }
 
@@ -602,6 +605,7 @@ impl MetadataPublisher {
             self.grok_observed.try_lock().ok().and_then(|value| *value),
             Instant::now(),
             config.usage_max_age_ms,
+            config.refresh_interval_ms,
         );
         let mode = match config.logo_mode.as_str() {
             "font" => tokens::LogoMode::Font,
@@ -1732,17 +1736,56 @@ mod tests {
     }
 
     #[test]
-    fn missing_reset_weekly_expires_at_configured_freshness() {
+    fn missing_reset_weekly_covers_next_query_and_refresh() {
         let now = Instant::now();
         let sample = Some(model::WeeklySample {
             used_percent: 35.0,
             resets_at: None,
         });
+        let settings = crate::quota_grok::Settings::default();
+        let config = Config::default();
+        let refresh = Duration::from_millis(config.refresh_interval_ms);
+        let next_query_done = now + settings.interval() + settings.timeout();
         assert!(
-            fresh_grok_weekly(sample, Some(now), now + Duration::from_secs(59), 60000).is_some()
+            fresh_grok_weekly(
+                sample,
+                Some(now),
+                next_query_done + refresh,
+                config.usage_max_age_ms,
+                config.refresh_interval_ms
+            )
+            .is_some()
         );
         assert!(
-            fresh_grok_weekly(sample, Some(now), now + Duration::from_secs(61), 60000).is_none()
+            fresh_grok_weekly(
+                sample,
+                Some(now),
+                next_query_done + refresh + Duration::from_millis(1),
+                config.usage_max_age_ms,
+                config.refresh_interval_ms
+            )
+            .is_none()
+        );
+        let longer_age = settings.interval() + settings.timeout() + refresh + settings.interval();
+        assert!(
+            fresh_grok_weekly(
+                sample,
+                Some(now),
+                now + longer_age,
+                longer_age.as_millis() as u64,
+                config.refresh_interval_ms
+            )
+            .is_some()
+        );
+        assert!(
+            fresh_grok_weekly(
+                sample,
+                None,
+                now,
+                config.usage_max_age_ms,
+                config.refresh_interval_ms
+            )
+            .is_none()
         );
     }
 
