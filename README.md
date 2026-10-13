@@ -292,7 +292,9 @@ terminal's machine; install the font and configure the terminal there too.
    herdr plugin log list --plugin herdr-lineup --limit 10
    ```
 
-   The font file is `herdr-lineup-HerdrAgentIconsMax-1b819949.ttf` in
+   The action lists each changed font, terminal config, and ownership record
+   path in its log output. The font file is
+   `herdr-lineup-HerdrAgentIconsMax-1b819949.ttf` in
    `~/Library/Fonts` on macOS, or `$XDG_DATA_HOME/fonts` on Linux
    (`~/.local/share/fonts` when no absolute `XDG_DATA_HOME` is set).
 
@@ -337,7 +339,8 @@ It appends a `# BEGIN herdr-lineup font` / `# END herdr-lineup font` block
 only to existing files, leaving other bytes and the primary font unchanged.
 It does not create missing terminal configs or backups. An existing symlinked
 candidate config (or a symlink beneath a resolved configuration root) makes the
-whole action refuse before changing font or terminal bytes. Use manual terminal
+whole action refuse before changing font or terminal bytes; the error names
+the symlink path. Use manual terminal
 setup for managed dotfiles; the bundled font is at
 `assets/fonts/HerdrAgentIconsMax-Regular.ttf` in the checkout. Manual font and
 mapping changes must also be removed manually.
@@ -359,10 +362,13 @@ kitty, or `font-codepoint-map = U+E1A0-U+E1BA=Herdr Agent Icons Max` for Ghostty
 3. Reload or reopen your terminal (and run `fc-cache` on Linux if needed).
 
 Uninstall removes only recorded, byte-identical blocks and a font file that
-Lineup installed. A preexisting identical font is preserved. If you edited or
-deleted a managed block in a surviving terminal config, both font actions refuse.
-Keep `$HERDR_PLUGIN_STATE_DIR/font-ownership.json`: each `entries` item contains
-the config `path` and exact `owned` text, including newlines. Restore that text
+Lineup installed. A preexisting identical font is preserved. If you removed a
+whole managed block by hand, retry either font action: it drops the stale
+ownership entry and continues. An install interrupted after a terminal write
+can also be retried because the ownership record is saved first. A partly
+removed or edited block still causes a conflict. Keep
+`$HERDR_PLUGIN_STATE_DIR/font-ownership.json`: each `entries` item contains the
+config `path` and exact `owned` text, including newlines. Restore that text
 exactly once in the matching file, preserving your unrelated edits, then retry
 uninstall. Keep the same home, XDG paths, and state directory used for install;
 do not delete the ownership record to bypass a conflict.
@@ -756,6 +762,10 @@ See [SECURITY.md](SECURITY.md) for the full boundaries.
   `herdr-lineup.install-font` action and check the terminal's codepoint map,
   or set `logo_mode = "text"`. `auto` currently uses the same text labels as
   `text`, even after font installation.
+- **A font action reports a managed-block conflict:** inspect the terminal
+  config named in the ownership record. For a partly removed or edited block,
+  use the recovery steps in [Disable icons](#disable-icons). A wholly removed
+  block is handled automatically when you retry the action.
 - **A build fails:** verify rustup can install the pinned toolchain and that Cargo
   can download the locked dependencies. No credentials or remote API setup are
   required for local context; account quota queries need the explicit opt-in above.
