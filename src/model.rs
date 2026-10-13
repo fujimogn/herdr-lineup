@@ -94,6 +94,10 @@ pub struct ReadRequest<'a> {
     pub now: SystemTime,
     pub max_age: Duration,
     pub timeout: Duration,
+    /// When set, the caller stops waiting as soon as daemon shutdown is set.
+    /// The in-flight read is not cancelled; its provider slot stays busy until
+    /// the read finishes, same as a timeout.
+    pub shutdown: Option<&'a AtomicBool>,
 }
 
 impl ReadRequest<'_> {
@@ -187,9 +191,15 @@ impl Drop for WeeklyWorker {
     }
 }
 
+/// How often a reader wait rechecks daemon shutdown. This matches the weekly
+/// worker's idle park slice: long enough to avoid a spin, short enough that
+/// stop's five-second deadline still covers the following metadata clear.
+const READER_SHUTDOWN_SLICE: Duration = Duration::from_millis(100);
+
 /// The caller's deadline covers discovery, reads and decompression, including stalled I/O.
-/// A timed-out job is not killed (Rust cannot safely cancel a blocked OS read), but its
-/// provider slot stays occupied until it finishes. Thus repeated polls cannot leak workers.
+/// A timed-out or shutdown-interrupted job is not killed (Rust cannot safely cancel a
+/// blocked OS read), but its provider slot stays occupied until it finishes. Thus
+/// repeated polls cannot leak workers.
 pub(crate) fn bounded_read<F>(
     request: &ReadRequest<'_>,
     source: SourceKind,
@@ -232,6 +242,9 @@ where
                 now: now.checked_add(started.elapsed()).unwrap_or(now),
                 max_age,
                 timeout: deadline.saturating_duration_since(Instant::now()),
+                // The caller observes shutdown while waiting. This worker cannot
+                // hold that borrowed flag, and a blocked read cannot be killed.
+                shutdown: None,
             };
             let result = job(&owned);
             drop(permit);
@@ -250,15 +263,41 @@ fn receive_by_deadline(
     deadline: Instant,
     receiver: std::sync::mpsc::Receiver<UsageReading>,
 ) -> UsageReading {
-    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(result) if Instant::now() < deadline => result,
-        // recv_timeout can dequeue a ready message even when its wait duration is zero.
-        Ok(_) => UsageReading::missing(request, source, MissingReason::Timeout),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            UsageReading::missing(request, source, MissingReason::Timeout)
+    let unavailable = |reason| UsageReading::missing(request, source, reason);
+    loop {
+        // Same observation point as a Git command wait: shutdown and the
+        // deadline both end the wait, and a ready result after either is
+        // discarded. recv_timeout can dequeue a message even for a zero wait.
+        let shutdown = request
+            .shutdown
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
+        if shutdown || Instant::now() >= deadline {
+            return match receiver.try_recv() {
+                Ok(_) | Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    unavailable(MissingReason::Timeout)
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    unavailable(MissingReason::SourceError)
+                }
+            };
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            UsageReading::missing(request, source, MissingReason::SourceError)
+        let slice = deadline
+            .saturating_duration_since(Instant::now())
+            .min(READER_SHUTDOWN_SLICE);
+        match receiver.recv_timeout(slice) {
+            Ok(result)
+                if Instant::now() < deadline
+                    && !request
+                        .shutdown
+                        .is_some_and(|flag| flag.load(Ordering::Acquire)) =>
+            {
+                return result;
+            }
+            Ok(_) => return unavailable(MissingReason::Timeout),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return unavailable(MissingReason::SourceError);
+            }
         }
     }
 }
@@ -554,6 +593,7 @@ pub(crate) mod tests {
             now: UNIX_EPOCH + Duration::from_secs(1791763200),
             max_age: Duration::from_secs(60),
             timeout: Duration::from_secs(2),
+            shutdown: None,
         }
     }
     #[test]

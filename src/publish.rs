@@ -681,6 +681,7 @@ impl MetadataPublisher {
                     now,
                     max_age: Duration::from_millis(config.usage_max_age_ms),
                     timeout: deadline.saturating_duration_since(Instant::now()),
+                    shutdown: self.shutdown.as_deref(),
                 };
                 let mut reading = if who.agent == Agent::Grok && self.homes.grok.is_none() {
                     // Billing account attribution does not require a local session
@@ -2406,6 +2407,173 @@ mod tests {
         assert!(flag.load(Ordering::Acquire), "fixture did not reach reader");
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         assert_eq!(reports, 0, "shutdown must not publish a partial refresh");
+    }
+
+    #[test]
+    fn shutdown_during_stalled_reader_returns_before_reader_timeout() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let dir = tempfile::tempdir().unwrap();
+        let identity = SessionIdentity {
+            provider: Provider::Codex,
+            native_session_id: "session-1".into(),
+            repository_identity: "repo-1".into(),
+        };
+        let timeout = Duration::from_millis(1200);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let request = ReadRequest {
+            identity: &identity,
+            home: dir.path(),
+            now: UNIX_EPOCH,
+            max_age: Duration::from_secs(60),
+            timeout,
+            shutdown: Some(&shutdown),
+        };
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_job = entered.clone();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let flag = shutdown.clone();
+        let watcher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !entered.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "stalled reader did not start");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            flag.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = bounded_read(&request, SourceKind::CodexRollout, &BUSY, move |request| {
+            entered_job.store(true, Ordering::Release);
+            let _ = blocked.recv();
+            UsageReading::sample(request, SourceKind::CodexRollout, 7.0, request.now)
+        });
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        watcher.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while BUSY.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "shutdown during a stalled reader waited {elapsed:?} of the {timeout:?} reader timeout"
+        );
+        assert_eq!(
+            result.context,
+            UsageOutcome::Unavailable(MissingReason::Timeout)
+        );
+    }
+
+    #[test]
+    fn shutdown_during_reader_then_clear_fits_in_stop_deadline() {
+        struct StalledReader {
+            entered: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
+        impl UsageReader for StalledReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                static BUSY: AtomicBool = AtomicBool::new(false);
+                let entered = self.entered.clone();
+                let release = self.release.clone();
+                bounded_read(request, SourceKind::CodexRollout, &BUSY, move |request| {
+                    entered.store(true, Ordering::Release);
+                    let give_up = Instant::now() + Duration::from_secs(30);
+                    while !release.load(Ordering::Acquire) && Instant::now() < give_up {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    UsageReading::missing(request, SourceKind::CodexRollout, MissingReason::Timeout)
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stop-budget.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(2));
+            let mut line = String::new();
+            while stream.read_line(&mut line).is_ok() && !line.is_empty() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let response = if request["method"] == "session.snapshot" {
+                    json!({"id":request["id"],"result":{
+                        "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                        "workspaces":[{"workspace_id":"w1"}],"panes":[{
+                        "pane_id":"w1:p1","workspace_id":"w1","agent":"codex",
+                        "agent_session":{"agent":"codex","kind":"id","value":"synthetic-native"},
+                        "agent_status":"idle"}]}
+                    }})
+                } else {
+                    json!({"id":request["id"],"result":{"type":"ok"}})
+                };
+                if writeln!(stream.get_mut(), "{response}").is_err() {
+                    break;
+                }
+                line.clear();
+            }
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().join("state"),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("synthetic-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        publisher.set_shutdown(shutdown.clone());
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let reader = StalledReader {
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let (signaled_tx, signaled_rx) = std::sync::mpsc::channel();
+        let flag = shutdown.clone();
+        let watcher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !entered.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "reader did not start");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            signaled_tx.send(Instant::now()).unwrap();
+            flag.store(true, Ordering::Release);
+        });
+        let config = Config {
+            refresh_interval_ms: 30000,
+            reader_timeout_ms: 30000,
+            usage_max_age_ms: 30000,
+            providers: vec!["codex".into()],
+            ..Config::default()
+        };
+        let refresh =
+            publisher.refresh_with_readers(&mut transport, &config, &reader, &TimeoutReader);
+        let signaled = signaled_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let reader_wait = signaled.elapsed();
+        release.store(true, Ordering::Release);
+        watcher.join().unwrap();
+        assert_eq!(refresh.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(
+            reader_wait < Duration::from_millis(1500),
+            "shutdown during a 30000 ms reader waited {reader_wait:?}"
+        );
+        // Clear's own budget is three seconds. Stop allows five. The reader
+        // wait must leave that clear budget inside the stop deadline.
+        let clear_budget = Duration::from_secs(3);
+        assert!(
+            reader_wait + clear_budget < Duration::from_secs(5),
+            "reader shutdown wait {reader_wait:?} plus clear budget does not fit in five seconds"
+        );
+        let clear_started = Instant::now();
+        publisher.clear(&mut transport).unwrap();
+        assert!(clear_started.elapsed() < clear_budget);
+        assert!(
+            signaled.elapsed() < Duration::from_secs(5),
+            "shutdown through clear took {:?}",
+            signaled.elapsed()
+        );
+        drop(transport);
+        server.join().unwrap();
     }
 
     struct TimeoutReader;
