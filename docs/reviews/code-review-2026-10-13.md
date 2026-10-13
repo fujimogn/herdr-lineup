@@ -2,7 +2,7 @@
 
 Record of the first agent-versus-agent review of herdr-lineup. This file records the ballots. It does not change the product.
 
-Line numbers are the ones in the ballots and refer to reviewed commit `fca5bbcbdb06627534726f03099831061d4ac77f` (`main` at review time). Later status uses `git log fca5bbc..origin/main` as of `207cd971d89d4adc66938fba535c3701fcee1917`.
+Line numbers are the ones in the ballots and refer to reviewed commit `fca5bbcbdb06627534726f03099831061d4ac77f` (`main` at review time). Later status uses `git log fca5bbc..origin/main` as of `623a126ab65f0bcd9044fd1d3e20e115c66ee7d5`.
 
 ## Summary
 
@@ -13,10 +13,11 @@ Line numbers are the ones in the ballots and refer to reviewed commit `fca5bbcbd
 | Ballots | @claude `reviews/claude-2026-10-13-1230.md`. @codex main ballot `reviews/2026-10-13-1205-01825bde.md` and first, shallower ballot `reviews/2026-10-13-1149-c9c803dd.md`. |
 | Agreement | Counted as n/2. Agy submitted no ballot, so the denominator is 2. Dedup key is file:line plus kind. No pair shared both, so every finding below is 1/2. Overlapping substance with a different kind or line range is kept separate and called out under Differences. |
 | Counts | 6 High, 15 Medium, 1 Low–Medium, 21 Low. 43 findings after the dedup key. |
-| Highest priority before a tag | The ballots asked to fix, before tagging: repository-local Git config executing a program (C1); Codex context missing on long sessions (C2); README commands that fail when run directly (C3); checkout install and uninstall not written as one path (C4, plus the Codex uninstall and release-binary notes); icon setup not written as one path (C5); no way to discover `HERDR_PLUGIN_STATE_DIR` for statusLine (C6); `(planned)` still shown for implemented behavior (C7 and both Codex manifest notes); release bytes missing a documented use, `LICENSE`, `NOTICE.md`, and an architecture name (C8); `account/read` failures classified as authentication failures (Codex main). |
+| Highest priority before a tag | The ballots' pre-tag priorities (C1–C8, the Codex uninstall and manifest notes, and Codex `account/read` failure classes) were addressed by v0.1.0. Remaining follow-ups are identified in the statuses below. |
+| Status at this main | 33 findings addressed, 2 deferred, 7 with shipped and deferred parts, and 1 with a shipped record and an investigation in progress; ballot severity and agreement counts above are unchanged. |
 | Agy | Absent for both rounds. agent-room rejected the runs with `headless_payload_malformed` and `headless_payload_invalid_terminal` before a ballot existed. Those format errors are recorded here and are not treated as a review of the repository. |
 
-Status vocabulary: **Shipped** plus the short sha means the named commit in `fca5bbc..origin/main` addresses that finding. **In progress** means work still open on the large Codex rollout, Codex quota failure classes, the Git section of `SECURITY.md`, or the README screenshots and remaining README notes. **After v0.1.0** means neither of those.
+Status vocabulary: **Shipped** plus a short sha names a commit on `main` that addresses the finding or the named part. **Already fixed in** names an earlier commit whose behavior was confirmed later. **Deferred** names a remaining part and gives the reason. **In progress** identifies the isolated end-to-end rerun being investigated for finding 37. A mixed status lists each part separately. Status describes the implementation and documentation, not a new ballot.
 
 ## Reviewer cost
 
@@ -59,7 +60,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The long sessions where context matters most render `—`. That breaks the "Codex context" promise in the README and CHANGELOG.
 - Proposed change: Read only the last few MiB and take the last `token_count`. Skip the read when `(dev, ino, size, mtime)` is unchanged.
 - Test: A fixture over 16 MiB whose `token_count` is at the tail.
-- Status: In progress
+- Status: Shipped `024bcb0`, `c9a56e6` (bounded tail reads, unchanged-file cache, and stat-window append recovery).
 
 #### 3. `install-font` and `doctor` fail when typed as the README shows
 
@@ -139,7 +140,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: A downloaded binary cannot be installed as the plugin, and the font notice is not beside the binary.
 - Proposed change: Document a use (for example, put it on `PATH` for statusLine) or stop attaching binaries. If they are attached, ship an archive that includes `LICENSE` and `NOTICE.md`, and put the architecture in the name.
 - Test: Not given as a separate line.
-- Status: Shipped `4c4fb31` for the archive (`LICENSE`, `NOTICE.md`, architecture in the name) and Shipped `207cd97` for the README description of that archive. The README list of archive members still omits `README.md`, which the packaging now includes; that remaining note is In progress. macOS signing and notarization are After v0.1.0.
+- Status: Shipped `4c4fb31`, `207cd97`, `852293c` for the named archive, its documented use, and the corrected member list. Deferred: macOS signing and notarization require a separate release credential and distribution decision.
 
 #### 9. A transient Codex RPC failure is treated as an authentication failure
 
@@ -152,7 +153,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact (inference in the ballot): A transient timeout or a bad app-server response makes the diagnostic look like `unauthorized` and drops a quota value that had been kept. The weekly display can be missing until the next query, 5 minutes by default.
 - Proposed change: Separate authentication errors from transport, timeout, and malformed responses. Keep the cache for the latter until the known reset.
 - Test: An authentication refusal on `account/read` clears the cache. A timeout or transient error keeps the pre-reset value.
-- Status: In progress
+- Status: Shipped `bbcefea` (transient account-read failures retain the pre-reset quota value).
 
 #### 10. The plugin list describes implemented behavior as Planned
 
@@ -217,7 +218,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The checkpoint file keeps growing, and each refresh rewrites it.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line. The ballot's later test-gap list includes checkpoint growth.
-- Status: After v0.1.0
+- Status: Shipped `37c23ca` (closed-resource rows are pruned while endpoint sequence floors remain monotonic).
 
 #### 15. On macOS, a failed `setsockopt` on a control connection can exit the daemon (inference, not checked on a device)
 
@@ -243,7 +244,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: A long state directory fails readiness with no reason.
 - Proposed change: Check the length at the start of ensure, and return an error that states the reason.
 - Test: The ballot's later test-gap list includes `control.sock` path length.
-- Status: After v0.1.0
+- Status: Shipped `f2e9a30` (control socket path length fails with an explicit diagnostic).
 
 #### 17. The entry cap returns `Timeout`, and old context stays forever
 
@@ -256,7 +257,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Once the cap is crossed, stale context is kept with no expiry.
 - Proposed change: Not stated as a separate sentence.
 - Test: The ballot's later test-gap list includes the 4,096-entry boundary.
-- Status: After v0.1.0
+- Status: Shipped `47c181f` (the directory entry limit clears stale context and has boundary coverage).
 
 #### 18. The daemon's worst case is longer than stop's 5 seconds
 
@@ -269,7 +270,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: `stop` can give up before the daemon has finished the in-flight read and the clear.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `80e9af9` (reader waits observe shutdown within the stop deadline).
 
 #### 19. `install-font` is brittle
 
@@ -282,7 +283,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Font setup fails closed without a path, or gets stuck with no documented recovery.
 - Proposed change: Put the path in the error. Drop a marker from the ledger when the count is zero. Write the ledger first. Print each changed file.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `89f84dc`, `088059d` (interrupted font setup recovers and action results reflect changed paths).
 
 #### 20. `configure` behavior is absent from the README
 
@@ -308,7 +309,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: A reader of the specs will expect behavior the binary does not have.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0. The provider-reader tail window, header cap, cache, and append behavior are being updated with the large Codex rollout; that slice is In progress and does not cover the rest of this list.
+- Status: Shipped `024bcb0`, `c9a56e6`, `00d5756`, `4a56afa`, `623a126` (Codex reader behavior and the named spec mismatches now match the implementation, including Kimi context).
 
 ### Low–Medium
 
@@ -323,7 +324,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The build job holds a write token, and a rerun or a tag that is not on a green main is not rejected by the workflow.
 - Proposed change: Not stated as a separate sentence beyond the permissions, pins, and checks named above.
 - Test: Not given as a separate line.
-- Status: Shipped `4c4fb31` for splitting `contents: write` onto the publish job. The unpinned actions, the missing main/CI/date checks, the non-idempotent `gh release create`, and the lack of tests in the release workflow are After v0.1.0.
+- Status: Shipped `4c4fb31` for publish-job-only write permission. Deferred: action pinning, automated main/CI/date gates, rerun idempotence, and release-workflow tests require a separate release automation change.
 
 ### Low
 
@@ -351,7 +352,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Required variables are easy to miss, and the two XDG behaviors differ.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: Shipped `207cd97` for documenting the variables. The remaining mismatch, `configure` ignoring `XDG_CONFIG_HOME` while font reads it, is After v0.1.0.
+- Status: Shipped `207cd97` for documenting the variables. Deferred: unifying Herdr plugin config and terminal font config lookup would change their separate ownership paths.
 
 #### 25. Daemon log has no time, no reason, and no rotation
 
@@ -364,7 +365,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Not stated as a separate sentence.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `6262a38` (bounded timestamped logs record fixed reasons and keep one rotated generation).
 
 #### 26. SIGTERM does not clear runtime files
 
@@ -377,7 +378,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: A signal stop leaves the socket and pid file behind.
 - Proposed change: Not stated as a separate sentence.
 - Test: The later test-gap list includes SIGTERM.
-- Status: After v0.1.0
+- Status: Shipped `6262a38` (the existing stale-runtime detection and recovery path is verified by a SIGTERM test; no signal-specific cleanup handler was added).
 
 #### 27. Skipping one resource for capacity makes doctor exit non-zero
 
@@ -390,7 +391,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Doctor reports failure for one skipped resource.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `d1ee90d` (capacity skips no longer make an otherwise healthy doctor check fail).
 
 #### 28. The daemon does not `chdir`, and git and codex inherit the full environment
 
@@ -403,7 +404,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Not stated as a separate sentence. Finding 1 is the concrete program launch this environment inheritance allowed for Git.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0. `57facbf` stops the repository-heading Git query from honoring repository config and inherited Git environment overrides; this finding's `chdir` and Codex environment inheritance are not that commit.
+- Status: Shipped `57facbf`, `6262a38` for Git query isolation and the daemon's private working directory. Deferred: narrowing the Codex child environment would risk executable lookup, proxy, certificate, and authentication compatibility.
 
 #### 29. Grok weekly with no reset expires in 60 seconds but is fetched every 300
 
@@ -416,7 +417,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The value is expired for most of the interval.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `9b149b5` (a reset-less Grok weekly value stays visible through the next scheduled query).
 
 #### 30. `metadata_daemon_child` can publish to a real session
 
@@ -429,7 +430,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: A test helper can write into a real session.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `c72e242` (metadata daemon tests use an isolated session and reject inherited Herdr paths).
 
 #### 31. statusLine records grow per session and are never removed
 
@@ -442,7 +443,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The record directory grows without a bound.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Deferred: no reliable source identifies which statusLine sessions remain active, and unbounded context retention would change the current freshness contract.
 
 #### 32. `--then` resolves `sh` from `PATH`
 
@@ -455,7 +456,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Not stated as a separate sentence.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `917c21d` (`--then` invokes `/bin/sh` directly).
 
 #### 33. Uninstall reports success when it removed nothing
 
@@ -468,7 +469,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The message overstates what happened.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `088059d` (uninstall reports when it manages no font or terminal config).
 
 #### 34. The font file name includes a hash, so an old font cannot be removed after a swap
 
@@ -481,7 +482,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Replaced font files are left behind.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Deferred: no release has replaced the bundled font, so safe old-font removal cannot yet be verified against a replacement.
 
 #### 35. Doctor appends the `auto` explanation regardless of mode
 
@@ -494,7 +495,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Doctor text describes `auto` even when another mode is set.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `3bb2d2b` (doctor explains `auto` only when that mode is selected).
 
 #### 36. `SECURITY.md` gaps
 
@@ -507,7 +508,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The security document does not match the process model, and it exposes an internal date.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: In progress for the Git query description. The signal-exit cleanup note, the supported-versions section, and the internal approval date are After v0.1.0.
+- Status: Shipped `4e187c7`, `6262a38` for Git child-process boundaries and signal-exit recovery documentation. Deferred: a supported-versions policy and removal of the internal approval date need a separate security-document decision.
 
 #### 37. Testing evidence is from an older commit
 
@@ -520,7 +521,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The testing document does not show a run at the reviewed commit.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `c72e242` for the refreshed testing record. In progress: the isolated end-to-end rerun stopped at the publication check and is under investigation.
 
 #### 38. `fs2` is unmaintained
 
@@ -533,7 +534,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Not stated as a separate sentence.
 - Proposed change: Replace it with `File::try_lock`.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `95a5982` (`fs2` is removed in favor of standard-library file locking).
 
 #### 39. Dependency licenses are not in the binary distribution
 
@@ -546,7 +547,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Third-party notices are missing from the bytes that are shipped.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0. `4c4fb31` adds this repository's `LICENSE` and `NOTICE.md` to the archive. It does not add the dependency notices named here.
+- Status: Shipped `c7c3aa5`, `852293c` (dependency license texts are recorded, checked, and packaged in the release archive).
 
 #### 40. Kimi and Hermes readers are only used by their own tests
 
@@ -559,7 +560,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Not stated as a separate sentence.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `4a56afa`, `623a126` for a called Kimi context reader. Deferred: Hermes has no verified local usage source to enable its reader.
 
 #### 41. Public items that are unused or test-only
 
@@ -572,7 +573,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Not stated as a separate sentence.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `65859a3` (unused or test-only public items are removed or restricted).
 
 #### 42. Agent-name mapping is copied in three places
 
@@ -585,7 +586,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Not stated as a separate sentence.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: After v0.1.0
+- Status: Shipped `65859a3` (agent metadata is centralized).
 
 #### 43. Missing tests
 
@@ -598,7 +599,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The failures in findings 1, 2, 16, 17, and 26 can land without a test.
 - Proposed change: Not stated as a separate sentence beyond adding those cases.
 - Test: The cases listed in the content.
-- Status: Shipped `57facbf` for the hostile Git config coverage that commit added, and In progress for the over-16 MiB rollout coverage that belongs to the large Codex rollout. The 4,096-entry boundary, `control.sock` path length, immediate control close, SIGTERM, checkpoint growth, and macOS end-to-end coverage are After v0.1.0.
+- Status: Shipped `57facbf`, `024bcb0`, `47c181f`, `f2e9a30`, `8b8f2c4`, `6262a38`, `37c23ca` for the named Git, rollout, entry-limit, socket-path, immediate-close, SIGTERM, and checkpoint tests. Deferred: macOS end-to-end coverage needs a dedicated runner and isolated Herdr session.
 
 ## Differences
 
@@ -647,3 +648,5 @@ The first pass stayed on the release documents and finished in about a minute, s
 ### Agy
 
 Absent. Both rounds failed in agent-room before a ballot, with `headless_payload_malformed` and `headless_payload_invalid_terminal`.
+
+Status last updated: 2026-10-13 at main `623a126ab65f0bcd9044fd1d3e20e115c66ee7d5`.
