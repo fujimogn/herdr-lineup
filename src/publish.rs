@@ -3027,10 +3027,79 @@ mod tests {
         assert!(check_clear_deadline(now).is_err());
     }
 
+    fn assert_daemon_child_stays_closed(
+        listener: &UnixListener,
+        command: &mut std::process::Command,
+    ) {
+        listener.set_nonblocking(true).unwrap();
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "metadata daemon child must fail before opening a socket"
+        );
+        match listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("metadata daemon child opened the inherited socket"),
+            Err(error) => panic!("fake socket accept failed: {error}"),
+        }
+    }
+
+    #[test]
+    fn metadata_daemon_child_refuses_inherited_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let state = dir.path().join("state");
+        let config = dir.path().join("config");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "publish::tests::metadata_daemon_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HERDR_SOCKET_PATH", &socket)
+            .env("HERDR_PLUGIN_STATE_DIR", &state)
+            .env("HERDR_PLUGIN_CONFIG_DIR", &config)
+            .env("HERDR_SESSION", "main")
+            .env_remove(crate::test_support::ISOLATION_ROOT);
+        assert_daemon_child_stays_closed(&listener, &mut command);
+        assert!(std::fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn metadata_daemon_child_refuses_socket_outside_isolation_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let socket = outside.path().join("fake.sock");
+        let state = root.path().join("state");
+        let config = root.path().join("config");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let link = root.path().join("escaped.sock");
+        std::os::unix::fs::symlink(&socket, &link).unwrap();
+        let mut command =
+            crate::test_support::isolated_daemon_command(root.path(), &link, &state, &config);
+        command.args([
+            "--exact",
+            "publish::tests::metadata_daemon_child",
+            "--ignored",
+            "--nocapture",
+        ]);
+        assert_daemon_child_stays_closed(&listener, &mut command);
+    }
+
     #[test]
     #[ignore = "isolated metadata daemon subprocess entry point"]
     fn metadata_daemon_child() {
         let options = crate::daemon::Options::from_env().unwrap();
+        // Fail closed before any session connection when the inherited
+        // environment is not the explicit isolated root.
+        crate::test_support::require_isolated_runtime(&options).unwrap();
         let paths = crate::lock::RuntimePaths::new(&options.state, &options.socket).unwrap();
         // Missing homes exercise unavailable usage without reading real data.
         let mut publisher =
@@ -3110,19 +3179,19 @@ mod tests {
             reports
         });
         let paths = crate::lock::RuntimePaths::new(&options.state, &options.socket).unwrap();
-        let mut daemon = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = crate::test_support::isolated_daemon_command(
+            dir.path(),
+            &options.socket,
+            &options.state,
+            &options.config,
+        );
+        let mut daemon = command
             .args([
                 "--exact",
                 "publish::tests::metadata_daemon_child",
                 "--ignored",
                 "--nocapture",
             ])
-            .env_clear()
-            .env("HOME", dir.path())
-            .env("PATH", std::env::var_os("PATH").unwrap())
-            .env("HERDR_SOCKET_PATH", &options.socket)
-            .env("HERDR_PLUGIN_STATE_DIR", &options.state)
-            .env("HERDR_PLUGIN_CONFIG_DIR", &options.config)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()

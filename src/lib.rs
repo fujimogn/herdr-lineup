@@ -159,35 +159,4 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use std::io::{self, Write};
-    use std::path::Path;
-    use std::process::{Command, Stdio};
-
-    /// Publish a script without opening its write descriptor in the test process.
-    /// Concurrent forks can retain even CLOEXEC descriptors until they exec,
-    /// making a script written by the parent temporarily fail with ETXTBSY.
-    pub(crate) fn write_executable(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
-        let mut writer = Command::new("/bin/sh")
-            .args([
-                "-c",
-                "tmp=\"$1.tmp\"; /bin/cat > \"$tmp\" && /bin/chmod 700 \"$tmp\" && /bin/mv \"$tmp\" \"$1\"",
-                "lineup-test-script",
-            ])
-            .arg(path)
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()?;
-        // Only a pipe is writable in this process. Closing it sends EOF to cat.
-        let written = writer.stdin.take().unwrap().write_all(contents.as_ref());
-        let status = writer.wait()?;
-        written?;
-        if !status.success() {
-            return Err(io::Error::other(format!(
-                "script writer exited with {status}"
-            )));
-        }
-        Ok(())
-    }
-}
+pub(crate) mod test_support;

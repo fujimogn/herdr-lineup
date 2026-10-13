@@ -142,7 +142,8 @@ The trap confirmed deletion of the isolated session and private temporary
 directory. Real-agent pane verification was `SKIP`: the isolated HOME had no
 provider authentication. The synthetic pane is publication evidence only.
 This does not establish macOS behavior, real-agent usage, sidebar rendering,
-or shipment of the transport fix. The main-based rerun is recorded below.
+or shipment of the transport fix. An older main-based rerun is recorded below.
+The current rerun follows it.
 
 ## Main-based rerun
 
@@ -159,5 +160,38 @@ Doctor, idempotent stop, and the post-stop snapshot with no `lineup_` keys all
 passed. The trap confirmed isolated session and temporary-directory removal.
 Real-agent verification remained `SKIP` for the unauthenticated isolated HOME;
 no credentials, real provider sessions, or authenticated API calls were used.
-This rerun establishes Linux metadata behavior; it adds no macOS runtime or
-visual rendering evidence.
+This rerun establishes Linux metadata behavior at that older commit; it adds no
+macOS runtime or visual rendering evidence.
+
+## Current main rerun
+
+On 2026-10-13, on Linux with Herdr 0.9.3, the checks that do not attach to a
+user's session were re-run against
+`c7c3aa534fd7ab3de8311d70efd6159a11ef5d12`.
+
+`bash -n scripts/e2e-isolated.sh`, `bash scripts/e2e-isolated.sh --self-test`,
+and `shellcheck scripts/e2e-isolated.sh` passed. The self-test rejected a
+main-session socket and a symlink into that session, accepted an isolated
+path, and cleared inherited `HERDR_*` variables.
+
+`bash scripts/e2e-isolated.sh` created a private workspace and root pane.
+Repeated and concurrent `ensure` kept a single daemon PID. The publication
+check then failed with `Expected workspace/pane lineup_ tokens missing or
+incorrect`. Doctor, the sixteen-second renewal, idempotent stop, and the
+post-stop snapshot were not reached. The exit trap still deleted the isolated
+session and its private temporary directory.
+
+The harness still expects an unpadded em dash for `lineup_context_text`.
+Unit tests on this commit expect an em dash followed by two U+2800 cells.
+This rerun does not replace the older publication evidence above, and it does
+not show a passing metadata publication at this commit.
+
+On the same commit, `cargo fmt --all --check`,
+`cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`,
+and `target/release/herdr-lineup --help` passed. The library tests were 242
+passed and 2 ignored; the lifecycle integration test passed. The release
+binary used by the harness was built with `cargo build --release --locked`.
+
+Not re-run: macOS on a real machine, an authenticated provider pane, real-agent
+usage, and visual sidebar or font rendering. The isolated home has no provider
+authentication, so those checks stay outside this rerun.
