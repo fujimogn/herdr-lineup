@@ -65,7 +65,9 @@ pub trait Publisher {
     /// Drop any cached pane associations before authoritative reconciliation.
     fn reconnected(&mut self) {}
 }
-pub struct NoopPublisher;
+#[cfg(test)]
+struct NoopPublisher;
+#[cfg(test)]
 impl Publisher for NoopPublisher {
     fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
         Ok(())

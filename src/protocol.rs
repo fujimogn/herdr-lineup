@@ -10,18 +10,9 @@ use crate::tokens::{
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ErrorClass {
-    NotFound,
-    Unsupported,
-    InvalidRequest,
-    Reconcile,
-    Other,
-}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerError {
     pub code: String,
-    pub class: ErrorClass,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProtocolError {
@@ -105,17 +96,7 @@ pub fn response_result<'a>(id: &str, response: &'a Value) -> Result<&'a Value, P
         (None, Some(error)) => {
             let code = required_string(error, "code")?;
             required_string(error, "message")?;
-            let class = match code {
-                "not_found" => ErrorClass::NotFound,
-                "unknown_method" => ErrorClass::Unsupported,
-                "invalid_request" | "invalid_params" => ErrorClass::InvalidRequest,
-                "events_lost" => ErrorClass::Reconcile,
-                _ => ErrorClass::Other,
-            };
-            Err(ProtocolError::Server(ServerError {
-                code: code.into(),
-                class,
-            }))
+            Err(ProtocolError::Server(ServerError { code: code.into() }))
         }
         _ => Err(ProtocolError::MalformedResponse),
     }
@@ -172,15 +153,7 @@ pub fn parse_snapshot(id: &str, response: &Value) -> Result<Snapshot, ProtocolEr
                 return Err(ProtocolError::MalformedResponse);
             }
             let label = optional_string(pane, "agent")?;
-            let agent = label.and_then(|label| match label {
-                "claude" => Some(Agent::Claude),
-                "codex" => Some(Agent::Codex),
-                "grok" => Some(Agent::Grok),
-                "agy" => Some(Agent::Agy),
-                "kimi" => Some(Agent::Kimi),
-                "hermes" => Some(Agent::Hermes),
-                _ => None,
-            });
+            let agent = label.and_then(Agent::from_id);
             let occupant = agent.map(|agent| Occupant {
                 agent,
                 native_session: pane.get("agent_session").and_then(|session| {
@@ -495,22 +468,19 @@ mod tests {
     }
 
     #[test]
-    fn response_errors_are_classified_by_code_only() {
-        for (code, class) in [
-            ("not_found", ErrorClass::NotFound),
-            ("unknown_method", ErrorClass::Unsupported),
-            ("invalid_params", ErrorClass::InvalidRequest),
-            ("invalid_request", ErrorClass::InvalidRequest),
-            ("events_lost", ErrorClass::Reconcile),
-            ("future_code", ErrorClass::Other),
+    fn response_errors_preserve_codes_without_server_messages() {
+        for code in [
+            "not_found",
+            "unknown_method",
+            "invalid_params",
+            "invalid_request",
+            "events_lost",
+            "future_code",
         ] {
             let value = json!({"id":"r","error":{"code":code,"message":"synthetic detail"}});
             assert_eq!(
                 response_result("r", &value),
-                Err(ProtocolError::Server(ServerError {
-                    code: code.into(),
-                    class
-                }))
+                Err(ProtocolError::Server(ServerError { code: code.into() }))
             );
         }
         assert_eq!(

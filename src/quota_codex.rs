@@ -28,15 +28,6 @@ pub struct Weekly {
     pub resets_at: Option<SystemTime>,
 }
 
-/// An authenticated query, scheduled only by an explicitly enabled quota worker.
-/// Codex resolves its own credentials; Lineup never opens an authentication file.
-/// Errors contain only fixed diagnostics, never app-server output or account metadata.
-/// PermissionDenied means the cache must discard its prior account observation.
-/// Other errors are transient and may retain a prior value until its known reset.
-pub fn read_weekly(codex_home: &Path, timeout: Duration) -> io::Result<Option<Weekly>> {
-    read_weekly_controlled(codex_home, timeout, &QueryControl::default())
-}
-
 fn read_weekly_controlled(
     codex_home: &Path,
     timeout: Duration,

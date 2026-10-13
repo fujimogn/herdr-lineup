@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub type Tokens = BTreeMap<String, Option<String>>;
 pub const SOURCE: &str = "herdr-lineup";
-pub const DEFAULT_REFRESH_MS: u64 = 5_000;
 pub const PANE_KEYS: [&str; 14] = [
     "lineup_agent",
     "lineup_logo",
@@ -51,6 +50,69 @@ pub enum Agent {
     Kimi,
     Hermes,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AgentInfo {
+    pub(crate) agent: Agent,
+    pub(crate) id: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) glyph: &'static str,
+}
+
+impl Agent {
+    pub(crate) const ALL: [AgentInfo; 6] = [
+        AgentInfo {
+            agent: Agent::Claude,
+            id: "claude",
+            label: "Claude",
+            glyph: "\u{e1a0}",
+        },
+        AgentInfo {
+            agent: Agent::Codex,
+            id: "codex",
+            label: "Codex",
+            glyph: "\u{e1a1}",
+        },
+        AgentInfo {
+            agent: Agent::Grok,
+            id: "grok",
+            label: "Grok",
+            glyph: "\u{e1b1}",
+        },
+        AgentInfo {
+            agent: Agent::Agy,
+            id: "agy",
+            label: "Antigravity",
+            glyph: "\u{e1b2}",
+        },
+        AgentInfo {
+            agent: Agent::Kimi,
+            id: "kimi",
+            label: "Kimi",
+            glyph: "\u{e1a6}",
+        },
+        AgentInfo {
+            agent: Agent::Hermes,
+            id: "hermes",
+            label: "Hermes",
+            glyph: "\u{e1aa}",
+        },
+    ];
+
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.agent)
+    }
+
+    pub(crate) fn info(self) -> &'static AgentInfo {
+        Self::ALL
+            .iter()
+            .find(|entry| entry.agent == self)
+            .expect("every Agent has a catalog entry")
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogoMode {
     Auto,
@@ -89,25 +151,18 @@ pub fn pane_tokens(row: &PaneInput, mode: LogoMode, font_verified: bool, now_uni
     let Some(occupant) = row.occupant.as_ref() else {
         return tokens;
     };
-    let (id, label, glyph) = match occupant.agent {
-        Agent::Claude => ("claude", "Claude", "\u{e1a0}"),
-        Agent::Codex => ("codex", "Codex", "\u{e1a1}"),
-        Agent::Grok => ("grok", "Grok", "\u{e1b1}"),
-        Agent::Agy => ("agy", "Antigravity", "\u{e1b2}"),
-        Agent::Kimi => ("kimi", "Kimi", "\u{e1a6}"),
-        Agent::Hermes => ("hermes", "Hermes", "\u{e1aa}"),
-    };
+    let info = occupant.agent.info();
     let logo = if mode == LogoMode::Font || (mode == LogoMode::Auto && font_verified) {
-        glyph
+        info.glyph
     } else {
-        label
+        info.label
     };
     let state = row
         .state
         .as_deref()
         .filter(|state| ["idle", "working", "blocked", "done", "unknown"].contains(state))
         .unwrap_or("unknown");
-    tokens.insert("lineup_agent".into(), Some(id.into()));
+    tokens.insert("lineup_agent".into(), Some(info.id.into()));
     tokens.insert("lineup_logo".into(), Some(logo.into()));
     tokens.insert("lineup_state".into(), Some(state.into()));
     tokens.insert(format!("lineup_state_{state}"), Some("●".into()));
@@ -678,6 +733,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn agent_catalog_preserves_ids_labels_glyphs_and_order() {
+        let expected = [
+            (Agent::Claude, "claude", "Claude", "\u{e1a0}"),
+            (Agent::Codex, "codex", "Codex", "\u{e1a1}"),
+            (Agent::Grok, "grok", "Grok", "\u{e1b1}"),
+            (Agent::Agy, "agy", "Antigravity", "\u{e1b2}"),
+            (Agent::Kimi, "kimi", "Kimi", "\u{e1a6}"),
+            (Agent::Hermes, "hermes", "Hermes", "\u{e1aa}"),
+        ];
+        assert_eq!(Agent::ALL.len(), expected.len());
+        for (entry, (agent, id, label, glyph)) in Agent::ALL.iter().zip(expected) {
+            assert_eq!(entry.agent, agent);
+            assert_eq!(entry.id, id);
+            assert_eq!(entry.label, label);
+            assert_eq!(entry.glyph, glyph);
+            assert_eq!(Agent::from_id(id), Some(agent));
+        }
+        assert_eq!(Agent::from_id("unknown"), None);
     }
 
     #[test]

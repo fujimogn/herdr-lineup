@@ -21,7 +21,8 @@ pub struct Repository {
 /// Read local Git data only; never fetch or fall back to another commit.
 /// Missing refs retain the repository name, while non-working repositories
 /// and failed identity queries return `None`.
-pub fn read_repository(cwd: &Path) -> Option<Repository> {
+#[cfg(test)]
+fn read_repository(cwd: &Path) -> Option<Repository> {
     match read_repository_controlled(cwd, None) {
         RepositoryRead::Complete(repository) => repository,
         RepositoryRead::Interrupted => None,

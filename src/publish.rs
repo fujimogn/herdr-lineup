@@ -996,14 +996,7 @@ fn unix(time: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 fn agent_id(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Claude => "claude",
-        Agent::Codex => "codex",
-        Agent::Grok => "grok",
-        Agent::Agy => "agy",
-        Agent::Kimi => "kimi",
-        Agent::Hermes => "hermes",
-    }
+    agent.info().id
 }
 
 #[cfg(test)]

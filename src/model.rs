@@ -63,7 +63,6 @@ pub enum SourceKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeeklyWindow {
-    CalendarWeek,
     RollingSevenDays,
 }
 

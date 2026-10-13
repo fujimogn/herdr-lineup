@@ -1,5 +1,6 @@
 //! Bounded plugin configuration loaded without writing user settings.
 
+use crate::tokens::Agent;
 use serde::Deserialize;
 use std::{collections::HashSet, io, path::Path};
 
@@ -24,9 +25,7 @@ impl Default for Config {
             usage_max_age_ms: 60000,
             logo_mode: "auto".into(),
             non_first_pane_logo_indent: 0,
-            providers: ["claude", "codex", "grok", "agy", "kimi", "hermes"]
-                .map(String::from)
-                .to_vec(),
+            providers: Agent::ALL.iter().map(|entry| entry.id.to_owned()).collect(),
             allow_network: false,
         }
     }
@@ -73,16 +72,14 @@ impl Config {
             return invalid("non_first_pane_logo_indent must be 0..=16");
         }
         let mut unique = HashSet::new();
-        if self.providers.iter().any(|p| {
-            !["claude", "codex", "grok", "agy", "kimi", "hermes"].contains(&p.as_str())
-                || !unique.insert(p)
-        }) {
+        if self
+            .providers
+            .iter()
+            .any(|p| Agent::from_id(p).is_none() || !unique.insert(p))
+        {
             return invalid("providers must contain unique supported provider ids");
         }
         Ok(())
-    }
-    pub fn ttl_ms(&self) -> u64 {
-        self.refresh_interval_ms * 3
     }
 }
 
@@ -107,8 +104,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(dir.path()).unwrap();
         assert_eq!(config.refresh_interval_ms, 5000);
-        assert_eq!(config.ttl_ms(), 15000);
-        assert_eq!(config.providers.len(), 6);
+        assert_eq!(
+            config.providers,
+            ["claude", "codex", "grok", "agy", "kimi", "hermes"]
+        );
         assert!(!dir.path().join("config.toml").exists());
     }
 
@@ -134,7 +133,6 @@ mod tests {
     fn accepts_bounds_and_empty_providers() {
         let config = Config::parse("refresh_interval_ms = 1000\nreader_timeout_ms = 100\nusage_max_age_ms = 1000\nproviders = []\nlogo_mode = 'text'").unwrap();
         assert!(config.providers.is_empty());
-        assert_eq!(config.ttl_ms(), 3000);
         assert!(Config::parse("refresh_interval_ms = 3600000\nreader_timeout_ms = 30000\nusage_max_age_ms = 86400000").is_ok());
     }
 }
