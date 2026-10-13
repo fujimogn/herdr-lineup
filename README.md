@@ -620,6 +620,7 @@ query categories (`ok`, `auth_missing`, `auth_io`, `auth_shape`,
 `invalid_diagnostic` means the local record cannot be safely decoded. These are
 last query results, not cache availability or a new provider query. Values,
 credentials, paths, response bodies and error text are never recorded.
+
 Temporary failures retain the last success until its known reset; authentication
 failures clear it. Before the first successful query, after reset, and for Grok
 MONTHLY allowances, weekly stays `—`. Period names containing `WEEKLY`
@@ -699,6 +700,11 @@ and uses `—` for its ship-time text. The full pane contract has 14 keys, withi
 Herdr's 16 keys per report and 32 stored keys per resource; unrelated keys are
 preserved and counted before publication.
 
+`doctor` distinguishes metadata capacity skips from refresh failures. It shows
+the number of resources skipped during the latest refresh; skips alone do not
+make it fail. A real refresh failure still exits nonzero. It also checks the
+control socket path length before trying to connect.
+
 ### Per-session publisher
 
 Herdr startup hooks run once. Startup and `workspace.focused` therefore both
@@ -743,6 +749,11 @@ See [SECURITY.md](SECURITY.md) for the full boundaries.
   starting. Wait a few seconds, then run `herdr plugin action invoke
   herdr-lineup.doctor` again. A failed refresh is reported separately as
   `daemon refresh is unhealthy`.
+- **Doctor reports metadata capacity exhausted:** One or more resources were
+  skipped during the latest refresh. Other resources may still have updated;
+  reduce competing metadata keys. The count is for the latest refresh only.
+- **Doctor reports an overlong control socket path:** Use a shorter plugin
+  state directory. The diagnostic shows the path length and platform limit.
 - **A command fails:** it prints an error and exits nonzero. `stop` leaves the
   Herdr server running.
 - **No sidebar data after install or link:** confirm `ensure` is running for

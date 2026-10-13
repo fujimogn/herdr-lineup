@@ -83,6 +83,32 @@ pub struct Health {
     pub pid: u32,
     pub last_refresh_ms: Option<u64>,
     pub refresh_failed: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub capacity_skipped_resources: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+pub(crate) fn record_refresh(health: &mut Health, result: &io::Result<()>, elapsed_ms: u64) {
+    match result {
+        Ok(()) => {
+            health.last_refresh_ms = Some(elapsed_ms);
+            health.refresh_failed = false;
+            health.capacity_skipped_resources = 0;
+        }
+        Err(error) => {
+            if let Some(count) = crate::publish::capacity_skip_count(error) {
+                health.last_refresh_ms = Some(elapsed_ms);
+                health.refresh_failed = false;
+                health.capacity_skipped_resources = count;
+            } else {
+                health.refresh_failed = true;
+                health.capacity_skipped_resources = 0;
+            }
+        }
+    }
 }
 
 pub fn ensure(options: &Options) -> io::Result<()> {
@@ -265,6 +291,7 @@ fn run_locked(
         pid: std::process::id(),
         last_refresh_ms: None,
         refresh_failed: false,
+        capacity_skipped_resources: 0,
     };
     fs::write(&paths.pid, format!("{}\n", health.pid))?;
     let control = ControlWorker::start(listener, health.clone());
@@ -304,21 +331,17 @@ fn run_locked(
                 }
             }
             if Instant::now() >= refresh_at {
-                match publisher.refresh(&mut transport, &config) {
-                    Ok(()) => {
-                        health.last_refresh_ms =
-                            Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
-                        health.refresh_failed = false;
-                    }
-                    Err(error) => {
-                        health.refresh_failed = true;
+                let result = publisher.refresh(&mut transport, &config);
+                let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                record_refresh(&mut health, &result, elapsed_ms);
+                if let Err(error) = result {
+                    if health.capacity_skipped_resources > 0 {
+                        let _ = writeln!(
+                            log,
+                            "Lineup metadata capacity exhausted; affected resources skipped"
+                        );
+                    } else {
                         reconnect = error.kind() != io::ErrorKind::InvalidInput;
-                        if error.kind() == io::ErrorKind::InvalidInput {
-                            let _ = writeln!(
-                                log,
-                                "Lineup metadata capacity exhausted; affected resources skipped"
-                            );
-                        }
                         let _ = writeln!(
                             log,
                             "Lineup refresh failed; metadata will expire unless renewed"
@@ -1060,6 +1083,7 @@ mod tests {
             pid: std::process::id() + 1,
             last_refresh_ms: None,
             refresh_failed: false,
+            capacity_skipped_resources: 0,
         };
         let fake = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -1496,6 +1520,7 @@ mod tests {
             pid: 1,
             last_refresh_ms: Some(0),
             refresh_failed: false,
+            capacity_skipped_resources: 0,
         };
         let (mut client, server) = UnixStream::pair().unwrap();
         // BSD/macOS accept inherits the listener's O_NONBLOCK flag. Explicitly
@@ -1577,7 +1602,55 @@ mod tests {
             pid: 1,
             last_refresh_ms: Some(0),
             refresh_failed: false,
+            capacity_skipped_resources: 0,
         }
+    }
+
+    #[test]
+    fn capacity_skip_is_healthy_but_other_refresh_errors_are_not() {
+        let mut health = sample_health();
+        record_refresh(
+            &mut health,
+            &Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metadata capacity exhausted; affected resources skipped",
+            )),
+            11,
+        );
+        assert!(
+            health.refresh_failed,
+            "an untyped InvalidInput is not a capacity skip"
+        );
+        record_refresh(
+            &mut health,
+            &Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                crate::publish::CapacitySkip {
+                    skipped_resources: 2,
+                },
+            )),
+            12,
+        );
+        assert!(!health.refresh_failed);
+        assert_eq!(health.last_refresh_ms, Some(12));
+        assert_eq!(health.capacity_skipped_resources, 2);
+        record_refresh(
+            &mut health,
+            &Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "other invalid input",
+            )),
+            13,
+        );
+        assert!(health.refresh_failed);
+        assert_eq!(health.capacity_skipped_resources, 0);
+        record_refresh(&mut health, &Err(io::Error::other("transport")), 13);
+        assert!(health.refresh_failed);
+        assert_eq!(health.capacity_skipped_resources, 0);
+        record_refresh(&mut health, &Ok(()), 14);
+        assert!(!health.refresh_failed);
+        assert_eq!(health.capacity_skipped_resources, 0);
+        assert_eq!(health.last_refresh_ms, Some(14));
     }
 
     #[test]

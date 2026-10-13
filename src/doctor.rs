@@ -274,7 +274,7 @@ pub fn validate_pong(frame: &[u8]) -> io::Result<()> {
     // would incorrectly reject a compatible newer server (official stability contract).
     Ok(())
 }
-fn refresh_diagnostic(health: &Health) -> io::Result<u64> {
+pub(crate) fn refresh_diagnostic(health: &Health) -> io::Result<u64> {
     if health.refresh_failed {
         return Err(io::Error::other("daemon refresh is unhealthy"));
     }
@@ -283,9 +283,24 @@ fn refresh_diagnostic(health: &Health) -> io::Result<u64> {
     })
 }
 
+pub(crate) fn capacity_diagnostic(health: &Health) -> Option<String> {
+    (health.capacity_skipped_resources > 0).then(|| {
+        let noun = if health.capacity_skipped_resources == 1 {
+            "resource"
+        } else {
+            "resources"
+        };
+        format!(
+            "Metadata capacity exhausted: {} {noun} skipped",
+            health.capacity_skipped_resources
+        )
+    })
+}
+
 pub fn run(options: &Options) -> io::Result<()> {
     let config = Config::load(&options.config)?;
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
+    paths.validate_control_socket_path()?;
     println!("{}", weekly_diagnostics(&paths.root));
     println!("{}", local_diagnostics(&options.state, SystemTime::now()));
     let mut transport = Transport::connect(&options.socket)?;
@@ -297,6 +312,9 @@ pub fn run(options: &Options) -> io::Result<()> {
             "Herdr JSON API compatible; config valid; daemon/control/lock healthy; last refresh {} ms after startup",
             last_refresh_ms
         );
+        if let Some(diagnostic) = capacity_diagnostic(&health) {
+            println!("{diagnostic}");
+        }
     } else {
         if SessionLock::is_held(&paths)? {
             return Err(io::Error::other(
@@ -323,6 +341,71 @@ mod tests {
     use crate::socket::EndpointIdentity;
 
     #[test]
+    fn capacity_skip_survives_health_wire_round_trip_without_hiding_refresh_failure() {
+        let old_health = serde_json::json!({
+            "plugin": "herdr-lineup",
+            "socket_path": "/tmp/lineup-test.sock",
+            "socket_key": "test",
+            "endpoint": {"device": 1, "inode": 2},
+            "nonce": "test",
+            "pid": 1,
+            "last_refresh_ms": 9,
+            "refresh_failed": false
+        });
+        let mut skipped = old_health.clone();
+        skipped["capacity_skipped_resources"] = serde_json::json!(1);
+        let health: Health = serde_json::from_value(skipped).unwrap();
+        assert_eq!(refresh_diagnostic(&health).unwrap(), 9);
+        assert_eq!(
+            capacity_diagnostic(&health).unwrap(),
+            "Metadata capacity exhausted: 1 resource skipped"
+        );
+        assert_eq!(
+            serde_json::to_value(&health).unwrap()["capacity_skipped_resources"],
+            1
+        );
+        let legacy: Health = serde_json::from_value(old_health).unwrap();
+        assert_eq!(refresh_diagnostic(&legacy).unwrap(), 9);
+        assert!(capacity_diagnostic(&legacy).is_none());
+        let mut future = serde_json::to_value(&health).unwrap();
+        future["unknown_future_field"] = serde_json::json!({"value": 2});
+        let compatible: Health = serde_json::from_value(future).unwrap();
+        assert_eq!(compatible.capacity_skipped_resources, 1);
+        #[derive(serde::Deserialize)]
+        struct LegacyDoctorHealth {
+            last_refresh_ms: Option<u64>,
+            refresh_failed: bool,
+        }
+        let legacy_reader: LegacyDoctorHealth =
+            serde_json::from_value(serde_json::to_value(&compatible).unwrap()).unwrap();
+        assert_eq!(legacy_reader.last_refresh_ms, Some(9));
+        assert!(!legacy_reader.refresh_failed);
+        let mut failed = compatible;
+        failed.refresh_failed = true;
+        assert_eq!(
+            refresh_diagnostic(&failed).unwrap_err().to_string(),
+            "daemon refresh is unhealthy"
+        );
+    }
+
+    #[test]
+    fn doctor_explains_overlong_control_socket_path_before_connecting() {
+        let root = tempfile::tempdir().unwrap();
+        let options = Options {
+            socket: root.path().join("herdr.sock"),
+            state: root.path().join("a".repeat(110)),
+            config: root.path().join("config"),
+        };
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let error = run(&options).unwrap_err().to_string();
+        assert!(error.contains("control socket path"), "{error}");
+        assert!(
+            error.contains(&paths.control.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn first_refresh_pending_has_distinct_diagnostic_from_refresh_failure() {
         let mut health = Health {
             plugin: "herdr-lineup".into(),
@@ -336,6 +419,7 @@ mod tests {
             pid: 1,
             last_refresh_ms: None,
             refresh_failed: false,
+            capacity_skipped_resources: 0,
         };
         let pending = refresh_diagnostic(&health).unwrap_err().to_string();
         assert!(pending.contains("first refresh has not completed yet"));

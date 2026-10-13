@@ -28,6 +28,29 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Debug)]
+pub(crate) struct CapacitySkip {
+    pub skipped_resources: u64,
+}
+
+impl std::fmt::Display for CapacitySkip {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "metadata capacity exhausted; affected resources skipped"
+        )
+    }
+}
+
+impl std::error::Error for CapacitySkip {}
+
+pub(crate) fn capacity_skip_count(error: &io::Error) -> Option<u64> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<CapacitySkip>())
+        .map(|skip| skip.skipped_resources)
+}
+
 #[derive(Clone, Default)]
 pub struct Homes {
     pub codex: Option<PathBuf>,
@@ -444,7 +467,12 @@ impl MetadataPublisher {
             )
             .map_err(|error| match error {
                 tokens::PatchError::ResourceCapacity | tokens::PatchError::ReportCapacity => {
-                    io::Error::new(io::ErrorKind::InvalidInput, "metadata capacity exhausted")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        CapacitySkip {
+                            skipped_resources: 1,
+                        },
+                    )
                 }
                 _ => io::Error::other("metadata planning failed"),
             })?
@@ -580,7 +608,7 @@ impl MetadataPublisher {
             "text" => tokens::LogoMode::Text,
             _ => tokens::LogoMode::Auto,
         };
-        let mut failed = false;
+        let mut skipped_resources = 0u64;
         let local_now = chrono::Local::now();
         let mut headings = BTreeMap::new();
         for workspace in &snapshot.workspaces {
@@ -825,8 +853,8 @@ impl MetadataPublisher {
                 &desired,
                 None,
             ) {
-                if error.kind() == io::ErrorKind::InvalidInput {
-                    failed = true;
+                if capacity_skip_count(&error).is_some() {
+                    skipped_resources = skipped_resources.saturating_add(1);
                     continue;
                 }
                 // Do not continue I/O after an ambiguous response: reconnect/reconcile.
@@ -845,16 +873,16 @@ impl MetadataPublisher {
                 desired,
                 None,
             ) {
-                if error.kind() != io::ErrorKind::InvalidInput {
+                if capacity_skip_count(&error).is_none() {
                     return Err(error);
                 }
-                failed = true;
+                skipped_resources = skipped_resources.saturating_add(1);
             }
         }
-        if failed {
+        if skipped_resources > 0 {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "metadata capacity exhausted; affected resources skipped",
+                CapacitySkip { skipped_resources },
             ))
         } else {
             Ok(())
@@ -3157,11 +3185,8 @@ mod tests {
             Homes::default(),
         )
         .unwrap();
-        assert!(
-            publisher
-                .refresh(&mut transport, &crate::config::Config::default())
-                .is_err()
-        );
+        let result = publisher.refresh(&mut transport, &crate::config::Config::default());
+        assert_eq!(capacity_skip_count(result.as_ref().unwrap_err()), None);
         server.join().unwrap();
     }
 
@@ -3260,10 +3285,24 @@ mod tests {
         let mut transport = Transport::connect(&socket).unwrap();
         let mut publisher =
             MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
-        assert!(
-            publisher
-                .refresh(&mut transport, &crate::config::Config::default())
-                .is_err()
+        let result = publisher.refresh(&mut transport, &crate::config::Config::default());
+        assert_eq!(capacity_skip_count(result.as_ref().unwrap_err()), Some(1));
+        let mut health = crate::daemon::Health {
+            plugin: crate::daemon::PLUGIN_ID.into(),
+            socket_path: socket,
+            socket_key: "fake".into(),
+            endpoint: transport.identity(),
+            nonce: "test".into(),
+            pid: std::process::id(),
+            last_refresh_ms: None,
+            refresh_failed: false,
+            capacity_skipped_resources: 0,
+        };
+        crate::daemon::record_refresh(&mut health, &result, 7);
+        assert_eq!(crate::doctor::refresh_diagnostic(&health).unwrap(), 7);
+        assert_eq!(
+            crate::doctor::capacity_diagnostic(&health).unwrap(),
+            "Metadata capacity exhausted: 1 resource skipped"
         );
         server.join().unwrap();
     }
