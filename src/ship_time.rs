@@ -120,15 +120,25 @@ pub fn resolve_workspace_cwd<'a>(
 
 fn git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
+    command.env_clear();
+    // Preserve executable lookup and the user's Git configuration locations.
+    // The heading never contacts a remote, so proxy and authentication state
+    // are not needed by this child.
+    for key in [
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     command
         .arg("-C")
         .arg(cwd)
         .args(["--no-pager", "-c", "core.fsmonitor=false"]);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
-            command.env_remove(key);
-        }
-    }
     // These built-in, read-only queries do not invoke aliases or hooks; disable
     // pager and fsmonitor explicitly and never request signature verification.
     // Local object reads must not lazily fetch absent partial-clone objects.
@@ -293,7 +303,7 @@ mod tests {
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let script = bin.join("git");
-        crate::test_support::write_executable(&script, "#!/bin/sh\n/bin/sleep 30 >/dev/null 2>&1 &\necho $! > \"$2/descendant-pid\"\nprintf 'false\\n'\nexit 0\n").unwrap();
+        crate::test_support::write_executable(&script, "#!/bin/sh\ntest -z \"$LINEUP_TEST_GIT_DESCENDANT\" || exit 42\ntest -n \"$HOME\" || exit 43\n/bin/sleep 30 >/dev/null 2>&1 &\necho $! > \"$2/descendant-pid\"\nprintf 'false\\n'\nexit 0\n").unwrap();
 
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -747,20 +757,23 @@ mod tests {
     }
 
     #[test]
-    fn git_command_discards_inherited_git_environment() {
+    fn git_command_sets_only_required_environment() {
         let command = git_command(Path::new("/repository"));
-        let removed: Vec<_> = command
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(key, _)| key.to_owned())
-            .collect();
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("GIT_")
-                && key != "GIT_NO_LAZY_FETCH"
-                && key != "GIT_ALLOW_PROTOCOL"
-            {
-                assert!(removed.contains(&key));
-            }
+        for (key, value) in command.get_envs() {
+            assert!(value.is_some());
+            assert!(
+                [
+                    "PATH",
+                    "HOME",
+                    "TMPDIR",
+                    "XDG_CONFIG_HOME",
+                    "XDG_CACHE_HOME",
+                    "GIT_NO_LAZY_FETCH",
+                    "GIT_ALLOW_PROTOCOL"
+                ]
+                .iter()
+                .any(|allowed| key == *allowed)
+            );
         }
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),

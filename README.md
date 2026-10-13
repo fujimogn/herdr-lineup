@@ -711,6 +711,11 @@ control socket path length before trying to connect.
 
 Herdr startup hooks run once. Startup and `workspace.focused` therefore both
 invoke `ensure`; the per-session lock prevents duplicate daemons.
+The detached daemon changes to its private session state directory. Its
+`daemon.log` records UTC timestamps and fixed event/reason categories and keeps
+one rotated generation (`daemon.log.1`) when the current file reaches 1 MiB.
+After an external SIGTERM, `doctor` reports a stale PID record until `ensure`
+starts a new daemon; `stop` does not signal that stale PID.
 The publisher keeps one daemon per Herdr session and stores state under
 `$HERDR_PLUGIN_STATE_DIR`. Herdr v0.9.3 closes the socket after each
 `session.snapshot` and `report_metadata` JSON response. An isolated session

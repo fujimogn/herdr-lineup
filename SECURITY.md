@@ -17,6 +17,17 @@ ensure's own child loses the session lock, ensure waits for that child to exit
 before treating another healthy daemon as ready. Codex has a separate child process, so shutdown synchronously kills
 its process group and reaps the direct child through a spawn/stop synchronized
 owner. Error exits use the same cleanup, without touching the Herdr server.
+An external SIGTERM can leave `control.sock` and `daemon.pid` behind. The
+session lock is released by process exit; `stop` then returns without signalling
+the stale PID, `doctor` reports the stale record, and the next `ensure` removes
+the old control socket only after acquiring the session lock. Normal Herdr stop
+uses the authenticated control request, not SIGTERM.
+
+The detached daemon runs with its private session state directory as its working
+directory. Its session log contains only UTC timestamps and fixed event/reason
+categories; it never includes error text, paths, credentials, or conversation
+data. At 1 MiB, the current log is renamed to one `daemon.log.1` generation
+before the next event is written. Child stdout and stderr are discarded.
 
 ## Local data read by the Grok billing client
 
@@ -78,8 +89,9 @@ implemented runtime behavior. Other provider API access is outside this opt-in.
 ## Repository heading Git queries
 
 Repository headings use local, read-only Git built-in queries without signature
-verification. The commands disable Git pagers and filesystem monitors and remove
-inherited `GIT_*` environment variables. Lazy object fetches and all remote
+verification. The commands preserve only `PATH`, `HOME`, `TMPDIR`,
+`XDG_CONFIG_HOME`, and `XDG_CACHE_HOME` from the environment, along with fixed
+Git safety settings. Lazy object fetches and all remote
 protocols are disabled. These queries do not invoke aliases, hooks, credential
 helpers, or remote commands.
 
@@ -94,6 +106,9 @@ conversation contents and never opens `auth.json`. Codex uses its own existing
 authentication and may contact its provider or maintain its authentication state.
 This authenticated quota access was approved on 2026-10-12; other authenticated
 provider integrations remain outside this boundary.
+The Codex child retains its environment because its executable lookup, proxy,
+certificate, and authentication settings can depend on caller-supplied variables.
+Its stderr remains discarded, and the daemon does not record those values.
 
 Only a seven-day window's used percentage and optional absolute reset time are
 returned. API-key and signed-out accounts return no subscription quota. Raw

@@ -6,6 +6,7 @@ use crate::{
     lock::{LifecycleLock, ProcessExit, RuntimePaths, SessionLock, StartupLockContention},
     socket::{EndpointIdentity, Transport, read_frame, write_frame},
 };
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -27,6 +28,7 @@ use std::{
 pub const PLUGIN_ID: &str = "herdr-lineup";
 const START_DEADLINE: Duration = Duration::from_secs(5);
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
+const MAX_LOG_BYTES: u64 = 1024 * 1024;
 pub(crate) const LOCK_CONTENDED_EXIT_CODE: u8 = 75;
 
 #[derive(Debug, Clone)]
@@ -128,13 +130,9 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
         if may_spawn && let Some(lock) = SessionLock::acquire(&paths)? {
             // A reused PID record is never inspected or signalled. Stale control
             // paths are removed only after exclusive session ownership is acquired.
-            let log = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&paths.log)?;
+            log_event(&paths, "daemon_start", "ensure")?;
             command
+                .current_dir(&paths.root)
                 .env("HERDR_SOCKET_PATH", &options.socket)
                 .env("HERDR_PLUGIN_STATE_DIR", &options.state)
                 .env("HERDR_PLUGIN_CONFIG_DIR", &options.config)
@@ -142,8 +140,8 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
                 .env("LINEUP_EXPECTED_DEVICE", endpoint.device.to_string())
                 .env("LINEUP_EXPECTED_INODE", endpoint.inode.to_string())
                 .stdin(Stdio::null())
-                .stdout(Stdio::from(log.try_clone()?))
-                .stderr(Stdio::from(log));
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             let descriptor = lock.raw_fd();
             // SAFETY: after fork, only async-signal-safe libc functions execute.
             // dup2 preserves flock's shared open-file description across exec.
@@ -184,11 +182,13 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
                         may_spawn = false;
                         break;
                     }
+                    let _ = log_event(&paths, "daemon_exit", "startup_failure");
                     return Err(io::Error::other(
                         "daemon exited before readiness; inspect session daemon.log",
                     ));
                 }
                 if Instant::now() >= deadline {
+                    let _ = log_event(&paths, "daemon_exit", "startup_timeout");
                     return Err(io::Error::other(
                         "daemon startup timed out; inspect session daemon.log",
                     ));
@@ -215,16 +215,22 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
 
 pub fn foreground(options: &Options) -> io::Result<()> {
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
+    paths.create()?;
+    std::env::set_current_dir(&paths.root)?;
     let mut publisher = crate::publish::MetadataPublisher::new(
-        paths.root,
-        paths.key,
+        paths.root.clone(),
+        paths.key.clone(),
         crate::publish::Homes::from_env(),
     )?;
-    run_foreground(
+    let result = run_foreground(
         options,
         std::env::var_os("LINEUP_INHERITED_LOCK").as_deref() == Some(std::ffi::OsStr::new("3")),
         &mut publisher,
-    )
+    );
+    if result.is_err() {
+        let _ = log_event(&paths, "daemon_exit", "runtime_error");
+    }
+    result
 }
 pub fn run_foreground(
     options: &Options,
@@ -267,12 +273,6 @@ fn run_locked(
         }
     }
     doctor::check_transport(&mut transport)?;
-    let mut log = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&paths.log)?;
     remove_if_present(&paths.control)?;
     let listener = UnixListener::bind(&paths.control)?;
     listener.set_nonblocking(true)?;
@@ -336,16 +336,19 @@ fn run_locked(
                 record_refresh(&mut health, &result, elapsed_ms);
                 if let Err(error) = result {
                     if health.capacity_skipped_resources > 0 {
-                        let _ = writeln!(
-                            log,
-                            "Lineup metadata capacity exhausted; affected resources skipped"
-                        );
+                        let _ = log_event(&paths, "refresh_skipped", "metadata_capacity");
+                    } else if error.kind() == io::ErrorKind::Interrupted
+                        && control.shutdown.load(Ordering::Acquire)
+                    {
+                        let _ = log_event(&paths, "refresh_interrupted", "shutdown");
                     } else {
                         reconnect = error.kind() != io::ErrorKind::InvalidInput;
-                        let _ = writeln!(
-                            log,
-                            "Lineup refresh failed; metadata will expire unless renewed"
-                        );
+                        let reason = match error.kind() {
+                            io::ErrorKind::InvalidInput => "invalid_input",
+                            io::ErrorKind::Interrupted => "interrupted",
+                            _ => "transport_or_reader",
+                        };
+                        let _ = log_event(&paths, "refresh_failed", reason);
                     }
                 }
                 refresh_at = Instant::now() + Duration::from_millis(config.refresh_interval_ms);
@@ -418,6 +421,28 @@ fn remove_if_present(path: &std::path::Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+fn log_event(paths: &RuntimePaths, event: &'static str, reason: &'static str) -> io::Result<()> {
+    let line = format!(
+        "{} event={event} reason={reason}\n",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    let existing = match fs::symlink_metadata(&paths.log) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return Err(io::Error::other("daemon log is not a regular file")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    if existing.saturating_add(line.len() as u64) > MAX_LOG_BYTES {
+        fs::rename(&paths.log, paths.root.join("daemon.log.1"))?;
+    }
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&paths.log)?
+        .write_all(line.as_bytes())
 }
 struct RuntimeCleanup {
     paths: RuntimePaths,
@@ -748,6 +773,17 @@ mod tests {
             || std::env::var_os("LINEUP_TEST_FOREGROUND").is_some()
         {
             let options = Options::from_env().unwrap();
+            if std::env::var_os("LINEUP_TEST_RECORD_CWD").is_some() {
+                fs::write(
+                    options.state.join("daemon-cwd"),
+                    std::env::current_dir()
+                        .unwrap()
+                        .into_os_string()
+                        .into_string()
+                        .unwrap(),
+                )
+                .unwrap();
+            }
             if std::env::var_os("LINEUP_TEST_RECORD_START").is_some() {
                 let mut record = OpenOptions::new()
                     .create(true)
@@ -867,6 +903,34 @@ mod tests {
                 .unwrap();
                 return;
             }
+            if std::env::var_os("LINEUP_TEST_REFRESH_INTERRUPTED").is_some() {
+                struct InterruptedRefresh(Arc<AtomicBool>, PathBuf);
+                impl Publisher for InterruptedRefresh {
+                    fn set_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
+                        self.0 = shutdown;
+                    }
+                    fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                        fs::write(self.1.join("refresh-entered"), "")?;
+                        while !self.0.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(io::Error::new(io::ErrorKind::Interrupted, "private detail"))
+                    }
+                    fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                run_foreground(
+                    &options,
+                    true,
+                    &mut InterruptedRefresh(
+                        Arc::new(AtomicBool::new(false)),
+                        options.state.clone(),
+                    ),
+                )
+                .unwrap();
+                return;
+            }
             struct SlowRefresh(PathBuf, Option<Arc<AtomicBool>>);
             impl Drop for SlowRefresh {
                 fn drop(&mut self) {
@@ -938,6 +1002,85 @@ mod tests {
             pid.is_some()
         });
         pid.unwrap()
+    }
+
+    #[test]
+    fn shutdown_interruption_is_timestamped_and_not_logged_as_failure() {
+        let (_dir, options, done, server) = fixture();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_REFRESH_INTERRUPTED", "1");
+        ensure_command(&options, command).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| options.state.join("refresh-entered").exists());
+        stop(&options).unwrap();
+        let log = fs::read_to_string(&paths.log).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(log.contains("reason=shutdown"), "{log}");
+        assert!(!log.contains("refresh failed"), "{log}");
+        assert!(
+            log.lines()
+                .all(|line| line.starts_with("20") && line.contains('Z')),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn sigterm_stale_runtime_files_do_not_block_lifecycle() {
+        let (_dir, options, done, server) = fixture();
+        ensure_command(&options, child_command()).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let old = probe(&paths, &options.socket).unwrap().unwrap();
+        // This PID belongs to the isolated child started above.
+        assert_eq!(unsafe { libc::kill(old.pid as i32, libc::SIGTERM) }, 0);
+        wait_until(|| !SessionLock::is_held(&paths).unwrap());
+        assert!(paths.control.exists());
+        assert!(paths.pid.exists());
+        stop(&options).unwrap();
+        assert!(
+            doctor::run(&options)
+                .unwrap_err()
+                .to_string()
+                .contains("stale diagnostic PID")
+        );
+        ensure_command(&options, child_command()).unwrap();
+        let new = probe(&paths, &options.socket).unwrap().unwrap();
+        assert_ne!(new.pid, old.pid);
+        wait_until(|| {
+            probe(&paths, &options.socket)
+                .unwrap()
+                .unwrap()
+                .last_refresh_ms
+                .is_some()
+        });
+        doctor::run(&options).unwrap();
+        stop(&options).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn detached_daemon_uses_private_runtime_directory_and_rotates_log() {
+        let (_dir, options, done, server) = fixture();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        paths.create().unwrap();
+        fs::write(&paths.log, "x".repeat(MAX_LOG_BYTES as usize)).unwrap();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_RECORD_CWD", "1");
+        ensure_command(&options, command).unwrap();
+        wait_until(|| options.state.join("daemon-cwd").exists());
+        assert_eq!(
+            PathBuf::from(fs::read_to_string(options.state.join("daemon-cwd")).unwrap()),
+            paths.root
+        );
+        assert_eq!(
+            fs::metadata(paths.root.join("daemon.log.1")).unwrap().len(),
+            MAX_LOG_BYTES
+        );
+        assert!(fs::metadata(&paths.log).unwrap().len() < 1024);
+        stop(&options).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
     }
 
     #[test]
