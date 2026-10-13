@@ -74,6 +74,14 @@ local Herdr socket. Plugin settings and state belong in Herdr plugin directories
 Configuration writes require the explicit opt-in actions. See the README for
 implemented runtime behavior. Other provider API access is outside this opt-in.
 
+## Repository heading Git queries
+
+Repository headings use local, read-only Git built-in queries without signature
+verification. The commands disable Git pagers and filesystem monitors and remove
+inherited `GIT_*` environment variables. Lazy object fetches and all remote
+protocols are disabled. These queries do not invoke aliases, hooks, credential
+helpers, or remote commands.
+
 ## Codex app-server quota client
 
 `src/quota_codex.rs` implements the account-quota client called by the dedicated

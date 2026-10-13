@@ -126,8 +126,11 @@ workspace. The repository name SHALL be the basename of the canonical working
 repository root derived from Git's common directory, so linked worktrees use
 the same repository name. An unresolved/non-working repository SHALL show `—`.
 The plugin SHALL read the latest local `origin/main` commit's committer timestamp
-(for example `git log -1 --format=%ct refs/remotes/origin/main`) without fetching
-or contacting a remote. It SHALL NOT substitute HEAD, mtime, author date, or
+with `git -C <workspace-cwd> --no-pager -c core.fsmonitor=false for-each-ref
+--format='%(refname) %(committerdate:unix)' refs/remotes/origin/main` and accept
+only output whose refname exactly equals `refs/remotes/origin/main` (excluding
+descendant refs such as `refs/remotes/origin/main/topic`). It SHALL do so without
+fetching or contacting a remote. It SHALL NOT substitute HEAD, mtime, author date, or
 another branch when that ref is absent. "Last ship" means this locally known
 commit time, not proof of deployment or remote freshness.
 All Git commands for one heading SHALL share a one-second deadline and SHALL
