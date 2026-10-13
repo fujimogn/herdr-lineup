@@ -5,8 +5,9 @@ arm64 release binaries in `Cargo.lock`. Build dependencies, development
 dependencies, procedural macros, and their dependencies are excluded. The
 macOS-only dependency is marked below. For alternative licenses, the selected
 terms are shown. License text is reproduced once where pinned crates contain
-byte-identical text. The `ring` entries include BoringSSL and embedded
-once_cell terms; `zstd-sys` includes its Rust-binding and vendored C terms.
+byte-identical text. The `ring` entries include BoringSSL, embedded
+once_cell, and fiat-crypto terms; `zstd-sys` includes its Rust-binding
+and vendored C terms.
 
 <!-- dependency-list:start -->
 | Crate | Declared SPDX expression | Distributed terms | Platforms |
@@ -1164,6 +1165,30 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
+- ring@0.17.14 `third_party/fiat/LICENSE`
+
+````text
+The Apache License, Version 2.0 (Apache-2.0)
+
+Copyright 2015-2020 the fiat-crypto authors (see the AUTHORS file)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+````
+
+## License text 27
+
+Source crates and license files:
+
 - rustix@1.1.5 `COPYRIGHT`
 
 ````text
@@ -1198,7 +1223,7 @@ is licensed under:
 at your option.
 ````
 
-## License text 27
+## License text 28
 
 Source crates and license files:
 
@@ -1232,7 +1257,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ````
 
-## License text 28
+## License text 29
 
 Source crates and license files:
 
@@ -1260,7 +1285,7 @@ The files under third-party/chromium are licensed as described in
 third-party/chromium/LICENSE.
 ````
 
-## License text 29
+## License text 30
 
 Source crates and license files:
 
@@ -1294,7 +1319,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ````
 
-## License text 30
+## License text 31
 
 Source crates and license files:
 
@@ -1326,7 +1351,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
-## License text 31
+## License text 32
 
 Source crates and license files:
 
@@ -1364,7 +1389,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ````
 
-## License text 32
+## License text 33
 
 Source crates and license files:
 
@@ -1398,7 +1423,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ````
 
-## License text 33
+## License text 34
 
 Source crates and license files:
 
@@ -1420,7 +1445,7 @@ Source crates and license files:
 // OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ````
 
-## License text 34
+## License text 35
 
 Source crates and license files:
 
@@ -1436,7 +1461,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
-## License text 35
+## License text 36
 
 Source crates and license files:
 
@@ -1466,7 +1491,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
-## License text 36
+## License text 37
 
 Source crates and license files:
 
@@ -1500,7 +1525,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ````
 
-## License text 37
+## License text 38
 
 Source crates and license files:
 
@@ -1570,7 +1595,7 @@ of Data, including for example machine learning models and models'
 insights.
 ````
 
-## License text 38
+## License text 39
 
 Source crates and license files:
 
@@ -1598,7 +1623,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
-## License text 39
+## License text 40
 
 Source crates and license files:
 
@@ -1632,7 +1657,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ````
 
-## License text 40
+## License text 41
 
 Source crates and license files:
 
@@ -1670,7 +1695,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ````
 
-## License text 41
+## License text 42
 
 Source crates and license files:
 
@@ -1711,7 +1736,7 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ````
 
-## License text 42
+## License text 43
 
 Source crates and license files:
 

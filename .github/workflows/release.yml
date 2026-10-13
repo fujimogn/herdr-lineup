@@ -36,6 +36,8 @@ jobs:
         run: scripts/check-version.sh "$RELEASE_REF"
       - name: Release build
         run: cargo build --release --locked
+      - name: Check binary dependency licenses
+        run: python3 scripts/generate-third-party-licenses.py --check
       - name: Package artifact
         shell: bash
         run: |
@@ -51,7 +53,7 @@ jobs:
           esac
           artifact="herdr-lineup-${GITHUB_REF_NAME}-${platform}-${arch}.tar.gz"
           mkdir -p dist
-          tar -czf "dist/${artifact}" -C target/release herdr-lineup -C ../.. LICENSE NOTICE.md README.md
+          tar -czf "dist/${artifact}" -C target/release herdr-lineup -C ../.. LICENSE NOTICE.md THIRD-PARTY-LICENSES.md README.md
           (cd dist && shasum -a 256 "${artifact}" > "SHA256SUMS-${platform}-${arch}.txt")
       - uses: actions/upload-artifact@v4
         with:

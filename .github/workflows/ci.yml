@@ -45,6 +45,8 @@ jobs:
         run: scripts/test-extract-release-notes.sh
       - name: Release build
         run: cargo build --release --locked
+      - name: Check binary dependency licenses
+        run: python3 scripts/generate-third-party-licenses.py --check
       - name: CLI help
         run: target/release/herdr-lineup --help
 

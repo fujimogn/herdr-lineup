@@ -76,8 +76,17 @@ every architecture combination. Each archive contains these files at its root:
 
 - `herdr-lineup` — the executable, with its executable permission preserved.
 - `LICENSE` — the project license.
-- `NOTICE.md` — third-party attribution.
+- `NOTICE.md` — bundled font and adapted-code attribution.
+- `THIRD-PARTY-LICENSES.md` — pinned Rust binary dependency licenses and
+  attribution for both release platforms.
 - `README.md` — usage and installation instructions.
+
+When `Cargo.lock` changes, run
+`python3 scripts/generate-third-party-licenses.py` with Python 3.11+ and the pinned
+Rust toolchain, then review the generated text. The release build runs the same
+script with `--check`; CI also runs it before tagging. Either fails if the file
+differs from the locked crate sources.
+Cargo may fetch missing pinned crate sources; the script installs no additional tool.
 
 `SHA256SUMS.txt` covers the `.tar.gz` archives. From the download directory, run
 `shasum -a 256 -c SHA256SUMS.txt` after downloading all listed archives. Only

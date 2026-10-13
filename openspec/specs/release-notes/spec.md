@@ -60,7 +60,9 @@ consistency using `scripts/check-version.sh`, and create a GitHub Release titled
 `vX.Y.Z` with the extractor output as its body. It SHALL attach Linux and macOS
 archives named `herdr-lineup-<tag>-<os>-<arch>.tar.gz` and `SHA256SUMS.txt`
 covering those archives. Each archive SHALL contain `herdr-lineup`, `LICENSE`,
-`NOTICE.md`, and `README.md` at its root and preserve executable permission.
+`NOTICE.md`, `THIRD-PARTY-LICENSES.md`, and `README.md` at its root and preserve
+executable permission. The release build SHALL check that the third-party
+license file matches the locked binary dependencies before packaging.
 The OS and architecture SHALL come from the actual runner via `uname`, with
 `Linux` mapped to `linux`, `Darwin` to `macos`, and Linux `aarch64` to `arm64`.
 Only `x86_64` and `arm64` on those platforms SHALL be accepted; other combinations
@@ -81,7 +83,8 @@ Release creation.
 
 - **WHEN** a build runs on Linux x86_64 or macOS arm64
 - **THEN** the archive suffix is `linux-x86_64.tar.gz` or `macos-arm64.tar.gz`
-  respectively, and the archive includes the binary, license, notice, and README
+  respectively, and the archive includes the binary, project license, notice,
+  binary dependency licenses, and README
 - **AND** an unsupported OS/architecture combination fails before artifact upload
 
 #### Scenario: Prevent publication without a matching section

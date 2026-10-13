@@ -1,5 +1,8 @@
 # Third-party notices
 
+Rust binary dependency license texts are in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md),
+which is included alongside this file in release archives.
+
 ## HerdrAgentIconsMax
 
 This plugin bundles `assets/fonts/HerdrAgentIconsMax-Regular.ttf`, copied from

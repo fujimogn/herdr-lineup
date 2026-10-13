@@ -104,8 +104,9 @@ herdr plugin link .
 ```
 
 `plugin link` does not build or copy the checkout. Release archives contain a
-built binary, `LICENSE`, `NOTICE.md`, and `README.md`; they are not standalone
-plugin installations.
+built binary, `LICENSE`, `NOTICE.md`, `THIRD-PARTY-LICENSES.md`, and `README.md`;
+they are not standalone plugin installations. The third-party file includes the
+licenses of Rust dependencies in the binary.
 
 ## Usage
 
