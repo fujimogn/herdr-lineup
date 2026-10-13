@@ -65,8 +65,9 @@ fn signals_paths(
         .enumerate()
     {
         budget.check()?;
-        if index >= 4096 {
-            return Err(MissingReason::Timeout);
+        if index >= MAX_DIRECTORY_ENTRIES {
+            // The 4,097th entry is a full directory, not a deadline.
+            return Err(MissingReason::EntryLimit);
         }
         let entry = entry.map_err(|error| io_reason(&error))?;
         if entry.file_name() != id
@@ -298,6 +299,34 @@ mod tests {
         assert_eq!(
             GrokReader.read(&r).context,
             UsageOutcome::Unavailable(MissingReason::NotFound)
+        );
+    }
+    #[test]
+    fn session_directory_entry_cap_is_not_a_timeout() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for index in 0..(MAX_DIRECTORY_ENTRIES - 1) {
+            fs::write(sessions.join(format!("e{index:04}")), b"").unwrap();
+        }
+        let id = identity(Provider::Grok);
+        let mut request = request(&id, dir.path());
+        request.timeout = Duration::from_secs(10);
+        fixture(dir.path(), r#"{"contextWindowUsage":7}"#, request.now);
+        assert_eq!(
+            fs::read_dir(&sessions).unwrap().count(),
+            MAX_DIRECTORY_ENTRIES
+        );
+        assert_percent(GrokReader.read(&request).context);
+        fs::write(sessions.join("extra"), b"").unwrap();
+        assert_eq!(
+            fs::read_dir(&sessions).unwrap().count(),
+            MAX_DIRECTORY_ENTRIES + 1
+        );
+        assert_eq!(
+            GrokReader.read(&request).context,
+            UsageOutcome::Unavailable(MissingReason::EntryLimit)
         );
     }
 }

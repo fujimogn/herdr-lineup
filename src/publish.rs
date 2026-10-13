@@ -699,6 +699,8 @@ impl MetadataPublisher {
                 }
                 // A shared cycle budget can expire before this pane gets a turn.
                 // Do not turn a transient read timeout into loss of proven identity.
+                // EntryLimit is not transient: the directory stays over the cap, so
+                // the previous context must be dropped instead of kept without expiry.
                 // Cache local observations only; account workers retain their own
                 // reset/auth policy and are overlaid afresh below.
                 if reading.context
@@ -2411,6 +2413,82 @@ mod tests {
         fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
             UsageReading::missing(request, SourceKind::CodexRollout, MissingReason::Timeout)
         }
+    }
+
+    struct EntryCapReader {
+        root: PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl UsageReader for EntryCapReader {
+        fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                return UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now);
+            }
+            let mut budget = Budget::new(request);
+            match budget.files(&self.root, 0, |_| true) {
+                Ok(paths) if paths.len() == MAX_DIRECTORY_ENTRIES => {
+                    UsageReading::sample(request, SourceKind::CodexRollout, 7.0, request.now)
+                }
+                Ok(_) => {
+                    UsageReading::missing(request, SourceKind::CodexRollout, MissingReason::Invalid)
+                }
+                Err(reason) => UsageReading::missing(request, SourceKind::CodexRollout, reason),
+            }
+        }
+    }
+
+    #[test]
+    fn entry_cap_boundary_does_not_keep_previous_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = dir.path().join("entries");
+        std::fs::create_dir(&entries).unwrap();
+        for index in 0..MAX_DIRECTORY_ENTRIES {
+            std::fs::write(entries.join(format!("e{index:04}")), b"").unwrap();
+        }
+        let socket = dir.path().join("fake.sock");
+        let server = token_server(
+            UnixListener::bind(&socket).unwrap(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().into(),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("empty-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        let reader = EntryCapReader {
+            root: entries.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let config = Config {
+            refresh_interval_ms: 5000,
+            reader_timeout_ms: 5000,
+            ..Config::default()
+        };
+        let context = |publisher: &mut MetadataPublisher, transport: &mut Transport| {
+            let (_, response) = publisher.request(transport, "session.snapshot").unwrap();
+            response["result"]["snapshot"]["panes"][0]["tokens"]["lineup_context_text"].clone()
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &config, &reader, &TimeoutReader)
+            .unwrap();
+        assert_eq!(context(&mut publisher, &mut transport), "42%");
+        publisher
+            .refresh_with_readers(&mut transport, &config, &reader, &TimeoutReader)
+            .unwrap();
+        assert_eq!(context(&mut publisher, &mut transport), "07%");
+        std::fs::write(entries.join("extra"), b"").unwrap();
+        publisher
+            .refresh_with_readers(&mut transport, &config, &reader, &TimeoutReader)
+            .unwrap();
+        assert_eq!(context(&mut publisher, &mut transport), "—\u{2800}\u{2800}");
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
     }
 
     struct SampleReader;

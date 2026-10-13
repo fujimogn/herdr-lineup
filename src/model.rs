@@ -32,10 +32,18 @@ pub enum MissingReason {
     PermissionDenied,
     Unassociated,
     Invalid,
+    /// The deadline passed, or another read still holds this provider's slot.
+    /// Callers may keep the previous observation.
     Timeout,
+    /// A directory listing passed `MAX_DIRECTORY_ENTRIES`. The condition lasts
+    /// until entries are removed, so callers must not keep the previous observation.
+    EntryLimit,
     Stale,
     SourceError,
 }
+
+/// Discovery stops after this many directory entries. One more is `EntryLimit`.
+pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UsageOutcome {
@@ -370,8 +378,10 @@ impl Budget {
         for entry in fs::read_dir(root).map_err(|e| io_reason(&e))? {
             self.check()?;
             self.entries += 1;
-            if self.entries > 4096 {
-                return Err(MissingReason::Timeout);
+            if self.entries > MAX_DIRECTORY_ENTRIES {
+                // Distinct from `Timeout`: a full directory does not become readable
+                // on the next attempt, so retaining the previous observation hides it.
+                return Err(MissingReason::EntryLimit);
             }
             let entry = entry.map_err(|e| io_reason(&e))?;
             let kind = entry.file_type().map_err(|e| io_reason(&e))?;
@@ -630,6 +640,26 @@ pub(crate) mod tests {
             )
             .context,
             UsageOutcome::Unavailable(MissingReason::Invalid)
+        );
+    }
+    #[test]
+    fn directory_entry_cap_is_distinct_from_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for index in 0..MAX_DIRECTORY_ENTRIES {
+            fs::write(root.join(format!("e{index:04}")), b"").unwrap();
+        }
+        let id = identity(Provider::Codex);
+        let mut request = request(&id, root);
+        request.timeout = Duration::from_secs(10);
+        let mut budget = Budget::new(&request);
+        let found = budget.files(root, 0, |_| true).unwrap();
+        assert_eq!(found.len(), MAX_DIRECTORY_ENTRIES);
+        fs::write(root.join("extra"), b"").unwrap();
+        let mut budget = Budget::new(&request);
+        assert_eq!(
+            budget.files(root, 0, |_| true),
+            Err(MissingReason::EntryLimit)
         );
     }
 }
