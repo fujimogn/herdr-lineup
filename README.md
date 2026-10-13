@@ -4,7 +4,7 @@ See each AI coding agent's state, context use, and weekly quota in one sidebar
 row in [Herdr](https://herdr.dev), alongside each repository's latest local
 `origin/main` commit time.
 
-<img src="docs/images/sidebar-agents.png" alt="Herdr Agents sidebar showing Lineup agent rows, context use, and weekly quota" width="420">
+<img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/v0.1.0/docs/images/sidebar-agents.png" alt="Herdr Agents sidebar showing Lineup agent rows, context use, and weekly quota" width="420">
 
 - **One row per agent.** Keep vendor logos, state, context, and weekly remaining quota together in the sidebar.
 - **Session-bound usage.** Read local Codex/Grok files and opt-in Claude/Antigravity statusLine observations for the matching pane.
@@ -415,19 +415,47 @@ existing agent settings before changing them; startup does not edit them.
    agent does not inherit a later shell export; set this in its launch wrapper
    or shell configuration and launch the agent with that environment.
 
-2. Put the built binary on the agent's `PATH`. From the checkout root, if
-   `~/.local/bin/herdr-lineup` does not already exist:
+2. Put the binary on the agent's `PATH`. For a GitHub installation, first run
+   `herdr plugin list --plugin herdr-lineup --json` and copy the absolute
+   `plugin_root` value for `herdr-lineup`. This is Herdr's managed checkout,
+   **not** the path printed by `herdr plugin config-dir herdr-lineup`.
+   Check that its built binary exists, then create a link if the destination
+   does not already exist (replace the placeholder with the copied path):
 
    ```sh
+   LINEUP_ROOT="/absolute/plugin_root/from/plugin-list"
+   test -x "$LINEUP_ROOT/target/release/herdr-lineup"
    mkdir -p "$HOME/.local/bin"
-   ln -s "$PWD/target/release/herdr-lineup" "$HOME/.local/bin/herdr-lineup"
+   ln -s "$LINEUP_ROOT/target/release/herdr-lineup" "$HOME/.local/bin/herdr-lineup"
    export PATH="$HOME/.local/bin:$PATH"
    herdr-lineup --version
    ```
 
-   Keep the checkout at that location, and persist the `PATH` change in the
-   environment that launches the agent. Inspect an existing destination instead
-   of overwriting it.
+   Inspect an existing destination instead of overwriting it. Persist the `PATH`
+   change in the environment that launches the agent. Reinstalling replaces the
+   managed checkout: run `herdr plugin list --plugin herdr-lineup --json` again
+   after an upgrade, check `plugin_root` and `herdr-lineup --version`, and update
+   the link if the root changed. Do not copy the managed binary and assume it
+   will update automatically.
+
+   Alternatively, download the archive for your OS and architecture and
+   `SHA256SUMS.txt` from the [release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.1.0).
+   Verify the archive as described in the
+   [release instructions](https://github.com/fujimogn/herdr-lineup/blob/v0.1.0/docs/releasing.md), extract it,
+   and put its `herdr-lineup` executable on `PATH` (replace the placeholder with
+   the extraction directory):
+
+   ```sh
+   mkdir -p "$HOME/.local/bin"
+   install -m 755 /absolute/path/to/extracted/herdr-lineup "$HOME/.local/bin/herdr-lineup"
+   export PATH="$HOME/.local/bin:$PATH"
+   herdr-lineup --version
+   ```
+
+   Inspect an existing destination before replacing it. This archive binary
+   serves the statusLine hook; the Herdr plugin still needs the GitHub install
+   above. Repeat the archive installation when upgrading it, and keep its
+   version aligned with the installed plugin.
 
 3. Merge a `statusLine` entry into `~/.claude/settings.json` (or the project's
    Claude settings). Replace the placeholder with your existing command to
@@ -544,13 +572,25 @@ runtime state or user settings.
 
 ## Uninstall
 
-Keep the checkout, plugin settings, and ownership records until cleanup actions
-have succeeded. Before starting, save the state path from the doctor's
+Keep the plugin, its settings, and ownership records until cleanup actions have
+succeeded. Before starting, save the state path from the doctor's
 `State directory:` line and the config path from
-`herdr plugin config-dir herdr-lineup` for step 6. If Lineup is linked in several
-Herdr sessions, perform the daemon stop in each session before unregistering it.
+`herdr plugin config-dir herdr-lineup` for the final cleanup. Run each action
+from a Herdr pane and check its completed `status`, `exit_code`, and output with
+`herdr plugin log list --plugin herdr-lineup --limit 10` before continuing.
 
-1. Remove the managed sidebar block and check the action log:
+1. Stop only Lineup in every Herdr session where it is running:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.stop
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   Wait for a successful completed stop command in each session. Avoid switching
+   workspaces after stopping: the `workspace.focused` hook can start Lineup
+   again. If it does, repeat the stop before uninstalling.
+
+2. Remove the managed sidebar block:
 
    ```sh
    herdr plugin action invoke herdr-lineup.unconfigure
@@ -561,42 +601,49 @@ Herdr sessions, perform the daemon stop in each session before unregistering it.
    `herdr config check` and `herdr server reload-config`. Resolve modified managed
    blocks as described in [Sidebar](#sidebar) before continuing.
 
-2. If icons were enabled, set `logo_mode = "text"` first, then remove the font
-   and terminal mappings:
+3. If icons were enabled, remove the owned font and terminal mappings:
 
    ```sh
    herdr plugin action invoke herdr-lineup.uninstall-font
    herdr plugin log list --plugin herdr-lineup --limit 10
    ```
 
-   Resolve ownership conflicts with [Disable icons](#disable-icons) before
-   continuing. Remove manual font/mapping installations manually, and reload
-   the terminal configuration.
+   Check the action log for removed paths or `nothing managed`. Resolve ownership
+   conflicts with [Disable icons](#disable-icons) before continuing. Remove
+   manual font/mapping installations manually, and reload the terminal
+   configuration.
 
-3. Stop only Lineup and wait for a successful completed command in the log:
+4. Restore the previous `statusLine` entries in your Claude/Antigravity settings
+   (or remove the entries you added). Inspect those settings to confirm no
+   `herdr-lineup statusline` command remains. Remove the launch-environment
+   export and the `~/.local/bin/herdr-lineup` link or copied archive binary only
+   if you created them for Lineup; check `command -v herdr-lineup` in a new agent
+   launch environment to confirm the intended command is gone. Close any agent
+   still using the old statusLine command before removing the plugin.
+
+5. Immediately before uninstalling, repeat the stop action in every Herdr
+   session where Lineup was running and check its successful completed log entry.
+   This also catches a daemon restarted by a `workspace.focused` hook during
+   the preceding steps:
 
    ```sh
    herdr plugin action invoke herdr-lineup.stop
    herdr plugin log list --plugin herdr-lineup --limit 10
    ```
 
-4. Unregister the linked checkout:
-
-   Avoid switching workspaces between stopping Lineup and unlinking it: the
-   `workspace.focused` hook can restart the daemon. If you switch, repeat step 3
-   before unlinking and verify the daemon remains stopped after unlinking.
+   After every stop completes successfully, uninstall the GitHub-managed plugin
+   without switching workspaces again:
 
    ```sh
-   herdr plugin unlink herdr-lineup
+   herdr plugin uninstall herdr-lineup
+   herdr plugin list --plugin herdr-lineup --json
    ```
 
-   For a GitHub-managed installation, use `herdr plugin uninstall herdr-lineup`
-   instead; it also removes the managed checkout. Unlink leaves the local
-   checkout in place. Config and state are separate from the checkout.
-
-5. Restore the previous `statusLine` entries in your Claude/Antigravity settings
-   (or remove the entries you added). Remove the launch-environment export and
-   the `~/.local/bin/herdr-lineup` symlink if you created them only for Lineup.
+   The list's `result.plugins` array should be empty. Uninstall unregisters the
+   plugin and removes its managed checkout. If you linked a local checkout for
+   development instead, use
+   `herdr plugin unlink herdr-lineup`; it unregisters the plugin but leaves
+   your checkout in place. Config and state are separate from either checkout.
 
 6. After no session daemon or agent hook uses Lineup, inspect the saved plugin
    state/config paths and remove only the Lineup data you no longer need. Keep
@@ -611,7 +658,7 @@ The repository heading reads the newest local `origin/main` commit without
 fetching: `HH:MM` for today, `M/D` for earlier dates. This is a commit-time label,
 not proof of a deployment.
 
-<img src="docs/images/sidebar-spaces.png" alt="Herdr Spaces sidebar showing repository names and local last-ship times" width="420">
+<img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/v0.1.0/docs/images/sidebar-spaces.png" alt="Herdr Spaces sidebar showing repository names and local last-ship times" width="420">
 
 ### Account quota behavior
 
