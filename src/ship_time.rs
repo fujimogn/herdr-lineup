@@ -69,17 +69,22 @@ fn read_repository_before(
     let root = worktrees.split('\0').next()?.strip_prefix("worktree ")?;
     let root = Path::new(root).canonicalize().ok()?;
     let name = root.file_name()?.to_str()?.to_owned();
+    // Unlike log, this format never verifies signatures through a configured
+    // GPG program. Keep the format free of signature verification atoms.
     let ship_unix = output(
         cwd,
         &[
-            "log",
-            "-1",
-            "--format=%ct",
+            "for-each-ref",
+            "--format=%(refname) %(committerdate:unix)",
             "refs/remotes/origin/main",
-            "--",
         ],
     )
-    .and_then(|value| value.trim().parse().ok());
+    .and_then(|value| {
+        // for-each-ref patterns also match descendants such as main/topic.
+        value
+            .lines()
+            .find_map(|line| line.strip_prefix("refs/remotes/origin/main ")?.parse().ok())
+    });
     Some(Repository { name, ship_unix })
 }
 
@@ -115,13 +120,18 @@ pub fn resolve_workspace_cwd<'a>(
 
 fn git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
-    command.arg("-C").arg(cwd);
+    command
+        .arg("-C")
+        .arg(cwd)
+        .args(["--no-pager", "-c", "core.fsmonitor=false"]);
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") {
             command.env_remove(key);
         }
     }
-    // Local log reads must not lazily fetch absent partial-clone objects.
+    // These built-in, read-only queries do not invoke aliases or hooks; disable
+    // pager and fsmonitor explicitly and never request signature verification.
+    // Local object reads must not lazily fetch absent partial-clone objects.
     // Deny remote protocols as well, including on older Git versions.
     command
         .env("GIT_NO_LAZY_FETCH", "1")
@@ -539,6 +549,177 @@ mod tests {
         );
     }
 
+    impl Fixture {
+        fn signed_origin_main(&self) {
+            // A synthetic signature triggers Git's verifier without any keys.
+            let commit = self.git(&["cat-file", "commit", "HEAD"], None);
+            let commit = commit.replacen(
+                "\n\n",
+                "\ngpgsig -----BEGIN PGP SIGNATURE-----\n synthetic\n -----END PGP SIGNATURE-----\n\n",
+                1,
+            );
+            let path = self.root.join("signed-commit");
+            std::fs::write(&path, commit).unwrap();
+            let oid = self.git(
+                &["hash-object", "-t", "commit", "-w", path.to_str().unwrap()],
+                None,
+            );
+            self.git(&["update-ref", "refs/remotes/origin/main", &oid], None);
+        }
+
+        fn hostile_config(&self) -> Vec<PathBuf> {
+            let script = self.root.join("external-program");
+            let body = "#!/bin/sh\nprintf 'executed\\n' > \"$0.marker\"\nexit 1\n";
+            crate::test_support::write_executable(&script, body).unwrap();
+            let program = script.to_str().unwrap();
+            let shell_program = format!("'{}'", program.replace('\'', "'\\''"));
+            for key in [
+                "core.fsmonitor",
+                "core.pager",
+                "gpg.program",
+                "gpg.openpgp.program",
+                "gpg.ssh.program",
+                "gpg.x509.program",
+                "core.sshCommand",
+                "core.gitProxy",
+                "diff.external",
+            ] {
+                self.git(&["config", key, program], None);
+            }
+            for key in ["rev-parse", "worktree", "log", "for-each-ref"] {
+                self.git(
+                    &[
+                        "config",
+                        &format!("alias.{key}"),
+                        &format!("!{shell_program}"),
+                    ],
+                    None,
+                );
+                self.git(&["config", &format!("pager.{key}"), "true"], None);
+            }
+            self.git(
+                &["config", "credential.helper", &format!("!{shell_program}")],
+                None,
+            );
+            self.git(&["config", "log.showSignature", "true"], None);
+            self.git(&["config", "gpg.format", "openpgp"], None);
+            self.git(&["config", "protocol.allow", "always"], None);
+            self.git(
+                &["config", "remote.origin.url", "ssh://fixture.invalid/repo"],
+                None,
+            );
+            let hooks = self.root.join("hooks");
+            std::fs::create_dir(&hooks).unwrap();
+            let mut markers = vec![script.with_extension("marker")];
+            for hook in [
+                "post-checkout",
+                "post-index-change",
+                "reference-transaction",
+                "pre-auto-gc",
+                "pre-command",
+                "post-command",
+            ] {
+                let path = hooks.join(hook);
+                crate::test_support::write_executable(&path, body).unwrap();
+                markers.push(path.with_extension("marker"));
+            }
+            self.git(&["config", "core.hooksPath", hooks.to_str().unwrap()], None);
+            markers
+        }
+    }
+
+    #[test]
+    fn repository_reads_do_not_execute_repo_configured_programs() {
+        let fixture = Fixture::new();
+        fixture.signed_origin_main();
+        let linked = fixture.root.join("detached-worktree");
+        fixture.git(
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+            None,
+        );
+        let markers = fixture.hostile_config();
+        // Both entry points exercise every production Git invocation, including
+        // worktree list from the common directory and both rev-parse queries.
+        for cwd in [&fixture.repo, &linked] {
+            let repository = read_repository(cwd);
+            for marker in &markers {
+                assert!(
+                    !marker.exists(),
+                    "Git executed a configured program: {marker:?}"
+                );
+            }
+            assert_eq!(
+                repository,
+                Some(Repository {
+                    name: "canonical-repo".to_owned(),
+                    ship_unix: Some(1_704_067_200),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_broken_origin_main_does_not_run_configured_programs() {
+        for ref_contents in [
+            None,
+            Some("broken\n"),
+            Some("1111111111111111111111111111111111111111\n"),
+        ] {
+            let fixture = Fixture::new();
+            // Exercise the missing-object path of a partial clone as well.
+            fixture.git(&["config", "remote.origin.promisor", "true"], None);
+            fixture.git(
+                &["config", "remote.origin.partialclonefilter", "blob:none"],
+                None,
+            );
+            let refs = fixture.repo.join(".git/refs/remotes/origin");
+            std::fs::create_dir_all(&refs).unwrap();
+            if let Some(contents) = ref_contents {
+                std::fs::write(refs.join("main"), contents).unwrap();
+            }
+            let markers = fixture.hostile_config();
+            // Missing objects must not reach SSH, credential helpers, or an
+            // external transport even if repository config permits protocols.
+            for remote in [
+                "ssh://fixture.invalid/repo".to_owned(),
+                "https://fixture.invalid/repo".to_owned(),
+                format!("ext::{}", fixture.root.join("external-program").display()),
+            ] {
+                fixture.git(&["config", "remote.origin.url", &remote], None);
+                let repository = read_repository(&fixture.repo);
+                for marker in &markers {
+                    assert!(
+                        !marker.exists(),
+                        "Git executed a configured program: {marker:?}"
+                    );
+                }
+                assert_eq!(
+                    repository,
+                    Some(Repository {
+                        name: "canonical-repo".to_owned(),
+                        ship_unix: None,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn origin_main_prefix_does_not_substitute_a_different_ref() {
+        let fixture = Fixture::new();
+        fixture.git(
+            &["update-ref", "refs/remotes/origin/main/topic", "HEAD"],
+            None,
+        );
+        assert_eq!(read_repository(&fixture.repo).unwrap().ship_unix, None);
+    }
+
     #[test]
     fn linked_worktree_uses_canonical_repository_name() {
         let fixture = Fixture::new();
@@ -583,7 +764,13 @@ mod tests {
         }
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["-C", "/repository"]
+            [
+                "-C",
+                "/repository",
+                "--no-pager",
+                "-c",
+                "core.fsmonitor=false"
+            ]
         );
     }
 
