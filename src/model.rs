@@ -1,8 +1,8 @@
 //! Session-bound local usage observations. No account or conversation data is returned.
 
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,7 +58,7 @@ pub enum SourceKind {
     CodexRollout,
     GrokSignals,
     HermesUnsupported,
-    KimiUnsupported,
+    KimiSession,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,6 +342,13 @@ impl UsageReading {
         }
         reading.context = match request.now.duration_since(observed_at) {
             Err(_) => UsageOutcome::Unavailable(MissingReason::Invalid),
+            // Codex and Grok context do not expire by age. Kimi does, in this
+            // function, at the `request.now` the caller already chose. Codex
+            // and Kimi pass `now_after` the read. Grok passes the worker-start
+            // clock and does not take this branch.
+            Ok(age) if source == SourceKind::KimiSession && age > request.max_age => {
+                UsageOutcome::Unavailable(MissingReason::Stale)
+            }
             // Exact-session context is the last known occupancy, not a heartbeat.
             // Weekly observations apply their own age/reset policy independently.
             Ok(_) if percent.is_finite() && (0.0..=100.0).contains(&percent) => {
@@ -516,6 +523,86 @@ impl Budget {
     }
 }
 
+/// Bytes kept from the end of a plain JSONL file. The header check and its
+/// newline must fit in `JSONL_HEADER_BYTES`; a larger first line is `SourceError`.
+pub(crate) const JSONL_TAIL_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const JSONL_HEADER_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Fingerprint {
+    pub dev: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub mtime: (i64, i64),
+}
+impl Fingerprint {
+    pub(crate) fn of(meta: &Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            inode: meta.ino(),
+            size: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotChange {
+    Stable,
+    Appended,
+    Rejected,
+}
+
+/// An append leaves the bytes already read intact. A rewrite, truncation, or
+/// replacement does not, so the caller must drop that result.
+pub(crate) fn snapshot_change(
+    before: Fingerprint,
+    path_after: Fingerprint,
+    file_after: Fingerprint,
+) -> SnapshotChange {
+    if path_after == before && file_after == before {
+        return SnapshotChange::Stable;
+    }
+    if path_after.dev == before.dev
+        && path_after.inode == before.inode
+        && file_after.dev == before.dev
+        && file_after.inode == before.inode
+        && path_after.size >= before.size
+        && file_after.size >= before.size
+        && (path_after.size > before.size || file_after.size > before.size)
+    {
+        return SnapshotChange::Appended;
+    }
+    SnapshotChange::Rejected
+}
+
+/// Read a whole small JSONL file, or the header plus a complete tail.
+/// `bind_header` runs only when the file is larger than the tail. The returned
+/// text drops a partial first line of a tail and a partial trailing UTF-8 byte.
+pub(crate) fn read_jsonl_tail(
+    budget: &Budget,
+    file: &mut File,
+    size: u64,
+    bind_header: impl FnOnce(&[u8]) -> Result<(), MissingReason>,
+) -> Result<String, MissingReason> {
+    if size <= JSONL_TAIL_BYTES as u64 {
+        return Budget::decode_jsonl(budget.read_range(file, 0, size as usize)?);
+    }
+    let header = budget.read_range(file, 0, JSONL_HEADER_BYTES)?;
+    let end = header
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or(MissingReason::SourceError)?;
+    bind_header(&header[..end])?;
+    let start = size - JSONL_TAIL_BYTES as u64 - 1;
+    let bytes = budget.read_range(file, start, JSONL_TAIL_BYTES + 1)?;
+    let complete = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |index| index + 1);
+    Budget::decode_jsonl(bytes[complete..].to_vec())
+}
+
 pub(crate) fn timestamp(value: &serde_json::Value) -> Option<SystemTime> {
     let date = chrono::DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
     let millis = u64::try_from(date.timestamp_millis()).ok()?;
@@ -679,6 +766,19 @@ pub(crate) mod tests {
             )
             .context,
             UsageOutcome::Unavailable(MissingReason::Invalid)
+        );
+        let mut kimi = identity(Provider::Kimi);
+        kimi.repository_identity = "/synthetic/repo".into();
+        let mut kimi_request = request(&kimi, tmp.path());
+        kimi_request.max_age = Duration::from_secs(60);
+        let stale_at = kimi_request.now - Duration::from_secs(61);
+        assert_eq!(
+            UsageReading::sample(&kimi_request, SourceKind::KimiSession, 7.5, stale_at).context,
+            UsageOutcome::Unavailable(MissingReason::Stale)
+        );
+        assert_eq!(
+            UsageReading::sample(&r, SourceKind::CodexRollout, 7.5, stale_at).context,
+            UsageOutcome::Available(7.5)
         );
     }
     #[test]

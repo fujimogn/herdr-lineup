@@ -9,6 +9,7 @@ use crate::{
     reader_claude::ClaudeReader,
     reader_codex::CodexReader,
     reader_grok::GrokReader,
+    reader_kimi::KimiReader,
     ship_time,
     socket::Transport,
     tokens::{self, Agent, ResourceId, ResourceKind},
@@ -55,6 +56,7 @@ pub(crate) fn capacity_skip_count(error: &io::Error) -> Option<u64> {
 pub struct Homes {
     pub codex: Option<PathBuf>,
     pub grok: Option<PathBuf>,
+    pub kimi: Option<PathBuf>,
     pub statusline_state: Option<PathBuf>,
 }
 impl Homes {
@@ -66,9 +68,14 @@ impl Homes {
             Some(path) => Some(PathBuf::from(path)).filter(|p| p.is_absolute()),
             None => home.as_ref().map(|home| home.join(default)),
         };
+        let kimi = match std::env::var_os("KIMI_CODE_HOME") {
+            Some(path) if !path.is_empty() => Some(PathBuf::from(path)).filter(|p| p.is_absolute()),
+            _ => home.as_ref().map(|home| home.join(".kimi-code")),
+        };
         Self {
             codex: provider("CODEX_HOME", ".codex"),
             grok: provider("GROK_HOME", ".grok"),
+            kimi,
             statusline_state: std::env::var_os("HERDR_PLUGIN_STATE_DIR")
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute()),
@@ -84,6 +91,36 @@ fn grok_sample(outcome: crate::quota_grok::Outcome) -> Option<model::WeeklySampl
         }),
         _ => None,
     }
+}
+
+fn observation_within_max_age(
+    observed: Option<SystemTime>,
+    now: SystemTime,
+    max_age: Duration,
+) -> bool {
+    observed.is_some_and(|observed| now.duration_since(observed).is_ok_and(|age| age <= max_age))
+}
+
+/// Keep the previous local reading after a timeout. Weekly samples without a
+/// reset expire through `observation_within_max_age`. Codex and Grok context
+/// does not expire by age. Kimi context uses that same age check.
+fn restore_local_after_timeout(
+    previous: &model::UsageReading,
+    now: SystemTime,
+    max_age: Duration,
+) -> model::UsageReading {
+    let mut reading = previous.clone();
+    let fresh = observation_within_max_age(reading.observed_at, now, max_age);
+    if reading.source_kind == model::SourceKind::KimiSession && !fresh {
+        reading.context = model::UsageOutcome::Unavailable(model::MissingReason::Stale);
+    }
+    let weekly_valid = reading.weekly_resets_at.map_or(fresh, |reset| reset > now);
+    if !weekly_valid {
+        reading.weekly_remaining = model::UsageOutcome::Unavailable(model::MissingReason::Stale);
+        reading.weekly_window = None;
+        reading.weekly_resets_at = None;
+    }
+    reading
 }
 
 fn fresh_grok_weekly(
@@ -572,6 +609,7 @@ impl MetadataPublisher {
                                     | (model::Provider::Codex, Agent::Codex)
                                     | (model::Provider::Grok, Agent::Grok)
                                     | (model::Provider::Agy, Agent::Agy)
+                                    | (model::Provider::Kimi, Agent::Kimi)
                             )
                             && reading.identity.native_session_id
                                 == who.native_session.clone().unwrap_or_default()
@@ -694,6 +732,11 @@ impl MetadataPublisher {
                         self.homes.grok.as_ref().unwrap_or(&self.directory),
                         grok,
                     ),
+                    Agent::Kimi => (
+                        model::Provider::Kimi,
+                        self.homes.kimi.as_ref()?,
+                        &KimiReader,
+                    ),
                     _ => return None,
                 };
                 // Snapshot has no pane-specific home/profile. Only the injected daemon
@@ -746,22 +789,7 @@ impl MetadataPublisher {
                     && previous.identity == identity
                     && previous.source_kind == reading.source_kind
                 {
-                    reading = previous.clone();
-                    let weekly_valid = reading.weekly_resets_at.map_or_else(
-                        || {
-                            reading.observed_at.is_some_and(|observed| {
-                                now.duration_since(observed)
-                                    .is_ok_and(|age| age <= request.max_age)
-                            })
-                        },
-                        |reset| reset > now,
-                    );
-                    if !weekly_valid {
-                        reading.weekly_remaining =
-                            model::UsageOutcome::Unavailable(model::MissingReason::Stale);
-                        reading.weekly_window = None;
-                        reading.weekly_resets_at = None;
-                    }
+                    reading = restore_local_after_timeout(previous, now, request.max_age);
                 }
                 if reading.binding.is_some() {
                     self.local_readings
@@ -3582,6 +3610,7 @@ mod tests {
         let homes = Homes {
             codex: Some(home.clone()),
             grok: Some(home),
+            kimi: None,
             statusline_state: None,
         };
         let mut publisher =
@@ -3620,5 +3649,200 @@ mod tests {
         );
         assert_eq!(reports[3]["params"]["seq"], 3);
         assert_eq!(reports[4]["params"]["seq"], 2);
+    }
+
+    #[test]
+    fn kimi_dispatch_publishes_completed_context_and_keeps_weekly_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("kimi-home");
+        let session = home.join("sessions/wd_synthetic/session-1");
+        std::fs::create_dir_all(session.join("agents/main")).unwrap();
+        std::fs::write(
+            session.join("state.json"),
+            r#"{"id":"session-1","cwd":"/synthetic/repo"}"#,
+        )
+        .unwrap();
+        let observed_ms = (unix(SystemTime::now()) as u128) * 1000;
+        std::fs::write(
+            session.join("agents/main/wire.jsonl"),
+            format!(
+                r#"{{"type":"metadata","protocol_version":"1.5","created_at":1}}
+{{"type":"profile.bind","agentId":"main","modelAlias":"synthetic-alias","systemPrompt":"synthetic","disallowedTools":[],"thinkingEffort":"off","time":{observed_ms}}}
+{{"type":"token_counting.turn_recorded","agentId":"main","turnId":1,"length":2,"tokens":75,"time":{observed_ms}}}
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[models.\"synthetic-alias\"]\nmax_input_size = 1000\nmax_context_size = 100000\napi_key = \"synthetic-credential\"\n",
+        )
+        .unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = Arc::new(std::sync::Mutex::new(json!({
+            "id": "template",
+            "result": {"type":"session_snapshot","snapshot":{
+                "version":"0.9.3","protocol":22,
+                "workspaces":[{"workspace_id":"w1"}],
+                "panes":[{
+                    "pane_id":"w1:p1",
+                    "workspace_id":"w1",
+                    "agent":"kimi",
+                    "agent_session":{"agent":"kimi","kind":"id","value":"session-1"},
+                    "agent_status":"idle",
+                    "cwd":"/synthetic/repo"
+                }]
+            }}
+        })));
+        let server = token_server_with_template(
+            UnixListener::bind(&socket).unwrap(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            template,
+        );
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            state,
+            "fake".into(),
+            Homes {
+                kimi: Some(home),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        publisher
+            .refresh(&mut transport, &Config::default())
+            .unwrap();
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        let tokens = &response["result"]["snapshot"]["panes"][0]["tokens"];
+        assert_eq!(tokens["lineup_context_text"], "08%");
+        assert_eq!(tokens["lineup_context_pct"], "7.5");
+        assert_eq!(tokens["lineup_weekly_text"], "—");
+        assert!(tokens["lineup_weekly_pct"].is_null());
+        let mut disabled = Config::default();
+        disabled.providers.retain(|provider| provider != "kimi");
+        publisher.refresh(&mut transport, &disabled).unwrap();
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        let tokens = &response["result"]["snapshot"]["panes"][0]["tokens"];
+        assert!(tokens["lineup_context_pct"].is_null());
+        assert!(tokens["lineup_context_text"].is_null());
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn timeout_restore_applies_usage_age_to_kimi_context_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("kimi-home");
+        let session = home.join("sessions/wd_synthetic/session-1");
+        std::fs::create_dir_all(session.join("agents/main")).unwrap();
+        std::fs::write(
+            session.join("state.json"),
+            r#"{"id":"session-1","cwd":"/synthetic/repo"}"#,
+        )
+        .unwrap();
+        let observed_ms = (unix(SystemTime::now()) as u128) * 1000;
+        std::fs::write(
+            session.join("agents/main/wire.jsonl"),
+            format!(
+                r#"{{"type":"profile.bind","agentId":"main","modelAlias":"synthetic-alias","time":{observed_ms}}}
+{{"type":"token_counting.turn_recorded","agentId":"main","tokens":75,"time":{observed_ms}}}
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[models.\"synthetic-alias\"]\nmax_input_size = 1000\nmax_context_size = 100000\n",
+        )
+        .unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = Arc::new(std::sync::Mutex::new(json!({
+            "id": "template",
+            "result": {"type":"session_snapshot","snapshot":{
+                "version":"0.9.3","protocol":22,
+                "workspaces":[{"workspace_id":"w1"}],
+                "panes":[
+                    {
+                        "pane_id":"w1:p1","workspace_id":"w1","agent":"codex",
+                        "agent_session":{"agent":"codex","kind":"id","value":"synthetic-session"},
+                        "agent_status":"idle","cwd":"/synthetic/repo"
+                    },
+                    {
+                        "pane_id":"w1:p2","workspace_id":"w1","agent":"kimi",
+                        "agent_session":{"agent":"kimi","kind":"id","value":"session-1"},
+                        "agent_status":"idle","cwd":"/synthetic/repo"
+                    }
+                ]
+            }}
+        })));
+        let server = token_server_with_template(
+            UnixListener::bind(&socket).unwrap(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            template,
+        );
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            state,
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("codex-home")),
+                kimi: Some(home),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        let config = Config {
+            refresh_interval_ms: 1000,
+            reader_timeout_ms: 100,
+            usage_max_age_ms: 1000,
+            ..Config::default()
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &config, &SampleReader, &TimeoutReader)
+            .unwrap();
+        struct ExhaustBudget;
+        impl UsageReader for ExhaustBudget {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                std::thread::sleep(request.timeout + Duration::from_millis(1));
+                TimeoutReader.read(request)
+            }
+        }
+        publisher
+            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .unwrap();
+        let (_, fresh) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        let pane = |response: &Value, index: usize| {
+            response["result"]["snapshot"]["panes"][index]["tokens"].clone()
+        };
+        assert_eq!(pane(&fresh, 0)["lineup_context_text"], "42%");
+        assert_eq!(pane(&fresh, 1)["lineup_context_text"], "08%");
+        let stale_at = SystemTime::now() - Duration::from_millis(config.usage_max_age_ms + 1);
+        for reading in publisher.local_readings.values_mut() {
+            reading.observed_at = Some(stale_at);
+        }
+        publisher
+            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .unwrap();
+        let (_, expired) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        assert_eq!(pane(&expired, 0)["lineup_context_text"], "42%");
+        assert_eq!(
+            pane(&expired, 1)["lineup_context_text"],
+            "—\u{2800}\u{2800}"
+        );
+        assert!(pane(&expired, 1)["lineup_context_pct"].is_null());
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
     }
 }

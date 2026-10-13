@@ -50,15 +50,15 @@ not be mislabeled weekly. Used percentage SHALL be converted to remaining by
 
 ### Requirement: Provider source availability remains explicit
 The plugin SHALL support six provider identities for pane rows and invoke
-local readers for the four implemented adapters only.
+local readers for the five implemented adapters only.
 
 #### Scenario: Enumerate reader availability
 - **WHEN** a supported provider is selected
 - **THEN** its adapter obeys the stage and source-detail status in this table
 
-The publisher SHALL invoke local readers only for Claude, Codex, Grok, and
-Antigravity. Kimi and Hermes SHALL retain unavailable usage without invoking
-their unsupported reader types. Source implementation details SHALL be
+The publisher SHALL invoke local readers only for Claude, Codex, Grok,
+Antigravity, and Kimi. Hermes SHALL retain unavailable usage without invoking
+its unsupported reader type. Source implementation details SHALL be
 resolved by the usage-source research before enabling another adapter.
 
 | Reader | Context outcome | Weekly remaining outcome | Source detail status |
@@ -67,13 +67,12 @@ resolved by the usage-source research before enabling another adapter.
 | `codex` | Exact native-session rollout context with the 12,000-token UI baseline or unavailable | Subscription seven-day remaining from the daemon home, with network opt-in | Implemented local context and background app-server quota; Lineup never opens Codex auth files |
 | `grok` | Exact native-session `signals.json` context or unavailable | Account-wide WEEKLY billing remaining with network opt-in | Implemented local context and background authenticated billing; MONTHLY is unavailable |
 | `agy` | Validated statusLine context or unavailable | Active-pool weekly remaining or unavailable | Implemented capture and local reader; hook opt-in required |
-| `kimi` | Unavailable in stage one | Unavailable in stage one | TBD; enable only after confirmed source |
+| `kimi` | Completed-turn context from the exact local session, or unavailable | Unavailable | Local session file under `KIMI_CODE_HOME` (default `~/.kimi-code`); no network and no credential values |
 | `hermes` | Unavailable in stage one | Unavailable in stage one | TBD; enable only after confirmed source |
 
-#### Scenario: Kimi before research acceptance
-- **WHEN** a Kimi pane exists but its usage adapter has no confirmed source
-- **THEN** its logo and Herdr state still render, while context and weekly display
-  are both `—` and their numeric keys are cleared
+#### Scenario: Kimi weekly stays unavailable
+- **WHEN** a Kimi pane has a published context percentage
+- **THEN** weekly remaining still displays `—` and its numeric key is cleared
 
 ### Requirement: Freshness and failure do not retain misleading usage
 Local reader calls SHALL share a bounded refresh-cycle deadline and retain only
@@ -97,8 +96,9 @@ Samples whose timestamps are invalid, or later than that read's comparison
 clock, or whose identity no longer matches the occupant SHALL be unavailable.
 The comparison clock SHALL be taken for the pane being read and advanced
 through the read, so an observation written while an earlier pane was processed
-is not future. Context SHALL retain the last valid exact
-session or statusLine-bound observation regardless of its age. Weekly samples
+is not future. Context for Claude, Antigravity, Codex, and Grok SHALL retain
+the last valid exact session or statusLine-bound observation regardless of its
+age. Kimi completed-turn context SHALL expire after `usage_max_age_ms`. Weekly samples
 with a reset time SHALL expire at that time; statusLine weekly samples without a
 reset time SHALL expire after `usage_max_age_ms`. Codex quota without a reset
 SHALL follow the client interval and be cleared after a failed query. The daemon SHALL replace expired or failed
@@ -112,8 +112,8 @@ SHALL return unavailable. Reader results, metadata, and diagnostics SHALL NOT
 contain credential values, conversation contents, or personal account identifiers.
 
 #### Scenario: Exact-session context stops updating while idle
-- **WHEN** the last valid context observation exceeds 60 seconds but its binding
-  still matches the current occupant
+- **WHEN** the last valid Claude, Antigravity, Codex, or Grok context observation
+  exceeds 60 seconds but its binding still matches the current occupant
 - **THEN** context retains the last observed percentage
 - **AND** weekly without a reset time expires after its maximum age
 - **AND** weekly with a reset time remains available only until that reset
@@ -170,6 +170,80 @@ SHALL remain unchanged. Error exits SHALL use the same worker cleanup.
 - **WHEN** shutdown is requested during HTTP or app-server I/O
 - **THEN** stop finishes within its five-second deadline without joining HTTP
 - **AND** no Codex app-server child remains after daemon exit
+
+### Requirement: Kimi context comes from one completed turn
+When `kimi` is enabled, the publisher SHALL read the daemon's Kimi home. The
+home SHALL be `KIMI_CODE_HOME` when that variable is a nonempty absolute path,
+and `~/.kimi-code` when the variable is unset or empty. A non-absolute override
+SHALL make the home unavailable. The reader SHALL select exactly one regular,
+nonsymlinked `state.json` under `sessions/` whose `id` equals the pane's
+nonempty native session id and whose lexically normalized `cwd` equals the pane
+cwd. Normalization SHALL NOT resolve symlinks. Zero matches, mismatches, and
+more than one readable match SHALL be unavailable. An unreadable `state.json`
+whose session directory name equals the pane's native session id SHALL make
+context unavailable, because that file could be a duplicate. An unreadable
+`state.json` in a differently named session directory SHALL NOT hide one
+readable match.
+
+The reader SHALL then read that session's regular, nonsymlinked
+`agents/main/wire.jsonl` from its tail, using the same fingerprint and
+append-during-read rules as the Codex rollout reader. Directory components,
+including `agents` and `main`, SHALL be opened with `O_NOFOLLOW` and SHALL NOT
+be followed when they are symlinks. It SHALL use the last main-agent
+`token_counting.turn_recorded.tokens` and the model alias bound before that
+turn. A binding after that turn, an alias that falls outside the read tail, or
+an alias that cannot be determined uniquely SHALL make context unavailable. A
+later event that changes context, including `token_counting.rebased`,
+`context.apply_compaction`, or an in-progress turn, SHALL make context
+unavailable. The alias SHALL resolve to that model's `max_input_size` in
+`config.toml`, or `max_context_size` when `max_input_size` is absent. The
+reader SHALL parse the file with the `toml` crate and retain only those two
+integer fields. An integer below 1, or a value that is not an integer, SHALL
+make the window unavailable and SHALL NOT fall back to the other size. The
+Kimi home MAY be a symlink, matching Codex resolution of its home. A symlink
+at `sessions/` or below SHALL NOT be followed. Unknown
+aliases, nonpositive windows, ambiguous model entries, and an input size
+greater than the context size SHALL be unavailable. The percentage SHALL be
+`100 * tokens / window`, bounded like the other context labels. An observation
+older than `usage_max_age_ms` SHALL be unavailable, including when a timeout
+restores the previous local reading through the same retention function as
+Codex and Grok. That function SHALL keep Codex and Grok context regardless of
+age.
+
+The reader SHALL NOT use the network. It SHALL parse `config.toml` with the
+`toml` crate and retain only `id`, `cwd`, event type, `agentId`, `tokens`,
+`time`, the alias bound to the selected turn, and that alias's `max_input_size`
+and `max_context_size`.
+Credential, token, and API-key values SHALL NOT be retained or logged. Kimi
+weekly remaining SHALL stay unavailable.
+
+#### Scenario: Completed turn publishes context
+- **WHEN** one regular session matches the pane's native session id and cwd
+- **AND** its main-agent wire ends on a completed turn whose model window is positive
+- **AND** the observation is within `usage_max_age_ms`
+- **THEN** context is `100 * tokens / window`
+- **AND** weekly remaining is unavailable
+
+#### Scenario: Binding and file shape reject a value
+- **WHEN** the native session id or normalized cwd does not match, more than one
+  session matches, or `state.json` or `wire.jsonl` is a symlink
+- **THEN** context is unavailable
+
+#### Scenario: Later context changes and unknown models reject a value
+- **WHEN** a turn is still in progress, a compaction or token rebase follows the
+  recorded turn, a model binding follows the selected turn without a new
+  completed turn, the alias is outside the read tail, or the model alias has no
+  positive unambiguous window
+- **THEN** context is unavailable
+
+#### Scenario: A model switch uses the alias in effect for the new turn
+- **WHEN** one completed turn is bound to alias A and a later completed turn is
+  bound to alias B
+- **THEN** context uses alias B's window
+
+#### Scenario: Old Kimi observation expires
+- **WHEN** the completed-turn observation is older than `usage_max_age_ms`
+- **THEN** context is unavailable
 
 ### Requirement: Codex context matches its UI baseline
 Codex context SHALL calculate `max(total_tokens - 12000, 0) /
@@ -295,8 +369,10 @@ Readers SHALL reject future observations, oversized or malformed records,
 nonregular files, and symlinked observation
 roots/files. The read SHALL use the existing bounded timeout contract. An
 observation whose supplied weekly reset is at or before `now` SHALL have
-unavailable weekly data, while a bound context observation may remain available.
-Context SHALL NOT expire by `max_age`. Weekly without a reset SHALL still obey
+unavailable weekly data, while a bound Claude, Antigravity, Codex, or Grok
+context observation may remain available.
+Those context observations SHALL NOT expire by `max_age`. Kimi completed-turn
+context SHALL expire after `usage_max_age_ms`. Weekly without a reset SHALL still obey
 `max_age`; weekly with a reset SHALL use that reset as its expiry.
 Unavailable weekly SHALL clear window/reset values. A missing reset SHALL omit
 the countdown without inventing a timestamp. The publisher SHALL select both

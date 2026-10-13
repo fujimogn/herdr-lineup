@@ -33,7 +33,8 @@ remaining, and the time until reset. Unavailable usage shows `—`.
 | Codex | Exact-session local rollout, with the 12,000-token UI baseline | Account quota worker when `allow_network = true` |
 | Grok | Exact-session local `signals.json` | Shared billing worker when `allow_network = true`; WEEKLY only |
 | Antigravity | Opt-in statusLine observation | Active-model weekly pool from statusLine |
-| Kimi / Hermes | Unavailable | Unavailable |
+| Kimi | Local session file | Unavailable |
+| Hermes | Unavailable | Unavailable |
 
 See [Sidebar tokens](#sidebar-tokens) for display formatting and terminal-cell
 alignment, and [Source research](docs/research/usage-sources.md) for usage inputs.
@@ -390,7 +391,7 @@ credentials are displayed or persisted by Lineup. Do not restart the Herdr serve
 
 ### Claude and Antigravity statusLine (opt-in)
 
-Codex and Grok context are read from local session files. Claude and
+Codex, Grok, and Kimi context are read from local session files. Claude and
 Antigravity supply observations through an opt-in statusLine command. Save your
 existing agent settings before changing them; startup does not edit them.
 
@@ -509,10 +510,12 @@ pane. Antigravity ignores any conversation id in the JSON. Herdr panes provide
 `HERDR_PANE_ID`.
 
 Context stays `—` until an observation matches the pane, then retains the last
-valid value while that exact session or pane binding matches. Idle context does
-not expire by age. Weekly quota with a reset time expires at that time. StatusLine
-weekly without a reset uses the default maximum age of 60 seconds; Codex quota
-without a reset follows its client interval and clears after a failed query.
+valid value while that exact session or pane binding matches. Idle Claude,
+Antigravity, Codex, and Grok context does not expire by age. Kimi context expires
+after `usage_max_age_ms`. Weekly quota with a reset time expires at that time.
+StatusLine weekly without a reset uses the default maximum age of 60 seconds;
+Codex quota without a reset follows its client interval and clears after a failed
+query.
 
 ### Environment variables
 
@@ -532,6 +535,7 @@ paths for state, socket, config, and provider homes.
 | `XDG_CONFIG_HOME` | Font actions' kitty/Ghostty config base; an absolute value replaces `~/.config`. Does not select Herdr's sidebar config. |
 | `CODEX_HOME` | Codex local session home and account-quota client home; defaults to `~/.codex`. A non-absolute override makes the local home unavailable. |
 | `GROK_HOME` | Grok local session home (default `~/.grok`) and fallback base for `auth.json`. A non-absolute override makes the local session home unavailable. |
+| `KIMI_CODE_HOME` | Kimi local session home; defaults to `~/.kimi-code`. An empty value uses that default. A non-absolute override makes the local home unavailable. |
 | `GROK_AUTH_FILE` | Explicit Grok billing auth file, before `GROK_HOME/auth.json` and `~/.grok/auth.json`; used only with network opt-in. |
 
 `HOME` supplies the per-user defaults above and must be absolute for font
@@ -644,6 +648,32 @@ Lineup daemon after changing authentication or profiles to discard cached accoun
 quota. Grok has one configured auth source, so its weekly quota is shared by all
 Grok panes, even without local context.
 
+Kimi context uses one regular, nonsymlinked `state.json` under `KIMI_CODE_HOME`
+whose `id` equals the pane's nonempty native session id and whose normalized
+`cwd` equals the pane cwd. Duplicate readable matches are unavailable. An
+unreadable `state.json` hides that match only when its session directory name
+is the pane's native session id, because that file could be a duplicate.
+`KIMI_CODE_HOME` may itself be a symlink, and symlinks underneath it are not
+followed. From
+that session's regular `agents/main/wire.jsonl`, opened without following a
+symlink at `agents` or `main`, the reader uses the last
+`token_counting.turn_recorded.tokens` for the main agent and the model alias
+bound before that turn. A binding after the turn, an alias that is outside the
+read tail, compaction, a token rebase, or a turn still in progress makes the
+value unavailable. The alias resolves through the `toml` crate to `max_input_size` in
+`config.toml`, or `max_context_size` when the input size is absent. Only those
+integers are kept. A value that is not an integer of at least 1 makes the
+window unavailable and does not fall back to the other size. Unknown aliases,
+nonpositive
+windows, and an input size above the context size are unavailable. The
+percentage is `100 * tokens / window`, and the sidebar rounds it like the other
+context labels. The reader does not use the network. The `toml` crate parses
+`config.toml` and the reader keeps only that alias's `max_input_size` and
+`max_context_size`; credential,
+token, and API-key values are not retained or logged. A timeout keeps a fresh
+Kimi context only until `usage_max_age_ms`, through the same retention path as
+Codex and Grok. Kimi weekly remains unavailable.
+
 Workers stop scheduling queries on daemon shutdown. Stop does not join a pending
 Grok HTTP request (process exit ends it), and it kills/reaps the in-flight Codex
 app-server process group. The existing five-second stop deadline is preserved.
@@ -736,6 +766,9 @@ Lineup reads usage fields from local session files and publishes display
 metadata to the local Herdr socket. It does not store conversation text,
 transcript paths, or credentials. StatusLine records contain only percentages,
 an optional reset time, the provider, an opaque binding key, and observation time.
+The Kimi reader uses session `id` and `cwd`, the main-agent turn's token count,
+time, and model alias, and that model's window keys. It does not retain other
+`config.toml` values.
 
 Network access stays disabled unless you set `allow_network = true`. That opt-in
 enables only the configured Codex account-quota and Grok billing workers.

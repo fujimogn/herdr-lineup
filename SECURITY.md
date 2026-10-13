@@ -86,6 +86,29 @@ local Herdr socket. Plugin settings and state belong in Herdr plugin directories
 Configuration writes require the explicit opt-in actions. See the README for
 implemented runtime behavior. Other provider API access is outside this opt-in.
 
+## Kimi local session reader
+
+When `kimi` is enabled, the publisher reads one Kimi home resolved from
+`KIMI_CODE_HOME` or, when that variable is unset or empty, `~/.kimi-code`.
+A non-absolute override disables the home. The home path itself may be a
+symlink, the same way Codex resolves its home. The reader opens only regular
+files and does not follow symlinks underneath that home, including `sessions`,
+`agents`, or `main`:
+
+- `sessions/<workdir-key>/<session>/state.json`, retaining only `id` and `cwd`
+- that session's `agents/main/wire.jsonl`, retaining only event type, `agentId`,
+  `tokens`, `time`, and the `modelAlias` bound before the selected turn
+- `config.toml`, parsed with the `toml` crate so the reader keeps only
+  `max_input_size` and `max_context_size` for the selected model alias
+
+Other `config.toml` keys, including credential, token, and API-key values, are
+not retained or logged. The reader performs no network I/O and does not open
+credential stores. An unreadable `state.json` hides a match only when its
+session directory is named with the pane's native session id, because that
+file could be a duplicate. A window value that is not an integer of at least 1
+does not select the other window. Weekly
+Kimi quota stays unavailable. Development tests use synthetic fixtures only.
+
 ## Repository heading Git queries
 
 Repository headings use local, read-only Git built-in queries without signature

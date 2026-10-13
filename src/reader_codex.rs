@@ -2,36 +2,14 @@
 use crate::model::*;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::{self, Metadata};
-use std::os::unix::fs::MetadataExt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
-// A context observation outside this suffix is NotFound, not a full-file scan.
-// The header and its newline must fit in 256 KiB. Oversized headers are SourceError.
-const TAIL_BYTES: usize = 2 * 1024 * 1024;
-const HEADER_BYTES: usize = 256 * 1024;
 const CACHE_ENTRIES: usize = 128;
 type Observation = Result<(f64, SystemTime), MissingReason>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Fingerprint {
-    dev: u64,
-    inode: u64,
-    size: u64,
-    mtime: (i64, i64),
-}
-impl Fingerprint {
-    fn of(meta: &Metadata) -> Self {
-        Self {
-            dev: meta.dev(),
-            inode: meta.ino(),
-            size: meta.len(),
-            mtime: (meta.mtime(), meta.mtime_nsec()),
-        }
-    }
-}
 struct CachedRollout {
     fingerprint: Fingerprint,
     observation: Observation,
@@ -134,20 +112,12 @@ fn read_session_with_hooks(
     let path_after = Fingerprint::of(&current);
     after_path_stat(path);
     let file_after = Fingerprint::of(&file.metadata().map_err(|e| io_reason(&e))?);
-    if path_after != fingerprint || file_after != fingerprint {
+    match snapshot_change(fingerprint, path_after, file_after) {
         // An append cannot change bytes in the prefix read above. Return its
         // complete observation, but require a fresh read on the next cycle.
-        if path_after.dev == fingerprint.dev
-            && path_after.inode == fingerprint.inode
-            && file_after.dev == fingerprint.dev
-            && file_after.inode == fingerprint.inode
-            && path_after.size >= fingerprint.size
-            && file_after.size >= fingerprint.size
-            && (path_after.size > fingerprint.size || file_after.size > fingerprint.size)
-        {
-            return result;
-        }
-        return Err(MissingReason::SourceError);
+        SnapshotChange::Appended => return result,
+        SnapshotChange::Rejected => return Err(MissingReason::SourceError),
+        SnapshotChange::Stable => {}
     }
     if !matches!(
         result,
@@ -169,31 +139,14 @@ fn read_session_with_hooks(
 }
 
 fn read_tail(file: &mut fs::File, size: u64, id: &str, budget: &Budget) -> Observation {
-    if size <= TAIL_BYTES as u64 {
-        let text = Budget::decode_jsonl(budget.read_range(file, 0, size as usize)?)?;
-        return parse_records(&text, id, budget, false);
-    }
-    let header = budget.read_range(file, 0, HEADER_BYTES)?;
-    let end = header
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .ok_or(MissingReason::SourceError)?;
-    let value: Value =
-        serde_json::from_slice(&header[..end]).map_err(|_| MissingReason::Invalid)?;
-    if value["type"] != "session_meta" || value["payload"]["id"].as_str() != Some(id) {
-        return Err(MissingReason::Unassociated);
-    }
-    // Include the preceding byte: a suffix exactly on a line boundary must keep
-    // its first record. Otherwise discard bytes before the next newline, before
-    // UTF-8 decoding (the split can itself be inside a multibyte character).
-    let start = size - TAIL_BYTES as u64 - 1;
-    let bytes = budget.read_range(file, start, TAIL_BYTES + 1)?;
-    let complete = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(bytes.len(), |i| i + 1);
-    let text = Budget::decode_jsonl(bytes[complete..].to_vec())?;
-    parse_records(&text, id, budget, true)
+    let text = read_jsonl_tail(budget, file, size, |header| {
+        let value: Value = serde_json::from_slice(header).map_err(|_| MissingReason::Invalid)?;
+        if value["type"] != "session_meta" || value["payload"]["id"].as_str() != Some(id) {
+            return Err(MissingReason::Unassociated);
+        }
+        Ok(())
+    })?;
+    parse_records(&text, id, budget, size > JSONL_TAIL_BYTES as u64)
 }
 
 fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Observation {
@@ -302,7 +255,7 @@ mod tests {
             );
             assert_eq!(header.len() + 1, header_bytes);
             fs::write(&path, format!("{header}\n{padding}{sample}")).unwrap();
-            assert!(fs::metadata(&path).unwrap().len() > TAIL_BYTES as u64);
+            assert!(fs::metadata(&path).unwrap().len() > JSONL_TAIL_BYTES as u64);
             let result = read_session(&r).map(|_| ());
             assert_eq!(result, expected);
         }
@@ -457,10 +410,10 @@ mod tests {
         let empty =
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null}}\n";
         let partial = "{\"type\":";
-        let filler = " ".repeat(TAIL_BYTES - sample.len() - empty.len() - partial.len() - 3);
+        let filler = " ".repeat(JSONL_TAIL_BYTES - sample.len() - empty.len() - partial.len() - 3);
         // The only sample starts exactly at the suffix boundary.
         let suffix = format!("{sample}{filler}{{}}\n{empty}{partial}");
-        assert_eq!(suffix.len(), TAIL_BYTES);
+        assert_eq!(suffix.len(), JSONL_TAIL_BYTES);
         fs::write(&path, format!("{header}\n{suffix}")).unwrap();
         assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
         fs::write(&path, format!("{header}\n{suffix}\n")).unwrap();
@@ -478,7 +431,7 @@ mod tests {
             .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
         let text = fs::read_to_string(&path).unwrap();
         let (header, sample) = text.split_once('\n').unwrap();
-        let padding = format!("{{\"text\":\"{}\"}}\n", "x".repeat(TAIL_BYTES));
+        let padding = format!("{{\"text\":\"{}\"}}\n", "x".repeat(JSONL_TAIL_BYTES));
         fs::write(&path, format!("{header}\n{sample}{padding}")).unwrap();
         assert_eq!(read_session(&r), Err(MissingReason::NotFound));
         let wrong_header = header.replace("session-1", "session-2");
