@@ -4,9 +4,10 @@ Maintainer-facing release process, following the structure of
 [graphify's release guide](https://github.com/Graphify-Labs/graphify/blob/v8/RELEASING.md).
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the
-binaries and creates a GitHub Release in this repository. The repository stays
-private; nothing is published to a marketplace. A human creates and pushes the
-tag. The workflow never tags or pushes on its own.
+binaries and creates a GitHub Release in this public repository. Marketplace
+discovery is automatic for public repositories with the `herdr-plugin` topic
+and a valid manifest; a listing is not a Herdr review. A human creates and
+pushes the tag. The workflow never tags or pushes on its own.
 
 ## Steps
 
@@ -86,13 +87,13 @@ Plugin installation builds from a checkout using the manifest's Cargo build
 command. The archives are not standalone plugin installations: they do not
 include the manifest or Rust sources. Put the extracted executable on the
 agent's `PATH` for commands such as `statusline`, following the README's shared
-`HERDR_PLUGIN_STATE_DIR` setup. Install or link the plugin from a checkout as
-described in the README.
+`HERDR_PLUGIN_STATE_DIR` setup. Install from GitHub, or build and link a local
+checkout for development, as described in the README.
 
 The macOS executable is not Developer ID signed or notarized. Browser downloads
 receive macOS quarantine metadata, so Gatekeeper may block execution even after
-the checksum matches. Building from a trusted checkout is the documented plugin
-installation path; an archive checksum alone does not establish publisher trust.
+the checksum matches. The documented plugin installation builds a GitHub
+checkout locally; an archive checksum alone does not establish publisher trust.
 
 ## Version numbering
 

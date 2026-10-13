@@ -10,13 +10,9 @@ row in [Herdr](https://herdr.dev), alongside each repository's latest local
 - **Session-bound usage.** Read local Codex/Grok files and opt-in Claude/Antigravity statusLine observations for the matching pane.
 - **Account quota by choice.** Enable Codex/Grok account queries with `allow_network = true`; network access is off by default.
 
-> [!NOTE]
-> This repository is private. Public installation is **Planned**; the local
-> release build already publishes rows after `ensure`.
-
 ## Documentation
 
-- [Releasing](docs/releasing.md) — version checks, release notes, and the private release workflow.
+- [Releasing](docs/releasing.md) — version checks, release notes, and the release workflow.
 - [Testing](docs/testing.md) — isolated lifecycle and metadata verification.
 - [Usage sources](docs/research/usage-sources.md) — provider inputs and availability.
 - [Codex context drift](docs/research/codex-context-drift.md) — evidence for the one-point display gap.
@@ -45,36 +41,31 @@ alignment, and [Source research](docs/research/usage-sources.md) for usage input
 ## Install
 
 Requires macOS or Linux, Herdr 0.9.3 or later, Git, and
-[rustup](https://rustup.rs). You need access to this private repository.
+[rustup](https://rustup.rs) with the toolchain pinned in
+`rust-toolchain.toml` (Rust 1.99.0). Make sure `cargo` is available on `PATH`.
+The source build during installation can take several minutes.
 
-1. Clone the checkout into a directory you will keep:
-
-   ```sh
-   git clone https://github.com/fujimogn/herdr-lineup.git
-   cd herdr-lineup
-   ```
-
-2. Let rustup install the toolchain pinned in `rust-toolchain.toml` (Rust 1.99.0),
-   then build the release binary:
+1. Install from the public GitHub repository:
 
    ```sh
-   rustup toolchain install
-   cargo build --release --locked
+   herdr plugin install fujimogn/herdr-lineup
    ```
 
-3. Register that checkout. Linking does not build it or copy it elsewhere:
+   Review Herdr's source and command preview before confirming. The manifest's
+   `cargo build --release --locked` command runs after confirmation and before
+   registration; if the build fails, Herdr does not register Lineup. To pin the
+   v0.1.0 release, add `--ref v0.1.0`. Use `--yes` only when you already trust
+   the source and want to skip the interactive confirmation. If you previously
+   linked a local checkout, run `herdr plugin unlink herdr-lineup` before
+   installing; installation over a local link is refused.
 
-   ```sh
-   herdr plugin link .
-   ```
-
-4. In a pane of the Herdr session you want to use, start Lineup:
+2. In a pane of the Herdr session you want to use, start Lineup:
 
    ```sh
    herdr plugin action invoke herdr-lineup.start
    ```
 
-5. Check the daemon and read the action's output in the plugin log:
+3. Check the daemon and read the action's output in the plugin log:
 
    ```sh
    herdr plugin action invoke herdr-lineup.doctor
@@ -88,20 +79,6 @@ Requires macOS or Linux, Herdr 0.9.3 or later, Git, and
    failure. Missing optional usage is expected. Next, [configure the sidebar](#sidebar)
    to display the rows.
 
-Release archives contain a built binary, `LICENSE`, `NOTICE.md`, and `README.md`.
-Plugin installation assumes building from a checkout as above.
-
-### Planned public installation
-
-After the repository is published:
-
-```sh
-herdr plugin install fujimogn/herdr-lineup
-```
-
-Herdr builds the plugin with `cargo build --release --locked` during installation.
-A public install is not published yet.
-
 When installing or upgrading:
 
 - Reinstalling replaces the managed checkout (`HERDR_PLUGIN_ROOT`). Never store
@@ -109,7 +86,26 @@ When installing or upgrading:
   user settings in `HERDR_PLUGIN_CONFIG_DIR`.
 - There is no `herdr plugin update`. To upgrade, install again.
 - Pin a version with a release tag:
-  `herdr plugin install fujimogn/herdr-lineup --ref vX.Y.Z`.
+  `herdr plugin install fujimogn/herdr-lineup --ref v0.1.0`.
+
+The [Herdr marketplace](https://herdr.dev/docs/marketplace/) is an automatic,
+unreviewed index of public repositories, not an endorsement or code review.
+
+### Develop from a checkout
+
+Clone and build a checkout that you will keep:
+
+```sh
+git clone https://github.com/fujimogn/herdr-lineup.git
+cd herdr-lineup
+rustup toolchain install
+cargo build --release --locked
+herdr plugin link .
+```
+
+`plugin link` does not build or copy the checkout. Release archives contain a
+built binary, `LICENSE`, `NOTICE.md`, and `README.md`; they are not standalone
+plugin installations.
 
 ## Usage
 
