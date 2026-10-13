@@ -1,7 +1,45 @@
 //! Codex UI context percentage from exact-session rollout token_count observations.
 use crate::model::*;
 use serde_json::Value;
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs::{self, Metadata};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
+
+// A context observation outside this suffix is NotFound, not a full-file scan.
+// The header must fit in 64 KiB. Oversized headers are SourceError.
+const TAIL_BYTES: usize = 2 * 1024 * 1024;
+const HEADER_BYTES: usize = 64 * 1024;
+const CACHE_ENTRIES: usize = 128;
+type Observation = Result<(f64, SystemTime), MissingReason>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Fingerprint {
+    dev: u64,
+    inode: u64,
+    size: u64,
+    mtime: (i64, i64),
+}
+impl Fingerprint {
+    fn of(meta: &Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            inode: meta.ino(),
+            size: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+        }
+    }
+}
+struct CachedRollout {
+    fingerprint: Fingerprint,
+    observation: Observation,
+}
+// Only paths, exact session IDs and derived observations are retained in memory.
+// Discovery still runs on cache hits to reject duplicate and symlinked sources.
+static CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), CachedRollout>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub struct CodexReader;
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -34,6 +72,13 @@ fn rollout(path: &Path) -> bool {
     })
 }
 fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime), MissingReason> {
+    read_session_with_hook(request, |_| {})
+}
+
+fn read_session_with_hook(
+    request: &ReadRequest<'_>,
+    after_read: impl FnOnce(&Path),
+) -> Result<(f64, std::time::SystemTime), MissingReason> {
     let mut budget = Budget::new(request);
     // Discovery reads names only. Other sessions and credential files are never opened.
     let mut paths = budget.files(&request.home.join("sessions"), 3, rollout)?;
@@ -51,8 +96,97 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime
         return Err(MissingReason::Unassociated);
     }
     let path = paths.first().ok_or(MissingReason::NotFound)?;
-    let text = budget.jsonl_text(path, path.extension().is_some_and(|e| e == "zst"))?;
-    let mut bound = false;
+    let mut file = budget.open(path)?;
+    let fingerprint = Fingerprint::of(&file.metadata().map_err(|e| io_reason(&e))?);
+    let key = (path.to_path_buf(), id.clone());
+    if let Some(cached) = CACHE
+        .lock()
+        .map_err(|_| MissingReason::SourceError)?
+        .get(&key)
+        && cached.fingerprint == fingerprint
+    {
+        budget.check()?;
+        return cached.observation;
+    }
+    let result = if path.extension().is_some_and(|e| e == "zst") {
+        // Keep the existing 16 MiB decompressed limit (SourceError on overflow).
+        budget
+            .jsonl_text(path, true)
+            .and_then(|text| parse_records(&text, id, &budget, false))
+    } else {
+        read_tail(&mut file, fingerprint.size, id, &budget)
+    };
+    budget.check()?;
+    after_read(path);
+    // Never cache a mixed snapshot while a writer appends, truncates or replaces it.
+    let current = fs::symlink_metadata(path).map_err(|e| io_reason(&e))?;
+    if !current.is_file() || current.file_type().is_symlink() {
+        return Err(MissingReason::SourceError);
+    }
+    let path_after = Fingerprint::of(&current);
+    let file_after = Fingerprint::of(&file.metadata().map_err(|e| io_reason(&e))?);
+    if path_after != fingerprint || file_after != fingerprint {
+        // An append cannot change bytes in the prefix read above. Return its
+        // complete observation, but require a fresh read on the next cycle.
+        if path_after.dev == fingerprint.dev
+            && path_after.inode == fingerprint.inode
+            && file_after.dev == fingerprint.dev
+            && file_after.inode == fingerprint.inode
+            && path_after.size > fingerprint.size
+            && file_after.size >= path_after.size
+        {
+            return result;
+        }
+        return Err(MissingReason::SourceError);
+    }
+    if !matches!(
+        result,
+        Err(MissingReason::Timeout | MissingReason::SourceError | MissingReason::PermissionDenied)
+    ) {
+        let mut cache = CACHE.lock().map_err(|_| MissingReason::SourceError)?;
+        if cache.len() >= CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            CachedRollout {
+                fingerprint,
+                observation: result,
+            },
+        );
+    }
+    result
+}
+
+fn read_tail(file: &mut fs::File, size: u64, id: &str, budget: &Budget) -> Observation {
+    if size <= TAIL_BYTES as u64 {
+        let text = Budget::decode_jsonl(budget.read_range(file, 0, size as usize)?)?;
+        return parse_records(&text, id, budget, false);
+    }
+    let header = budget.read_range(file, 0, HEADER_BYTES)?;
+    let end = header
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or(MissingReason::SourceError)?;
+    let value: Value =
+        serde_json::from_slice(&header[..end]).map_err(|_| MissingReason::Invalid)?;
+    if value["type"] != "session_meta" || value["payload"]["id"].as_str() != Some(id) {
+        return Err(MissingReason::Unassociated);
+    }
+    // Include the preceding byte: a suffix exactly on a line boundary must keep
+    // its first record. Otherwise discard bytes before the next newline, before
+    // UTF-8 decoding (the split can itself be inside a multibyte character).
+    let start = size - TAIL_BYTES as u64 - 1;
+    let bytes = budget.read_range(file, start, TAIL_BYTES + 1)?;
+    let complete = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |i| i + 1);
+    let text = Budget::decode_jsonl(bytes[complete..].to_vec())?;
+    parse_records(&text, id, budget, true)
+}
+
+fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Observation {
     let mut observation = None;
     for line in text.split_inclusive('\n') {
         budget.check()?;
@@ -105,6 +239,280 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn append_after_read_returns_complete_prefix_without_caching_it() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let original = fs::read_to_string(
+            dir.path()
+                .join("sessions/2026/10/12/rollout-test-session-1.jsonl"),
+        )
+        .unwrap();
+        let (_, sample) = original.split_once('\n').unwrap();
+        let next = sample.replace("26000", "28000");
+        let result = read_session_with_hook(&r, |path| {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(next.as_bytes())
+                .unwrap();
+        });
+        assert!((result.unwrap().0 - 7.0).abs() < 1e-9);
+        assert!((read_session(&r).unwrap().0 - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn replacement_truncation_and_same_size_rewrite_during_read_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let original = fs::read_to_string(&path).unwrap();
+        let old_time = fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert_eq!(
+            read_session_with_hook(&r, |path| {
+                fs::write(path, "").unwrap();
+            }),
+            Err(MissingReason::SourceError)
+        );
+        fs::write(&path, &original).unwrap();
+        assert_eq!(
+            read_session_with_hook(&r, |path| {
+                let replacement = path.with_extension("replacement");
+                fs::write(&replacement, &original).unwrap();
+                fs::rename(replacement, path).unwrap();
+            }),
+            Err(MissingReason::SourceError)
+        );
+        assert_eq!(
+            read_session_with_hook(&r, |path| {
+                fs::write(path, original.replace("26000", "28000")).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(old_time + std::time::Duration::from_secs(1))
+                    .unwrap();
+            }),
+            Err(MissingReason::SourceError)
+        );
+    }
+
+    #[test]
+    fn large_rollout_reads_latest_context_from_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let text = fs::read_to_string(&path).unwrap();
+        let (header, sample) = text.split_once('\n').unwrap();
+        let padding = "{\"type\":\"response_item\"}\n".repeat(800_000);
+        fs::write(&path, format!("{header}\n{padding}{sample}")).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+        crate::model::tests::CONTENT_READS.set(0);
+        assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
+        let reads = crate::model::tests::CONTENT_READS.get();
+        assert!(reads > 0);
+        assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
+        assert_eq!(crate::model::tests::CONTENT_READS.get(), reads);
+    }
+
+    #[test]
+    fn unchanged_rollout_does_not_read_content_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        crate::model::tests::CONTENT_READS.set(0);
+        let first = read_session(&r).unwrap();
+        let reads = crate::model::tests::CONTENT_READS.get();
+        assert!(reads > 0);
+        assert_eq!(read_session(&r).unwrap(), first);
+        assert_eq!(crate::model::tests::CONTENT_READS.get(), reads);
+    }
+
+    #[test]
+    fn tail_starting_inside_a_record_discards_the_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let text = fs::read_to_string(&path).unwrap();
+        let (header, sample) = text.split_once('\n').unwrap();
+        // The tail begins in a long JSON string, potentially inside UTF-8.
+        let padding = "あ".repeat(6 * 1024 * 1024);
+        fs::write(
+            &path,
+            format!("{header}\n{{\"text\":\"{padding}\"}}\n{sample}"),
+        )
+        .unwrap();
+        assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tail_boundary_null_events_and_partial_append_preserve_last_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let text = fs::read_to_string(&path).unwrap();
+        let (header, sample) = text.split_once('\n').unwrap();
+        let empty =
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null}}\n";
+        let partial = "{\"type\":";
+        let filler = " ".repeat(TAIL_BYTES - sample.len() - empty.len() - partial.len() - 3);
+        // The only sample starts exactly at the suffix boundary.
+        let suffix = format!("{sample}{filler}{{}}\n{empty}{partial}");
+        assert_eq!(suffix.len(), TAIL_BYTES);
+        fs::write(&path, format!("{header}\n{suffix}")).unwrap();
+        assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
+        fs::write(&path, format!("{header}\n{suffix}\n")).unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::Invalid));
+    }
+
+    #[test]
+    fn bounded_tail_requires_matching_header_and_returns_missing_outside_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let text = fs::read_to_string(&path).unwrap();
+        let (header, sample) = text.split_once('\n').unwrap();
+        let padding = format!("{{\"text\":\"{}\"}}\n", "x".repeat(TAIL_BYTES));
+        fs::write(&path, format!("{header}\n{sample}{padding}")).unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::NotFound));
+        let wrong_header = header.replace("session-1", "session-2");
+        fs::write(&path, format!("{wrong_header}\n{padding}{sample}")).unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::Unassociated));
+        fs::write(&path, format!("{header}\n{padding}{header}\n{sample}")).unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::Unassociated));
+        fs::write(&path, format!("{padding}{sample}")).unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::SourceError));
+    }
+
+    #[test]
+    fn cache_invalidates_on_append_rewrite_replacement_truncation_and_duplicate() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let original = fs::read_to_string(&path).unwrap();
+        let (_, sample) = original.split_once('\n').unwrap();
+        assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(sample.replace("26000", "28000").as_bytes())
+            .unwrap();
+        assert!((read_session(&r).unwrap().0 - 8.0).abs() < 1e-9);
+
+        let changed = fs::read_to_string(&path).unwrap().replace("28000", "30000");
+        let prior = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, changed).unwrap();
+        // Force an mtime-only fingerprint change even on coarse filesystems.
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(prior + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!((read_session(&r).unwrap().0 - 9.0).abs() < 1e-9);
+
+        let metadata = fs::metadata(&path).unwrap();
+        let replacement = path.with_extension("replacement");
+        fs::write(
+            &replacement,
+            fs::read_to_string(&path).unwrap().replace("30000", "32000"),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(metadata.modified().unwrap())
+            .unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert!((read_session(&r).unwrap().0 - 10.0).abs() < 1e-9);
+
+        fs::write(&path, &original).unwrap();
+        assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
+        fs::create_dir(dir.path().join("archived_sessions")).unwrap();
+        fs::write(
+            dir.path()
+                .join("archived_sessions/rollout-copy-session-1.jsonl"),
+            &original,
+        )
+        .unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::Unassociated));
+    }
+
+    #[test]
+    fn cache_does_not_cross_homes_or_follow_replaced_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        fixture(other.path(), "session-2", "2026-10-12T00:00:00Z", 26_000);
+        assert!((read_session(&r).unwrap().0 - 7.0).abs() < 1e-9);
+        assert_eq!(
+            read_session(&request(&id, other.path())),
+            Err(MissingReason::Unassociated)
+        );
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let moved = path.with_extension("saved");
+        fs::rename(&path, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &path).unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::NotFound));
+        assert!(matches!(
+            Budget::new(&r).open(&path),
+            Err(MissingReason::Invalid)
+        ));
+    }
+
+    #[test]
+    fn compressed_rollout_keeps_decompressed_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fs::create_dir(dir.path().join("archived_sessions")).unwrap();
+        let bytes = vec![b' '; 16 * 1024 * 1024 + 1];
+        fs::write(
+            dir.path()
+                .join("archived_sessions/rollout-test-session-1.jsonl.zst"),
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_session(&r), Err(MissingReason::SourceError));
+    }
+
     #[test]
     fn context_matches_codex_baseline_and_rejects_small_windows() {
         let dir = tempfile::tempdir().unwrap();

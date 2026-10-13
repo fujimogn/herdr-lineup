@@ -1,7 +1,8 @@
 //! Session-bound local usage observations. No account or conversation data is returned.
 
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -391,7 +392,9 @@ impl Budget {
         path: &Path,
         compressed: bool,
     ) -> Result<String, MissingReason> {
-        let mut bytes = self.bytes(path, compressed)?;
+        Self::decode_jsonl(self.bytes(path, compressed)?)
+    }
+    pub(crate) fn decode_jsonl(mut bytes: Vec<u8>) -> Result<String, MissingReason> {
         if let Err(error) = std::str::from_utf8(&bytes) {
             if error.error_len().is_some() {
                 return Err(MissingReason::SourceError);
@@ -404,25 +407,61 @@ impl Budget {
         }
         String::from_utf8(bytes).map_err(|_| MissingReason::SourceError)
     }
-    fn bytes(&self, path: &Path, compressed: bool) -> Result<Vec<u8>, MissingReason> {
+    pub(crate) fn open(&self, path: &Path) -> Result<File, MissingReason> {
         self.check()?;
         let meta = fs::symlink_metadata(path).map_err(|e| io_reason(&e))?;
         if !meta.is_file() || meta.file_type().is_symlink() {
             return Err(MissingReason::Invalid);
         }
-        let file = File::open(path).map_err(|e| io_reason(&e))?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| io_reason(&e))?;
+        if !file.metadata().map_err(|e| io_reason(&e))?.is_file() {
+            return Err(MissingReason::Invalid);
+        }
+        self.check()?;
+        Ok(file)
+    }
+    /// Read only a bounded region of a regular file already opened without following symlinks.
+    pub(crate) fn read_range(
+        &self,
+        file: &mut File,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, MissingReason> {
+        self.check()?;
+        if length > 16 * 1024 * 1024 {
+            return Err(MissingReason::SourceError);
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| io_reason(&e))?;
+        let mut bytes = vec![0; length];
+        #[cfg(test)]
+        tests::CONTENT_READS.with(|count| count.set(count.get() + 1));
+        file.read_exact(&mut bytes).map_err(|e| io_reason(&e))?;
+        self.check()?;
+        Ok(bytes)
+    }
+    fn bytes(&self, path: &Path, compressed: bool) -> Result<Vec<u8>, MissingReason> {
+        let file = self.open(path)?;
         let reader: Box<dyn Read> = if compressed {
             Box::new(zstd::stream::read::Decoder::new(file).map_err(|e| io_reason(&e))?)
         } else {
             Box::new(file)
         };
         let mut text = Vec::new();
+        #[cfg(test)]
+        tests::CONTENT_READS.with(|count| count.set(count.get() + 1));
         reader
             .take(16 * 1024 * 1024 + 1)
             .read_to_end(&mut text)
             .map_err(|e| io_reason(&e))?;
         self.check()?;
         if text.len() > 16 * 1024 * 1024 {
+            // In particular, zstd rollouts exceeding 16 MiB after decompression
+            // are unavailable with SourceError; compressed streams cannot seek.
             return Err(MissingReason::SourceError);
         }
         Ok(text)
@@ -438,6 +477,9 @@ pub(crate) fn timestamp(value: &serde_json::Value) -> Option<SystemTime> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    thread_local! {
+        pub(crate) static CONTENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
     #[test]
     fn weekly_worker_cache_never_waits_for_query_and_expires_during_query() {
         let shutdown = std::sync::Arc::new(AtomicBool::new(false));
