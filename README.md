@@ -42,8 +42,51 @@ alignment, and [Source research](docs/research/usage-sources.md) for usage input
 
 ## Install
 
-Requires macOS or Linux, Herdr 0.9.3 or later, and Rust/Cargo. The build uses the
-toolchain pinned in `rust-toolchain.toml` (Rust 1.99.0); install it with rustup.
+Requires macOS or Linux, Herdr 0.9.3 or later, Git, and
+[rustup](https://rustup.rs). You need access to this private repository.
+
+1. Clone the checkout into a directory you will keep:
+
+   ```sh
+   git clone https://github.com/fujimogn/herdr-lineup.git
+   cd herdr-lineup
+   ```
+
+2. Let rustup install the toolchain pinned in `rust-toolchain.toml` (Rust 1.99.0),
+   then build the release binary:
+
+   ```sh
+   rustup toolchain install
+   cargo build --release --locked
+   ```
+
+3. Register that checkout. Linking does not build it or copy it elsewhere:
+
+   ```sh
+   herdr plugin link .
+   ```
+
+4. In a pane of the Herdr session you want to use, start Lineup:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.start
+   ```
+
+5. Check the daemon and read the action's output in the plugin log:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.doctor
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   Look for the completed `doctor` command, its exit status, and the diagnostic
+   output. Healthy output includes `daemon/control/lock healthy`. Missing optional
+   usage is expected. Next, [configure the sidebar](#sidebar) to display the rows.
+
+Release archives contain a built binary, `LICENSE`, and `NOTICE.md`.
+Plugin installation assumes building from a checkout as above.
+
+### Planned public installation
 
 **Planned public installation**, after the repository is published:
 
@@ -52,8 +95,7 @@ herdr plugin install fujimogn/herdr-lineup
 ```
 
 Herdr builds the plugin with `cargo build --release --locked` during installation.
-A public install is not published yet. A local release build can publish rows
-after `ensure`. See Development to build the current code locally.
+A public install is not published yet.
 
 When installing or upgrading:
 
@@ -66,13 +108,14 @@ When installing or upgrading:
 
 ## Usage
 
-Inspect the available commands:
+Inspect the built binary from the checkout (or use `herdr-lineup` after adding
+it to your `PATH` as shown in [statusLine setup](#claude-and-antigravity-statusline-opt-in)):
 
 ```sh
-cargo run --locked -- --help
-cargo run --locked -- --version
-cargo run --locked -- doctor --help
-cargo run --locked -- statusline --help
+./target/release/herdr-lineup --help
+./target/release/herdr-lineup --version
+./target/release/herdr-lineup doctor --help
+./target/release/herdr-lineup statusline --help
 ```
 
 ### Common commands
@@ -92,20 +135,31 @@ cargo run --locked -- statusline --help
 Herdr actions: `herdr-lineup.start`, `herdr-lineup.stop`,
 `herdr-lineup.doctor`, `herdr-lineup.configure`, `herdr-lineup.unconfigure`,
 `herdr-lineup.install-font`, and `herdr-lineup.uninstall-font`.
-For example:
+For example, check the daemon and inspect its output:
 
 ```sh
-herdr plugin action invoke herdr-lineup.start
 herdr plugin action invoke herdr-lineup.doctor
-herdr plugin action invoke herdr-lineup.configure
-herdr plugin action invoke herdr-lineup.unconfigure
-herdr plugin action invoke herdr-lineup.install-font
-herdr plugin action invoke herdr-lineup.uninstall-font
+herdr plugin log list --plugin herdr-lineup --limit 10
 ```
 
-The same commands run directly as `herdr-lineup configure`,
-`herdr-lineup unconfigure`, `herdr-lineup install-font`, and
-`herdr-lineup uninstall-font`. Startup and focus hooks never run them.
+Run these actions from a Herdr pane, and use
+`herdr plugin log list --plugin herdr-lineup --limit 10` to inspect their results.
+Logs are JSON: find the relevant `command`, its completed `status` and
+`exit_code`, then read `stdout` and `stderr`. If it is still running, run the
+log command again; continue to the next setup step only after success.
+Herdr supplies the plugin environment to action processes; an ordinary pane's
+shell does not receive `HERDR_PLUGIN_*`. Direct `install-font` and
+`uninstall-font` need an absolute `HERDR_PLUGIN_STATE_DIR` (and `HOME`).
+Direct `doctor`, `ensure`, `daemon`, and `stop` additionally need absolute
+`HERDR_SOCKET_PATH` and `HERDR_PLUGIN_CONFIG_DIR`.
+
+`configure` and `unconfigure` can also run directly, for example
+`./target/release/herdr-lineup configure`: they resolve the Herdr config from
+`HERDR_CONFIG_PATH` or `~/.config/herdr/config.toml` and use
+`~/.local/state/herdr-lineup` for transaction locks when
+`HERDR_PLUGIN_STATE_DIR` is unset or empty. This fallback is for sidebar
+transactions, not the daemon's state directory. Startup and focus hooks never
+configure the sidebar or install fonts.
 
 ## Configuration
 
@@ -141,7 +195,7 @@ logo_mode = "text"
 
 | Value | Logos |
 | --- | --- |
-| `auto` | Text labels until terminal glyph support is affirmatively known. The publisher does not treat font installation as that proof, so `auto` stays on text. |
+| `auto` | Currently the same ASCII labels as `text`, even after font installation. |
 | `font` | Vendor glyphs (U+E1A0–U+E1BA). This asserts that the icon font and the terminal codepoint map are already configured. |
 | `text` | ASCII labels: `Claude`, `Codex`, `Grok`, `Antigravity`, `Kimi`, `Hermes`. |
 
@@ -162,17 +216,146 @@ defaults. Unknown keys fail validation.
 providers = ["claude", "codex", "grok"]
 ```
 
-Sidebar rows are added by hand or through the explicit, opt-in `configure`
-action. Startup does not edit the user's Herdr configuration. Configuration
-edits use marker comments and a backup, preserving unrelated settings.
-`unconfigure` removes only an unmodified plugin-managed block.
+### Sidebar
 
-The plugin bundles the HerdrAgentIconsMax icon font and can emit its icon
-codepoints. The font is installed only through the explicit, opt-in
-`herdr-lineup.install-font` action and removed with
-`herdr-lineup.uninstall-font`; startup never touches font setup. Text labels
-remain available, and automatic mode stays on text until terminal glyph support
-is known. See [NOTICE.md](NOTICE.md) for sources and licensing.
+1. Check the target Herdr configuration: `HERDR_CONFIG_PATH` when set, otherwise
+   `~/.config/herdr/config.toml`. A relative override is resolved from the
+   command's working directory. For actions, this is the plugin's environment,
+   not a shell variable exported only in your pane. The action prints its target
+   in the log. If the file is a symlink or already defines `ui.sidebar.agents`
+   or `ui.sidebar.spaces`, use the manual setup below.
+
+2. Opt in to the managed layout:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.configure
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   This appends a block between `# BEGIN herdr-lineup managed sidebar v1` and
+   `# END herdr-lineup managed sidebar v1`, preserving unrelated settings. It
+   runs `herdr config check` on a staged file, saves a unique sibling backup
+   such as `config.toml.<random>.bak`, replaces the config, and runs
+   `herdr server reload-config`. Reload failure triggers restoration and a
+   second reload attempt; check the log for any restoration failure.
+
+3. To undo the managed layout:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.unconfigure
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   An unchanged block is removed; a modified or ambiguous block is refused.
+   Repeated configure with the same block makes no change. Each actual
+   configure/unconfigure change creates another `.bak`; backups are not pruned.
+   Keep them until you have checked the result. For a modified block, compare
+   the backup with current settings and resolve only the Lineup rows manually.
+
+For managed dotfiles or an existing layout, edit the source configuration
+yourself. These are the tables and rows generated by `configure`; merge the
+rows into existing tables instead of defining a table twice. Leave out the
+ownership markers for manual setup, and undo your manual edits manually:
+
+```toml
+[ui.sidebar.agents]
+rows = [["$lineup_logo", { token = "$lineup_state_idle", fg = "#808080" }, { token = "$lineup_state_working", fg = "#89b4fa" }, { token = "$lineup_state_blocked", fg = "#f38ba8" }, { token = "$lineup_state_done", fg = "#a6e3a1" }, { token = "$lineup_state_unknown", fg = "#6c7086" }, "$lineup_context_text", "$lineup_weekly_text"]]
+
+[ui.sidebar.spaces]
+rows = [["$lineup_repo", "$lineup_ship_text"]]
+```
+
+After saving a manual edit, run `herdr config check` and, only if it succeeds,
+`herdr server reload-config` with the same `HERDR_CONFIG_PATH` when overridden.
+Neither setup method requires restarting the Herdr server.
+
+### Icons
+
+The bundled font is **Herdr Agent Icons Max**. See [NOTICE.md](NOTICE.md) for
+sources and licensing. Font actions install on the machine where they run.
+Over SSH, installing on the remote host does not install anything on your local
+terminal's machine; install the font and configure the terminal there too.
+
+#### Enable icons
+
+1. Install the font and supported terminal mappings explicitly:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.install-font
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   The font file is `herdr-lineup-HerdrAgentIconsMax-1b819949.ttf` in
+   `~/Library/Fonts` on macOS, or `$XDG_DATA_HOME/fonts` on Linux
+   (`~/.local/share/fonts` when no absolute `XDG_DATA_HOME` is set).
+
+2. Run `herdr plugin config-dir herdr-lineup`, then create or edit `config.toml`
+   inside the printed directory. Preserve other keys and set this key once:
+
+   ```toml
+   logo_mode = "font"
+   ```
+
+3. Apply the mode by stopping and starting only the Lineup daemon:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.stop
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   herdr plugin action invoke herdr-lineup.start
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   Wait for the stop command to finish successfully before starting again.
+
+4. Reload the terminal configuration or reopen the terminal. On Linux, run
+   `fc-cache` if needed. The terminal must map **U+E1A0–U+E1BA** to
+   **Herdr Agent Icons Max**; other terminals require this mapping manually.
+   `auto` currently renders the same text labels as `text`.
+
+Only Ghostty and kitty mappings are automatic. Let `<config>` mean an absolute
+`XDG_CONFIG_HOME`, or `~/.config` otherwise. The installer checks all five paths:
+
+| Terminal | Candidate configuration file |
+| --- | --- |
+| kitty | `<config>/kitty/kitty.conf` |
+| Ghostty | `<config>/ghostty/config` |
+| Ghostty | `<config>/ghostty/config.ghostty` |
+| Ghostty | `~/Library/Application Support/com.mitchellh.ghostty/config` |
+| Ghostty | `~/Library/Application Support/com.mitchellh.ghostty/config.ghostty` |
+
+It appends a `# BEGIN herdr-lineup font` / `# END herdr-lineup font` block
+only to existing files, leaving other bytes and the primary font unchanged.
+It does not create missing terminal configs or backups. An existing symlinked
+candidate config (or a symlink beneath a resolved configuration root) makes the
+whole action refuse before changing font or terminal bytes. Use manual terminal
+setup for managed dotfiles; the bundled font is at
+`assets/fonts/HerdrAgentIconsMax-Regular.ttf` in the checkout. Manual font and
+mapping changes must also be removed manually.
+
+The appended mapping is `symbol_map U+E1A0-U+E1BA Herdr Agent Icons Max` for
+kitty, or `font-codepoint-map = U+E1A0-U+E1BA=Herdr Agent Icons Max` for Ghostty.
+
+#### Disable icons
+
+1. Change `logo_mode` to `"text"` in the plugin's `config.toml` and repeat the
+   Lineup stop/start commands above so no glyphs are published.
+2. Remove the owned installation and read the result:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.uninstall-font
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+3. Reload or reopen your terminal (and run `fc-cache` on Linux if needed).
+
+Uninstall removes only recorded, byte-identical blocks and a font file that
+Lineup installed. A preexisting identical font is preserved. If you edited or
+deleted a managed block in a surviving terminal config, both font actions refuse.
+Keep `$HERDR_PLUGIN_STATE_DIR/font-ownership.json`: each `entries` item contains
+the config `path` and exact `owned` text, including newlines. Restore that text
+exactly once in the matching file, preserving your unrelated edits, then retry
+uninstall. Keep the same home, XDG paths, and state directory used for install;
+do not delete the ownership record to bypass a conflict.
 
 ### Account quota (opt-in)
 
@@ -190,15 +373,105 @@ credentials are displayed or persisted by Lineup. Do not restart the Herdr serve
 
 ### Claude and Antigravity statusLine (opt-in)
 
-Codex and Grok context are read from local session files for the pane's native
-session. Claude and Antigravity usage is not read from those agents' config or
-credential files. Each agent sends it by running this plugin as its statusLine
-command:
+Codex and Grok context are read from local session files. Claude and
+Antigravity supply observations through an opt-in statusLine command. Save your
+existing agent settings before changing them; startup does not edit them.
 
-```sh
-herdr-lineup statusline claude
-herdr-lineup statusline agy
-```
+1. Find the daemon's actual state directory through its `doctor` action:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.doctor
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   In the completed doctor's output, find `State directory: <absolute path>`.
+   Copy the path after the colon exactly. Do not use the plugin config directory
+   or `HERDR_PLUGIN_ROOT`. Before launching the agent, export that path in its
+   launch environment (replace the placeholder):
+
+   ```sh
+   export HERDR_PLUGIN_STATE_DIR="/absolute/path/copied/from/doctor"
+   ```
+
+   The statusLine process and daemon must use the same directory. An existing
+   agent does not inherit a later shell export; set this in its launch wrapper
+   or shell configuration and launch the agent with that environment.
+
+2. Put the built binary on the agent's `PATH`. From the checkout root, if
+   `~/.local/bin/herdr-lineup` does not already exist:
+
+   ```sh
+   mkdir -p "$HOME/.local/bin"
+   ln -s "$PWD/target/release/herdr-lineup" "$HOME/.local/bin/herdr-lineup"
+   export PATH="$HOME/.local/bin:$PATH"
+   herdr-lineup --version
+   ```
+
+   Keep the checkout at that location, and persist the `PATH` change in the
+   environment that launches the agent. Inspect an existing destination instead
+   of overwriting it.
+
+3. Merge a `statusLine` entry into `~/.claude/settings.json` (or the project's
+   Claude settings). Replace the placeholder with your existing command to
+   preserve its display:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "herdr-lineup statusline claude --then '<existing statusLine command>'"
+     }
+   }
+   ```
+
+   Without an existing command, omit `--then`:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "herdr-lineup statusline claude"
+     }
+   }
+   ```
+
+   Antigravity CLI uses the same shape in
+   `~/.gemini/antigravity-cli/settings.json`:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "herdr-lineup statusline agy --then '<existing statusLine command>'"
+     }
+   }
+   ```
+
+   Preserve other settings in those files. The `--then` value is one shell
+   argument, subsequently run through `sh -c`. For an existing command containing
+   single quotes, replace each inner `'` with `'"'"'` when enclosing the argument
+   in single quotes; JSON also needs the double quotes escaped. For example,
+   chaining the existing command `printf '%s\n' ready` becomes:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "herdr-lineup statusline claude --then 'printf '\"'\"'%s\\n'\"'\"' ready'"
+     }
+   }
+   ```
+
+   For a complex existing command, keep it in a shell script and pass
+   `--then 'sh /absolute/path/to/statusline.sh'` instead.
+
+4. Let the agent produce a statusLine update, then run the doctor action and
+   inspect the plugin log again. `StatusLine records: 0` means no readable
+   regular records were found (also check the state directory's permissions);
+   otherwise `StatusLine records: <count> (latest: <N>s ago)` reports the count
+   and newest record age. The scan examines at most 1,024 directory entries
+   without following symlinks. This is a storage diagnostic, not proof that a
+   record belongs to the current pane. Check that the relevant pane gains usage data.
 
 Usage is shown in the sidebar only. `herdr-lineup statusline` does not render
 a status line and does not print a pace label. `herdr-lineup statusline --help`
@@ -218,60 +491,94 @@ native session. Antigravity's binding key is `HERDR_PANE_ID`, matched to the
 pane. Antigravity ignores any conversation id in the JSON. Herdr panes provide
 `HERDR_PANE_ID`.
 
-The statusLine process and the session daemon must use the same absolute
-`HERDR_PLUGIN_STATE_DIR`. Herdr sets that variable for plugin processes. A
-statusLine command runs inside the agent, so the agent's environment has to
-provide the same directory. Do not point it at `HERDR_PLUGIN_ROOT`. The release
-binary is `target/release/herdr-lineup` in the plugin directory; `herdr-lineup`
-must be on the agent's `PATH`. Startup does not edit agent settings. Hook
-installation is opt-in.
-
-Claude Code reads the command from `~/.claude/settings.json` or from the
-project's Claude settings. This keeps an existing status line:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "herdr-lineup statusline claude --then '<existing statusLine command>'"
-  }
-}
-```
-
-Omit `--then` when there is no existing command:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "herdr-lineup statusline claude"
-  }
-}
-```
-
-Antigravity CLI uses the same shape in `~/.gemini/antigravity-cli/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "herdr-lineup statusline agy --then '<existing statusLine command>'"
-  }
-}
-```
-
-Set `HERDR_PLUGIN_STATE_DIR` in the environment that launches the agent, using
-the plugin state directory the daemon already uses:
-
-```sh
-export HERDR_PLUGIN_STATE_DIR="/path/to/herdr-lineup/state"
-```
-
 Context stays `—` until an observation matches the pane, then retains the last
 valid value while that exact session or pane binding matches. Idle context does
 not expire by age. Weekly quota with a reset time expires at that time. StatusLine
 weekly without a reset uses the default maximum age of 60 seconds; Codex quota
 without a reset follows its client interval and clears after a failed query.
+
+### Environment variables
+
+Herdr supplies plugin variables to actions and hooks. Provider paths are read
+from the daemon's environment, not individually from each pane. Use absolute
+paths for state, socket, config, and provider homes.
+
+| Variable | Used for / default |
+| --- | --- |
+| `HERDR_SOCKET_PATH` | Session socket; required by `ensure`, `daemon`, `stop`, and `doctor`. |
+| `HERDR_PLUGIN_STATE_DIR` | Runtime files, font ownership, sidebar transaction locks, and `statusline/` records. Required by daemon commands and font actions; statusLine recording needs the same absolute path. Only configure/unconfigure fall back to `~/.local/state/herdr-lineup`. |
+| `HERDR_PLUGIN_CONFIG_DIR` | Directory containing Lineup's optional `config.toml`; required by daemon commands and `doctor`. Discover with `herdr plugin config-dir herdr-lineup`. |
+| `HERDR_CONFIG_PATH` | Herdr config file for configure/unconfigure; defaults to `~/.config/herdr/config.toml`. Empty is rejected; a relative path resolves from the command's working directory. |
+| `HERDR_BIN_PATH` | Herdr executable for sidebar validation and reload; defaults to `herdr` on `PATH`. |
+| `HERDR_PANE_ID` | Herdr-provided pane identity; binds Antigravity statusLine records to the pane. Claude uses JSON `session_id` instead. |
+| `XDG_DATA_HOME` | Linux font base directory; an absolute value gives `<value>/fonts`, otherwise `~/.local/share/fonts`. Ignored for the macOS font destination. |
+| `XDG_CONFIG_HOME` | Font actions' kitty/Ghostty config base; an absolute value replaces `~/.config`. Does not select Herdr's sidebar config. |
+| `CODEX_HOME` | Codex local session home and account-quota client home; defaults to `~/.codex`. A non-absolute override makes the local home unavailable. |
+| `GROK_HOME` | Grok local session home (default `~/.grok`) and fallback base for `auth.json`. A non-absolute override makes the local session home unavailable. |
+| `GROK_AUTH_FILE` | Explicit Grok billing auth file, before `GROK_HOME/auth.json` and `~/.grok/auth.json`; used only with network opt-in. |
+
+`HOME` supplies the per-user defaults above and must be absolute for font
+actions. `HERDR_PLUGIN_ROOT` is the plugin checkout, never a destination for
+runtime state or user settings.
+
+## Uninstall
+
+Keep the checkout, plugin settings, and ownership records until cleanup actions
+have succeeded. Before starting, save the state path from the doctor's
+`State directory:` line and the config path from
+`herdr plugin config-dir herdr-lineup` for step 6. If Lineup is linked in several
+Herdr sessions, perform the daemon stop in each session before unregistering it.
+
+1. Remove the managed sidebar block and check the action log:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.unconfigure
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   For a manually configured sidebar, remove only the rows you added, then run
+   `herdr config check` and `herdr server reload-config`. Resolve modified managed
+   blocks as described in [Sidebar](#sidebar) before continuing.
+
+2. If icons were enabled, set `logo_mode = "text"` first, then remove the font
+   and terminal mappings:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.uninstall-font
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+   Resolve ownership conflicts with [Disable icons](#disable-icons) before
+   continuing. Remove manual font/mapping installations manually, and reload
+   the terminal configuration.
+
+3. Stop only Lineup and wait for a successful completed command in the log:
+
+   ```sh
+   herdr plugin action invoke herdr-lineup.stop
+   herdr plugin log list --plugin herdr-lineup --limit 10
+   ```
+
+4. Unregister the linked checkout:
+
+   ```sh
+   herdr plugin unlink herdr-lineup
+   ```
+
+   For a GitHub-managed installation, use `herdr plugin uninstall herdr-lineup`
+   instead; it also removes the managed checkout. Unlink leaves the local
+   checkout in place. Config and state are separate from the checkout.
+
+5. Restore the previous `statusLine` entries in your Claude/Antigravity settings
+   (or remove the entries you added). Remove the launch-environment export and
+   the `~/.local/bin/herdr-lineup` symlink if you created them only for Lineup.
+
+6. After no session daemon or agent hook uses Lineup, inspect the saved plugin
+   state/config paths and remove only the Lineup data you no longer need. Keep
+   `font-ownership.json` until font cleanup succeeds. Inspect and remove unwanted
+   `config.toml.<random>.bak` files beside the Herdr config separately; they
+   contain earlier settings and are never automatically pruned. Direct
+   configure/unconfigure may also have left locks in `~/.local/state/herdr-lineup`.
 
 ## How it works
 
@@ -421,7 +728,8 @@ See [SECURITY.md](SECURITY.md) for the full boundaries.
   `HERDR_PLUGIN_STATE_DIR` is the same absolute directory the daemon uses, and
   that Claude's `session_id` or Antigravity's `HERDR_PANE_ID` matches the pane.
 - **Codex or Grok weekly quota stays `—`:** check `allow_network = true`, the
-  selected `providers`, and the last query category with `herdr-lineup doctor`.
+  selected `providers`, and the last query category with
+  `herdr plugin action invoke herdr-lineup.doctor`, then read the plugin log.
   No successful query, an expired reset, or Grok MONTHLY data leaves weekly
   unavailable. Restart only Lineup after authentication or profile changes.
 - **Icon rendering shows boxes:** run the opt-in
