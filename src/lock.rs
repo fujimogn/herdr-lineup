@@ -5,6 +5,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     os::unix::{
+        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         io::{AsRawFd, FromRawFd},
     },
@@ -38,7 +39,6 @@ impl RuntimePaths {
             ));
         }
         // Stable FNV-1a hashes bind state to the lexical absolute socket path.
-        use std::os::unix::ffi::OsStrExt;
         let key = format!(
             "{:016x}",
             socket
@@ -58,6 +58,23 @@ impl RuntimePaths {
             root,
             key,
         })
+    }
+    pub(crate) fn validate_control_socket_path(&self) -> io::Result<()> {
+        // UnixListener::bind needs one sun_path byte for the trailing NUL.
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let capacity = address.sun_path.len();
+        let maximum = capacity - 1;
+        let actual = self.control.as_os_str().as_bytes().len();
+        if actual > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "control socket path {} is {actual} bytes; maximum is {maximum} path bytes ({capacity}-byte Unix socket limit includes a NUL terminator)",
+                    self.control.display()
+                ),
+            ));
+        }
+        Ok(())
     }
     pub fn create(&self) -> io::Result<()> {
         std::fs::create_dir_all(&self.root)?;

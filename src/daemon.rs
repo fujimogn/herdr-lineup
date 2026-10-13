@@ -91,9 +91,10 @@ pub fn ensure(options: &Options) -> io::Result<()> {
     ensure_command(options, command)
 }
 fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
+    let paths = RuntimePaths::new(&options.state, &options.socket)?;
+    paths.validate_control_socket_path()?;
     Config::load(&options.config)?;
     let endpoint = EndpointIdentity::read(&options.socket)?;
-    let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let deadline = Instant::now() + START_DEADLINE;
     let _lifecycle = LifecycleLock::acquire(&paths, deadline)?;
     let mut may_spawn = true;
@@ -595,6 +596,7 @@ fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
 mod tests {
     use super::*;
     use std::io::BufRead;
+    use std::os::unix::ffi::OsStrExt;
 
     fn fixture() -> (
         tempfile::TempDir,
@@ -689,6 +691,32 @@ mod tests {
             .env_clear()
             .env("HOME", "/nonexistent-lineup-test-home");
         command
+    }
+
+    #[test]
+    fn ensure_explains_overlong_control_socket_path() {
+        let (_dir, mut options, done, server) = fixture();
+        options.state = options.state.join("a".repeat(110));
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let error = ensure_command(&options, child_command()).unwrap_err();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        let message = error.to_string();
+        assert!(
+            message.contains(&paths.control.display().to_string()),
+            "{message}"
+        );
+        let actual = paths.control.as_os_str().as_bytes().len();
+        let capacity = if cfg!(target_os = "macos") { 104 } else { 108 };
+        assert!(message.contains(&format!("is {actual} bytes")), "{message}");
+        assert!(
+            message.contains(&format!("maximum is {} path bytes", capacity - 1)),
+            "{message}"
+        );
+        assert!(
+            !paths.root.exists(),
+            "ensure created state before validation"
+        );
     }
     #[test]
     #[ignore = "isolated daemon subprocess entry point"]
