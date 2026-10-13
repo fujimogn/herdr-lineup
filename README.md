@@ -1,5 +1,14 @@
 # herdr-lineup
 
+<p align="center">
+  <a href="https://github.com/fujimogn/herdr-lineup/releases/latest"><img src="https://img.shields.io/github/v/release/fujimogn/herdr-lineup" alt="Latest release"></a>
+  <a href="https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml"><img src="https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue" alt="MIT license"></a>
+  <a href="https://herdr.dev/plugins/"><img src="https://img.shields.io/badge/Herdr_plugin-%E2%89%A5_0.9.3-blue" alt="Herdr plugin requires version 0.9.3 or later"></a>
+  <a href="https://github.com/fujimogn/herdr-lineup/blob/main/herdr-plugin.toml"><img src="https://img.shields.io/badge/Platform-macOS_%7C_Linux-blue" alt="Platform: macOS and Linux"></a>
+  <a href="https://github.com/fujimogn/herdr-lineup/blob/main/rust-toolchain.toml"><img src="https://img.shields.io/badge/Rust-1.99.0-blue" alt="Rust 1.99.0"></a>
+</p>
+
 See each AI coding agent's state, context use, and weekly quota in one sidebar
 row in [Herdr](https://herdr.dev), alongside each repository's latest local
 `origin/main` commit time.

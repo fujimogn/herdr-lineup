@@ -13,6 +13,7 @@ pushes the tag. The workflow never tags or pushes on its own.
 
 1. **Bump the version.** Pick `X.Y.Z` and update `package.version` in
    `Cargo.toml` and the top-level `version` in `herdr-plugin.toml` together.
+   Check the static values in the README badges against `herdr-plugin.toml` and `rust-toolchain.toml`.
 2. **Update the changelog.** Rename `## Unreleased` to
    `## X.Y.Z (YYYY-MM-DD)` using the release date, then add a fresh empty
    `## Unreleased` section above it. Each populated section starts with a
