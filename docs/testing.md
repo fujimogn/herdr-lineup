@@ -167,28 +167,32 @@ macOS runtime or visual rendering evidence.
 
 On 2026-10-13, on Linux with Herdr 0.9.3, the checks that do not attach to a
 user's session were re-run against
-`c7c3aa534fd7ab3de8311d70efd6159a11ef5d12`.
+`bb4d362d4aa9fd690b6185e71dfca6a8bbc3aa35`, including the harness update in
+this change.
 
 `bash -n scripts/e2e-isolated.sh`, `bash scripts/e2e-isolated.sh --self-test`,
 and `shellcheck scripts/e2e-isolated.sh` passed. The self-test rejected a
 main-session socket and a symlink into that session, accepted an isolated
-path, and cleared inherited `HERDR_*` variables.
+path, and cleared inherited `HERDR_*` variables. It also rejected a bare em
+dash for `lineup_context_text`.
 
-`bash scripts/e2e-isolated.sh` created a private workspace and root pane.
-Repeated and concurrent `ensure` kept a single daemon PID. The publication
-check then failed with `Expected workspace/pane lineup_ tokens missing or
-incorrect`. Doctor, the sixteen-second renewal, idempotent stop, and the
-post-stop snapshot were not reached. The exit trap still deleted the isolated
-session and its private temporary directory.
+`bash scripts/e2e-isolated.sh` and `bash scripts/e2e-isolated.sh --tokens`
+each created a private workspace and root pane. Repeated and concurrent
+`ensure` kept a single daemon PID. Publication, the sixteen-second renewal,
+doctor, idempotent stop, and the post-stop snapshot with no `lineup_` tokens
+all passed. The exit trap deleted the isolated session and its private
+temporary directory. Real-agent verification remained `SKIP` for the
+unauthenticated isolated HOME.
 
-The harness still expects an unpadded em dash for `lineup_context_text`.
-Unit tests on this commit expect an em dash followed by two U+2800 cells.
-This rerun does not replace the older publication evidence above, and it does
-not show a passing metadata publication at this commit.
+An earlier rerun the same day stopped at publication. The harness still
+expected a bare em dash for `lineup_context_text`, while `pane_tokens` has
+published U+2014 followed by two U+2800 cells for missing context since
+`40ff85d`, before v0.1.0. That failure was a stale harness expectation, not a
+product regression.
 
-On the same commit, `cargo fmt --all --check`,
+On the same base, `cargo fmt --all --check`,
 `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`,
-and `target/release/herdr-lineup --help` passed. The library tests were 242
+and `target/release/herdr-lineup --help` passed. The library tests were 265
 passed and 2 ignored; the lifecycle integration test passed. The release
 binary used by the harness was built with `cargo build --release --locked`.
 

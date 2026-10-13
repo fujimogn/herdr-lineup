@@ -28,26 +28,61 @@ token_check() {
     python3 - "$@" <<'PYTOK'
 import copy, datetime, json, sys
 
-def require(value):
-    if not value: raise ValueError('token mismatch')
+# pane_tokens in src/tokens.rs publishes this for missing context.
+MISSING_CONTEXT_TEXT = '\u2014\u2800\u2800'
+
+def code_points(value):
+    if value is None:
+        return 'missing'
+    if not isinstance(value, str):
+        return 'non-string'
+    if value == '':
+        return 'empty'
+    return ' '.join(f'U+{ord(ch):04X}' for ch in value)
+
+def workspace_expected(ship):
+    stamp = datetime.datetime.fromtimestamp(int(ship))
+    text = stamp.strftime('%H:%M') if stamp.date() == datetime.datetime.now().date() else f'{stamp.month}/{stamp.day}'
+    return {'lineup_repo': 'lineup-e2e', 'lineup_ship_unix': str(ship), 'lineup_ship_text': text}
+
+def pane_expected():
+    return {'lineup_agent': 'codex', 'lineup_logo': 'Codex', 'lineup_state': 'idle',
+            'lineup_state_idle': '●', 'lineup_context_text': MISSING_CONTEXT_TEXT,
+            'lineup_weekly_text': '—'}
+
+def diff_map(tokens, expected, absent):
+    if not isinstance(tokens, dict):
+        return ['tokens expected object actual missing']
+    lines = []
+    for key, want in expected.items():
+        if key not in tokens or tokens[key] != want:
+            got = tokens[key] if key in tokens else None
+            lines.append(f'{key} expected {code_points(want)} actual {code_points(got)}')
+    for key in absent:
+        if key in tokens:
+            lines.append(f'{key} expected absent actual {code_points(tokens[key])}')
+    return lines
+
+def diff_snapshot(snapshot, workspace, pane, ship):
+    try:
+        rows = snapshot['result']['snapshot']
+        work = next(r for r in rows['workspaces'] if r['workspace_id'] == workspace)
+        lines = diff_map(work.get('tokens') or {}, workspace_expected(ship), ())
+        if pane:
+            row = next(r for r in rows['panes'] if r['pane_id'] == pane)
+            lines.extend(diff_map(row.get('tokens') or {}, pane_expected(),
+                                  ('lineup_context_pct', 'lineup_weekly_pct')))
+        return lines
+    except (KeyError, StopIteration, TypeError, ValueError):
+        return ['snapshot expected workspace and pane token rows actual missing']
 
 def check(snapshot, workspace, pane, ship):
-    rows = snapshot['result']['snapshot']
-    w = next(r for r in rows['workspaces'] if r['workspace_id'] == workspace)
-    tokens = w.get('tokens', {})
-    require(tokens.get('lineup_repo') == 'lineup-e2e')
-    require(tokens.get('lineup_ship_unix') == ship)
-    stamp = datetime.datetime.fromtimestamp(int(ship))
-    expected_text = stamp.strftime('%H:%M') if stamp.date() == datetime.datetime.now().date() else f'{stamp.month}/{stamp.day}'
-    require(tokens.get('lineup_ship_text') == expected_text)
-    if pane:
-        p = next(r for r in rows['panes'] if r['pane_id'] == pane)
-        tokens = p.get('tokens', {})
-        expected = {'lineup_agent': 'codex', 'lineup_logo': 'Codex',
-                    'lineup_state': 'idle', 'lineup_state_idle': '●',
-                    'lineup_context_text': '—', 'lineup_weekly_text': '—'}
-        require(all(tokens.get(k) == v for k, v in expected.items()))
-        require('lineup_context_pct' not in tokens and 'lineup_weekly_pct' not in tokens)
+    if diff_snapshot(snapshot, workspace, pane, ship):
+        raise ValueError('token mismatch')
+
+def require(value):
+    if not value:
+        raise ValueError('token mismatch')
 
 def cleared(snapshot):
     rows = snapshot['result']['snapshot']
@@ -60,13 +95,15 @@ if sys.argv[1] == 'self-test':
         'lineup_ship_unix': '123', 'lineup_ship_text': '1/1'}}], 'panes': [{
         'pane_id': 'w1:p1', 'tokens': {'lineup_agent': 'codex',
         'lineup_logo': 'Codex', 'lineup_state': 'idle', 'lineup_state_idle': '●',
-        'lineup_context_text': '—', 'lineup_weekly_text': '—'}}]}}}
+        'lineup_context_text': MISSING_CONTEXT_TEXT, 'lineup_weekly_text': '—'}}]}}}
     stamp = datetime.datetime.fromtimestamp(123)
     fixture['result']['snapshot']['workspaces'][0]['tokens']['lineup_ship_text'] = stamp.strftime('%H:%M') if stamp.date() == datetime.datetime.now().date() else f'{stamp.month}/{stamp.day}'
+    good = copy.deepcopy(fixture)
     check(fixture, 'w1', 'w1:p1', '123')
     for kind, key, value in [('workspaces', 'lineup_repo', '—'),
                              ('workspaces', 'lineup_ship_unix', '124'),
                              ('panes', 'lineup_weekly_text', '7d 99%'),
+                             ('panes', 'lineup_context_text', '—'),
                              ('panes', 'lineup_context_pct', '12')]:
         bad = copy.deepcopy(fixture)
         bad['result']['snapshot'][kind][0]['tokens'][key] = value
@@ -85,11 +122,25 @@ if sys.argv[1] == 'self-test':
     for kind in ('workspaces', 'panes'):
         fixture['result']['snapshot'][kind][0]['tokens'] = {'other_plugin': 'kept'}
     cleared(fixture)
+    bare = copy.deepcopy(good)
+    bare['result']['snapshot']['panes'][0]['tokens']['lineup_context_text'] = '—'
+    reported = diff_snapshot(bare, 'w1', 'w1:p1', '123')
+    if reported != ['lineup_context_text expected U+2014 U+2800 U+2800 actual U+2014']:
+        sys.exit('FAIL: mismatch report')
+    extra = copy.deepcopy(good)
+    extra['result']['snapshot']['panes'][0]['tokens']['lineup_group'] = 'lineup-e2e'
+    if diff_snapshot(extra, 'w1', 'w1:p1', '123'):
+        sys.exit('FAIL: extra key reported')
     print('PASS: token validation rejects wrong/missing values and uncleared tokens')
 else:
     snapshot = json.load(open(sys.argv[2]))
     try:
         if sys.argv[1] == 'clear': cleared(snapshot)
+        elif sys.argv[1] == 'explain':
+            lines = diff_snapshot(snapshot, *sys.argv[3:])
+            if lines:
+                print('\n'.join(lines), file=sys.stderr)
+                sys.exit(1)
         else: check(snapshot, *sys.argv[3:])
     except (ValueError, KeyError, StopIteration):
         sys.exit(1)
@@ -336,7 +387,11 @@ PYID
         fi
         sleep 0.2
     done
-    $found || { echo 'Expected workspace/pane lineup_ tokens missing or incorrect' >&2; exit 1; }
+    $found || {
+        token_check explain "$temp/snapshot.json" "$workspace" "$pane" "$ship_unix" >&2 || true
+        echo 'Expected workspace/pane lineup_ tokens missing or incorrect' >&2
+        exit 1
+    }
     python3 - "$temp/snapshot.json" "$workspace" "$pane" <<'PYVIEW'
 import json, sys
 rows=json.load(open(sys.argv[1]))['result']['snapshot']
@@ -351,7 +406,11 @@ PYVIEW
     # A second snapshot after 16 seconds plus a newer checkpoint proves renewal.
     sleep 16
     herdr_cmd api snapshot > "$temp/renewed.json"
-    token_check present "$temp/renewed.json" "$workspace" "$pane" "$ship_unix" || { echo 'Tokens expired before renewal' >&2; exit 1; }
+    if ! token_check present "$temp/renewed.json" "$workspace" "$pane" "$ship_unix"; then
+        token_check explain "$temp/renewed.json" "$workspace" "$pane" "$ship_unix" >&2 || true
+        echo 'Tokens expired before renewal' >&2
+        exit 1
+    fi
     sequence_record > "$temp/seq-second.json"
     sequence_check "$temp/seq-first.json" "$temp/seq-second.json"
     echo 'PASS: second snapshot after default TTL retains tokens with newer sequences'
