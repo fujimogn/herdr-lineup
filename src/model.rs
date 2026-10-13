@@ -78,7 +78,7 @@ pub struct UsageReading {
     pub weekly_resets_at: Option<SystemTime>,
 }
 
-/// Homes are explicitly passed from the pane's environment; readers do not access global homes.
+/// The caller injects the daemon home; the snapshot provides no pane-specific home.
 pub struct ReadRequest<'a> {
     pub identity: &'a SessionIdentity,
     pub home: &'a Path,

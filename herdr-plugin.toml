@@ -1,10 +1,10 @@
 id = "herdr-lineup"
 name = "Lineup"
 version = "0.1.0"
-# Baseline for the planned sidebar metadata publisher and agent integrations.
+# Minimum Herdr version for the sidebar metadata publisher and agent integrations.
 # Startup is one-shot; ensure must also recover after workspace.focused.
 min_herdr_version = "0.9.3"
-description = "Agent status, context, quota, and repository ship times in the sidebar (planned)."
+description = "Agent status, context, quota, and repository ship times in the sidebar."
 platforms = ["macos", "linux"]
 
 [[build]]

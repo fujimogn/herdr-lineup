@@ -58,15 +58,31 @@ is absent or its date heading does not match the `YYYY-MM-DD` format.
 The release workflow SHALL run on a human-pushed `v*` tag, verify version
 consistency using `scripts/check-version.sh`, and create a GitHub Release titled
 `vX.Y.Z` with the extractor output as its body. It SHALL attach Linux and macOS
-binaries and `SHA256SUMS.txt`, and SHALL NOT create or push tags itself or publish
-to a marketplace. Failed extraction SHALL prevent Release creation.
+archives named `herdr-lineup-<tag>-<os>-<arch>.tar.gz` and `SHA256SUMS.txt`
+covering those archives. Each archive SHALL contain `herdr-lineup`, `LICENSE`,
+`NOTICE.md`, and `README.md` at its root and preserve executable permission.
+The OS and architecture SHALL come from the actual runner via `uname`, with
+`Linux` mapped to `linux`, `Darwin` to `macos`, and Linux `aarch64` to `arm64`.
+Only `x86_64` and `arm64` on those platforms SHALL be accepted; other combinations
+SHALL fail packaging. Build jobs SHALL have only `contents: read`; only the
+publish job SHALL receive `contents: write`. The workflow SHALL NOT create or
+push tags itself or publish to a marketplace. Failed extraction SHALL prevent
+Release creation.
 
 #### Scenario: Publish a prepared release
 
 - **WHEN** a human pushes vX.Y.Z with matching manifest and lockfile versions
   and a valid dated changelog section
 - **THEN** the workflow builds both platform binaries and creates the Release
-  with title vX.Y.Z, heading-inclusive notes, and checksum attachments
+  with title vX.Y.Z, heading-inclusive notes, platform/architecture archives,
+  and archive checksum attachments
+
+#### Scenario: Package the runner architecture
+
+- **WHEN** a build runs on Linux x86_64 or macOS arm64
+- **THEN** the archive suffix is `linux-x86_64.tar.gz` or `macos-arm64.tar.gz`
+  respectively, and the archive includes the binary, license, notice, and README
+- **AND** an unsupported OS/architecture combination fails before artifact upload
 
 #### Scenario: Prevent publication without a matching section
 
@@ -78,7 +94,13 @@ to a marketplace. Failed extraction SHALL prevent Release creation.
 The release guide SHALL use numbered bold Steps, Version numbering, and
 Supported versions sections. It SHALL document version and lockfile alignment,
 dated changelog preparation, both preflight scripts, development checks,
-reviewed integration, human-owned tagging, and release verification. CI SHALL
+reviewed integration, human-owned tagging, and release verification. Before
+tagging, the maintainer SHALL confirm that the dated heading matches the tag's
+creation day and land any date correction first. The guide SHALL explain that
+the macOS executable is not Developer ID signed or notarized, browser downloads
+receive quarantine metadata, plugin installation builds from a checkout, and
+archive executables serve PATH-based uses such as statusLine rather than
+standalone plugin installation. CI SHALL
 exercise extraction success, missing versions, Unreleased-only input, malformed
 dates, adjacent-section boundaries, and surrounding blank lines.
 

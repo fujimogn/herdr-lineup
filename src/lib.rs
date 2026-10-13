@@ -1,4 +1,4 @@
-//! Lineup command-line scaffold and planned runtime modules.
+//! Lineup commands, sidebar publisher, and agent usage integrations.
 
 pub mod config;
 pub mod configure;
@@ -61,7 +61,7 @@ enum Command {
     UninstallFont,
 }
 
-/// Run the command-line scaffold.
+/// Parse and run a Lineup command.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {

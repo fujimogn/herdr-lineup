@@ -356,7 +356,7 @@ PYVIEW
     sequence_check "$temp/seq-first.json" "$temp/seq-second.json"
     echo 'PASS: second snapshot after default TTL retains tokens with newer sequences'
 else
-    echo 'SKIP: publication tokens; rerun with --tokens after publication wiring lands'
+    echo 'SKIP: publication tokens; rerun with --tokens to verify published sidebar metadata'
 fi
 lineup_cmd doctor
 lineup_cmd stop

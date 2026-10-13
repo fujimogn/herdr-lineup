@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +14,8 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.os }})
+    permissions:
+      contents: read
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -37,15 +39,20 @@ jobs:
       - name: Package artifact
         shell: bash
         run: |
-          case "${{ matrix.os }}" in
-            ubuntu-latest) platform=linux ;;
-            macos-latest) platform=macos ;;
-            *) echo "unsupported runner: ${{ matrix.os }}" >&2; exit 1 ;;
+          set -euo pipefail
+          platform=$(uname -s)
+          arch=$(uname -m)
+          case "$platform:$arch" in
+            Linux:x86_64) platform=linux ;;
+            Linux:aarch64|Linux:arm64) platform=linux; arch=arm64 ;;
+            Darwin:x86_64) platform=macos ;;
+            Darwin:arm64) platform=macos ;;
+            *) echo "unsupported runner: $platform/$arch" >&2; exit 1 ;;
           esac
-          artifact="herdr-lineup-${GITHUB_REF_NAME}-${platform}"
+          artifact="herdr-lineup-${GITHUB_REF_NAME}-${platform}-${arch}.tar.gz"
           mkdir -p dist
-          cp target/release/herdr-lineup "dist/${artifact}"
-          (cd dist && shasum -a 256 "${artifact}" > "SHA256SUMS-${platform}.txt")
+          tar -czf "dist/${artifact}" -C target/release herdr-lineup -C ../.. LICENSE NOTICE.md README.md
+          (cd dist && shasum -a 256 "${artifact}" > "SHA256SUMS-${platform}-${arch}.txt")
       - uses: actions/upload-artifact@v4
         with:
           name: artifact-${{ matrix.os }}
@@ -54,6 +61,8 @@ jobs:
 
   publish:
     name: Publish GitHub Release
+    permissions:
+      contents: write
     needs: build
     runs-on: ubuntu-latest
     steps:

@@ -46,8 +46,10 @@ tag. The workflow never tags or pushes on its own.
    together using the conventions in `AGENTS.md`, and land the reviewed changes
    on `main` through the repository's approved integration path. Confirm CI is
    green for that release commit.
-6. **Push the release tag.** A human tags the verified release commit on `main`
-   and pushes only the tag:
+6. **Push the release tag.** Before tagging, confirm that the changelog heading's
+   date matches the day the tag will be created. If release preparation happened
+   earlier, update the date and land that reviewed change first. A human tags
+   the verified release commit on `main` and pushes only the tag:
    ```sh
    git tag vX.Y.Z <release-commit>
    git push origin vX.Y.Z
@@ -55,11 +57,42 @@ tag. The workflow never tags or pushes on its own.
    The workflow checks the tag against the manifests and lockfile, builds on
    `ubuntu-latest` and `macos-latest`, and creates a GitHub Release titled
    `vX.Y.Z`. The body is the extractor's output, including
-   `## X.Y.Z (YYYY-MM-DD)`, and the attachments are the Linux and macOS binaries
+   `## X.Y.Z (YYYY-MM-DD)`, and the attachments are the Linux and macOS archives
    plus `SHA256SUMS.txt`. Missing release notes fail publication.
 7. **Verify the release.** Confirm the workflow succeeded and the GitHub Release
-   has the expected title, dated notes, both platform binaries, and checksums.
+   has the expected title, dated notes, both platform archives, and checksums.
    Compare the downloaded artifacts with `SHA256SUMS.txt` before using them.
+
+## Release artifacts
+
+Each archive is named `herdr-lineup-<tag>-<os>-<arch>.tar.gz`, for example
+`herdr-lineup-v0.1.0-linux-x86_64.tar.gz` or
+`herdr-lineup-v0.1.0-macos-arm64.tar.gz`. The build reads the runner's actual OS
+and CPU architecture with `uname`; unsupported combinations fail packaging.
+Linux and macOS support `x86_64` and `arm64` labels (`aarch64` on Linux is
+normalized to `arm64`). The runner matrix produces one archive per OS, not
+every architecture combination. Each archive contains these files at its root:
+
+- `herdr-lineup` — the executable, with its executable permission preserved.
+- `LICENSE` — the project license.
+- `NOTICE.md` — third-party attribution.
+- `README.md` — usage and installation instructions.
+
+`SHA256SUMS.txt` covers the `.tar.gz` archives. From the download directory, run
+`shasum -a 256 -c SHA256SUMS.txt` after downloading all listed archives. Only
+the publish job receives `contents: write`; builds use `contents: read`.
+
+Plugin installation builds from a checkout using the manifest's Cargo build
+command. The archives are not standalone plugin installations: they do not
+include the manifest or Rust sources. Put the extracted executable on the
+agent's `PATH` for commands such as `statusline`, following the README's shared
+`HERDR_PLUGIN_STATE_DIR` setup. Install or link the plugin from a checkout as
+described in the README.
+
+The macOS executable is not Developer ID signed or notarized. Browser downloads
+receive macOS quarantine metadata, so Gatekeeper may block execution even after
+the checksum matches. Building from a trusted checkout is the documented plugin
+installation path; an archive checksum alone does not establish publisher trust.
 
 ## Version numbering
 
