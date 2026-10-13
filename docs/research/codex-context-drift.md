@@ -125,7 +125,7 @@ So "rounding of the same latest integer sample" does not explain a one-point gap
 
 ## Behaviors that do not produce one point
 
-- File larger than 16 MiB: lineup `Budget::bytes` reads at most `16 * 1024 * 1024 + 1` bytes and returns `SourceError` (`src/model.rs`). The retired reader still uses the last 256 KiB. The sidebar is `—` versus a percent.
+- File larger than 16 MiB: lineup reads the final 2 MiB of an uncompressed rollout after checking its bounded session header, so size alone does not produce `SourceError` (`src/reader_codex.rs`). A zstd rollout still returns `SourceError` when its decompressed content exceeds 16 MiB (`src/model.rs`). The retired reader uses the last 256 KiB. A differing selected `token_count` can therefore produce a different percent or an unavailable result.
 - Two rollout paths for one session id: lineup returns `Unassociated` when more than one `sessions` or `archived_sessions` name ends with `-{id}.jsonl` or `-{id}.jsonl.zst` (`src/reader_codex.rs`). The retired finder keeps the newest mtime whose name contains the id, and skips a `.jsonl.zst` that has a plain sibling. Again `—` versus a percent, unless the two files' percents are what get compared across different choices.
 - Future `timestamp`: lineup drops the sample (`src/model.rs`). The retired timestamp is only the cache-TTL anchor. `—` versus a percent.
 - Idle age: lineup does not expire exact-session context. The retired context value is also the last accepted rollout observation, not a heartbeat. Age alone does not move the integer while the file is unchanged.

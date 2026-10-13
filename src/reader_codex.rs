@@ -9,9 +9,9 @@ use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
 // A context observation outside this suffix is NotFound, not a full-file scan.
-// The header must fit in 64 KiB. Oversized headers are SourceError.
+// The header and its newline must fit in 256 KiB. Oversized headers are SourceError.
 const TAIL_BYTES: usize = 2 * 1024 * 1024;
-const HEADER_BYTES: usize = 64 * 1024;
+const HEADER_BYTES: usize = 256 * 1024;
 const CACHE_ENTRIES: usize = 128;
 type Observation = Result<(f64, SystemTime), MissingReason>;
 
@@ -79,6 +79,14 @@ fn read_session_with_hook(
     request: &ReadRequest<'_>,
     after_read: impl FnOnce(&Path),
 ) -> Result<(f64, std::time::SystemTime), MissingReason> {
+    read_session_with_hooks(request, after_read, |_| {})
+}
+
+fn read_session_with_hooks(
+    request: &ReadRequest<'_>,
+    after_read: impl FnOnce(&Path),
+    after_path_stat: impl FnOnce(&Path),
+) -> Result<(f64, std::time::SystemTime), MissingReason> {
     let mut budget = Budget::new(request);
     // Discovery reads names only. Other sessions and credential files are never opened.
     let mut paths = budget.files(&request.home.join("sessions"), 3, rollout)?;
@@ -124,6 +132,7 @@ fn read_session_with_hook(
         return Err(MissingReason::SourceError);
     }
     let path_after = Fingerprint::of(&current);
+    after_path_stat(path);
     let file_after = Fingerprint::of(&file.metadata().map_err(|e| io_reason(&e))?);
     if path_after != fingerprint || file_after != fingerprint {
         // An append cannot change bytes in the prefix read above. Return its
@@ -132,8 +141,9 @@ fn read_session_with_hook(
             && path_after.inode == fingerprint.inode
             && file_after.dev == fingerprint.dev
             && file_after.inode == fingerprint.inode
-            && path_after.size > fingerprint.size
-            && file_after.size >= path_after.size
+            && path_after.size >= fingerprint.size
+            && file_after.size >= fingerprint.size
+            && (path_after.size > fingerprint.size || file_after.size > fingerprint.size)
         {
             return result;
         }
@@ -240,6 +250,65 @@ fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Obse
 #[cfg(test)]
 mod tests {
     #[test]
+    fn append_between_path_and_file_stats_returns_prefix_without_caching() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let original = fs::read_to_string(&path).unwrap();
+        let (_, sample) = original.split_once('\n').unwrap();
+        let next = sample.replace("26000", "28000");
+        let result = read_session_with_hooks(
+            &r,
+            |_| {},
+            |path| {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(next.as_bytes())
+                    .unwrap();
+            },
+        );
+        assert!((result.unwrap().0 - 7.0).abs() < 1e-9);
+        assert!((read_session(&r).unwrap().0 - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn large_rollout_header_limit_includes_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let path = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let original = fs::read_to_string(&path).unwrap();
+        let (_, sample) = original.split_once('\n').unwrap();
+        let template =
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\"},\"padding\":\"\"}";
+        let padding = "{\"type\":\"response_item\"}\n".repeat(100_000);
+        for (header_bytes, expected) in [
+            (256 * 1024, Ok(())),
+            (256 * 1024 + 1, Err(MissingReason::SourceError)),
+        ] {
+            let header = template.replace(
+                "\"\"}",
+                &format!("\"{}\"}}", "x".repeat(header_bytes - template.len() - 1)),
+            );
+            assert_eq!(header.len() + 1, header_bytes);
+            fs::write(&path, format!("{header}\n{padding}{sample}")).unwrap();
+            assert!(fs::metadata(&path).unwrap().len() > TAIL_BYTES as u64);
+            let result = read_session(&r).map(|_| ());
+            assert_eq!(result, expected);
+        }
+    }
+
+    #[test]
     fn append_after_read_returns_complete_prefix_without_caching_it() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
@@ -300,6 +369,17 @@ mod tests {
                     .open(path)
                     .unwrap()
                     .set_modified(old_time + std::time::Duration::from_secs(1))
+                    .unwrap();
+            }),
+            Err(MissingReason::SourceError)
+        );
+        assert_eq!(
+            read_session_with_hook(&r, |path| {
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(old_time + std::time::Duration::from_secs(2))
                     .unwrap();
             }),
             Err(MissingReason::SourceError)

@@ -175,19 +175,39 @@ including a split UTF-8 sequence without a newline, SHALL NOT hide a completed
 observation earlier in the scanned region. A completed malformed record within
 that region SHALL make the source unavailable.
 
-An uncompressed Codex rollout of at most 2 MiB SHALL be scanned in full.
-Larger rollouts SHALL verify the exact native session against the first
-`session_meta` record within 64 KiB, then scan only the final 2 MiB, discarding
-any initial partial record before decoding UTF-8. A `token_count` outside that
-bounded region SHALL be unavailable. Zstd rollouts SHALL retain
-the 16 MiB decompressed full-read limit; exceeding it SHALL be unavailable with
-`SourceError` because the stream cannot be sought.
+#### Scenario: Bound uncompressed rollout reads
+- **WHEN** an uncompressed Codex rollout is at most 2 MiB
+- **THEN** the reader scans the full file
 
-The reader SHALL reuse a derived result without rereading content while the
-path, native session ID, device, inode, size, and modification time match. If
-the same file grows during a read, the reader SHALL return the complete
-observation from the scanned prefix without caching it. Replacement, truncation,
-or same-size modification during a read SHALL produce `SourceError`.
+#### Scenario: Bound large uncompressed rollout reads
+- **WHEN** an uncompressed rollout exceeds 2 MiB
+- **THEN** the reader verifies the exact native session against the first
+  `session_meta` record and its newline within 256 KiB
+- **AND** it scans only the final 2 MiB, discarding an initial partial record
+  before decoding UTF-8
+- **AND** a `token_count` outside that region is unavailable
+- **AND** a header whose newline exceeds 256 KiB produces `SourceError`
+
+#### Scenario: Bound compressed rollout reads
+- **WHEN** a zstd rollout is read
+- **THEN** the reader scans its decompressed content in full up to 16 MiB
+- **AND** exceeding that limit produces `SourceError` because the stream cannot
+  be sought
+
+#### Scenario: Reuse an unchanged rollout
+- **WHEN** the path, native session ID, device, inode, size, and modification
+  time match a cached result
+- **THEN** the reader reuses the result without rereading content
+
+#### Scenario: Rollout changes during a read
+- **WHEN** the same file grows between the initial file stat and the final path
+  and file stats, including between those final stats
+- **THEN** the reader returns the complete observation from the scanned prefix
+  without caching it
+
+#### Scenario: Reject non-append rollout changes
+- **WHEN** the file is replaced, truncated, or modified without size growth
+- **THEN** the reader produces `SourceError`
 
 ### Requirement: Local statusLine capture and transparent chaining
 `herdr-lineup statusline <claude|agy>` SHALL accept at most 1 MiB for JSON
