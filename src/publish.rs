@@ -110,6 +110,9 @@ pub struct MetadataPublisher {
     codex_control: Arc<crate::quota_codex::QueryControl>,
     headings: BTreeMap<String, HeadingCache>,
     local_readings: BTreeMap<String, model::UsageReading>,
+    /// Successful `sequences.json` writes. Tests assert one write per report.
+    #[cfg(test)]
+    checkpoint_persists: std::sync::atomic::AtomicU64,
 }
 impl MetadataPublisher {
     /// Construction performs no state I/O. The daemon acquires its session lock
@@ -138,6 +141,8 @@ impl MetadataPublisher {
             codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
             headings: BTreeMap::new(),
             local_readings: BTreeMap::new(),
+            #[cfg(test)]
+            checkpoint_persists: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -347,7 +352,12 @@ impl MetadataPublisher {
         file.as_file().sync_all()?;
         file.persist(self.directory.join("sequences.json"))
             .map_err(|_| io::Error::other("cannot persist sequence checkpoint"))?;
-        File::open(&self.directory)?.sync_all()
+        File::open(&self.directory)?.sync_all()?;
+        #[cfg(test)]
+        {
+            let _ = self.checkpoint_persists.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn request(&mut self, transport: &mut Transport, method: &str) -> io::Result<(String, Value)> {
@@ -449,7 +459,10 @@ impl MetadataPublisher {
         self.planner
             .acknowledge(&report, now_ms)
             .map_err(|_| io::Error::other("invalid metadata reservation"))?;
-        self.persist()
+        // `acknowledge` records acceptance only. `checkpoint()` is the high-water
+        // sequence already saved before the send, so another persist would
+        // rewrite the same bytes.
+        Ok(())
     }
 
     fn reconcile_missing(&mut self, snapshot: &protocol::Snapshot) {
@@ -2443,6 +2456,77 @@ mod tests {
             .unwrap();
         let reports = server.join().unwrap();
         assert_eq!(reports[0]["params"]["seq"], 41);
+    }
+
+    #[test]
+    fn one_report_persists_the_reserved_sequence_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(2));
+            for _ in 0..2 {
+                let request = receive(&mut stream);
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id": request["id"], "result": {"type": "ok"}})
+                )
+                .unwrap();
+            }
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let resource = ResourceId {
+            endpoint_session: "endpoint".into(),
+            kind: ResourceKind::Pane,
+            id: "w1:p1".into(),
+        };
+        let desired = BTreeMap::from([("lineup_agent".into(), Some("codex".into()))]);
+        publisher
+            .report(
+                &mut transport,
+                &resource,
+                &BTreeSet::new(),
+                None,
+                &desired,
+                None,
+            )
+            .unwrap();
+        assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 1);
+        let reserved = std::fs::read(dir.path().join("sequences.json")).unwrap();
+        let rows: Vec<CheckpointRow> = serde_json::from_slice(&reserved).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq, 1);
+        // Acceptance does not move the high-water mark, so rewriting the
+        // checkpoint after acknowledge stores the same bytes.
+        publisher.persist().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("sequences.json")).unwrap(),
+            reserved
+        );
+
+        let mut restarted =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        restarted.load_checkpoint().unwrap();
+        assert_eq!(restarted.planner.checkpoint().get(&resource), Some(&1));
+        restarted
+            .report(
+                &mut transport,
+                &resource,
+                &BTreeSet::new(),
+                None,
+                &desired,
+                None,
+            )
+            .unwrap();
+        assert_eq!(restarted.checkpoint_persists.load(Ordering::Relaxed), 1);
+        let rows: Vec<CheckpointRow> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
+                .unwrap();
+        assert_eq!(rows[0].seq, 2);
+        server.join().unwrap();
     }
 
     #[test]

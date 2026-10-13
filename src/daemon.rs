@@ -4,7 +4,7 @@ use crate::{
     config::Config,
     doctor,
     lock::{LifecycleLock, ProcessExit, RuntimePaths, SessionLock, StartupLockContention},
-    socket::{EndpointIdentity, Transport, read_frame},
+    socket::{EndpointIdentity, Transport, read_frame, write_frame},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -407,8 +407,8 @@ impl Drop for RuntimeCleanup {
 fn control_stream(paths: &RuntimePaths) -> io::Result<Option<BufReader<UnixStream>>> {
     match crate::socket::connect_stream(&paths.control) {
         Ok(stream) => {
-            stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-            stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+            // Frame deadlines are poll-based inside read_frame and write_frame.
+            // setsockopt timeouts return EINVAL on macOS after the peer closes.
             Ok(Some(BufReader::new(stream)))
         }
         Err(error)
@@ -427,7 +427,7 @@ fn read_identity(
     paths: &RuntimePaths,
     socket: &std::path::Path,
 ) -> io::Result<Health> {
-    stream.get_mut().write_all(b"health\n")?;
+    write_frame(stream.get_mut(), b"health")?;
     let health: Health = serde_json::from_slice(&read_frame(stream, 8192)?)
         .map_err(|_| io::Error::other("invalid daemon control identity"))?;
     if health.plugin != PLUGIN_ID
@@ -494,8 +494,7 @@ fn stop_with_lock(options: &Options, after_lock: impl FnOnce()) -> io::Result<()
     verify_peer_pid(stream.get_ref(), identity.pid)?;
     let process = ProcessExit::observe(identity.pid)?;
     let request = serde_json::json!({"stop":identity.nonce,"plugin":PLUGIN_ID,"socket_key":paths.key,"endpoint":identity.endpoint});
-    serde_json::to_writer(stream.get_mut(), &request)?;
-    stream.get_mut().write_all(b"\n")?;
+    write_frame(stream.get_mut(), &serde_json::to_vec(&request)?)?;
     if read_frame(&mut stream, 8192)? != b"stopping" {
         return Err(io::Error::other("daemon refused shutdown identity"));
     }
@@ -557,12 +556,10 @@ fn verify_peer_pid(stream: &UnixStream, expected: u32) -> io::Result<()> {
     Ok(())
 }
 fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
-    // BSD/macOS accept inherits O_NONBLOCK from our listener. A timeout does
-    // not clear that flag; explicitly block so the identity/stop exchange waits
-    // for the next frame within its deadline instead of closing on WouldBlock.
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+    // Accept inherits O_NONBLOCK. read_frame and write_frame keep non-blocking
+    // I/O and one poll deadline. Do not apply that deadline with setsockopt:
+    // on macOS it returns EINVAL after the peer has closed, and that error
+    // would exit the control worker.
     let mut reader = BufReader::new(stream);
     // Broken or slow clients cannot terminate the daemon.
     let Ok(frame) = read_frame(&mut reader, 8192) else {
@@ -571,9 +568,10 @@ fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
     if frame != b"health" {
         return Ok(false);
     }
-    if serde_json::to_writer(reader.get_mut(), health).is_err()
-        || reader.get_mut().write_all(b"\n").is_err()
-    {
+    let Ok(bytes) = serde_json::to_vec(health) else {
+        return Ok(false);
+    };
+    if write_frame(reader.get_mut(), &bytes).is_err() {
         return Ok(false);
     }
     let Ok(frame) = read_frame(&mut reader, 8192) else {
@@ -589,7 +587,7 @@ fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
     {
         return Ok(false);
     }
-    let _ = reader.get_mut().write_all(b"stopping\n");
+    let _ = write_frame(reader.get_mut(), b"stopping");
     Ok(true)
 }
 
@@ -1534,6 +1532,58 @@ mod tests {
         std::fs::write(options.config.join("config.toml"), "unknown = 'PRIVATE'").unwrap();
         assert!(ensure_command(&options, child_command()).is_err());
         assert!(!options.state.exists());
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    fn sample_health() -> Health {
+        Health {
+            plugin: PLUGIN_ID.into(),
+            socket_path: PathBuf::from("/isolated/herdr.sock"),
+            socket_key: "isolated".into(),
+            endpoint: EndpointIdentity {
+                device: 1,
+                inode: 2,
+            },
+            nonce: "a".repeat(64),
+            pid: 1,
+            last_refresh_ms: Some(0),
+            refresh_failed: false,
+        }
+    }
+
+    #[test]
+    fn serve_control_rejects_a_peer_that_is_already_closed() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // Reproduce the non-blocking flag inherited from the listener.
+        server.set_nonblocking(true).unwrap();
+        drop(client);
+        let started = Instant::now();
+        assert!(!serve_control(server, &sample_health()).unwrap());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn clients_that_close_immediately_do_not_stop_the_daemon() {
+        let (_dir, options, done, server) = fixture();
+        ensure_command(&options, child_command()).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let identity = probe(&paths, &options.socket).unwrap().unwrap();
+        for _ in 0..24 {
+            drop(UnixStream::connect(&paths.control).unwrap());
+        }
+        // Let the control worker accept the closed sockets. A setsockopt
+        // failure would finish that worker and take the daemon with it.
+        std::thread::sleep(Duration::from_millis(400));
+        let after = probe(&paths, &options.socket).unwrap().unwrap();
+        assert_eq!(after.pid, identity.pid);
+        assert_eq!(after.nonce, identity.nonce);
+        assert_eq!(unsafe { libc::kill(identity.pid as i32, 0) }, 0);
+        let started = Instant::now();
+        stop(&options).unwrap();
+        assert!(started.elapsed() < STOP_DEADLINE);
+        assert!(probe(&paths, &options.socket).unwrap().is_none());
+        assert!(SessionLock::acquire(&paths).unwrap().is_some());
         done.store(true, Ordering::Relaxed);
         server.join().unwrap();
     }
