@@ -1,13 +1,13 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/main/docs/images/herdr-lineup.png" alt="herdr-lineup" width="220">
+<p align="center"><img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/main/docs/images/herdr-lineup.png" alt="herdr-lineup" width="420"></p>
 
 [![Latest release](https://img.shields.io/github/v/release/fujimogn/herdr-lineup?logo=github&color=brightgreen)](https://github.com/fujimogn/herdr-lineup/releases/latest) [![CI](https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml) [![Rust 1.99.0](https://img.shields.io/badge/Rust-1.99.0-orange?logo=rust)](https://github.com/fujimogn/herdr-lineup/blob/main/rust-toolchain.toml)
 [![Herdr plugin requires version 0.9.3 or later](https://img.shields.io/badge/Herdr_plugin-%E2%89%A5_0.9.3-purple)](https://herdr.dev/plugins/) [![Platform: macOS and Linux](https://img.shields.io/badge/Platform-macOS_%7C_Linux-blue)](https://github.com/fujimogn/herdr-lineup/blob/main/herdr-plugin.toml) [![MIT license](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
 **herdr-lineup** shows each AI coding agent's state, context use, and weekly quota in one sidebar row in [Herdr](https://herdr.dev), alongside each repository's latest local `origin/main` commit time.
 
-<img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/main/docs/images/sidebar-agents.png" alt="Herdr Agents sidebar showing Lineup agent rows, context use, and weekly quota" width="420">
+<p align="center"><img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/main/docs/images/sidebar-agents.png" alt="Herdr Agents sidebar showing Lineup agent rows, context use, and weekly quota" width="420"></p>
 
 </div>
 
@@ -687,7 +687,7 @@ The repository heading reads the newest local `origin/main` commit without
 fetching: `HH:MM` for today, `M/D` for earlier dates. This is a commit-time label,
 not proof of a deployment.
 
-<img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/main/docs/images/sidebar-spaces.png" alt="Herdr Spaces sidebar showing repository names and local last-ship times" width="420">
+<p align="center"><img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/main/docs/images/sidebar-spaces.png" alt="Herdr Spaces sidebar showing repository names and local last-ship times" width="420"></p>
 
 ### Account quota behavior
 
