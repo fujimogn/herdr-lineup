@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1 align="center">herdr-lineup</h1>
+<img src="https://raw.githubusercontent.com/fujimogn/herdr-lineup/v0.1.1/docs/images/herdr-lineup.png" alt="herdr-lineup" width="220">
 
 [![Latest release](https://img.shields.io/github/v/release/fujimogn/herdr-lineup?logo=github&color=brightgreen)](https://github.com/fujimogn/herdr-lineup/releases/latest) [![CI](https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fujimogn/herdr-lineup/actions/workflows/ci.yml) [![Rust 1.99.0](https://img.shields.io/badge/Rust-1.99.0-orange?logo=rust)](https://github.com/fujimogn/herdr-lineup/blob/main/rust-toolchain.toml)
 [![Herdr plugin requires version 0.9.3 or later](https://img.shields.io/badge/Herdr_plugin-%E2%89%A5_0.9.3-purple)](https://herdr.dev/plugins/) [![Platform: macOS and Linux](https://img.shields.io/badge/Platform-macOS_%7C_Linux-blue)](https://github.com/fujimogn/herdr-lineup/blob/main/herdr-plugin.toml) [![MIT license](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
