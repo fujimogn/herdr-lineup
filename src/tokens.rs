@@ -262,9 +262,17 @@ struct ResourceState {
 #[derive(Clone, Debug, Default)]
 pub struct Publisher {
     resources: BTreeMap<ResourceId, ResourceState>,
+    endpoint_floors: BTreeMap<String, u64>,
 }
 impl Publisher {
     pub fn restore(checkpoint: BTreeMap<ResourceId, u64>) -> Self {
+        Self::restore_with_floors(checkpoint, BTreeMap::new())
+    }
+
+    pub fn restore_with_floors(
+        checkpoint: BTreeMap<ResourceId, u64>,
+        endpoint_floors: BTreeMap<String, u64>,
+    ) -> Self {
         Self {
             resources: checkpoint
                 .into_iter()
@@ -278,6 +286,7 @@ impl Publisher {
                     )
                 })
                 .collect(),
+            endpoint_floors,
         }
     }
 
@@ -286,6 +295,44 @@ impl Publisher {
             .iter()
             .map(|(resource, state)| (resource.clone(), state.high_water))
             .collect()
+    }
+
+    pub fn checkpoint_floors(&self) -> BTreeMap<String, u64> {
+        self.endpoint_floors.clone()
+    }
+
+    /// The authoritative snapshot permits removal of absent resource rows.
+    /// Their maximum reserved sequence remains as a durable endpoint floor,
+    /// so a resource ID reused by this same server cannot restart at seq 1.
+    /// A different endpoint has no access to the prior server's metadata.
+    pub fn prune_for_snapshot(&mut self, endpoint: &str, live: &BTreeSet<ResourceId>) -> bool {
+        let mut changed = false;
+        let mut floor = self
+            .endpoint_floors
+            .get(endpoint)
+            .copied()
+            .unwrap_or_default();
+        self.resources.retain(|resource, state| {
+            if resource.endpoint_session != endpoint {
+                changed = true;
+                return false;
+            }
+            if !live.contains(resource) {
+                floor = floor.max(state.high_water);
+                changed = true;
+                return false;
+            }
+            true
+        });
+        self.endpoint_floors.retain(|key, _| {
+            let keep = key == endpoint;
+            changed |= !keep;
+            keep
+        });
+        if floor > 0 {
+            changed |= self.endpoint_floors.insert(endpoint.into(), floor) != Some(floor);
+        }
+        changed
     }
 
     /// `now_ms` is an injected monotonic clock; Unix time is only for displays.
@@ -383,6 +430,12 @@ impl Publisher {
         }
         let seq = state
             .high_water
+            .max(
+                self.endpoint_floors
+                    .get(&resource.endpoint_session)
+                    .copied()
+                    .unwrap_or_default(),
+            )
             .checked_add(1)
             .ok_or(PatchError::SequenceExhausted)?;
         let report = Report {
@@ -1125,6 +1178,40 @@ mod tests {
                 .unwrap_err(),
             PatchError::SequenceExhausted
         );
+    }
+
+    #[test]
+    fn missing_resources_compact_without_reusing_sequence_after_restart() {
+        let pane = resource("gone");
+        let live = resource("live");
+        let mut old = resource("old-endpoint");
+        old.endpoint_session = "replaced/socket/session".into();
+        let mut publisher = Publisher::restore(BTreeMap::from([
+            (pane.clone(), 17),
+            (live.clone(), 4),
+            (old.clone(), 99),
+        ]));
+        assert!(
+            publisher.prune_for_snapshot(&pane.endpoint_session, &BTreeSet::from([live.clone()]))
+        );
+        assert_eq!(publisher.checkpoint().len(), 1);
+        assert!(!publisher.checkpoint().contains_key(&pane));
+        assert!(!publisher.checkpoint().contains_key(&old));
+
+        let mut restarted =
+            Publisher::restore_with_floors(publisher.checkpoint(), publisher.checkpoint_floors());
+        let report = restarted
+            .prepare(
+                &pane,
+                &snapshot(0),
+                None,
+                &Tokens::from([("lineup_agent".into(), Some("codex".into()))]),
+                0,
+                5000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.seq, 18);
     }
 
     #[test]

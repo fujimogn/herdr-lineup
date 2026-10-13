@@ -305,7 +305,14 @@ impl MetadataPublisher {
                 let rows: Vec<CheckpointRow> = serde_json::from_reader(file)
                     .map_err(|_| io::Error::other("invalid sequence checkpoint"))?;
                 let mut checkpoint = BTreeMap::new();
+                let mut floors = BTreeMap::new();
                 for row in rows {
+                    if row.kind == "endpoint" {
+                        if !row.id.is_empty() || floors.insert(row.endpoint, row.seq).is_some() {
+                            return Err(io::Error::other("invalid checkpoint endpoint floor"));
+                        }
+                        continue;
+                    }
                     let kind = match row.kind.as_str() {
                         "pane" => ResourceKind::Pane,
                         "workspace" => ResourceKind::Workspace,
@@ -320,18 +327,20 @@ impl MetadataPublisher {
                         return Err(io::Error::other("duplicate checkpoint resource"));
                     }
                 }
-                checkpoint
+                (checkpoint, floors)
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                (BTreeMap::new(), BTreeMap::new())
+            }
             Err(_) => return Err(io::Error::other("cannot read sequence checkpoint")),
         };
-        self.planner = tokens::Publisher::restore(checkpoint);
+        self.planner = tokens::Publisher::restore_with_floors(checkpoint.0, checkpoint.1);
         self.checkpoint_loaded = true;
         Ok(())
     }
 
     fn persist(&self) -> io::Result<()> {
-        let rows: Vec<_> = self
+        let mut rows: Vec<_> = self
             .planner
             .checkpoint()
             .into_iter()
@@ -346,6 +355,17 @@ impl MetadataPublisher {
                 seq,
             })
             .collect();
+        rows.extend(
+            self.planner
+                .checkpoint_floors()
+                .into_iter()
+                .map(|(endpoint, seq)| CheckpointRow {
+                    endpoint,
+                    kind: "endpoint".into(),
+                    id: String::new(),
+                    seq,
+                }),
+        );
         let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
         serde_json::to_writer(file.as_file_mut(), &rows)?;
         file.flush()?;
@@ -465,7 +485,7 @@ impl MetadataPublisher {
         Ok(())
     }
 
-    fn reconcile_missing(&mut self, snapshot: &protocol::Snapshot) {
+    fn reconcile_missing(&mut self, snapshot: &protocol::Snapshot) -> io::Result<()> {
         self.headings.retain(|id, _| {
             snapshot
                 .workspaces
@@ -481,20 +501,16 @@ impl MetadataPublisher {
                     self.resource(ResourceKind::Workspace, &workspace.workspace_id)
                 }))
                 .collect();
-        for resource in self.planner.checkpoint().keys() {
-            if resource.endpoint_session == self.endpoint.as_deref().unwrap_or("")
-                && !live.contains(resource)
-            {
-                let _ = self.planner.prepare(
-                    resource,
-                    &tokens::ResourceSnapshot::default(),
-                    None,
-                    &tokens::Tokens::new(),
-                    0,
-                    self.refresh_ms,
-                );
-            }
+        let previous = self.planner.clone();
+        if self.planner.prune_for_snapshot(
+            self.endpoint.as_deref().expect("snapshot binds endpoint"),
+            &live,
+        ) && let Err(error) = self.persist()
+        {
+            self.planner = previous;
+            return Err(error);
         }
+        Ok(())
     }
 
     fn refresh_with_readers(
@@ -509,7 +525,7 @@ impl MetadataPublisher {
         self.refresh_ms = config.refresh_interval_ms;
         let snapshot = self.snapshot(transport)?;
         self.check_shutdown()?;
-        self.reconcile_missing(&snapshot);
+        self.reconcile_missing(&snapshot)?;
         // Keep cached association only while the authoritative pane identity matches.
         self.local_readings.retain(|id, reading| {
             snapshot.panes.iter().any(|pane| {
@@ -895,7 +911,10 @@ impl daemon::Publisher for MetadataPublisher {
         Ok(())
     }
     fn reconnected(&mut self) {
-        self.planner = tokens::Publisher::restore(self.planner.checkpoint());
+        self.planner = tokens::Publisher::restore_with_floors(
+            self.planner.checkpoint(),
+            self.planner.checkpoint_floors(),
+        );
     }
 }
 
@@ -2456,6 +2475,71 @@ mod tests {
             .unwrap();
         let reports = server.join().unwrap();
         assert_eq!(reports[0]["params"]["seq"], 41);
+    }
+
+    #[test]
+    fn checkpoint_pruning_persists_floor_and_drops_replaced_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = "fake:1:2";
+        let rows = vec![
+            CheckpointRow {
+                endpoint: endpoint.into(),
+                kind: "pane".into(),
+                id: "w1:p2".into(),
+                seq: 17,
+            },
+            CheckpointRow {
+                endpoint: "fake:old:socket".into(),
+                kind: "pane".into(),
+                id: "w1:p3".into(),
+                seq: 99,
+            },
+        ];
+        std::fs::write(
+            dir.path().join("sequences.json"),
+            serde_json::to_vec(&rows).unwrap(),
+        )
+        .unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        publisher.load_checkpoint().unwrap();
+        publisher.endpoint = Some(endpoint.into());
+        let current =
+            protocol::parse_snapshot("snapshot", &snapshot(&json!("snapshot"), true)).unwrap();
+        publisher.reconcile_missing(&current).unwrap();
+
+        let rows: Vec<CheckpointRow> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "endpoint");
+        assert_eq!(rows[0].endpoint, endpoint);
+        assert_eq!(rows[0].seq, 17);
+
+        let mut restarted =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        restarted.load_checkpoint().unwrap();
+        let resource = ResourceId {
+            endpoint_session: endpoint.into(),
+            kind: ResourceKind::Pane,
+            id: "w1:p2".into(),
+        };
+        let report = restarted
+            .planner
+            .prepare(
+                &resource,
+                &tokens::ResourceSnapshot {
+                    exists: true,
+                    stored_keys: BTreeSet::new(),
+                },
+                None,
+                &BTreeMap::from([("lineup_agent".into(), Some("codex".into()))]),
+                0,
+                5000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.seq, 18);
     }
 
     #[test]

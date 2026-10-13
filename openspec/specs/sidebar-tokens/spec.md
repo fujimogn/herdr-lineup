@@ -208,6 +208,13 @@ increasing per-resource `seq` persisted before sending. Clearing reports SHALL
 also use that source and increasing sequence. Restart SHALL preserve sequence
 progress for the same socket/session and resource.
 
+After an authoritative snapshot, checkpoint rows for resources absent from that
+snapshot SHALL be removed only after their maximum reserved sequence is retained
+as a durable floor for the same endpoint. A resource ID that reappears on that
+endpoint SHALL use a sequence greater than that floor. Rows and floors for a
+different socket endpoint SHALL be removed once the current endpoint identity is
+verified; its metadata cannot be updated through the replaced endpoint.
+
 The default refresh interval SHALL be 5,000 ms and TTL 15,000 ms. Events SHALL
 invalidate cached state and trigger authoritative reconciliation: bootstrap,
 pane agent/status/session or cwd changes, and workspace creation/focus/cwd
@@ -243,6 +250,12 @@ more than fourteen keys, including clears. It SHALL publish no undocumented v1 k
 #### Scenario: No changes while alive
 - **WHEN** usage and state remain unchanged for one refresh interval after publication
 - **THEN** the next refresh renews those live keys instead of waiting for a second interval
+
+#### Scenario: Reuse a disappeared pane ID after a publisher restart
+- **WHEN** a pane disappears, its checkpoint row is compacted, and the same pane
+  ID later reappears on the same socket endpoint after a publisher restart
+- **THEN** the new report sequence exceeds the compacted pane's last reserved
+  sequence, including a sequence whose send outcome was ambiguous
 
 #### Scenario: Other plugin consumes capacity
 - **WHEN** adding lineup keys would exceed 32 keys on a resource
