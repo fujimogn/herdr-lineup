@@ -344,7 +344,8 @@ fn run_hook<R: Read + Send + 'static, W: Write>(
         let _ = capture(agent, &prefix, state, pane, SystemTime::now());
     }
     let Some(then) = then else { return 0 };
-    let Ok(mut child) = Command::new("sh")
+    // Linux and macOS both provide /bin/sh. An absolute path keeps PATH from choosing it.
+    let Ok(mut child) = Command::new("/bin/sh")
         .args(["-c", then])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -718,6 +719,44 @@ mod tests {
             assert_eq!(out, input);
             assert_eq!(code, 7);
         }
+    }
+    #[test]
+    fn then_uses_absolute_bin_sh() {
+        if std::env::var_os("LINEUP_TEST_THEN_SHELL").is_some() {
+            let mut out = Vec::new();
+            let code = run_hook(
+                Agent::Claude,
+                Cursor::new(b"not-json"),
+                &mut out,
+                None,
+                None,
+                Some("printf absolute"),
+            );
+            assert_eq!(out, b"absolute");
+            assert_eq!(code, 0);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        crate::test_support::write_executable(
+            &bin.join("sh"),
+            "#!/bin/sh\nprintf path-sh\nexit 9\n",
+        )
+        .unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "statusline::tests::then_uses_absolute_bin_sh",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", &bin)
+            .env("LINEUP_TEST_THEN_SHELL", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
     #[test]
     fn no_then_is_silent_and_success_on_record_failure() {
