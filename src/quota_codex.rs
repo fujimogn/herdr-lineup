@@ -285,13 +285,17 @@ fn read_with_control(
         }),
     )?;
     rpc.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}))?;
-    // Account failures invalidate a prior observation rather than silently keeping
-    // another account's subscription. refreshToken=false does not request a login.
-    let account = rpc
-        .request(2, "account/read", json!({"refreshToken":false}))
-        .map_err(|_| authentication_error())?;
-    if account.pointer("/account/type").and_then(Value::as_str) != Some("chatgpt") {
-        return Ok(None);
+    // An explicit account failure invalidates a prior observation rather than
+    // keeping another account's subscription. refreshToken=false does not log in.
+    let account = rpc.request(2, "account/read", json!({"refreshToken":false}))?;
+    match account.get("account") {
+        Some(Value::Object(details)) => match details.get("type").and_then(Value::as_str) {
+            Some("chatgpt") => {}
+            Some(_) => return Ok(None),
+            None => return Err(io::Error::other("Invalid Codex account response")),
+        },
+        Some(Value::Null) => return Ok(None),
+        _ => return Err(io::Error::other("Invalid Codex account response")),
     }
     let limits = rpc.request(3, "account/rateLimits/read", json!({}))?;
     Ok(parse_weekly(&limits))
@@ -426,6 +430,9 @@ impl Rpc {
                         .iter()
                         .any(|marker| message.contains(marker))
                 {
+                    return Err(authentication_error());
+                }
+                if method == "account/read" {
                     return Err(authentication_error());
                 }
                 return Err(io::Error::other("Codex app-server request failed"));
@@ -706,9 +713,34 @@ mod tests {
         ] {
             let fake = Fake::new(account, json!({}));
             assert_eq!(fake.read(Duration::from_secs(2)).unwrap(), None);
+            let now = Instant::now();
+            let wall = UNIX_EPOCH + Duration::from_secs(1792000000);
+            let sample = Some(Weekly {
+                used_percent: 12.0,
+                resets_at: Some(wall + Duration::from_secs(1000)),
+            });
+            let mut client = WeeklyClient::new(
+                fake.dir.path().to_owned(),
+                MIN_REFRESH_INTERVAL,
+                DEFAULT_TIMEOUT,
+            );
+            assert_eq!(client.refresh_with(now, wall, || Ok(sample)), sample);
+            assert_eq!(
+                client.refresh_with(now + MIN_REFRESH_INTERVAL, wall, || {
+                    fake.read(Duration::from_secs(2))
+                }),
+                None
+            );
             assert_eq!(
                 fake.methods(),
-                ["initialize", "initialized", "account/read"]
+                [
+                    "initialize",
+                    "initialized",
+                    "account/read",
+                    "initialize",
+                    "initialized",
+                    "account/read"
+                ]
             );
             fake.assert_reaped();
         }
@@ -907,6 +939,8 @@ mod tests {
 
     #[test]
     fn account_read_errors_are_permanent_and_rate_limit_auth_errors_are_sanitized() {
+        use crate::doctor::WeeklyResult;
+
         let fake = Fake::new(
             subscription(),
             json!({"rateLimits":{"primary":window(10080, 20.0)}}),
@@ -915,6 +949,12 @@ mod tests {
         let account_reply = json!({"id":2,"result":subscription()}).to_string();
         let limits_reply =
             json!({"id":3,"result":{"rateLimits":{"primary":window(10080, 20.0)}}}).to_string();
+        let now = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(1792000000);
+        let sample = Some(Weekly {
+            used_percent: 12.0,
+            resets_at: Some(wall + Duration::from_secs(1000)),
+        });
         for (reply, code) in [
             (&account_reply, 500),
             (&limits_reply, 401),
@@ -925,6 +965,19 @@ mod tests {
             let error = fake.read(Duration::from_secs(2)).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
             assert!(!error.to_string().contains("synthetic-private-marker"));
+            let mut client = WeeklyClient::new(
+                fake.dir.path().to_owned(),
+                MIN_REFRESH_INTERVAL,
+                DEFAULT_TIMEOUT,
+            );
+            assert_eq!(client.refresh_with(now, wall, || Ok(sample)), sample);
+            assert_eq!(
+                client.refresh_with(now + MIN_REFRESH_INTERVAL, wall, || {
+                    fake.read(Duration::from_secs(2))
+                }),
+                None
+            );
+            assert_eq!(client.last_result(), WeeklyResult::Unauthorized);
             fake.assert_reaped();
         }
         let replacement =
@@ -939,6 +992,61 @@ mod tests {
             io::ErrorKind::Other
         );
         fake.assert_reaped();
+    }
+
+    #[test]
+    fn account_read_transport_failures_retain_cache_only_until_reset() {
+        use crate::doctor::WeeklyResult;
+
+        let fake = Fake::new(subscription(), json!({}));
+        let original = fs::read_to_string(&fake.executable).unwrap();
+        let account_reply = json!({"id":2,"result":subscription()}).to_string();
+        let account_line = format!("printf '%s\\n' '{account_reply}'");
+        let now = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(1792000000);
+        let sample = Some(Weekly {
+            used_percent: 12.0,
+            resets_at: Some(wall + Duration::from_secs(180)),
+        });
+        for (reply, expected_kind) in [
+            ("exec sleep 30", io::ErrorKind::TimedOut),
+            ("printf '%s\\n' 'not-json'", io::ErrorKind::Other),
+            ("exit 1", io::ErrorKind::Other),
+            (
+                "printf '%s\\n' '{\"id\":2,\"result\":{}}'",
+                io::ErrorKind::Other,
+            ),
+        ] {
+            fs::write(&fake.executable, original.replace(&account_line, reply)).unwrap();
+            let mut client = WeeklyClient::new(
+                fake.dir.path().to_owned(),
+                MIN_REFRESH_INTERVAL,
+                Duration::from_millis(150),
+            );
+            assert_eq!(client.refresh_with(now, wall, || Ok(sample)), sample);
+            assert_eq!(
+                client.refresh_with(
+                    now + MIN_REFRESH_INTERVAL,
+                    wall + MIN_REFRESH_INTERVAL,
+                    || {
+                        let error = fake.read(Duration::from_millis(150)).unwrap_err();
+                        assert_eq!(error.kind(), expected_kind);
+                        Err(error)
+                    }
+                ),
+                sample
+            );
+            assert_eq!(client.last_result(), WeeklyResult::Transient);
+            fake.assert_reaped();
+            assert_eq!(
+                client.refresh_with(
+                    now + MIN_REFRESH_INTERVAL + Duration::from_secs(1),
+                    wall + Duration::from_secs(180),
+                    || panic!("must use cache until the next query")
+                ),
+                None
+            );
+        }
     }
 
     #[test]
