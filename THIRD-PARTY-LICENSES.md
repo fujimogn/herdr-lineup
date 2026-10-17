@@ -46,7 +46,7 @@ and vendored C terms.
 | `percent-encoding@2.3.2` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `ring@0.17.14` | `Apache-2.0 AND ISC` | `Apache-2.0 AND ISC` | linux, macos |
 | `rustix@1.1.5` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `MIT` | linux, macos |
-| `rustls@0.23.45` | `Apache-2.0 OR ISC OR MIT` | `MIT` | linux, macos |
+| `rustls@0.23.46` | `Apache-2.0 OR ISC OR MIT` | `MIT` | linux, macos |
 | `rustls-pki-types@1.15.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `rustls-webpki@0.103.15` | `ISC` | `ISC` | linux, macos |
 | `serde@1.0.229` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
@@ -1254,7 +1254,7 @@ third-party/chromium/LICENSE.
 
 Source crates and license files:
 
-- rustls@0.23.45 `LICENSE-MIT`
+- rustls@0.23.46 `LICENSE-MIT`
 
 ````text
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
