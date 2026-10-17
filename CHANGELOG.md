@@ -4,6 +4,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Maintenance: **Toolchain** is pinned to Rust 1.99.1.
+
 ## 0.1.1 (2026-10-14)
 
 Lineup reads Kimi context from the matching local session, keeps stop and doctor inside their existing limits, and ships dependency licenses with release archives.
