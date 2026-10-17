@@ -5,6 +5,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 ## Unreleased
 
 - Maintenance: **Toolchain** is pinned to Rust 1.99.1.
+- Security: **Dependencies** update rustls to 0.23.46 for RUSTSEC-2026-0346 to 0349.
 
 ## 0.1.1 (2026-10-14)
 
