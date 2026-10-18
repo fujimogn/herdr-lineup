@@ -57,8 +57,8 @@ pub enum Failure {
 }
 
 impl Failure {
-    pub(crate) fn diagnostic(self) -> crate::doctor::WeeklyResult {
-        use crate::doctor::WeeklyResult;
+    pub(crate) fn diagnostic(self) -> crate::quota_diagnostic::WeeklyResult {
+        use crate::quota_diagnostic::WeeklyResult;
         match self {
             Self::AuthMissing => WeeklyResult::AuthMissing,
             Self::AuthIo => WeeklyResult::AuthIo,
@@ -110,7 +110,7 @@ pub struct Client {
     agent: ureq::Agent,
     next_request: Option<Instant>,
     cached: Outcome,
-    last_result: crate::doctor::WeeklyResult,
+    last_result: crate::quota_diagnostic::WeeklyResult,
     last_success: Option<Instant>,
 }
 
@@ -158,7 +158,7 @@ impl Client {
             agent,
             next_request: None,
             cached: Outcome::Unavailable(Failure::AuthMissing),
-            last_result: crate::doctor::WeeklyResult::Pending,
+            last_result: crate::quota_diagnostic::WeeklyResult::Pending,
             last_success: None,
         }
     }
@@ -167,7 +167,7 @@ impl Client {
         self.last_success
     }
 
-    pub(crate) fn last_result(&self) -> crate::doctor::WeeklyResult {
+    pub(crate) fn last_result(&self) -> crate::quota_diagnostic::WeeklyResult {
         self.last_result
     }
 
@@ -188,8 +188,8 @@ impl Client {
                 self.last_success = Some(Instant::now());
             }
             self.last_result = match fetched {
-                Ok(Outcome::Weekly(_)) => crate::doctor::WeeklyResult::Ok,
-                Ok(Outcome::NonWeekly) => crate::doctor::WeeklyResult::NonWeekly,
+                Ok(Outcome::Weekly(_)) => crate::quota_diagnostic::WeeklyResult::Ok,
+                Ok(Outcome::NonWeekly) => crate::quota_diagnostic::WeeklyResult::NonWeekly,
                 Ok(Outcome::Unavailable(failure)) | Err(failure) => failure.diagnostic(),
             };
             self.cached = match fetched {
@@ -683,9 +683,9 @@ mod tests {
             assert_eq!(
                 client.last_result(),
                 if retain {
-                    crate::doctor::WeeklyResult::Transient
+                    crate::quota_diagnostic::WeeklyResult::Transient
                 } else {
-                    crate::doctor::WeeklyResult::Unauthorized
+                    crate::quota_diagnostic::WeeklyResult::Unauthorized
                 }
             );
             if retain {

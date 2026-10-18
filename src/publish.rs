@@ -360,7 +360,7 @@ impl MetadataPublisher {
     }
 
     fn start_weekly(&mut self, config: &Config) -> io::Result<()> {
-        use crate::doctor::{WeeklyProvider, WeeklyResult, write_weekly_result};
+        use crate::quota_diagnostic::{WeeklyProvider, WeeklyResult, write_weekly_result};
         // Only the daemon holding the session lock receives a shutdown flag.
         let Some(shutdown) = self.shutdown.clone() else {
             return Ok(());
@@ -2030,7 +2030,7 @@ mod tests {
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                let diagnostic = crate::doctor::weekly_diagnostics(&root);
+                let diagnostic = crate::quota_diagnostic::weekly_diagnostics(&root);
                 if diagnostic.contains("grok=auth_shape") {
                     assert!(diagnostic.contains("codex=disabled"));
                     break;
@@ -2067,7 +2067,7 @@ mod tests {
         publisher.set_shutdown(Arc::new(AtomicBool::new(false)));
         publisher.start_weekly(&Config::default()).unwrap();
         assert_eq!(
-            crate::doctor::weekly_diagnostics(dir.path()),
+            crate::quota_diagnostic::weekly_diagnostics(dir.path()),
             "Last saved weekly query results: codex=disabled; grok=disabled; kimi=disabled"
         );
     }
@@ -2127,7 +2127,10 @@ mod tests {
                 .unwrap();
             assert_eq!(publisher.kimi_weekly.is_some(), expected);
             if !expected {
-                assert!(crate::doctor::weekly_diagnostics(&directory).contains("kimi=disabled"));
+                assert!(
+                    crate::quota_diagnostic::weekly_diagnostics(&directory)
+                        .contains("kimi=disabled")
+                );
             }
         }
     }

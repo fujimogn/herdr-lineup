@@ -62,7 +62,7 @@ pub struct WeeklyClient {
     timeout: Duration,
     last_attempt: Option<Instant>,
     cached: Option<Weekly>,
-    last_result: crate::doctor::WeeklyResult,
+    last_result: crate::quota_diagnostic::WeeklyResult,
 }
 
 impl WeeklyClient {
@@ -73,7 +73,7 @@ impl WeeklyClient {
             timeout: timeout.clamp(Duration::from_millis(1), MAX_TIMEOUT),
             last_attempt: None,
             cached: None,
-            last_result: crate::doctor::WeeklyResult::Pending,
+            last_result: crate::quota_diagnostic::WeeklyResult::Pending,
         }
     }
 
@@ -82,7 +82,7 @@ impl WeeklyClient {
     }
 
     /// Last actual query category, independent of the display cache.
-    pub(crate) fn last_result(&self) -> crate::doctor::WeeklyResult {
+    pub(crate) fn last_result(&self) -> crate::quota_diagnostic::WeeklyResult {
         self.last_result
     }
 
@@ -125,7 +125,7 @@ impl WeeklyClient {
             return self.cached;
         }
         self.last_attempt = Some(now);
-        use crate::doctor::WeeklyResult;
+        use crate::quota_diagnostic::WeeklyResult;
         match query() {
             Ok(value) => {
                 self.last_result = if value.is_some() {
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn last_query_result_is_separate_from_retained_cache() {
-        use crate::doctor::WeeklyResult;
+        use crate::quota_diagnostic::WeeklyResult;
         let now = Instant::now();
         let wall = SystemTime::now();
         let mut client = WeeklyClient::new(
@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn account_read_errors_are_permanent_and_rate_limit_auth_errors_are_sanitized() {
-        use crate::doctor::WeeklyResult;
+        use crate::quota_diagnostic::WeeklyResult;
 
         let fake = Fake::new(
             subscription(),
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[test]
     fn account_read_transport_failures_retain_cache_only_until_reset() {
-        use crate::doctor::WeeklyResult;
+        use crate::quota_diagnostic::WeeklyResult;
 
         let fake = Fake::new(subscription(), json!({}));
         let original = fs::read_to_string(&fake.executable).unwrap();
