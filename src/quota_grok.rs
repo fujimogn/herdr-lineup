@@ -135,18 +135,22 @@ impl Client {
         )
     }
 
+    fn request_agent(timeout: Duration) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .max_redirects(0)
+            .https_only(!cfg!(test))
+            .build()
+            .new_agent()
+    }
+
     fn with_endpoint(
         auth_file: PathBuf,
         settings: Settings,
         endpoint: String,
         timeout: Duration,
     ) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .max_redirects(0)
-            .https_only(!cfg!(test))
-            .build()
-            .new_agent();
+        let agent = Self::request_agent(timeout);
         Self {
             auth_file,
             settings,
@@ -667,12 +671,13 @@ mod tests {
             (403, Duration::ZERO, false, Duration::from_secs(1)),
         ] {
             let (url, handle) = server(200, WEEK, Duration::ZERO);
-            let (_dir, mut client) = client(url, timeout);
+            let (_dir, mut client) = client(url, Duration::from_secs(1));
             let now = Instant::now();
             let original = client.poll_at(now, SystemTime::now());
             assert!(matches!(original, Outcome::Weekly(_)));
             handle.join().unwrap();
             let (url, handle) = server(status, "fake-test-secret", delay);
+            client.agent = Client::request_agent(timeout);
             client.endpoint = url;
             let result = client.poll_at(now + Duration::from_secs(300), SystemTime::now());
             assert_eq!(
