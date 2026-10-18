@@ -141,7 +141,8 @@ request. Missing initial quota SHALL display `—`.
   waiting for them
 - **AND** expired reset times clear weekly instead of retaining stale quota
 - **AND** repeated refreshes and panes do not spawn additional workers; clients
-  preserve bounded 60..=3600 second query intervals, defaulting to five minutes
+  preserve bounded 60..=3600 second query intervals, defaulting to five minutes,
+  independently of publication
 
 Transient failures SHALL retain the last successful sample only until its
 known reset. A sample without a known reset SHALL clear after a failed query.
