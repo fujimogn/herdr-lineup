@@ -1,141 +1,141 @@
 # Kimi weekly quota design
 
-## Status and evidence
+## Status and source
 
 **Proposed; no Kimi weekly implementation exists.** The shipped Kimi reader
-uses a completed turn from one exact local session and always returns unavailable
-weekly. That session match does not prove which managed OAuth account a separate
-server uses. [Local research](../../../docs/research/kimi-usage.md) records this
-gap and distinguishes completed-turn context from account quota.
+supplies completed-turn context for an exact local session and always returns
+unavailable weekly. This design instead uses the managed Kimi account logged in
+under the daemon's Kimi home for an account-wide weekly sample shared by every
+Kimi pane. A pane's session does not identify its account; the selected daemon
+home is the account scope, as with the existing Grok quota source. Local context
+remains session-specific and independent of account quota.
 
-The [Kimi Server API reference](https://www.kimi.com/code/docs/en/kimi-code-cli/reference/server-api.html)
-documents Bearer authentication, `GET /api/v1/oauth/usage`, the `limit7d`
-response, cold-session resumption by the status endpoint, and the experimental
-API warning. The [sessions guide](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/sessions.html)
-describes local session metadata and recovery files. These are documentation
-contracts, not live endpoint or account verification.
+The installed Kimi CLI 2.1.1 bundle at
+`~/.bun/install/global/node_modules/@moonshot-ai/kimi-code/dist/main.mjs`
+provides the structural evidence: `packages/oauth/src/managed-usage.ts`
+(`kimiCodeBaseUrl`, `kimiCodeUsageUrl`, `fetchManagedUsage`,
+`parseQuotaUsages`, and `parseQuotaEntry`), `storage.ts` (`FileTokenStorage`),
+`types.ts` (`tokenFromWire`), and `managed-kimi-code.ts` /
+`toolkit.ts` (`resolveKimiCodeRuntimeAuth`, `resolveKimiCodeOAuthKey`,
+`resolveKimiTokenStorageName`). This is evidence for this installed version,
+not a stable public API guarantee. No credential value or account data was read,
+and no Kimi endpoint was called for this design.
 
-## Opt-in and configuration
+## Opt-in and account scope
 
 Add `kimi_weekly_enabled = false` to Lineup's `config.toml` under
-`HERDR_PLUGIN_CONFIG_DIR`. A Kimi quota worker may start only when that key and
-the existing `allow_network = true` are both explicit, and `kimi` is in
-`providers`. `allow_network` alone must not enable Kimi quota. Disabling either
-gate drops the in-memory quota and publishes `—` with no numeric or reset key;
-local Kimi context continues to work. Startup must not edit configuration.
-This follows the existing [configuration and quota-worker contract](../../../openspec/specs/provider-readers/spec.md)
-and the [README usage source](../../../README.md).
+`HERDR_PLUGIN_CONFIG_DIR`. A Kimi quota worker may start only when this key and
+existing `allow_network = true` are both explicit and `kimi` is in
+`providers`. Neither gate alone enables Kimi quota. Disabling either gate
+clears the in-memory sample and publishes `—` with no numeric or reset key;
+local context continues. Startup must not edit user configuration.
 
-## Credential and account route
+Resolve `KIMI_CODE_HOME` exactly as the shipped local Kimi reader does:
+nonempty absolute override, otherwise `~/.kimi-code`; a relative override is
+unavailable. One worker reads the managed account selected by that home and
+shares one weekly result across all Kimi panes, including panes without a
+valid local context reading. Do not use pane cwd, native session ID, local
+server, or a per-pane credential to choose the quota account. If the daemon
+home or selected OAuth credential changes, clear the cached sample before
+publication. A different Kimi home is outside this worker's scope.
 
-The Kimi server requires `Authorization: Bearer <token>` for the usage route.
-The Bearer token authenticates the *local server*; that server's
-`managed:kimi-code` OAuth account supplies the quota. They are distinct
-credentials. The worker must never request login, refresh a credential itself,
-read the OAuth credential store, or put a token in plugin config. An explicit,
-owner-approved runtime credential handoff must identify one loopback server
-instance and supply its Bearer token only for a request. The worker may hold the
-token transiently in process memory to send that request, but must not persist,
-log, include in errors, or place it in diagnostics. Do not scan ports or pick the
-first instance: the reference allows multiple servers under one home and a port
-fallback. Reject non-loopback origins, redirects, ambiguous instances, and a
-server that reports auth bypass. The precise handoff mechanism is an Open
-question because the documented API does not prescribe a Lineup-safe token
-source. No endpoint is called until it is settled and tested.
+## Read-only credential route
 
-The only planned quota request is `GET /api/v1/oauth/usage` with the managed
-provider fixed to `managed:kimi-code`. A successful `code = 0` envelope can
-still contain `data.kind = "error"`, so both levels must be checked. Do not
-query `userinfo` merely to obtain an identifier: it returns personal account
-fields and does not itself prove which account owns the pane. The quota response
-contains no account binding. [API reference: authentication and usage](https://www.kimi.com/code/docs/en/kimi-code-cli/reference/server-api.html#authentication).
+Kimi's `FileTokenStorage` stores `<name>.json` under
+`<KIMI_CODE_HOME>/credentials/`. For the default managed OAuth key
+`oauth/kimi-code`, `resolveKimiTokenStorageName` selects `kimi-code.json`.
+For a region or environment-specific login, read
+`providers["managed:kimi-code"].oauth.key` from that home's `config.toml`
+and apply the same storage-name mapping; do not guess the default file when a
+configured key or environment selects another slot. The token file's wire
+keys are `access_token` and `expires_at` (Unix seconds). Read only these
+fields from a regular, nonsymlinked file under the selected home. Missing,
+malformed, empty, revoked, unreadable, or expired credentials make weekly
+unavailable. Do not use `refresh_token`, call Kimi login/refresh, or write the
+credential, config, or Lineup state. Never place the access token in plugin
+config, persistent state, diagnostics, command arguments, or logs. Hold it only
+long enough in request memory to set `Authorization: Bearer <access_token>`;
+clear request-owned memory on completion as far as the implementation permits.
+A 401/403 response clears the quota immediately; the next poll may only use a
+currently valid token read from disk. Do not emit a credential or response
+value in errors. Inspect file metadata and key names during implementation;
+no real credential contents are needed for design or fixtures.
 
-## Pane, session, and account attribution
+## Bounded request and response
 
-Require a provenance chain captured from the *same running Kimi process*:
-Herdr pane ID and exact native `agent_session` ID → validated local Kimi
-`state.json` ID and cwd → server instance ID → managed OAuth account identity.
-Each link needs a trusted, contemporaneous source. An exact local state match
-alone proves only the session link. Cwd, a session directory name, a server
-found under the same home, a user-selected URL, and successful Bearer auth do
-not prove the server/account links. Herdr's current pane snapshot has no PID;
-the documented usage response has no account or session ID. Therefore the
-current sources cannot satisfy the entire chain and **weekly remains
-unavailable even after opt-in** until a binding mechanism is approved and
-verified. A future Kimi process or host integration could provide a signed or
-otherwise trusted, short-lived binding record at launch; Lineup must check
-pane/session/server/account identity on every publication and invalidate the
-cache when any link changes, including account switch or server restart.
-An explicit user's assertion alone is not a proof of this chain.
+The installed `managed-usage.ts` uses `GET
+{KIMI_CODE_BASE_URL}/usages`, defaulting to
+`https://api.kimi.com/coding/v1/usages` after trimming trailing slashes.
+Lineup shall send only this GET with `Accept: application/json` and the
+transient OAuth Bearer header. `KIMI_CODE_BASE_URL` is an input to the
+selected daemon environment, not an arbitrary URL from a pane. Accept only an
+HTTPS base URL whose normalized origin and path are explicitly approved for
+this Kimi managed API and whose OAuth key matches the selected credential
+slot; reject userinfo, query, fragment, nonstandard ports, redirects, and
+unapproved hosts. The installed bundle also names
+`https://api.kimi.ai/coding/v1` for its global region; an override to that
+origin needs the matching scoped OAuth key. Other custom overrides remain
+unavailable until their destination and key mapping are explicitly approved.
+Never send a token to a fallback host after a failure.
 
-For the first implementation, configure and poll at most one proved
-account/server binding; panes for any other account stay unavailable.
-Account-wide quota may then be reused only across panes with independently
-proved bindings to that same account and server. Never infer a weekly result
-from local context. This stricter rule avoids transferring one managed account's
-quota to unrelated Kimi panes. See [local research: Server API and binding](../../../docs/research/kimi-usage.md#server-api-and-binding).
+Use the existing quota worker bounds: five-minute default interval, configured
+interval clamped to 60–3600 seconds, request timeout clamped to 1–30 seconds,
+64 KiB maximum response, no redirects, no retry within an interval, and at
+most one in-flight request. Refresh reads memory and never waits for HTTP.
+Do not start a Kimi server or query session, user-info, login, or credential
+endpoints. A request response arriving after timeout, opt-out, or credential
+change must be discarded.
 
-## Passive queries and quota conversion
+The raw JSON response used by the CLI has `usages.limit_7d.used_ratio` and
+optional `reset_time`; `parseQuotaUsages` maps those into
+`limit7d.usedRatio` and `resetAt`. Unlike the local Server API, this route
+has no `code = 0` / `data.kind = "ok"` envelope. Require HTTP success, a
+JSON object, `usages.limit_7d`, and a finite ratio in [0, 1] (a numeric
+string may be parsed only as the installed CLI does). Remaining percentage is
+`100 × (1 - used_ratio)`, with rolling-seven-day window kind. Parse a present
+`reset_time` as future RFC3339; malformed or past reset is invalid. If absent,
+publish without a countdown and apply the bounded age cap below. Do not
+substitute `limit_5h`, monthly windows, or `boosterWallet` for weekly usage.
+Keep only percentage, receipt time, and validated reset in quota memory.
 
-Do not call `GET /api/v1/sessions/{session_id}/status` to verify attribution:
-the [API reference](https://www.kimi.com/code/docs/en/kimi-code-cli/reference/server-api.html)
-says that reading it resumes a cold session. Do not call session messages,
-snapshot, runtime, or login endpoints as part of quota polling. The quota
-worker is passive with respect to sessions and must not start a Kimi server.
+## Freshness, failure, and API change
 
-After a proved binding, accept only HTTP success with envelope `code = 0`,
-`data.kind = "ok"`, and a present `quota.usages.limit7d.usedRatio` that is a
-finite number in [0, 1]. Compute remaining percentage as
-`100 × (1 - usedRatio)`; do not use `limit5h`, monthly windows, or `extraUsage`.
-Parse optional `resetAt` as RFC3339. A malformed or past reset is invalid;
-when absent, publish without a countdown and apply an age cap. Never infer a
-reset or a full allowance at expiry. Keep only percentage, receipt time, and
-validated reset in memory. This follows the [documented usage shape](https://www.kimi.com/code/docs/en/kimi-code-cli/reference/server-api.html)
-and the [provider-reader percentage contract](../../../openspec/specs/provider-readers/spec.md).
-
-## Cadence, freshness, and failure
-
-Use one background worker for the single configured, proved account/server
-binding, never per pane. Multiple bindings require a separate design decision.
-Default poll interval: five minutes; clamp configured interval to 60–3600
-seconds and request timeout to 1–30 seconds, matching the existing Codex/Grok
-quota-worker bounds. No retry inside an interval and at most one in-flight
-request. Refresh reads memory and never waits for HTTP. Bound response size to
-64 KiB, reject redirects, and discard a late response after timeout or binding
-change. These values are proposed Lineup policy, not Kimi API guarantees.
-
-Before the first valid response, show `—`. A successful sample with `resetAt`
-expires at that time; one without reset expires after the greater of
+Before the first valid response, show `—`. A sample with a reset expires at
+that time. A reset-less sample expires after the greater of
 `usage_max_age_ms` and interval + timeout + one sidebar refresh interval.
-Transient network/5xx or in-band upstream errors may retain a sample until
-its known reset, or until the age cap when reset is absent. Authentication
-failure, malformed schema, missing
-`limit7d`, identity loss, opt-out, or account/server change clears it
-immediately. Every unavailable state clears the numeric and reset keys while
-leaving Kimi context independent. Diagnostics use fixed categories only, with
-no URL, account ID, response body, token, or upstream message.
+A transient network/5xx failure may retain only a sample that has not yet
+expired. Credential absence/expiry/change, 401/403, malformed or incompatible
+schema, missing `limit_7d`, opt-out, or unapproved endpoint clears it
+immediately. Never infer a reset or a fresh 100% allowance after expiry.
+Diagnostics use fixed categories without URL, token, account identifier,
+response body, or upstream message. Local Kimi context is unaffected.
 
-## Experimental API guard
+`/usages` and its response shape are not a documented stable Lineup API.
+Fail closed on changed fields, types, semantics, or unexpected response shape;
+keep the feature default-off. Check the installed CLI version and synthetic
+fixtures before implementation and again for upgrades. Disabling the Kimi
+worker must leave local context intact. No live Kimi API or credential
+endpoint was called for this design.
 
-The server API is explicitly experimental and its live authenticated OpenAPI
-schema takes precedence over the prose reference. Before implementation,
-verify the intended installed Kimi version and response shape in a controlled
-fixture or explicitly authorized environment. Runtime parsing must fail
-closed on changed envelopes, fields, types, or window semantics and never
-interpret another quota bucket as weekly. Feature rollout remains default-off;
-a schema change can be handled by disabling the Kimi worker without affecting
-local context. No live API or credential endpoint was called for this design.
+## SECURITY.md follow-up
+
+Before enabling the feature, `SECURITY.md` should disclose that explicit
+Kimi weekly opt-in makes Lineup read the selected Kimi OAuth `access_token`
+from the daemon home's credential file and send it to the approved Kimi
+managed API; it does not refresh or persist that token. This differs from the
+Codex quota worker, for which Lineup never opens Codex auth files. Document
+scope across all Kimi panes, destination restrictions, transient in-memory
+handling, error/log exclusions, and the behavior of an expired or rotated
+token. This assignment only lists the required disclosure; `SECURITY.md` is
+outside its touching scope.
 
 ## Open questions for the owner
 
-1. Which trusted integration will attest the pane → running Kimi process →
-   server instance → managed account chain? The currently documented and local
-   data do not prove it. Is adding such an integration acceptable, or should
-   Kimi weekly remain unavailable?
-2. What approved runtime channel will supply the server's Bearer token without
-   storing it in Lineup configuration/state or exposing it in process arguments
-   or logs? How will server rotation and account switching invalidate a binding?
-3. Is retaining a reset-less sample for about five minutes plus timeout and
-   one refresh, or a reset-bearing sample until its known reset (potentially
-   days) after transient failures acceptable for this experimental API? If
-   not, should every failed poll clear the value immediately?
+1. Which exact official Kimi origins beyond the default `.com` host should be
+   enabled initially, and how will a custom `KIMI_CODE_BASE_URL` be approved?
+2. Should any transient failure clear a reset-bearing sample immediately,
+   rather than retaining it until the known reset? The existing Codex/Grok
+   worker boundary permits retention until expiry.
+3. How should a credential change be detected promptly between polls without
+   retaining a token or account identifier? File identity/fingerprint can be
+   compared, but the implementation and race behavior need fixture coverage.
