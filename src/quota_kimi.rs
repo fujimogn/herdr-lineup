@@ -13,6 +13,7 @@ use serde::Deserialize;
 const USAGES_URL: &str = "https://api.kimi.com/coding/v1/usages";
 const BASE_URL: &str = "https://api.kimi.com/coding/v1";
 const MAX_BYTES: u64 = 64 * 1024;
+const CREDENTIAL_RELATIVE_PATH: &str = "credentials/kimi-code.json";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
@@ -92,7 +93,7 @@ pub enum Outcome {
 }
 
 /// Resolve the daemon's Kimi home, without reading a file or changing env.
-pub fn auth_path(kimi_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf, Failure> {
+pub fn home_path(kimi_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf, Failure> {
     let base = match kimi_home {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         _ => PathBuf::from(home.ok_or(Failure::AuthMissing)?).join(".kimi-code"),
@@ -100,7 +101,15 @@ pub fn auth_path(kimi_home: Option<OsString>, home: Option<OsString>) -> Result<
     if !base.is_absolute() {
         return Err(Failure::AuthShape);
     }
-    Ok(base.join("credentials/kimi-code.json"))
+    Ok(base)
+}
+
+pub fn credential_path(home: &Path) -> PathBuf {
+    home.join(CREDENTIAL_RELATIVE_PATH)
+}
+
+pub fn auth_path(kimi_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf, Failure> {
+    home_path(kimi_home, home).map(|home| credential_path(&home))
 }
 
 fn validate_base_url(base: Option<OsString>) -> Result<(), Failure> {
@@ -472,6 +481,14 @@ mod tests {
 
     #[test]
     fn paths_require_absolute_home_and_default_slot() {
+        assert_eq!(
+            home_path(None, Some("/tmp/test-home".into())).unwrap(),
+            PathBuf::from("/tmp/test-home/.kimi-code")
+        );
+        assert_eq!(
+            credential_path(Path::new("/tmp/test-home/.kimi-code")),
+            auth_path(None, Some("/tmp/test-home".into())).unwrap()
+        );
         assert_eq!(
             auth_path(None, Some("/tmp/test-home".into())).unwrap(),
             PathBuf::from("/tmp/test-home/.kimi-code/credentials/kimi-code.json")
