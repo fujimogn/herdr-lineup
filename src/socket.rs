@@ -73,6 +73,13 @@ impl Transport {
         }
         Ok(())
     }
+    /// Missing paths are transient; only a different observed inode proves replacement.
+    pub fn endpoint_replaced(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            metadata.dev() != self.identity.device || metadata.ino() != self.identity.inode
+        })
+    }
     pub fn send_line(&mut self, frame: &[u8]) -> io::Result<()> {
         self.verify_endpoint()?;
         if frame.len() > MAX_FRAME_BYTES || frame.contains(&b'\n') {
@@ -141,76 +148,94 @@ pub(crate) fn connect_stream(path: &Path) -> io::Result<UnixStream> {
     {
         address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
     }
-    // SAFETY: a successful socket fd is immediately owned by UnixStream.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    unsafe {
-        if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "socket connect deadline exceeded",
+            ));
+        }
+        // SAFETY: a successful socket fd is immediately owned by UnixStream.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-    }
-    stream.set_nonblocking(true)?;
-    let status = unsafe {
-        libc::connect(
-            fd,
-            (&address as *const libc::sockaddr_un).cast(),
-            std::mem::size_of::<libc::sockaddr_un>() as _,
-        )
-    };
-    if status < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINPROGRESS) {
-            return Err(error);
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
         }
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "socket connect deadline exceeded",
-                ));
-            }
-            let mut pollfd = libc::pollfd {
-                fd: stream.as_raw_fd(),
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            let result = unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis().max(1) as i32) };
-            if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+        stream.set_nonblocking(true)?;
+        let status = unsafe {
+            libc::connect(
+                fd,
+                (&address as *const libc::sockaddr_un).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as _,
+            )
+        };
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EAGAIN) {
+                // Linux reports EAGAIN when the Unix listen backlog is full.
+                // poll may report POLLOUT|POLLHUP and SO_ERROR=0 for that fd
+                // even though it never connected; retry with a fresh fd.
+                drop(stream);
+                std::thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
                 continue;
             }
-            if result < 0 {
-                return Err(io::Error::last_os_error());
+            if error.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(error);
             }
-            if result == 0 {
-                continue;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "socket connect deadline exceeded",
+                    ));
+                }
+                let mut pollfd = libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let result =
+                    unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis().max(1) as i32) };
+                if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if result < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if result == 0 {
+                    continue;
+                }
+                let mut error = 0i32;
+                let mut size = std::mem::size_of::<i32>() as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&mut error as *mut i32).cast(),
+                        &mut size,
+                    )
+                } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if error != 0 {
+                    return Err(io::Error::from_raw_os_error(error));
+                }
+                break;
             }
-            let mut error = 0i32;
-            let mut size = std::mem::size_of::<i32>() as libc::socklen_t;
-            if unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_ERROR,
-                    (&mut error as *mut i32).cast(),
-                    &mut size,
-                )
-            } < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if error != 0 {
-                return Err(io::Error::from_raw_os_error(error));
-            }
-            break;
         }
+        stream.set_nonblocking(false)?;
+        return Ok(stream);
     }
-    stream.set_nonblocking(false)?;
-    Ok(stream)
 }
 
 /// Wait against one monotonic deadline without changing socket options.
@@ -357,6 +382,36 @@ mod tests {
         replacement.set_nonblocking(true).unwrap();
         assert!(transport.reconnect_same_endpoint().is_err());
         assert!(replacement.accept().is_err());
+    }
+    #[test]
+    fn missing_endpoint_is_retryable_but_replacement_is_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let hidden = dir.path().join("hidden.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let transport = Transport::connect(&path).unwrap();
+        let _peer = listener.accept().unwrap();
+        fs::rename(&path, &hidden).unwrap();
+        assert!(!transport.endpoint_replaced());
+        fs::rename(&hidden, &path).unwrap();
+        assert!(!transport.endpoint_replaced());
+        fs::remove_file(&path).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(transport.endpoint_replaced());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_listen_backlog_never_returns_an_unconnected_stream() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued = UnixStream::connect(&path).unwrap();
+        let started = Instant::now();
+        let error = connect_stream(&path).expect_err("backlog is still full");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(900));
     }
     #[test]
     fn completed_response_allows_eof_but_never_a_replacement_endpoint() {
