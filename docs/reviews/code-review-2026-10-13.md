@@ -324,7 +324,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The build job holds a write token, and a rerun or a tag that is not on a green main is not rejected by the workflow.
 - Proposed change: Not stated as a separate sentence beyond the permissions, pins, and checks named above.
 - Test: Not given as a separate line.
-- Status: Shipped `4c4fb31` for publish-job-only write permission. Deferred: action pinning, automated main/CI/date gates, rerun idempotence, and release-workflow tests require a separate release automation change.
+- Status: Shipped `4c4fb31`, `8683282`, `8161fac` for publish-job-only write permission, action pinning, automated main/CI/date gates, rerun idempotence, and release-workflow tests (no deferred items remain).
 
 ### Low
 
@@ -508,7 +508,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: The security document does not match the process model, and it exposes an internal date.
 - Proposed change: Not stated as a separate sentence.
 - Test: Not given as a separate line.
-- Status: Shipped `4e187c7`, `6262a38` for Git child-process boundaries and signal-exit recovery documentation. Deferred: a supported-versions policy and removal of the internal approval date need a separate security-document decision.
+- Status: Shipped `4e187c7`, `6262a38`, `246f50e` for Git child-process boundaries, signal-exit recovery documentation, a supported-versions policy, and removal of the internal approval date (no deferred items remain).
 
 #### 37. Testing evidence is from an older commit
 

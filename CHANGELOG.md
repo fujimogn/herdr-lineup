@@ -6,6 +6,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 - Maintenance: **Toolchain** is pinned to Rust 1.99.1.
 - Security: **Dependencies** update rustls to 0.23.46 for RUSTSEC-2026-0346 to 0349.
+- Maintenance: **Release workflow** pins actions to commit SHAs, verifies before build that release tags point to successful main CI commits and match changelog dates, and does not fail on reruns for existing tags.
+- Security: **Security policy** adds a supported versions section to SECURITY.md, clarifying that only the latest release receives security fixes.
 
 ## 0.1.1 (2026-10-14)
 
