@@ -403,7 +403,7 @@ impl Budget {
         &mut self,
         root: &Path,
         depth: usize,
-        accept: fn(&Path) -> bool,
+        accept: impl Fn(&Path) -> bool + Copy,
     ) -> Result<Vec<PathBuf>, MissingReason> {
         self.check()?;
         let meta = match fs::symlink_metadata(root) {
@@ -595,7 +595,9 @@ pub(crate) fn read_jsonl_tail(
         .iter()
         .position(|byte| *byte == b'\n')
         .map_or(bytes.len(), |index| index + 1);
-    Budget::decode_jsonl(bytes[complete..].to_vec())
+    let mut bytes = bytes;
+    bytes.drain(..complete);
+    Budget::decode_jsonl(bytes)
 }
 
 pub(crate) fn timestamp(value: &serde_json::Value) -> Option<SystemTime> {

@@ -1,5 +1,6 @@
 //! Codex UI context percentage from exact-session rollout token_count observations.
 use crate::model::*;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -67,17 +68,18 @@ fn read_session_with_hooks(
 ) -> Result<(f64, std::time::SystemTime), MissingReason> {
     let mut budget = Budget::new(request);
     // Discovery reads names only. Other sessions and credential files are never opened.
-    let mut paths = budget.files(&request.home.join("sessions"), 3, rollout)?;
-    paths.extend(budget.files(&request.home.join("archived_sessions"), 3, rollout)?);
     let id = &request.identity.native_session_id;
-    paths.retain(|path| {
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|name| {
-                name.ends_with(&format!("-{id}.jsonl"))
-                    || name.ends_with(&format!("-{id}.jsonl.zst"))
-            })
-    });
+    let jsonl_suffix = format!("-{id}.jsonl");
+    let zst_suffix = format!("-{id}.jsonl.zst");
+    let matching_rollout = |path: &Path| {
+        rollout(path)
+            && path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| name.ends_with(&jsonl_suffix) || name.ends_with(&zst_suffix))
+    };
+    let mut paths = budget.files(&request.home.join("sessions"), 3, matching_rollout)?;
+    paths.extend(budget.files(&request.home.join("archived_sessions"), 3, matching_rollout)?);
     if paths.len() > 1 {
         return Err(MissingReason::Unassociated);
     }
@@ -149,37 +151,133 @@ fn read_tail(file: &mut fs::File, size: u64, id: &str, budget: &Budget) -> Obser
     parse_records(&text, id, budget, size > JSONL_TAIL_BYTES as u64)
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ObjectOrOther<T> {
+    Object(T),
+    Other(Value),
+}
+
+#[derive(Deserialize)]
+struct CodexRecord {
+    #[serde(rename = "type")]
+    kind: Option<Value>,
+    payload: Option<ObjectOrOther<CodexPayload>>,
+    timestamp: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct CodexPayload {
+    id: Option<Value>,
+    #[serde(rename = "type")]
+    kind: Option<Value>,
+    info: Option<ObjectOrOther<CodexInfo>>,
+}
+
+#[derive(Deserialize)]
+struct CodexInfo {
+    last_token_usage: Option<ObjectOrOther<CodexUsage>>,
+    model_context_window: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct CodexUsage {
+    total_tokens: Option<Value>,
+}
+
+fn parse_record(line: &str) -> Result<Option<CodexRecord>, serde_json::Error> {
+    if !line.trim_start().starts_with('{') {
+        serde_json::from_str::<serde::de::IgnoredAny>(line)?;
+        return Ok(None);
+    }
+    match serde_json::from_str(line) {
+        Ok(record) => Ok(Some(record)),
+        Err(error) if error.to_string().starts_with("duplicate field") => {
+            let value: Value = serde_json::from_str(line)?;
+            serde_json::from_value(value).map(Some)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Observation {
     let mut observation = None;
     for line in text.split_inclusive('\n') {
         budget.check()?;
-        let value: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
+        let value = match parse_record(line) {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
             // An append may be visible before its final bytes/newline arrive.
             // Only an unfinished final record is transient; completed corruption
             // and malformed syntax still invalidate the source.
             Err(error) if !line.ends_with('\n') && error.is_eof() => continue,
             Err(_) => return Err(MissingReason::Invalid),
         };
-        match value["type"].as_str() {
+        let recovered_payload = match value.payload.as_ref() {
+            Some(ObjectOrOther::Other(raw)) => {
+                serde_json::from_value::<CodexPayload>(raw.clone()).ok()
+            }
+            _ => None,
+        };
+        let payload = match value.payload.as_ref() {
+            Some(ObjectOrOther::Object(payload)) => Some(payload),
+            _ => recovered_payload.as_ref(),
+        };
+        match value.kind.as_ref().and_then(Value::as_str) {
             Some("session_meta") => {
-                if value["payload"]["id"].as_str() != Some(id) || bound {
+                if payload
+                    .and_then(|payload| payload.id.as_ref())
+                    .and_then(Value::as_str)
+                    != Some(id)
+                    || bound
+                {
                     return Err(MissingReason::Unassociated);
                 }
                 bound = true;
             }
-            Some("event_msg") if value["payload"]["type"] == "token_count" => {
-                let info = &value["payload"]["info"];
+            Some("event_msg")
+                if payload
+                    .and_then(|payload| payload.kind.as_ref())
+                    .and_then(Value::as_str)
+                    == Some("token_count") =>
+            {
+                let info = payload.and_then(|payload| payload.info.as_ref());
                 // Quota-only events have no context observation. In particular,
                 // resumed sessions can emit these before any valid token sample.
-                if info.is_null() {
+                if info.is_none() {
                     continue;
                 }
-                let used = info["last_token_usage"]["total_tokens"]
-                    .as_f64()
-                    .ok_or(MissingReason::Invalid)?;
-                let capacity = info["model_context_window"]
-                    .as_f64()
+                let recovered_info = match info {
+                    Some(ObjectOrOther::Other(raw)) => {
+                        serde_json::from_value::<CodexInfo>(raw.clone()).ok()
+                    }
+                    _ => None,
+                };
+                let info = match info {
+                    Some(ObjectOrOther::Object(info)) => Some(info),
+                    _ => recovered_info.as_ref(),
+                };
+                let Some(info) = info else {
+                    return Err(MissingReason::Invalid);
+                };
+                let recovered_usage = match info.last_token_usage.as_ref() {
+                    Some(ObjectOrOther::Other(raw)) => {
+                        serde_json::from_value::<CodexUsage>(raw.clone()).ok()
+                    }
+                    _ => None,
+                };
+                let used = match info.last_token_usage.as_ref() {
+                    Some(ObjectOrOther::Object(usage)) => usage.total_tokens.as_ref(),
+                    _ => recovered_usage
+                        .as_ref()
+                        .and_then(|usage| usage.total_tokens.as_ref()),
+                }
+                .and_then(Value::as_f64)
+                .ok_or(MissingReason::Invalid)?;
+                let capacity = info
+                    .model_context_window
+                    .as_ref()
+                    .and_then(Value::as_f64)
                     .ok_or(MissingReason::Invalid)?;
                 if !used.is_finite() || !capacity.is_finite() || used < 0.0 || capacity <= 12_000.0
                 {
@@ -189,7 +287,11 @@ fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Obse
                 // deduct the 12,000-token baseline from both used and capacity.
                 observation = Some((
                     (used - 12_000.0).max(0.0) / (capacity - 12_000.0) * 100.0,
-                    timestamp(&value["timestamp"]).ok_or(MissingReason::Invalid)?,
+                    value
+                        .timestamp
+                        .as_ref()
+                        .and_then(timestamp)
+                        .ok_or(MissingReason::Invalid)?,
                 ));
             }
             _ => {}
@@ -202,6 +304,43 @@ fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Obse
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_tail_ignores_valid_non_objects_and_rejects_completed_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        let budget = Budget::new(&r);
+        let sample = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\"}}\n{\"type\":\"event_msg\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":26000},\"model_context_window\":212000}}}\n";
+        let text = format!("null\n[1,2,3]\n{sample}");
+        assert!((parse_records(&text, "session-1", &budget, false).unwrap().0 - 7.0).abs() < 1e-9);
+        assert_eq!(
+            parse_records(&format!("{text}{{bad}}\n"), "session-1", &budget, false),
+            Err(MissingReason::Invalid)
+        );
+        let duplicate = text.replace(
+            "{\"type\":\"session_meta\"",
+            "{\"type\":\"ignored\",\"type\":\"session_meta\"",
+        );
+        assert!(parse_records(&duplicate, "session-1", &budget, false).is_ok());
+        let nested_duplicate = text
+            .replace(
+                "\"id\":\"session-1\"",
+                "\"id\":\"other\",\"id\":\"session-1\"",
+            )
+            .replace(
+                "\"total_tokens\":26000",
+                "\"total_tokens\":1,\"total_tokens\":26000",
+            );
+        assert!(
+            (parse_records(&nested_duplicate, "session-1", &budget, false)
+                .unwrap()
+                .0
+                - 7.0)
+                .abs()
+                < 1e-9
+        );
+    }
+
     #[test]
     fn append_between_path_and_file_stats_returns_prefix_without_caching() {
         use std::io::Write;
@@ -750,5 +889,41 @@ mod tests {
             CodexReader.read(&r).context,
             UsageOutcome::Unavailable(MissingReason::Unassociated)
         );
+    }
+
+    #[test]
+    #[ignore = "synthetic performance sample"]
+    fn benchmark_discovery_and_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let folder = dir.path().join("sessions/2026/10/12");
+        for index in 0..1500 {
+            fs::write(folder.join(format!("rollout-other-{index}.jsonl")), b"{}\n").unwrap();
+        }
+        read_session(&r).unwrap();
+        let mut durations = Vec::new();
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            std::hint::black_box(read_session(&r).unwrap());
+            durations.push(started.elapsed().as_micros());
+        }
+        durations.sort_unstable();
+        eprintln!("codex_discovery_us_median={}", durations[3]);
+
+        let budget = Budget::new(&r);
+        let text = format!(
+            "{{\"text\":\"{}\"}}\n{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"session-1\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"total_tokens\":26000}},\"model_context_window\":212000}}}}}}\n",
+            "x".repeat(JSONL_TAIL_BYTES - 300)
+        );
+        let mut durations = Vec::new();
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            std::hint::black_box(parse_records(&text, "session-1", &budget, false).unwrap());
+            durations.push(started.elapsed().as_micros());
+        }
+        durations.sort_unstable();
+        eprintln!("codex_tail_us_median={}", durations[3]);
     }
 }
