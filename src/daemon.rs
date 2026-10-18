@@ -204,9 +204,13 @@ fn ensure_command(options: &Options, mut command: Command) -> io::Result<()> {
             if health.endpoint == endpoint {
                 return Ok(());
             }
-            return Err(io::Error::other(
-                "live daemon belongs to a replaced endpoint",
-            ));
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "live daemon belongs to a replaced endpoint",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(
@@ -526,6 +530,14 @@ fn control_stream(paths: &RuntimePaths) -> io::Result<Option<BufReader<UnixStrea
         Err(error) => Err(error),
     }
 }
+#[derive(Debug)]
+struct ReplacedEndpoint;
+impl std::fmt::Display for ReplacedEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("daemon belongs to a replaced socket endpoint")
+    }
+}
+impl std::error::Error for ReplacedEndpoint {}
 fn read_identity(
     stream: &mut BufReader<UnixStream>,
     paths: &RuntimePaths,
@@ -548,9 +560,7 @@ fn read_identity(
     if let Ok(current) = EndpointIdentity::read(socket)
         && current != health.endpoint
     {
-        return Err(io::Error::other(
-            "daemon belongs to a replaced socket endpoint",
-        ));
+        return Err(io::Error::other(ReplacedEndpoint));
     }
     Ok(health)
 }
@@ -572,8 +582,16 @@ fn transient_control_error(error: &io::Error) -> bool {
 fn probe_starting(paths: &RuntimePaths, socket: &std::path::Path) -> io::Result<Option<Health>> {
     match probe(paths, socket) {
         // The serial handler may be busy with another probe/stop or refresh.
-        // Retry only transient transport failures, never invalid identities.
+        // Wait for a typed endpoint replacement while its old owner exits;
+        // all other invalid identities remain fatal.
         Err(error) if transient_control_error(&error) => Ok(None),
+        Err(error)
+            if error
+                .get_ref()
+                .is_some_and(|source| source.downcast_ref::<ReplacedEndpoint>().is_some()) =>
+        {
+            Ok(None)
+        }
         result => result,
     }
 }
@@ -1725,6 +1743,56 @@ mod tests {
         assert!(replacement.accept().is_err());
         done.store(true, Ordering::Relaxed);
         server.join().unwrap();
+    }
+    #[test]
+    fn ensure_waits_for_old_daemon_after_missing_socket_is_replaced() {
+        let (_dir, options, done, server) = fixture();
+        let mut old_command = child_command();
+        old_command.env("LINEUP_TEST_RETRY", "1");
+        old_command.env("HOME", &options.state);
+        old_command.env("CODEX_HOME", &options.state);
+        ensure_command(&options, old_command).unwrap();
+        wait_until(|| options.state.join("hidden-socket").exists());
+        let replacement = UnixListener::bind(&options.socket).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        let replacement_done = done.clone();
+        let replacement_server = std::thread::spawn(move || {
+            while !replacement_done.load(Ordering::Relaxed) {
+                match replacement.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut line = String::new();
+                        BufReader::new(stream.try_clone().unwrap())
+                            .read_line(&mut line)
+                            .unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        writeln!(
+                            stream,
+                            "{}",
+                            serde_json::json!({
+                                "id": request["id"],
+                                "result": {"type":"pong", "version":"0.9.3", "protocol":17}
+                            })
+                        )
+                        .unwrap();
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        let mut new_command = child_command();
+        new_command.env("HOME", &options.state);
+        new_command.env("CODEX_HOME", &options.state);
+        let ensured = ensure_command(&options, new_command);
+        if ensured.is_ok() {
+            stop(&options).unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        replacement_server.join().unwrap();
+        assert!(
+            ensured.is_ok(),
+            "ensure did not wait for old daemon: {ensured:?}"
+        );
     }
     #[test]
     fn transient_reconnect_and_ping_failures_retry_then_clear_on_stop() {
