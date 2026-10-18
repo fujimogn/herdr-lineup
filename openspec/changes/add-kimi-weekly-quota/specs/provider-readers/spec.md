@@ -46,7 +46,8 @@ publication. Missing initial quota SHALL display `—`.
   waiting for them
 - **AND** expired reset times clear weekly instead of retaining stale quota
 
-Transient failures SHALL retain the last successful sample only while valid.
+Transient failures SHALL retain the last successful sample only until its
+known reset. A sample without a known reset SHALL clear after a failed query.
 Authentication failures SHALL clear it. Passed reset times SHALL be
 unavailable even while another request is pending. Codex samples without a
 known reset SHALL be discarded after a failed query. Existing client outcome
@@ -194,6 +195,10 @@ nonsymlinked file. It SHALL never refresh, log, or persist the token.
 - **THEN** no Kimi request is made and weekly has no numeric or reset key
 - **AND** local Kimi context remains independent
 
+#### Scenario: Oversized credential file is unavailable
+- **WHEN** the selected credential file exceeds 64 KiB
+- **THEN** no token is read and no Kimi request is made
+
 #### Scenario: Credential stays transient
 - **WHEN** an access token is used for a request
 - **THEN** only request memory may hold it to form the Authorization header
@@ -244,7 +249,8 @@ The managed `/usages` JSON SHALL be accepted only after HTTP success and
 strict shape validation of `usages.limit_7d.used_ratio` as a finite value in
 [0, 1]. Remaining percentage SHALL be `100 × (1 - used_ratio)` with
 rolling-seven-day window kind. A present `reset_time` SHALL parse as future
-RFC3339. Unexpected fields, types, or semantics SHALL fail closed.
+RFC3339. Unexpected `limit_7d` fields, types, or semantics SHALL fail closed
+without rejecting unrelated quota windows in an otherwise valid response.
 
 #### Scenario: Convert managed seven-day usage
 - **WHEN** a valid managed response has `limit_7d.used_ratio = 0.25` and a
@@ -269,7 +275,8 @@ RFC3339. Unexpected fields, types, or semantics SHALL fail closed.
 A sample with a known reset SHALL expire at that reset. A reset-less sample
 SHALL expire after the greater of `usage_max_age_ms` and interval + timeout +
 one sidebar refresh interval. Transient network/5xx failure MAY retain only a
-still-valid sample. Authentication and invalid source/schema SHALL clear
+still-valid sample with a known future reset; a sample without a reset SHALL
+clear on a failed query. Authentication and invalid source/schema SHALL clear
 cached weekly immediately. Local context SHALL remain independently available.
 
 #### Scenario: Authentication failure clears a cached sample
@@ -288,3 +295,8 @@ cached weekly immediately. Local context SHALL remain independently available.
 #### Scenario: Reset-less sample ages out
 - **WHEN** a successful sample has no `reset_time` and exceeds its age cap
 - **THEN** Kimi weekly is unavailable without inventing a reset
+
+#### Scenario: Failure clears a reset-less sample
+- **WHEN** a transient query failure follows a valid sample without
+  `reset_time`
+- **THEN** Kimi weekly is unavailable on the next refresh

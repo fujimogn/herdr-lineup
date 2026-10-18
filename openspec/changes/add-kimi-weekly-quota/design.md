@@ -51,8 +51,9 @@ configured key or environment selects another slot. The token file's wire
 keys are `access_token` and `expires_at` (Unix seconds). Read only these
 fields from a regular, nonsymlinked file under the selected home. Missing,
 malformed, empty, revoked, unreadable, or expired credentials make weekly
+unavailable. Bound the credential read to 64 KiB; larger files are
 unavailable. Do not use `refresh_token`, call Kimi login/refresh, or write the
-credential, config, or Lineup state. Never place the access token in plugin
+credential or config. Never place the access token in plugin
 config, persistent state, diagnostics, command arguments, or logs. Hold it only
 long enough in request memory to set `Authorization: Bearer <access_token>`;
 clear request-owned memory on completion as far as the implementation permits.
@@ -103,15 +104,20 @@ Keep only percentage, receipt time, and validated reset in quota memory.
 Before the first valid response, show `—`. A sample with a reset expires at
 that time. A reset-less sample expires after the greater of
 `usage_max_age_ms` and interval + timeout + one sidebar refresh interval.
-A transient network/5xx failure may retain only a sample that has not yet
-expired. Credential absence/expiry/change, 401/403, malformed or incompatible
+A transient network/5xx failure may retain only a sample with a known future
+reset; a reset-less sample clears on the failed query. Credential
+absence/expiry/change, 401/403, malformed or incompatible
 schema, missing `limit_7d`, opt-out, or unapproved endpoint clears it
 immediately. Never infer a reset or a fresh 100% allowance after expiry.
 Diagnostics use fixed categories without URL, token, account identifier,
-response body, or upstream message. Local Kimi context is unaffected.
+response body, or upstream message. As with Codex/Grok, a private
+`weekly-kimi.json` under `HERDR_PLUGIN_STATE_DIR` may store only the fixed
+query-result category, never quota or credential values; the category may
+differ from retained cache availability. Local Kimi context is unaffected.
 
 `/usages` and its response shape are not a documented stable Lineup API.
-Fail closed on changed fields, types, semantics, or unexpected response shape;
+Fail closed on changed `limit_7d` fields, types, or semantics, while allowing
+unrelated quota windows in an otherwise valid response;
 keep the feature default-off. Check the installed CLI version and synthetic
 fixtures before implementation and again for upgrades. Disabling the Kimi
 worker must leave local context intact. No live Kimi API or credential

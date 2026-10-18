@@ -13,6 +13,9 @@
 - [ ] Document in `SECURITY.md` that Lineup reads the Kimi OAuth access token
       from disk, unlike the Codex quota path, and describe the network destination,
       memory lifetime, and log exclusions.
+- [ ] Update `docs/research/kimi-usage.md` to replace the former Server API
+      and pane/server/account binding proposal with the approved daemon-home
+      credential route and all-Kimi-pane account scope.
 - [ ] Verify the installed Kimi version and nonpublic response schema in an
       approved environment, then update user documentation and run release checks.
 
