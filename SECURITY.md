@@ -1,5 +1,11 @@
 # Security
 
+## Supported versions
+
+Only the latest release receives security fixes. Fixes are published as the next
+patch release after the latest release; older versions do not receive fixes or
+backports. Upgrade to the latest patch release to receive security fixes.
+
 ## Runtime data boundaries
 
 Local usage reads and explicit configuration actions are described in the README.
@@ -133,8 +139,7 @@ stdio JSON-RPC: `initialize`, `initialized`, `account/read` (without requesting
 a token refresh), and `account/rateLimits/read`. It never requests threads or
 conversation contents and never opens `auth.json`. Codex uses its own existing
 authentication and may contact its provider or maintain its authentication state.
-This authenticated quota access was approved on 2026-10-12; other authenticated
-provider integrations remain outside this boundary.
+Other authenticated provider integrations remain outside this boundary.
 The Codex child retains its environment because its executable lookup, proxy,
 certificate, and authentication settings can depend on caller-supplied variables.
 Its stderr remains discarded, and the daemon does not record those values.
