@@ -3,7 +3,8 @@
 - [ ] Resolve the provenance and credential-channel Open questions in `design.md`;
       do not enable the worker without a verified account binding.
 - [ ] Add the default-off Kimi-specific option to plugin config and document its
-      conjunction with `allow_network` without changing user settings.
+      conjunction with `allow_network` without changing user settings. Plan
+      compatibility for older binaries because config rejects unknown keys.
 - [ ] Add a bounded, passive Kimi quota worker and strict `limit7d` parser using
       recorded fixtures; keep credentials and account identifiers out of state,
       diagnostics, and logs.

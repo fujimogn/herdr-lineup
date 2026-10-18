@@ -68,8 +68,10 @@ pane/session/server/account identity on every publication and invalidate the
 cache when any link changes, including account switch or server restart.
 An explicit user's assertion alone is not a proof of this chain.
 
+For the first implementation, configure and poll at most one proved
+account/server binding; panes for any other account stay unavailable.
 Account-wide quota may then be reused only across panes with independently
-proved bindings to the same account and server. Never infer a weekly result
+proved bindings to that same account and server. Never infer a weekly result
 from local context. This stricter rule avoids transferring one managed account's
 quota to unrelated Kimi panes. See [local research: Server API and binding](../../../docs/research/kimi-usage.md#server-api-and-binding).
 
@@ -93,7 +95,8 @@ and the [provider-reader percentage contract](../../../openspec/specs/provider-r
 
 ## Cadence, freshness, and failure
 
-Use one background worker per *proved* account/server binding, never per pane.
+Use one background worker for the single configured, proved account/server
+binding, never per pane. Multiple bindings require a separate design decision.
 Default poll interval: five minutes; clamp configured interval to 60–3600
 seconds and request timeout to 1–30 seconds, matching the existing Codex/Grok
 quota-worker bounds. No retry inside an interval and at most one in-flight
@@ -104,8 +107,9 @@ change. These values are proposed Lineup policy, not Kimi API guarantees.
 Before the first valid response, show `—`. A successful sample with `resetAt`
 expires at that time; one without reset expires after the greater of
 `usage_max_age_ms` and interval + timeout + one sidebar refresh interval.
-Transient network/5xx or in-band upstream errors may retain only a still-valid
-sample until that cap. Authentication failure, malformed schema, missing
+Transient network/5xx or in-band upstream errors may retain a sample until
+its known reset, or until the age cap when reset is absent. Authentication
+failure, malformed schema, missing
 `limit7d`, identity loss, opt-out, or account/server change clears it
 immediately. Every unavailable state clears the numeric and reset keys while
 leaving Kimi context independent. Diagnostics use fixed categories only, with
@@ -131,6 +135,7 @@ local context. No live API or credential endpoint was called for this design.
 2. What approved runtime channel will supply the server's Bearer token without
    storing it in Lineup configuration/state or exposing it in process arguments
    or logs? How will server rotation and account switching invalidate a binding?
-3. Is showing a cached value for up to the five-minute polling interval (or
-   until a known reset) acceptable for this experimental account API? If not,
-   should every failed poll clear the value immediately?
+3. Is retaining a reset-less sample for about five minutes plus timeout and
+   one refresh, or a reset-bearing sample until its known reset (potentially
+   days) after transient failures acceptable for this experimental API? If
+   not, should every failed poll clear the value immediately?

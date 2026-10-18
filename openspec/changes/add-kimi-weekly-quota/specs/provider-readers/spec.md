@@ -40,7 +40,10 @@ SHALL additionally require explicit `kimi_weekly_enabled = true` and a proved
 pane-to-managed-account binding; it SHALL be limited to one worker per proved
 account/server binding. Refresh SHALL
 read quota memory without waiting for a provider request. Repeated refreshes
-and panes SHALL NOT spawn additional quota workers. The clients SHALL preserve
+and panes sharing one proved binding SHALL NOT spawn additional quota
+workers. At most one Kimi account/server binding SHALL be configured and
+polled in the first implementation; other Kimi accounts remain unavailable.
+The clients SHALL preserve
 their bounded 60..=3600 second query intervals, with a five-minute default,
 independently of publication. Missing initial quota SHALL display `—`.
 
@@ -94,6 +97,89 @@ only `GET /api/v1/oauth/usage` for `managed:kimi-code`. It SHALL not start a
 server, resume a session, initiate login, read OAuth credentials, or retain or
 log tokens, personal account identity, raw responses, or upstream errors.
 
+### Requirement: Kimi context comes from one completed turn
+When `kimi` is enabled, the publisher SHALL read the daemon's Kimi home. The
+home SHALL be `KIMI_CODE_HOME` when that variable is a nonempty absolute path,
+and `~/.kimi-code` when the variable is unset or empty. A non-absolute override
+SHALL make the home unavailable. The reader SHALL select exactly one regular,
+nonsymlinked `state.json` under `sessions/` whose `id` equals the pane's
+nonempty native session id and whose lexically normalized `cwd` equals the pane
+cwd. Normalization SHALL NOT resolve symlinks. Zero matches, mismatches, and
+more than one readable match SHALL be unavailable. An unreadable `state.json`
+whose session directory name equals the pane's native session id SHALL make
+context unavailable, because that file could be a duplicate. An unreadable
+`state.json` in a differently named session directory SHALL NOT hide one
+readable match.
+
+The reader SHALL then read that session's regular, nonsymlinked
+`agents/main/wire.jsonl` from its tail, using the same fingerprint and
+append-during-read rules as the Codex rollout reader. Directory components,
+including `agents` and `main`, SHALL be opened with `O_NOFOLLOW` and SHALL NOT
+be followed when they are symlinks. It SHALL use the last main-agent
+`token_counting.turn_recorded.tokens` and the model alias bound before that
+turn. A binding after that turn, an alias that falls outside the read tail, or
+an alias that cannot be determined uniquely SHALL make context unavailable. A
+later event that changes context, including `token_counting.rebased`,
+`context.apply_compaction`, or an in-progress turn, SHALL make context
+unavailable. The alias SHALL resolve to that model's `max_input_size` in
+`config.toml`, or `max_context_size` when `max_input_size` is absent. The
+reader SHALL parse the file with the `toml` crate and retain only those two
+integer fields. An integer below 1, or a value that is not an integer, SHALL
+make the window unavailable and SHALL NOT fall back to the other size. The
+Kimi home MAY be a symlink, matching Codex resolution of its home. A symlink
+at `sessions/` or below SHALL NOT be followed. Unknown
+aliases, nonpositive windows, ambiguous model entries, and an input size
+greater than the context size SHALL be unavailable. The percentage SHALL be
+`100 * tokens / window`, bounded like the other context labels. A completed
+turn SHALL remain available regardless of age. A timestamp later than the
+read's comparison clock SHALL be unavailable. When a timeout restores the
+previous local reading, that restore SHALL use the same retention function as
+Codex and Grok and SHALL keep Kimi context regardless of age. An unchanged
+`wire.jsonl` SHALL NOT be reread; the reader SHALL use the same fingerprint
+cache as the Codex rollout reader.
+
+The reader SHALL NOT use the network. It SHALL parse `config.toml` with the
+`toml` crate and retain only `id`, `cwd`, event type, `agentId`, `tokens`,
+`time`, the alias bound to the selected turn, and that alias's `max_input_size`
+and `max_context_size`.
+Credential, token, and API-key values SHALL NOT be retained or logged. The local Kimi context reader SHALL keep weekly unavailable. A separately
+opted-in quota worker MAY supply weekly only under the Kimi account binding
+requirements in this change.
+
+#### Scenario: Completed turn publishes context
+- **WHEN** one regular session matches the pane's native session id and cwd
+- **AND** its main-agent wire ends on a completed turn whose model window is positive
+- **AND** the observation is older than `usage_max_age_ms` and not later than the comparison clock
+- **THEN** context is `100 * tokens / window`
+- **AND** the local reader supplies no weekly result; any weekly value must
+  independently satisfy the opt-in account quota requirements
+
+#### Scenario: Binding and file shape reject a value
+- **WHEN** the native session id or normalized cwd does not match, more than one
+  session matches, or `state.json` or `wire.jsonl` is a symlink
+- **THEN** context is unavailable
+
+#### Scenario: Later context changes and unknown models reject a value
+- **WHEN** a turn is still in progress, a compaction or token rebase follows the
+  recorded turn, a model binding follows the selected turn without a new
+  completed turn, the alias is outside the read tail, or the model alias has no
+  positive unambiguous window
+- **THEN** context is unavailable
+
+#### Scenario: A model switch uses the alias in effect for the new turn
+- **WHEN** one completed turn is bound to alias A and a later completed turn is
+  bound to alias B
+- **THEN** context uses alias B's window
+
+#### Scenario: Old Kimi observation stays
+- **WHEN** the completed-turn observation is older than `usage_max_age_ms`
+- **AND** no later event changes context and the timestamp is not in the future
+- **THEN** context retains `100 * tokens / window`
+
+#### Scenario: Future Kimi observation is rejected
+- **WHEN** the completed-turn timestamp is later than the read's comparison clock
+- **THEN** context is unavailable
+
 ## ADDED Requirements
 
 ### Requirement: Kimi seven-day response is validated independently
@@ -129,9 +215,11 @@ windows and wallet values SHALL NOT substitute for `limit7d`.
 
 The Kimi worker SHALL poll by default every five minutes with a configured
 60–3600 second interval, 1–30 second timeout, and no overlapping request.
-A missing reset SHALL use a bounded age cap; a known reset SHALL expire at
-reset. Authentication, schema, or identity failures SHALL clear cached weekly
-immediately. Transient errors MAY retain only a still-valid bounded sample.
+A missing reset SHALL expire after the greater of `usage_max_age_ms`
+and the poll interval plus request timeout plus one sidebar refresh interval.
+A known reset SHALL expire at that reset. Authentication, schema, or identity
+failures SHALL clear cached weekly. Transient errors MAY retain only a
+still-valid sample.
 
 #### Scenario: Authentication failure clears a cached sample
 - **WHEN** a Kimi quota request fails authentication
