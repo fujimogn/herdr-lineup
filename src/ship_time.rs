@@ -65,11 +65,7 @@ fn read_repository_before(
             "--git-common-dir",
         ],
     )?;
-    let mut lines = rev_parse.lines();
-    if lines.next()? != "true" {
-        return None;
-    }
-    let common = lines.next()?;
+    let common = rev_parse.strip_prefix("true\n")?.strip_suffix('\n')?;
     let common = Path::new(common).canonicalize().ok()?;
     // The first worktree is the main working repository, even when cwd is a
     // linked worktree. Query its common directory, not the linked root name.
@@ -830,5 +826,21 @@ mod tests {
             std::ffi::OsStr::new("GIT_ALLOW_PROTOCOL"),
             Some(std::ffi::OsStr::new(""))
         )));
+    }
+
+    #[test]
+    fn repository_path_with_embedded_newline_is_preserved() {
+        let fixture = Fixture::new();
+        let newline_repo = fixture.root.join("repo\nwith\nnewline");
+        std::fs::create_dir(&newline_repo).unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&newline_repo)
+            .args(["init", "--initial-branch=main"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let repo = read_repository(&newline_repo).expect("must parse repo path with newlines");
+        assert_eq!(repo.name, "repo\nwith\nnewline");
     }
 }
