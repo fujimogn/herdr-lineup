@@ -367,13 +367,7 @@ impl<'de> Deserialize<'de> for AuthNode {
 }
 
 fn read_credentials(path: &Path) -> Result<Credentials, Failure> {
-    let file = std::fs::File::open(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Failure::AuthMissing
-        } else {
-            Failure::AuthIo
-        }
-    })?;
+    let file = open_regular(path)?;
     let mut bytes = Vec::new();
     file.take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -396,6 +390,27 @@ fn read_credentials(path: &Path) -> Result<Credentials, Failure> {
         return Err(Failure::AuthShape);
     }
     Ok(credentials)
+}
+
+fn open_regular(path: &Path) -> Result<std::fs::File, Failure> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Failure::AuthMissing
+            } else {
+                Failure::AuthIo
+            }
+        })?;
+    let metadata = file.metadata().map_err(|_| Failure::AuthIo)?;
+    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+        return Err(Failure::AuthShape);
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -601,9 +616,12 @@ mod tests {
 
     #[test]
     fn authentication_failure_and_timeout_are_missing_and_redacted() {
-        for (status, delay) in [(401, Duration::ZERO), (200, Duration::from_millis(150))] {
+        for (status, delay, timeout) in [
+            (401, Duration::ZERO, Duration::from_secs(1)),
+            (200, Duration::from_millis(150), Duration::from_millis(40)),
+        ] {
             let (url, handle) = server(status, "fake-test-secret", delay);
-            let (_dir, mut client) = client(url, Duration::from_millis(40));
+            let (_dir, mut client) = client(url, timeout);
             let result = client.poll();
             assert!(matches!(result, Outcome::Unavailable(_)));
             assert!(!format!("{result:?}").contains("fake-test-secret"));
@@ -637,14 +655,19 @@ mod tests {
 
     #[test]
     fn transient_failure_retains_success_until_reset_but_auth_failure_clears_it() {
-        for (status, delay, retain) in [
-            (500, Duration::ZERO, true),
-            (200, Duration::from_millis(150), true),
-            (401, Duration::ZERO, false),
-            (403, Duration::ZERO, false),
+        for (status, delay, retain, timeout) in [
+            (500, Duration::ZERO, true, Duration::from_secs(1)),
+            (
+                200,
+                Duration::from_millis(150),
+                true,
+                Duration::from_millis(40),
+            ),
+            (401, Duration::ZERO, false, Duration::from_secs(1)),
+            (403, Duration::ZERO, false, Duration::from_secs(1)),
         ] {
             let (url, handle) = server(200, WEEK, Duration::ZERO);
-            let (_dir, mut client) = client(url, Duration::from_millis(40));
+            let (_dir, mut client) = client(url, timeout);
             let now = Instant::now();
             let original = client.poll_at(now, SystemTime::now());
             assert!(matches!(original, Outcome::Weekly(_)));
@@ -674,6 +697,48 @@ mod tests {
             }
             handle.join().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_credentials_return_auth_shape_without_blocking_worker() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path_c` is NUL-terminated and points to a temporary path.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let mut client = Client::with_endpoint(
+            path,
+            Settings::default(),
+            "http://127.0.0.1:9/".to_owned(),
+            Duration::from_secs(1),
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || sender.send(client.poll()).unwrap());
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(Outcome::Unavailable(Failure::AuthShape))
+        );
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_symlinks_work_but_oversized_and_non_regular_files_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let link = dir.path().join("linked-auth.json");
+        std::fs::write(&path, r#"{"key":"fake-key"}"#).unwrap();
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_credentials(&link).is_ok());
+        std::fs::write(&path, "x".repeat(MAX_BYTES as usize + 1)).unwrap();
+        assert!(matches!(read_credentials(&link), Err(Failure::AuthShape)));
+        assert!(matches!(
+            read_credentials(dir.path()),
+            Err(Failure::AuthShape)
+        ));
     }
 
     #[test]
