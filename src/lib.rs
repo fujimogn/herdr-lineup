@@ -10,6 +10,7 @@ pub mod model;
 pub mod protocol;
 pub mod publish;
 pub mod quota_codex;
+pub mod quota_diagnostic;
 pub mod quota_grok;
 pub mod quota_kimi;
 pub mod reader_agy;

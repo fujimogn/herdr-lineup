@@ -62,8 +62,8 @@ impl Failure {
         self == Self::Transient
     }
 
-    pub(crate) fn diagnostic(self) -> crate::doctor::WeeklyResult {
-        use crate::doctor::WeeklyResult;
+    pub(crate) fn diagnostic(self) -> crate::quota_diagnostic::WeeklyResult {
+        use crate::quota_diagnostic::WeeklyResult;
         match self {
             Self::AuthMissing => WeeklyResult::AuthMissing,
             Self::AuthIo => WeeklyResult::AuthIo,
@@ -127,7 +127,7 @@ pub struct Client {
     endpoint: String,
     agent: ureq::Agent,
     next_request: Option<Instant>,
-    last_result: crate::doctor::WeeklyResult,
+    last_result: crate::quota_diagnostic::WeeklyResult,
     last_auth_expiry: Option<SystemTime>,
 }
 
@@ -174,12 +174,12 @@ impl Client {
             endpoint,
             agent,
             next_request: None,
-            last_result: crate::doctor::WeeklyResult::Pending,
+            last_result: crate::quota_diagnostic::WeeklyResult::Pending,
             last_auth_expiry: None,
         }
     }
 
-    pub(crate) fn last_result(&self) -> crate::doctor::WeeklyResult {
+    pub(crate) fn last_result(&self) -> crate::quota_diagnostic::WeeklyResult {
         self.last_result
     }
 
@@ -203,7 +203,7 @@ impl Client {
         self.next_request = Some(now + self.settings.interval);
         let outcome = self.fetch(wall_now);
         self.last_result = match outcome {
-            Outcome::Weekly(_) => crate::doctor::WeeklyResult::Ok,
+            Outcome::Weekly(_) => crate::quota_diagnostic::WeeklyResult::Ok,
             Outcome::Throttled => self.last_result,
             Outcome::Unavailable(failure) => failure.diagnostic(),
         };
@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(client.poll(), Outcome::Unavailable(Failure::AuthExpired));
         assert_eq!(
             client.last_result(),
-            crate::doctor::WeeklyResult::AuthExpired
+            crate::quota_diagnostic::WeeklyResult::AuthExpired
         );
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
