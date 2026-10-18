@@ -5,8 +5,12 @@ use std::path::Path;
 
 pub struct GrokReader;
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-impl UsageReader for GrokReader {
-    fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+impl GrokReader {
+    fn read_with_hook(
+        &self,
+        request: &ReadRequest<'_>,
+        after_discovery: impl FnOnce(&Path) + Send + 'static,
+    ) -> UsageReading {
         let source = SourceKind::GrokSignals;
         if !associated(request, Provider::Grok)
             || !safe_component(&request.identity.native_session_id)
@@ -14,11 +18,24 @@ impl UsageReader for GrokReader {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
         bounded_read(request, source, &BUSY, move |request| {
-            match read_session(request) {
-                Ok((percent, observed)) => UsageReading::sample(request, source, percent, observed),
+            let started = std::time::Instant::now();
+            match read_session_with_hook(request, after_discovery) {
+                Ok((percent, observed)) => {
+                    let evaluated = ReadRequest {
+                        now: request.now_after(started),
+                        ..*request
+                    };
+                    UsageReading::sample(&evaluated, source, percent, observed)
+                }
                 Err(reason) => UsageReading::missing(request, source, reason),
             }
         })
+    }
+}
+
+impl UsageReader for GrokReader {
+    fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+        self.read_with_hook(request, |_| {})
     }
 }
 fn signals_paths(
@@ -81,7 +98,10 @@ fn signals_paths(
     }
     Ok(paths)
 }
-fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime), MissingReason> {
+fn read_session_with_hook(
+    request: &ReadRequest<'_>,
+    after_discovery: impl FnOnce(&Path),
+) -> Result<(f64, std::time::SystemTime), MissingReason> {
     let budget = Budget::new(request);
     let paths = signals_paths(
         &request.home.join("sessions"),
@@ -92,6 +112,7 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime
         return Err(MissingReason::Unassociated);
     }
     let path = paths.first().ok_or(MissingReason::NotFound)?;
+    after_discovery(path);
     let before = std::fs::symlink_metadata(path).map_err(|e| io_reason(&e))?;
     let observed = before.modified().map_err(|e| io_reason(&e))?;
     let value: Value =
@@ -171,6 +192,26 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(time))
             .unwrap();
+    }
+    #[test]
+    fn signals_updated_during_read_use_advanced_comparison_clock() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Grok);
+        let r = request(&id, dir.path());
+        fixture(dir.path(), r#"{"contextWindowUsage":1}"#, r.now);
+        let observed = r.now + Duration::from_millis(100);
+        let reading = GrokReader.read_with_hook(&r, move |path| {
+            fs::write(path, r#"{"contextWindowUsage":7}"#).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(observed))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        assert_percent(reading.context);
     }
     #[test]
     fn normal_missing_idle_and_mismatch() {
