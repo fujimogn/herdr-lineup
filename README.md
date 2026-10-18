@@ -406,9 +406,11 @@ The daemon reads only the selected `KIMI_CODE_HOME/credentials/kimi-code.json`
 OAuth access token and its expiry; it does not log in, refresh, or write the
 credential. It sends the token only to `https://api.kimi.com/coding/v1/usages`.
 An expired or invalid token leaves weekly at `—` while local context remains
-available. The account sample is shared across all Kimi panes. A different
-`KIMI_CODE_BASE_URL` is unavailable before any request. Older Lineup binaries
-reject the new config key; remove it before downgrading. Restart only the
+available. The access token lasts 15 minutes (900 seconds). If Kimi CLI is
+closed and no longer refreshes it, weekly becomes `—` after the token expires;
+local context remains available. The account sample is shared across all Kimi
+panes. A different `KIMI_CODE_BASE_URL` is unavailable before any request.
+Older Lineup binaries reject the new config key; remove it before downgrading. Restart only the
 Lineup daemon after changing either opt-in or the selected Kimi account.
 
 ### Claude and Antigravity statusLine (opt-in)
@@ -925,9 +927,9 @@ See [SECURITY.md](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md
   the last query category with
   `herdr plugin action invoke herdr-lineup.doctor`, then read the plugin log.
   No successful query, an expired reset, Grok MONTHLY data, or an invalid Kimi
-  managed credential leaves weekly unavailable. Kimi's live `/usages` response
-  schema has not yet been verified. Restart only Lineup after authentication,
-  account, or profile changes.
+  managed credential leaves weekly unavailable. Kimi's access token expires
+  after 15 minutes if the CLI does not refresh it. Restart only Lineup after
+  authentication, account, or profile changes.
 - **Icon rendering shows boxes:** run the opt-in
   `herdr-lineup.install-font` action and check the terminal's codepoint map,
   or set `logo_mode = "text"`. `auto` currently uses the same text labels as

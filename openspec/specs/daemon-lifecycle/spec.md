@@ -78,7 +78,7 @@ Persistent sequence state SHALL remain available for a later restart.
 A `doctor` action SHALL be read-only and report config validity, endpoint/protocol
 compatibility, daemon/control/lock health, last refresh health, font-mode
 caveats, bounded statusLine record counts, and the saved result categories of
-the last Codex and Grok weekly queries. Metadata capacity exhaustion SHALL be
+the last Codex, Grok, and Kimi weekly queries. Metadata capacity exhaustion SHALL be
 recorded in the session-local daemon log. Doctor SHALL give a generic warning
 for unavailable optional provider data. It SHALL report
 unhealthy configuration/daemon conditions with a nonzero exit status. Missing
@@ -92,9 +92,9 @@ SHALL be written into `HERDR_PLUGIN_ROOT`.
 - **THEN** stop sends no signal to it and doctor reports the stale record
 
 #### Scenario: Missing usage is expected
-- **WHEN** the daemon is healthy and Kimi usage is unsupported
-- **THEN** doctor succeeds with a generic optional-provider warning, without starting a reader
-  network call, editing config, or restarting any server
+- **WHEN** the daemon is healthy and Kimi account quota is disabled or unavailable
+- **THEN** doctor succeeds with a generic optional-provider warning, without starting a
+  network query, editing config, or restarting any server
 
 ### Requirement: Explicit user configuration with bounded defaults
 The plugin SHALL read `$HERDR_PLUGIN_CONFIG_DIR/config.toml`, use the following
@@ -115,6 +115,7 @@ outside these bounds SHALL fail validation before spawning or publishing.
 | `non_first_pane_logo_indent` | `0` | Integer 0–16; prefix later-pane logos with that many U+2800 cells |
 | `providers` | `["claude", "codex", "grok", "agy", "kimi", "hermes"]` | Unique supported ids; an empty list disables all lineup agent rows |
 | `allow_network` | `false` | No network-dependent reader runs unless true and its researched adapter is enabled |
+| `kimi_weekly_enabled` | `false` | Kimi managed-account queries also require this true and `kimi` in `providers` |
 
 All selected intervals SHALL keep TTL within Herdr's 1–86400000 ms bound.
 Config edits SHALL take effect on a deliberate stop/start, not partially during
@@ -123,7 +124,7 @@ No credentials or sidebar layout SHALL be stored in this plugin config.
 
 #### Scenario: Absent and invalid configuration
 - **WHEN** the user config is absent
-- **THEN** the daemon uses the seven defaults above and never writes a config file
+- **THEN** the daemon uses the eight defaults above and never writes a config file
 - **AND WHEN** refresh interval is 1000 but reader timeout remains 2000
 - **THEN** config validation fails with an actionable bounded-value diagnostic
 

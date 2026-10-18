@@ -32,7 +32,7 @@ None.
 
 ## Impact
 
-The default-off client and daemon worker are implemented, but this change has
-not been archived. It does not enable network access or change user
-configuration. A live managed `/usages` response schema has not been verified;
-no authenticated Kimi endpoint was called during implementation or tests.
+The default-off client and daemon worker are implemented. It does not enable
+network access or change user configuration. An owner-authorized live schema
+check on 2026-10-19 matched the strict `limit_7d` parser; no authenticated
+Kimi endpoint was called during implementation or tests.

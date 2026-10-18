@@ -2,8 +2,8 @@
 
 ## Status and source
 
-**Implemented behind separate network and Kimi opt-ins; live authenticated
-verification is still pending.** The local Kimi reader
+**Implemented behind separate network and Kimi opt-ins; the owner-authorized
+live schema check matched the parser on 2026-10-19.** The local Kimi reader
 supplies completed-turn context for an exact local session. The weekly worker
 uses the managed Kimi account logged in
 under the daemon's Kimi home for an account-wide weekly sample shared by every
@@ -118,7 +118,8 @@ unrelated quota windows in an otherwise valid response;
 keep the feature default-off. Check the installed CLI version and synthetic
 fixtures before implementation and again for upgrades. Disabling the Kimi
 worker must leave local context intact. No live Kimi API or credential
-endpoint was called for this design.
+endpoint was called while preparing this design; the later owner-authorized
+schema check is recorded in `tasks.md`.
 
 ## SECURITY.md follow-up
 

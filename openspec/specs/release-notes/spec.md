@@ -55,6 +55,14 @@ is absent or its date heading does not match the `YYYY-MM-DD` format.
 
 ### Requirement: Human-triggered release publication
 
+Publication SHALL begin with a human-pushed version tag. The release workflow
+SHALL verify versions, build checked artifacts, and publish a GitHub Release.
+
+#### Scenario: Enforce the release workflow contract
+
+- **WHEN** the release workflow processes a human-pushed `v*` tag
+- **THEN** it follows these packaging, permission, and publication rules:
+
 The release workflow SHALL run on a human-pushed `v*` tag, verify version
 consistency using `scripts/check-version.sh`, and create a GitHub Release titled
 `vX.Y.Z` with the extractor output as its body. It SHALL attach Linux and macOS
@@ -93,6 +101,14 @@ Release creation.
 - **THEN** the workflow fails before creating the GitHub Release
 
 ### Requirement: Maintainer preflight and automated checks
+
+The maintainer SHALL complete the documented preflight before tagging, and CI
+SHALL test release-note extraction boundaries.
+
+#### Scenario: Prepare a release before tagging
+
+- **WHEN** the maintainer prepares a release
+- **THEN** the guide and CI follow these preflight and extraction rules:
 
 The release guide SHALL use numbered bold Steps, Version numbering, and
 Supported versions sections. It SHALL document version and lockfile alignment,

@@ -17,10 +17,17 @@
       with the implemented default-off daemon-home worker and its account scope.
 - [x] Add the `daemon-lifecycle` delta for the Kimi doctor category, the
       `kimi_weekly_enabled` config default, and the eight-default count.
-- [ ] Verify the installed Kimi version and nonpublic response schema in an
+- [x] Verify the installed Kimi version and nonpublic response schema in an
       approved environment, then update schema-dependent user documentation and
-      run release checks. Do not archive the change before this check.
+      run release checks before archiving. On 2026-10-19, the owner-authorized
+      `kimi --version` reported 2.2.0 and the live GET returned HTTP 200.
+      `usages.limit_7d` had exactly `used_ratio`
+      (number in [0, 1]) and `reset_time` (future RFC3339 string), matching
+      the strict parser. The credential file had `access_token`, `expires_at`,
+      `expires_in`, `refresh_token`, `scope`, and `token_type`; `expires_in` was
+      900 seconds. No credential or quota values are recorded.
 
-The standalone client and opt-in worker wiring are implemented. Live response
-schema verification and release checks remain open. No authenticated Kimi
-endpoint was called for the client or worker tests.
+The standalone client and opt-in worker wiring are implemented. The
+owner-authorized live schema check was completed on 2026-10-19; the client and
+worker tests still use synthetic fixtures. Release checks for this archive
+candidate are recorded in its Formation report.
