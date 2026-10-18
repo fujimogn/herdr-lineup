@@ -28,6 +28,8 @@ use std::{
 pub const PLUGIN_ID: &str = "herdr-lineup";
 const START_DEADLINE: Duration = Duration::from_secs(5);
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
+const IDLE_WAIT: Duration = Duration::from_millis(100);
+const RECONNECT_RETRY: Duration = Duration::from_millis(250);
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 pub(crate) const LOCK_CONTENDED_EXIT_CODE: u8 = 75;
 
@@ -310,11 +312,12 @@ fn run_locked(
                 }
                 return Ok(());
             }
-            if control
-                .worker
-                .as_ref()
-                .is_some_and(|worker| worker.is_finished())
-            {
+            if control_worker_exited_unexpectedly(&control.shutdown, || {
+                control
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished())
+            }) {
                 return Err(io::Error::other(
                     "daemon control worker exited unexpectedly",
                 ));
@@ -324,8 +327,18 @@ fn run_locked(
                 // each next request on the pinned dev/inode. This recovery path is
                 // for unexpected failures; a replaced server socket stops us.
                 let retrying_refresh = reconnect;
-                transport.reconnect_same_endpoint()?;
-                doctor::check_transport(&mut transport)?;
+                if let Err(error) = transport
+                    .reconnect_same_endpoint()
+                    .and_then(|_| doctor::check_transport(&mut transport))
+                {
+                    if transport.endpoint_replaced() {
+                        return Err(error);
+                    }
+                    reconnect = true;
+                    *control.health.lock().unwrap() = health.clone();
+                    std::thread::sleep(RECONNECT_RETRY);
+                    continue;
+                }
                 publisher.reconnected();
                 reconnect = false;
                 if !retrying_refresh {
@@ -359,12 +372,18 @@ fn run_locked(
             if control.shutdown.load(Ordering::Acquire) {
                 continue;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(IDLE_WAIT);
         }
     })();
     control.shutdown.store(true, Ordering::Release);
     publisher.shutdown();
     result
+}
+fn control_worker_exited_unexpectedly(
+    shutdown: &AtomicBool,
+    is_finished: impl FnOnce() -> bool,
+) -> bool {
+    is_finished() && !shutdown.load(Ordering::Acquire)
 }
 /// Own the control listener independently of publication. Drop joins the worker
 /// before runtime paths are removed and session ownership is released.
@@ -383,7 +402,28 @@ impl ControlWorker {
         let worker_shutdown = shutdown.clone();
         let worker_done = done.clone();
         let worker = std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
             while !worker_done.load(Ordering::Acquire) {
+                let mut descriptor = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // Bound drop's join while sleeping until a client arrives.
+                let ready = unsafe { libc::poll(&mut descriptor, 1, 100) };
+                if ready < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if ready == 0 {
+                    continue;
+                }
+                if descriptor.revents & libc::POLLIN == 0 {
+                    return Err(io::Error::other("daemon control listener poll failed"));
+                }
                 match listener.accept() {
                     Ok((stream, _)) => {
                         // Never hold the health mutex during I/O or a refresh.
@@ -396,7 +436,6 @@ impl ControlWorker {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
                     Err(error) => return Err(error),
                 }
-                std::thread::sleep(Duration::from_millis(5));
             }
             Ok(())
         });
@@ -679,6 +718,11 @@ mod tests {
                             .read_line(&mut line)
                             .unwrap();
                         let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if request["method"] == "ping"
+                            && fs::remove_file(workspace.join("fail-next-ping")).is_ok()
+                        {
+                            continue;
+                        }
                         let result = if workspace.join("snapshot-workspace").exists()
                             && request["method"] == "session.snapshot"
                         {
@@ -931,6 +975,35 @@ mod tests {
                     ),
                 )
                 .unwrap();
+                return;
+            }
+            if std::env::var_os("LINEUP_TEST_RETRY").is_some() {
+                struct RetryPublisher(PathBuf, usize);
+                impl Publisher for RetryPublisher {
+                    fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                        self.1 += 1;
+                        fs::write(self.0.join("refresh-count"), self.1.to_string())?;
+                        if self.1 == 1 {
+                            fs::rename(Options::from_env()?.socket, self.0.join("hidden-socket"))?;
+                            fs::write(self.0.join("fail-next-ping"), "")?;
+                            return Err(io::Error::other("synthetic refresh failure"));
+                        }
+                        Ok(())
+                    }
+                    fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                        fs::write(self.0.join("clear-called"), "")
+                    }
+                }
+                run_foreground(
+                    &options,
+                    true,
+                    &mut RetryPublisher(options.state.clone(), 0),
+                )
+                .unwrap();
+                return;
+            }
+            if std::env::var_os("LINEUP_TEST_IDLE").is_some() {
+                run_foreground(&options, true, &mut NoopPublisher).unwrap();
                 return;
             }
             struct SlowRefresh(PathBuf, Option<Arc<AtomicBool>>);
@@ -1638,6 +1711,89 @@ mod tests {
         assert!(replacement.accept().is_err());
         done.store(true, Ordering::Relaxed);
         server.join().unwrap();
+    }
+    #[test]
+    fn transient_reconnect_and_ping_failures_retry_then_clear_on_stop() {
+        let (_dir, options, done, server) = fixture();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_RETRY", "1");
+        command.env("HOME", &options.state);
+        command.env("CODEX_HOME", &options.state);
+        ensure_command(&options, command).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| options.state.join("hidden-socket").exists());
+        std::thread::sleep(Duration::from_millis(200));
+        fs::rename(options.state.join("hidden-socket"), &options.socket).unwrap();
+        wait_until(|| {
+            fs::read_to_string(options.state.join("refresh-count"))
+                .is_ok_and(|value| value.trim() == "2")
+        });
+        stop(&options).unwrap();
+        assert!(options.state.join("clear-called").exists());
+        assert!(!SessionLock::is_held(&paths).unwrap());
+        assert!(!options.state.join("fail-next-ping").exists());
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn completed_stop_wins_worker_exit_race() {
+        let shutdown = AtomicBool::new(false);
+        assert!(!control_worker_exited_unexpectedly(&shutdown, || {
+            shutdown.store(true, Ordering::Release);
+            true
+        }));
+        assert!(control_worker_exited_unexpectedly(
+            &AtomicBool::new(false),
+            || true
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "manual isolated idle context-switch measurement"]
+    fn measure_idle_context_switches() {
+        fn switches(pid: u32) -> u64 {
+            fs::read_dir(format!("/proc/{pid}/task"))
+                .unwrap()
+                .map(|entry| {
+                    fs::read_to_string(entry.unwrap().path().join("status"))
+                        .unwrap()
+                        .lines()
+                        .filter(|line| {
+                            line.starts_with("voluntary_ctxt_switches:")
+                                || line.starts_with("nonvoluntary_ctxt_switches:")
+                        })
+                        .map(|line| {
+                            line.split_whitespace()
+                                .last()
+                                .unwrap()
+                                .parse::<u64>()
+                                .unwrap()
+                        })
+                        .sum::<u64>()
+                })
+                .sum()
+        }
+        let (_dir, options, done, server) = fixture();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_IDLE", "1");
+        command.env("HOME", &options.state);
+        command.env("CODEX_HOME", &options.state);
+        ensure_command(&options, command).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let pid = probe(&paths, &options.socket).unwrap().unwrap().pid;
+        let before = switches(pid);
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_secs(2));
+        let per_second = (switches(pid) - before) as f64 / started.elapsed().as_secs_f64();
+        let stop_started = Instant::now();
+        stop(&options).unwrap();
+        let stop_elapsed = stop_started.elapsed();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(stop_elapsed < STOP_DEADLINE);
+        eprintln!("isolated idle context switches/s: {per_second:.1}, stop: {stop_elapsed:?}");
     }
     #[test]
     fn stopped_daemon_with_unrelated_pid_is_noop_and_doctor_does_not_create_state() {
