@@ -56,14 +56,21 @@ fn read_repository_before(
     deadline: Instant,
 ) -> Option<Repository> {
     let output = |path: &Path, args: &[&str]| git_output(path, args, deadline, shutdown);
-    if output(cwd, &["rev-parse", "--is-inside-work-tree"])? != "true\n" {
+    let rev_parse = output(
+        cwd,
+        &[
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+    )?;
+    let mut lines = rev_parse.lines();
+    if lines.next()? != "true" {
         return None;
     }
-    let common = output(
-        cwd,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
-    let common = Path::new(common.strip_suffix('\n')?).canonicalize().ok()?;
+    let common = lines.next()?;
+    let common = Path::new(common).canonicalize().ok()?;
     // The first worktree is the main working repository, even when cwd is a
     // linked worktree. Query its common directory, not the linked root name.
     let worktrees = output(&common, &["worktree", "list", "--porcelain", "-z"])?;
@@ -263,7 +270,30 @@ fn git_output(
                 .then(|| String::from_utf8(bytes).ok())
                 .flatten();
         }
-        std::thread::sleep(Duration::from_millis(5));
+        if !eof {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let millis = remaining.as_millis().clamp(1, 50) as i32;
+            let mut descriptor = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+            if ready < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                return None;
+            }
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let millis = remaining.as_millis().clamp(1, 5) as i32;
+            let ready = unsafe { libc::poll(std::ptr::null_mut(), 0, millis) };
+            if ready < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                return None;
+            }
+        }
     }
 }
 

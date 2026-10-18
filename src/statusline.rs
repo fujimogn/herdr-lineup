@@ -3,7 +3,7 @@ use crate::model;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    fs::{self, DirBuilder, File},
+    fs::{self, DirBuilder},
     io::{self, Read, Write},
     os::unix::{fs::DirBuilderExt, process::ExitStatusExt},
     path::{Path, PathBuf},
@@ -209,10 +209,9 @@ fn persist(state: &Path, record: &Record) -> io::Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(&directory)?;
     serde_json::to_writer(temp.as_file_mut(), record)?;
     temp.flush()?;
-    temp.as_file().sync_all()?;
     temp.persist(record_path(state, record.agent, &record.key))
         .map_err(|_| io::Error::other("cannot persist observation"))?;
-    File::open(directory)?.sync_all()
+    Ok(())
 }
 fn missing(
     request: &model::ReadRequest<'_>,
