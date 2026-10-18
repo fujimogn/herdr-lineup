@@ -68,10 +68,11 @@ impl Homes {
             Some(path) => Some(PathBuf::from(path)).filter(|p| p.is_absolute()),
             None => home.as_ref().map(|home| home.join(default)),
         };
-        let kimi = match std::env::var_os("KIMI_CODE_HOME") {
-            Some(path) if !path.is_empty() => Some(PathBuf::from(path)).filter(|p| p.is_absolute()),
-            _ => home.as_ref().map(|home| home.join(".kimi-code")),
-        };
+        let kimi = crate::quota_kimi::home_path(
+            std::env::var_os("KIMI_CODE_HOME"),
+            std::env::var_os("HOME"),
+        )
+        .ok();
         Self {
             codex: provider("CODEX_HOME", ".codex"),
             grok: provider("GROK_HOME", ".grok"),
@@ -187,19 +188,33 @@ fn current_kimi_weekly(
     now: SystemTime,
     instant: Instant,
 ) -> Option<model::WeeklySample> {
-    let enabled = config.allow_network
-        && config.kimi_weekly_enabled
-        && config.providers.iter().any(|provider| provider == "kimi");
-    let current_stamp = home
-        .and_then(|home| crate::quota_kimi::source_stamp(&home.join("credentials/kimi-code.json")));
+    current_kimi_weekly_with_stamp(source, config, now, instant, || {
+        home.and_then(|home| {
+            crate::quota_kimi::source_stamp(&crate::quota_kimi::credential_path(home))
+        })
+    })
+}
+
+fn current_kimi_weekly_with_stamp(
+    source: &std::sync::Mutex<Option<KimiSnapshot>>,
+    config: &Config,
+    now: SystemTime,
+    instant: Instant,
+    stamp: impl FnOnce() -> Option<crate::quota_kimi::SourceStamp>,
+) -> Option<model::WeeklySample> {
+    if !config.weekly_enabled(Agent::Kimi) {
+        if let Ok(mut source) = source.try_lock() {
+            *source = None;
+        }
+        return None;
+    }
+    let current_stamp = stamp();
     let snapshot = source.try_lock().ok().and_then(|mut source| {
-        if !enabled
-            || source.is_some_and(|snapshot| {
-                Some(snapshot.stamp) != current_stamp
-                    || snapshot.auth_expiry <= now
-                    || snapshot.sample.resets_at.is_some_and(|reset| reset <= now)
-            })
-        {
+        if source.is_some_and(|snapshot| {
+            Some(snapshot.stamp) != current_stamp
+                || snapshot.auth_expiry <= now
+                || snapshot.sample.resets_at.is_some_and(|reset| reset <= now)
+        }) {
             *source = None;
         }
         *source
@@ -211,6 +226,23 @@ fn current_kimi_weekly(
         config.usage_max_age_ms,
         config.refresh_interval_ms,
     )
+}
+
+fn repository_read_once(
+    readings: &mut BTreeMap<PathBuf, Result<Option<ship_time::Repository>, ()>>,
+    cwd: &Path,
+    read: impl FnOnce(&Path) -> ship_time::RepositoryRead,
+) -> ship_time::RepositoryRead {
+    let cached = readings
+        .entry(cwd.to_owned())
+        .or_insert_with(|| match read(cwd) {
+            ship_time::RepositoryRead::Complete(repository) => Ok(repository),
+            ship_time::RepositoryRead::Interrupted => Err(()),
+        });
+    match cached {
+        Ok(repository) => ship_time::RepositoryRead::Complete(repository.clone()),
+        Err(()) => ship_time::RepositoryRead::Interrupted,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -335,15 +367,12 @@ impl MetadataPublisher {
         };
         self.check_shutdown()?;
         if !self.weekly_diagnostics_initialized {
-            for (provider, name) in [
-                (WeeklyProvider::Codex, "codex"),
-                (WeeklyProvider::Grok, "grok"),
-                (WeeklyProvider::Kimi, "kimi"),
+            for (provider, agent) in [
+                (WeeklyProvider::Codex, Agent::Codex),
+                (WeeklyProvider::Grok, Agent::Grok),
+                (WeeklyProvider::Kimi, Agent::Kimi),
             ] {
-                let result = if config.allow_network
-                    && config.providers.iter().any(|id| id == name)
-                    && (name != "kimi" || config.kimi_weekly_enabled)
-                {
+                let result = if config.weekly_enabled(agent) {
                     WeeklyResult::Pending
                 } else {
                     WeeklyResult::Disabled
@@ -355,7 +384,7 @@ impl MetadataPublisher {
         if !config.allow_network {
             return Ok(());
         }
-        if self.codex_weekly.is_none() && config.providers.iter().any(|id| id == "codex") {
+        if self.codex_weekly.is_none() && config.weekly_enabled(Agent::Codex) {
             if let Some(home) = self.homes.codex.clone() {
                 let mut client = crate::quota_codex::WeeklyClient::new(
                     home,
@@ -393,7 +422,7 @@ impl MetadataPublisher {
                 )?;
             }
         }
-        if self.grok_weekly.is_none() && config.providers.iter().any(|id| id == "grok") {
+        if self.grok_weekly.is_none() && config.weekly_enabled(Agent::Grok) {
             let settings = crate::quota_grok::Settings::default();
             // Preserve resolution failures as fixed categories, not silent None.
             let mut client = crate::quota_grok::Client::from_env(settings);
@@ -418,10 +447,7 @@ impl MetadataPublisher {
                 },
             )?);
         }
-        if config.kimi_weekly_enabled
-            && self.kimi_weekly.is_none()
-            && config.providers.iter().any(|id| id == "kimi")
-        {
+        if self.kimi_weekly.is_none() && config.weekly_enabled(Agent::Kimi) {
             let settings = crate::quota_kimi::Settings::default();
             #[cfg(not(test))]
             let mut client = crate::quota_kimi::Client::from_env(settings);
@@ -743,10 +769,7 @@ impl MetadataPublisher {
             snapshot.panes.iter().any(|pane| {
                 pane.pane_id == *id
                     && pane.occupant.as_ref().is_some_and(|who| {
-                        config
-                            .providers
-                            .iter()
-                            .any(|provider| provider == agent_id(who.agent))
+                        config.has_provider(who.agent)
                             && matches!(
                                 (reading.identity.provider, who.agent),
                                 (model::Provider::Claude, Agent::Claude)
@@ -804,6 +827,7 @@ impl MetadataPublisher {
         let mut skipped_resources = 0u64;
         let local_now = chrono::Local::now();
         let mut headings = BTreeMap::new();
+        let mut repository_readings = BTreeMap::new();
         for workspace in &snapshot.workspaces {
             self.check_shutdown()?;
             let panes: Vec<_> = snapshot
@@ -817,7 +841,9 @@ impl MetadataPublisher {
                 &panes,
             );
             let reading = cwd.map_or(ship_time::RepositoryRead::Complete(None), |cwd| {
-                ship_time::read_repository_controlled(cwd, self.shutdown.as_deref())
+                repository_read_once(&mut repository_readings, cwd, |cwd| {
+                    ship_time::read_repository_controlled(cwd, self.shutdown.as_deref())
+                })
             });
             let occupants = snapshot
                 .panes
@@ -852,12 +878,10 @@ impl MetadataPublisher {
         for pane in &snapshot.panes {
             self.check_shutdown()?;
             let first_pane = first_panes.contains(pane.pane_id.as_str());
-            let occupant = pane.occupant.clone().filter(|who| {
-                config
-                    .providers
-                    .iter()
-                    .any(|provider| provider == agent_id(who.agent))
-            });
+            let occupant = pane
+                .occupant
+                .clone()
+                .filter(|who| config.has_provider(who.agent));
             let usage = occupant.as_ref().and_then(|who| {
                 let agy = AgyReader {
                     pane_id: pane.pane_id.clone(),
@@ -974,7 +998,7 @@ impl MetadataPublisher {
                         // Grok has one configured account, shared across all its
                         // panes even when no local context/native id is available.
                         Agent::Grok => grok_weekly,
-                        Agent::Kimi if config.kimi_weekly_enabled => kimi_weekly,
+                        Agent::Kimi if config.weekly_enabled(Agent::Kimi) => kimi_weekly,
                         _ => None,
                     };
                     if let Some(weekly) = weekly {
@@ -1185,10 +1209,6 @@ fn unix(time: SystemTime) -> i64 {
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
         .unwrap_or(0)
 }
-fn agent_id(agent: Agent) -> &'static str {
-    agent.info().id
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2229,6 +2249,54 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn disabled_kimi_never_checks_credential_stamp() {
+        let now = SystemTime::now();
+        let cache = std::sync::Mutex::new(None);
+        for config in [
+            Config::default(),
+            Config {
+                allow_network: true,
+                ..Config::default()
+            },
+            Config {
+                allow_network: true,
+                kimi_weekly_enabled: true,
+                providers: vec![],
+                ..Config::default()
+            },
+        ] {
+            assert!(
+                current_kimi_weekly_with_stamp(&cache, &config, now, Instant::now(), || panic!(
+                    "credential path was checked"
+                ))
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn same_cwd_is_read_once_per_cycle_and_refreshed_next_cycle() {
+        let cwd = Path::new("/synthetic/repo");
+        let mut calls = 0;
+        for cycle in 0..2 {
+            let mut readings = BTreeMap::new();
+            for _ in 0..2 {
+                let reading = repository_read_once(&mut readings, cwd, |_| {
+                    calls += 1;
+                    ship_time::RepositoryRead::Complete(Some(ship_time::Repository {
+                        name: format!("cycle-{cycle}"),
+                        ship_unix: Some(cycle),
+                    }))
+                });
+                assert!(
+                    matches!(reading, ship_time::RepositoryRead::Complete(Some(repo)) if repo.name == format!("cycle-{cycle}"))
+                );
+            }
+            assert_eq!(calls, cycle + 1);
+        }
     }
 
     #[test]

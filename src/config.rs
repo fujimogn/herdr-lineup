@@ -34,6 +34,18 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn has_provider(&self, agent: Agent) -> bool {
+        self.providers
+            .iter()
+            .any(|provider| provider == agent.info().id)
+    }
+
+    pub fn weekly_enabled(&self, agent: Agent) -> bool {
+        self.allow_network
+            && self.has_provider(agent)
+            && (agent != Agent::Kimi || self.kimi_weekly_enabled)
+    }
+
     pub fn load(directory: &Path) -> io::Result<Self> {
         match std::fs::read_to_string(directory.join("config.toml")) {
             Ok(text) => Self::parse(&text),
@@ -149,5 +161,20 @@ mod tests {
         );
         assert!(!Config::parse("").unwrap().kimi_weekly_enabled);
         assert!(Config::parse("kimi_weekly_enabled = 'true'").is_err());
+    }
+
+    #[test]
+    fn weekly_enablement_requires_network_provider_and_kimi_opt_in() {
+        let mut config = Config::default();
+        assert!(!config.weekly_enabled(Agent::Codex));
+        assert!(!config.weekly_enabled(Agent::Kimi));
+        config.allow_network = true;
+        assert!(config.weekly_enabled(Agent::Codex));
+        assert!(!config.weekly_enabled(Agent::Kimi));
+        config.kimi_weekly_enabled = true;
+        assert!(config.weekly_enabled(Agent::Kimi));
+        config.providers = vec!["codex".into()];
+        assert!(!config.weekly_enabled(Agent::Kimi));
+        assert!(config.weekly_enabled(Agent::Codex));
     }
 }

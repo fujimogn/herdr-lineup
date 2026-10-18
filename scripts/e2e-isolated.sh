@@ -242,7 +242,7 @@ server_pid=''
 isolated_env() {
     clean_env env HOME="$home" XDG_CONFIG_HOME="$config" XDG_DATA_HOME="$home/.local/share" \
         XDG_STATE_HOME="$home/.local/state" XDG_CACHE_HOME="$home/.cache" \
-        CODEX_HOME="$home/.codex" GROK_HOME="$home/.grok" \
+        CODEX_HOME="$home/.codex" GROK_HOME="$home/.grok" KIMI_CODE_HOME="$home/.kimi-code" \
         SHELL=/bin/sh HERDR_CONFIG_PATH="$config/herdr/config.toml" "$@"
 }
 check_endpoint() {
