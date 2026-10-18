@@ -74,7 +74,10 @@ pushes the tag. The workflow never tags or pushes on its own.
    Before any build, the workflow requires the tag's commit to be reachable
    from `origin/main`, the latest CI `push` run for that commit on `main` to
    have succeeded, and the `## X.Y.Z (YYYY-MM-DD)` heading to match the
-   annotated tag's tagger date. It reads CI runs with `actions: read`; if a
+   annotated tag's tagger date. The gate explicitly refetches the tag object
+   because checkout may replace the pushed annotated tag with a lightweight
+   local ref; it also checks that the fetched tag points to the checked-out
+   commit. It reads CI runs with `actions: read`; if a
    check fails or the API is unavailable, the release stops. The workflow
    then checks the tag against the manifests and lockfile, runs
    `cargo test --locked`, builds on `ubuntu-latest` and `macos-latest`, and

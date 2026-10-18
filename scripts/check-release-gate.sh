@@ -16,8 +16,11 @@ fail() {
   exit 1
 }
 
+git fetch --force --no-tags origin "refs/tags/$tag:refs/tags/$tag" || fail "cannot fetch $tag"
 [[ $(git cat-file -t "refs/tags/$tag" 2>/dev/null) == tag ]] || fail "$tag must be an annotated tag"
 commit=$(git rev-parse --verify "refs/tags/$tag^{commit}") || fail "cannot resolve $tag"
+checkout_commit=$(git rev-parse --verify HEAD) || fail 'cannot resolve checkout HEAD'
+[[ $commit == "$checkout_commit" ]] || fail "$tag does not point to checkout HEAD"
 git merge-base --is-ancestor "$commit" refs/remotes/origin/main || fail "$tag commit is not on origin/main"
 
 tag_date=$(git for-each-ref --format='%(taggerdate:short)' "refs/tags/$tag")

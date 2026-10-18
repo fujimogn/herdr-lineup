@@ -9,8 +9,9 @@ trap 'rm -f "$fixture_dir/bin/git" "$fixture_dir/bin/gh" "$fixture_dir/changelog
 cat > "$fixture_dir/bin/git" <<'MOCK'
 #!/usr/bin/env bash
 case "$1" in
+  fetch) [[ $* == 'fetch --force --no-tags origin refs/tags/v1.2.3:refs/tags/v1.2.3' && ${TEST_FETCH_OK:-yes} == yes ]] ;;
   cat-file) [[ ${TEST_TAG_TYPE:-tag} == tag ]] && echo tag || echo commit ;;
-  rev-parse) echo 1111111111111111111111111111111111111111 ;;
+  rev-parse) if [[ $3 == HEAD ]]; then echo "${TEST_CHECKOUT_SHA:-1111111111111111111111111111111111111111}"; else echo 1111111111111111111111111111111111111111; fi ;;
   merge-base) [[ ${TEST_ON_MAIN:-yes} == yes ]] ;;
   for-each-ref) echo "${TEST_TAG_DATE:-2026-10-18}" ;;
   *) echo "unexpected git command: $*" >&2; exit 1 ;;
@@ -43,6 +44,10 @@ gate
 
 TEST_ON_MAIN=no failure 'not on origin/main'
 unset TEST_ON_MAIN
+TEST_FETCH_OK=no failure 'cannot fetch'
+unset TEST_FETCH_OK
+TEST_CHECKOUT_SHA=2222222222222222222222222222222222222222 failure 'does not point to checkout HEAD'
+unset TEST_CHECKOUT_SHA
 TEST_TAG_DATE=2026-10-19 failure 'CHANGELOG date differs'
 unset TEST_TAG_DATE
 TEST_CI_RUNS='{"workflow_runs":[]}' failure 'CI is not green'
