@@ -144,4 +144,6 @@ behavior remains planned.
    configured timeout.
 3. The client distinguishes transient network/5xx failures from immediate
    clear conditions (401/403, invalid schema, unavailable credentials, or
-   destination mismatch). The worker owns sample retention and expiry.
+   destination mismatch). A poll before the interval has elapsed returns a
+   distinct `Throttled` outcome, so it does not clear a worker-held sample.
+   The worker owns sample retention and expiry.

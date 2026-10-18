@@ -83,6 +83,8 @@ pub struct WeeklyUsage {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Outcome {
     Weekly(WeeklyUsage),
+    /// No request was due; the worker keeps its current sample unchanged.
+    Throttled,
     Unavailable(Failure),
 }
 
@@ -156,12 +158,13 @@ impl Client {
 
     fn poll_at(&mut self, now: Instant, wall_now: SystemTime) -> Outcome {
         if self.next_request.is_some_and(|next| now < next) {
-            return Outcome::Unavailable(Failure::Request);
+            return Outcome::Throttled;
         }
         self.next_request = Some(now + self.settings.interval);
         let outcome = self.fetch(wall_now);
         self.last_result = match outcome {
             Outcome::Weekly(_) => crate::doctor::WeeklyResult::Ok,
+            Outcome::Throttled => self.last_result,
             Outcome::Unavailable(failure) => failure.diagnostic(),
         };
         outcome
@@ -236,11 +239,7 @@ fn validate_slot(path: &Path) -> Result<(), Failure> {
         return Err(Failure::AuthShape);
     }
     let mut bytes = Vec::new();
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(config)
-        .map_err(|_| Failure::AuthIo)?
+    open_regular(&config)?
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| Failure::AuthIo)?;
@@ -284,11 +283,7 @@ fn read_credentials(path: &Path, now: SystemTime) -> Result<Credential, Failure>
         return Err(Failure::AuthShape);
     }
     let mut bytes = Vec::new();
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| Failure::AuthIo)?
+    open_regular(path)?
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| Failure::AuthIo)?;
@@ -309,6 +304,19 @@ fn read_credentials(path: &Path, now: SystemTime) -> Result<Credential, Failure>
         return Err(Failure::AuthShape);
     }
     Ok(credential)
+}
+
+fn open_regular(path: &Path) -> Result<std::fs::File, Failure> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| Failure::AuthIo)?;
+    let metadata = file.metadata().map_err(|_| Failure::AuthIo)?;
+    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+        return Err(Failure::AuthShape);
+    }
+    Ok(file)
 }
 
 #[derive(Deserialize)]
@@ -564,7 +572,8 @@ mod tests {
             )
             .unwrap();
             let mut client = Client::with_endpoint(path, Settings::default(), url);
-            let outcome = client.poll();
+            let now = Instant::now();
+            let outcome = client.poll_at(now, SystemTime::now());
             let request = handle.join().unwrap();
             assert!(request.contains("GET /usages HTTP/1.1"));
             assert!(
@@ -577,6 +586,7 @@ mod tests {
                 assert!(matches!(outcome, Outcome::Weekly(_)));
             }
             assert!(!format!("{outcome:?}").contains("fake-token"));
+            assert_eq!(client.poll_at(now, SystemTime::now()), Outcome::Throttled);
         }
     }
 }
