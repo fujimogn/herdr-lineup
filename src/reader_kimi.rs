@@ -23,6 +23,12 @@ struct CachedWire {
 }
 static CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), CachedWire>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+type StateBinding = Result<Option<(String, PathBuf)>, MissingReason>;
+static STATE_CACHE: LazyLock<Mutex<HashMap<PathBuf, (Fingerprint, StateBinding)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+type CachedWindow = (Fingerprint, Result<f64, MissingReason>);
+static WINDOW_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), CachedWindow>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub struct KimiReader;
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -107,28 +113,52 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, SystemTime), MissingR
 fn state_binding(budget: &Budget, path: &Path) -> Result<Option<(String, PathBuf)>, MissingReason> {
     let mut file = budget.open(path)?;
     let before = Fingerprint::of(&file.metadata().map_err(|error| io_reason(&error))?);
+    if let Some((fingerprint, binding)) = STATE_CACHE
+        .lock()
+        .map_err(|_| MissingReason::SourceError)?
+        .get(path)
+        && *fingerprint == before
+    {
+        budget.check()?;
+        if stable_file(path, &file, before)? {
+            return binding.clone();
+        }
+        return Err(MissingReason::SourceError);
+    }
     let bytes = budget.read_range(&mut file, 0, before.size as usize)?;
+    if !stable_file(path, &file, before)? {
+        return Err(MissingReason::SourceError);
+    }
+    let binding = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|_| MissingReason::Invalid)
+        .map(|value| {
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .zip(
+                    value
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .and_then(lexical_absolute),
+                )
+                .map(|(id, cwd)| (id.to_owned(), cwd))
+        });
+    let mut cache = STATE_CACHE.lock().map_err(|_| MissingReason::SourceError)?;
+    if cache.len() >= 4096 {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), (before, binding.clone()));
+    binding
+}
+
+fn stable_file(path: &Path, file: &File, before: Fingerprint) -> Result<bool, MissingReason> {
     let current = fs::symlink_metadata(path).map_err(|error| io_reason(&error))?;
     if !current.is_file() || current.file_type().is_symlink() {
         return Err(MissingReason::SourceError);
     }
     let path_after = Fingerprint::of(&current);
     let file_after = Fingerprint::of(&file.metadata().map_err(|error| io_reason(&error))?);
-    if snapshot_change(before, path_after, file_after) != SnapshotChange::Stable {
-        return Err(MissingReason::SourceError);
-    }
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| MissingReason::Invalid)?;
-    let Some(id) = value.get("id").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(cwd) = value
-        .get("cwd")
-        .and_then(Value::as_str)
-        .and_then(lexical_absolute)
-    else {
-        return Ok(None);
-    };
-    Ok(Some((id.to_owned(), cwd)))
+    Ok(snapshot_change(before, path_after, file_after) == SnapshotChange::Stable)
 }
 
 /// Open `root/parts...` one component at a time. `O_NOFOLLOW` rejects a symlink
@@ -235,6 +265,33 @@ fn read_wire(
     result
 }
 
+#[derive(Deserialize)]
+struct WireRecord {
+    #[serde(rename = "type")]
+    kind: Option<Value>,
+    #[serde(rename = "agentId")]
+    agent_id: Option<Value>,
+    #[serde(rename = "modelAlias")]
+    model_alias: Option<Value>,
+    tokens: Option<Value>,
+    time: Option<Value>,
+}
+
+fn parse_wire_record(line: &str) -> Result<Option<WireRecord>, serde_json::Error> {
+    if !line.trim_start().starts_with('{') {
+        serde_json::from_str::<serde::de::IgnoredAny>(line)?;
+        return Ok(None);
+    }
+    match serde_json::from_str(line) {
+        Ok(record) => Ok(Some(record)),
+        Err(error) if error.to_string().starts_with("duplicate field") => {
+            let value: Value = serde_json::from_str(line)?;
+            serde_json::from_value(value).map(Some)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn parse_wire(text: &str, budget: &Budget) -> Result<Turn, MissingReason> {
     let mut alias = None;
     let mut turn: Option<Turn> = None;
@@ -242,15 +299,16 @@ fn parse_wire(text: &str, budget: &Budget) -> Result<Turn, MissingReason> {
     let mut invalidated = false;
     for line in text.split_inclusive('\n') {
         budget.check()?;
-        let value: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
+        let value = match parse_wire_record(line) {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
             Err(error) if !line.ends_with('\n') && error.is_eof() => continue,
             Err(_) => return Err(MissingReason::Invalid),
         };
-        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let agent = value.get("agentId").and_then(Value::as_str);
+        let kind = value.kind.as_ref().and_then(Value::as_str).unwrap_or("");
+        let agent = value.agent_id.as_ref().and_then(Value::as_str);
         if agent == Some("main") && matches!(kind, "profile.bind" | "config.update") {
-            if let Some(next) = value.get("modelAlias") {
+            if let Some(next) = value.model_alias.as_ref() {
                 // A binding that arrives after the selected turn is not that
                 // turn's alias. The next completed turn may adopt it.
                 binding_after_turn = turn.is_some();
@@ -264,11 +322,12 @@ fn parse_wire(text: &str, budget: &Budget) -> Result<Turn, MissingReason> {
             }
         } else if kind == "token_counting.turn_recorded" && agent == Some("main") {
             let tokens = value
-                .get("tokens")
+                .tokens
+                .as_ref()
                 .and_then(Value::as_f64)
                 .filter(|tokens| tokens.is_finite() && *tokens >= 0.0)
                 .ok_or(MissingReason::Invalid)?;
-            let observed = epoch_millis(value.get("time"))?;
+            let observed = epoch_millis(value.time.as_ref())?;
             let Some(current) = alias.clone() else {
                 turn = None;
                 invalidated = true;
@@ -343,13 +402,42 @@ struct WindowKeys {
 }
 
 fn model_window(budget: &Budget, home: &Path, alias: &str) -> Result<f64, MissingReason> {
-    let text = budget.text(&home.join("config.toml"), false)?;
+    let path = home.join("config.toml");
+    let mut file = budget.open(&path)?;
+    let before = Fingerprint::of(&file.metadata().map_err(|error| io_reason(&error))?);
+    let key = (path.clone(), alias.to_owned());
+    if let Some((fingerprint, window)) = WINDOW_CACHE
+        .lock()
+        .map_err(|_| MissingReason::SourceError)?
+        .get(&key)
+        && *fingerprint == before
+    {
+        budget.check()?;
+        if stable_file(&path, &file, before)? {
+            return *window;
+        }
+        return Err(MissingReason::SourceError);
+    }
+    let bytes = budget.read_range(&mut file, 0, before.size as usize)?;
+    if !stable_file(&path, &file, before)? {
+        return Err(MissingReason::SourceError);
+    }
+    let window = parse_window(&bytes, alias);
+    let mut cache = WINDOW_CACHE
+        .lock()
+        .map_err(|_| MissingReason::SourceError)?;
+    if cache.len() >= CACHE_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, (before, window));
+    window
+}
+
+fn parse_window(bytes: &[u8], alias: &str) -> Result<f64, MissingReason> {
+    let text = std::str::from_utf8(bytes).map_err(|_| MissingReason::SourceError)?;
     // Parse errors can quote file text. Do not log or keep them.
-    let document: WindowDocument = toml::from_str(&text).map_err(|_| MissingReason::Invalid)?;
-    drop(text);
-    let Some(model) = document.models.get(alias) else {
-        return Err(MissingReason::Invalid);
-    };
+    let document: WindowDocument = toml::from_str(text).map_err(|_| MissingReason::Invalid)?;
+    let model = document.models.get(alias).ok_or(MissingReason::Invalid)?;
     let input = window_at_least_one(model.max_input_size)?;
     let context = window_at_least_one(model.max_context_size)?;
     // The installed client clamps an input window above the context window.
@@ -421,6 +509,27 @@ mod tests {
     use super::*;
     use crate::model::tests::{identity, request};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn typed_wire_ignores_valid_non_objects_and_rejects_completed_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Kimi);
+        let r = request(&id, dir.path());
+        let budget = Budget::new(&r);
+        let sample = "{\"type\":\"profile.bind\",\"agentId\":\"main\",\"modelAlias\":\"alias\"}\n{\"type\":\"token_counting.turn_recorded\",\"agentId\":\"main\",\"tokens\":75,\"time\":1000}\n";
+        let text = format!("null\n[1,2,3]\n{sample}");
+        assert_eq!(parse_wire(&text, &budget).unwrap().0, 75.0);
+        assert_eq!(
+            parse_wire(&format!("{text}{{bad}}\n"), &budget),
+            Err(MissingReason::Invalid)
+        );
+        let duplicate = text.replace(
+            "{\"type\":\"profile.bind\"",
+            "{\"type\":\"metadata\",\"type\":\"profile.bind\"",
+        );
+        assert_eq!(parse_wire(&duplicate, &budget).unwrap().0, 75.0);
+    }
+
     #[test]
     fn unsupported_even_with_fresh_stale_or_mismatched_dummy_events() {
         let dir = tempfile::tempdir().unwrap();
@@ -922,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_wire_does_not_read_content_again() {
+    fn unchanged_state_wire_and_config_do_not_read_content_again() {
         let _gate = TEST_GATE.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut id = identity(Provider::Kimi);
@@ -944,7 +1053,64 @@ mod tests {
             "state and wire are read on a cold cache: {reads}"
         );
         assert_eq!(read_session(&base).unwrap(), first);
-        // Binding and the model window are rechecked. The wire body is not.
-        assert_eq!(crate::model::tests::CONTENT_READS.get(), reads + 2);
+        assert_eq!(crate::model::tests::CONTENT_READS.get(), reads);
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[models.\"synthetic-alias\"]\nmax_input_size = 500\nmax_context_size = 100000\n",
+        )
+        .unwrap();
+        assert_eq!(read_session(&base).unwrap().0, 15.0);
+        let state = dir
+            .path()
+            .join("sessions/wd_synthetic/session-1/state.json");
+        std::fs::write(&state, r#"{"id":"other-session","cwd":"/synthetic/repo"}"#).unwrap();
+        assert_eq!(read_session(&base), Err(MissingReason::Unassociated));
+    }
+
+    #[test]
+    #[ignore = "synthetic performance sample"]
+    fn benchmark_discovery_and_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut id = identity(Provider::Kimi);
+        id.repository_identity = "/synthetic/repo".into();
+        let r = request(&id, dir.path());
+        install(
+            dir.path(),
+            "session-1",
+            "/synthetic/repo",
+            75,
+            fresh_ms(&r),
+            "",
+        );
+        for index in 0..1500 {
+            let path = dir
+                .path()
+                .join(format!("sessions/wd_synthetic/other-{index}/state.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, r#"{"id":"other","cwd":"/synthetic/repo"}"#).unwrap();
+        }
+        read_session(&r).unwrap();
+        let mut durations = Vec::new();
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            std::hint::black_box(read_session(&r).unwrap());
+            durations.push(started.elapsed().as_micros());
+        }
+        durations.sort_unstable();
+        eprintln!("kimi_discovery_us_median={}", durations[3]);
+
+        let budget = Budget::new(&r);
+        let text = format!(
+            "{{\"text\":\"{}\"}}\n{{\"type\":\"profile.bind\",\"agentId\":\"main\",\"modelAlias\":\"alias\"}}\n{{\"type\":\"token_counting.turn_recorded\",\"agentId\":\"main\",\"tokens\":75,\"time\":1000}}\n",
+            "x".repeat(JSONL_TAIL_BYTES - 230)
+        );
+        let mut durations = Vec::new();
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            std::hint::black_box(parse_wire(&text, &budget).unwrap());
+            durations.push(started.elapsed().as_micros());
+        }
+        durations.sort_unstable();
+        eprintln!("kimi_tail_us_median={}", durations[3]);
     }
 }
