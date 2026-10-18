@@ -12,28 +12,46 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  gate:
+    name: Verify release tag
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4b15c8c7e3a540cc250e1c074ab0a5800e37df8 # v4.4.3
+        with:
+          fetch-depth: 0
+      - name: Check main, CI, and release date
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/check-release-gate.sh "$GITHUB_REF_NAME"
+
   build:
     name: Build (${{ matrix.os }})
     permissions:
       contents: read
     runs-on: ${{ matrix.os }}
+    needs: gate
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4b15c8c7e3a540cc250e1c074ab0a5800e37df8 # v4.4.3
       - name: Read pinned toolchain
         id: rust
         run: |
           python3 -c 'import tomllib; print("channel=" + tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])' >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.rust.outputs.channel }}
       - name: Check version consistency
         env:
           RELEASE_REF: ${{ github.ref_name }}
         run: scripts/check-version.sh "$RELEASE_REF"
+      - name: Test
+        run: cargo test --locked
       - name: Release build
         run: cargo build --release --locked
       - name: Check binary dependency licenses
@@ -55,7 +73,7 @@ jobs:
           mkdir -p dist
           tar -czf "dist/${artifact}" -C target/release herdr-lineup -C ../.. LICENSE NOTICE.md THIRD-PARTY-LICENSES.md README.md
           (cd dist && shasum -a 256 "${artifact}" > "SHA256SUMS-${platform}-${arch}.txt")
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifact-${{ matrix.os }}
           path: dist/
@@ -68,8 +86,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@b4b15c8c7e3a540cc250e1c074ab0a5800e37df8 # v4.4.3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: artifact-*
           path: dist/
@@ -80,11 +98,15 @@ jobs:
           rm dist/SHA256SUMS-*.txt
           version="${GITHUB_REF_NAME#v}"
           scripts/extract-release-notes.sh "$version" > RELEASE_NOTES.md
-      - name: Create GitHub Release
+      - name: Publish GitHub Release if absent
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >
-          gh release create "${GITHUB_REF_NAME}"
-          --title "${GITHUB_REF_NAME}"
-          --notes-file RELEASE_NOTES.md
-          dist/*
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "${GITHUB_REF_NAME} already exists; keeping its notes and assets"
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file RELEASE_NOTES.md \
+              dist/*
+          fi

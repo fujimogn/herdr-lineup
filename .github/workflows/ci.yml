@@ -23,16 +23,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4b15c8c7e3a540cc250e1c074ab0a5800e37df8 # v4.4.3
       - name: Read pinned toolchain
         id: rust
         run: |
           python3 -c 'import tomllib; print("channel=" + tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])' >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.rust.outputs.channel }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Clippy
@@ -43,6 +43,8 @@ jobs:
         run: scripts/check-version.sh
       - name: Test release notes extraction
         run: scripts/test-extract-release-notes.sh
+      - name: Test release gate
+        run: scripts/test-check-release-gate.sh
       - name: Release build
         run: cargo build --release --locked
       - name: Check binary dependency licenses
@@ -54,9 +56,11 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@b4b15c8c7e3a540cc250e1c074ab0a5800e37df8 # v4.4.3
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit locked dependencies

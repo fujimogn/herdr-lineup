@@ -3,8 +3,8 @@
 Maintainer-facing release process, following the structure of
 [graphify's release guide](https://github.com/Graphify-Labs/graphify/blob/v8/RELEASING.md).
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the
-binaries and creates a GitHub Release in this public repository. Marketplace
+Pushing an annotated `v*` tag triggers `.github/workflows/release.yml`, which
+builds the binaries and creates a GitHub Release in this public repository. Marketplace
 discovery is automatic for public repositories with the `herdr-plugin` topic
 and a valid manifest; a listing is not a Herdr review. A human creates and
 pushes the tag. The workflow never tags or pushes on its own.
@@ -29,6 +29,7 @@ pushes the tag. The workflow never tags or pushes on its own.
    ```sh
    scripts/check-version.sh vX.Y.Z
    scripts/extract-release-notes.sh X.Y.Z
+   scripts/test-check-release-gate.sh
    ```
    The version check must print `version check passed`. The extractor accepts
    an optional changelog path: `scripts/extract-release-notes.sh X.Y.Z CHANGELOG.md`.
@@ -62,18 +63,27 @@ pushes the tag. The workflow never tags or pushes on its own.
    on `main` through the repository's approved integration path. Confirm CI is
    green for that release commit.
 6. **Push the release tag.** Before tagging, confirm that the changelog heading's
-   date matches the day the tag will be created. If release preparation happened
+   date matches the annotated tag's tagger date. If release preparation happened
    earlier, update the date and land that reviewed change first. A human tags
-   the verified release commit on `main` and pushes only the tag:
+   the verified release commit on `main` with an annotated tag and pushes only
+   the tag:
    ```sh
-   git tag vX.Y.Z <release-commit>
+   git tag -a vX.Y.Z <release-commit> -m 'Release vX.Y.Z'
    git push origin vX.Y.Z
    ```
-   The workflow checks the tag against the manifests and lockfile, builds on
-   `ubuntu-latest` and `macos-latest`, and creates a GitHub Release titled
+   Before any build, the workflow requires the tag's commit to be reachable
+   from `origin/main`, the latest CI `push` run for that commit on `main` to
+   have succeeded, and the `## X.Y.Z (YYYY-MM-DD)` heading to match the
+   annotated tag's tagger date. It reads CI runs with `actions: read`; if a
+   check fails or the API is unavailable, the release stops. The workflow
+   then checks the tag against the manifests and lockfile, runs
+   `cargo test --locked`, builds on `ubuntu-latest` and `macos-latest`, and
+   creates a GitHub Release titled
    `vX.Y.Z`. The body is the extractor's output, including
    `## X.Y.Z (YYYY-MM-DD)`, and the attachments are the Linux and macOS archives
-   plus `SHA256SUMS.txt`. Missing release notes fail publication.
+   plus `SHA256SUMS.txt`. Missing release notes fail publication. Re-running
+   the same tag rebuilds and verifies the artifacts; if its GitHub Release
+   already exists, publication succeeds without changing its notes or assets.
 7. **Verify the release.** Confirm the workflow succeeded and the GitHub Release
    has the expected title, dated notes, both platform archives, and checksums.
    Compare the downloaded artifacts with `SHA256SUMS.txt` before using them.
