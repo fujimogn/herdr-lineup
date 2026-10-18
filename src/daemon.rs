@@ -303,6 +303,8 @@ fn run_locked(
     let started = Instant::now();
     let mut refresh_at = Instant::now();
     let mut reconnect = false;
+    let mut socket_missing_since: Option<Instant> = None;
+    let socket_missing_ttl = Duration::from_millis(config.refresh_interval_ms.saturating_mul(3));
     let result = (|| {
         loop {
             if control.shutdown.load(Ordering::Acquire) {
@@ -334,11 +336,23 @@ fn run_locked(
                     if transport.endpoint_replaced() {
                         return Err(error);
                     }
+                    let now = Instant::now();
+                    match fs::symlink_metadata(&options.socket) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            let since = socket_missing_since.get_or_insert(now);
+                            if now.duration_since(*since) >= socket_missing_ttl {
+                                let _ = log_event(&paths, "daemon_exit", "socket_missing_ttl");
+                                return Ok(());
+                            }
+                        }
+                        _ => socket_missing_since = None,
+                    }
                     reconnect = true;
                     *control.health.lock().unwrap() = health.clone();
                     std::thread::sleep(RECONNECT_RETRY);
                     continue;
                 }
+                socket_missing_since = None;
                 publisher.reconnected();
                 reconnect = false;
                 if !retrying_refresh {
@@ -1715,6 +1729,11 @@ mod tests {
     #[test]
     fn transient_reconnect_and_ping_failures_retry_then_clear_on_stop() {
         let (_dir, options, done, server) = fixture();
+        fs::write(
+            options.config.join("config.toml"),
+            "refresh_interval_ms = 1000\nreader_timeout_ms = 100\n",
+        )
+        .unwrap();
         let mut command = child_command();
         command.env("LINEUP_TEST_RETRY", "1");
         command.env("HOME", &options.state);
@@ -1722,7 +1741,8 @@ mod tests {
         ensure_command(&options, command).unwrap();
         let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
         wait_until(|| options.state.join("hidden-socket").exists());
-        std::thread::sleep(Duration::from_millis(200));
+        // Restore the pinned inode after multiple retries but before its 3s TTL.
+        std::thread::sleep(Duration::from_millis(1500));
         fs::rename(options.state.join("hidden-socket"), &options.socket).unwrap();
         wait_until(|| {
             fs::read_to_string(options.state.join("refresh-count"))
@@ -1734,6 +1754,43 @@ mod tests {
         assert!(!options.state.join("fail-next-ping").exists());
         done.store(true, Ordering::Relaxed);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn missing_socket_past_token_ttl_exits_without_clear() {
+        let (_dir, options, done, server) = fixture();
+        fs::write(
+            options.config.join("config.toml"),
+            "refresh_interval_ms = 1000\nreader_timeout_ms = 100\n",
+        )
+        .unwrap();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_RETRY", "1");
+        command.env("HOME", &options.state);
+        command.env("CODEX_HOME", &options.state);
+        ensure_command(&options, command).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| options.state.join("hidden-socket").exists());
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(4500);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if !SessionLock::is_held(&paths).unwrap() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !exited {
+            // Clean up the isolated child even when the regression assertion fails.
+            fs::rename(options.state.join("hidden-socket"), &options.socket).unwrap();
+            stop(&options).unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(exited, "daemon remained alive past the missing socket TTL");
+        assert!(started.elapsed() >= Duration::from_millis(2900));
+        assert!(!options.state.join("clear-called").exists());
     }
 
     #[test]
