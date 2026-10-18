@@ -2,7 +2,8 @@
 
 ## Status and source
 
-**Proposed; no Kimi weekly implementation exists.** The shipped Kimi reader
+**Proposed; the standalone Kimi client is implemented but not wired to the
+publisher.** The shipped Kimi reader
 supplies completed-turn context for an exact local session and always returns
 unavailable weekly. This design instead uses the managed Kimi account logged in
 under the daemon's Kimi home for an account-wide weekly sample shared by every
@@ -44,10 +45,9 @@ publication. A different Kimi home is outside this worker's scope.
 Kimi's `FileTokenStorage` stores `<name>.json` under
 `<KIMI_CODE_HOME>/credentials/`. For the default managed OAuth key
 `oauth/kimi-code`, `resolveKimiTokenStorageName` selects `kimi-code.json`.
-For a region or environment-specific login, read
-`providers["managed:kimi-code"].oauth.key` from that home's `config.toml`
-and apply the same storage-name mapping; do not guess the default file when a
-configured key or environment selects another slot. The token file's wire
+The first implementation accepts only the default managed key and rejects a
+configured different OAuth slot; it never guesses another credential file.
+The token file's wire
 keys are `access_token` and `expires_at` (Unix seconds). Read only these
 fields from a regular, nonsymlinked file under the selected home. Missing,
 malformed, empty, revoked, unreadable, or expired credentials make weekly
@@ -69,14 +69,11 @@ The installed `managed-usage.ts` uses `GET
 `https://api.kimi.com/coding/v1/usages` after trimming trailing slashes.
 Lineup shall send only this GET with `Accept: application/json` and the
 transient OAuth Bearer header. `KIMI_CODE_BASE_URL` is an input to the
-selected daemon environment, not an arbitrary URL from a pane. Accept only an
-HTTPS base URL whose normalized origin and path are explicitly approved for
-this Kimi managed API and whose OAuth key matches the selected credential
-slot; reject userinfo, query, fragment, nonstandard ports, redirects, and
-unapproved hosts. The installed bundle also names
-`https://api.kimi.ai/coding/v1` for its global region; an override to that
-origin needs the matching scoped OAuth key. Other custom overrides remain
-unavailable until their destination and key mapping are explicitly approved.
+selected daemon environment, not an arbitrary URL from a pane. The first
+implementation accepts only the exact base
+`https://api.kimi.com/coding/v1`; any different value, including
+`https://api.kimi.ai/coding/v1`, trailing slashes, ports, or custom hosts,
+makes weekly unavailable before a token is sent. Redirects are rejected.
 Never send a token to a fallback host after a failure.
 
 Use the existing quota worker bounds: five-minute default interval, configured
@@ -132,16 +129,19 @@ managed API; it does not refresh or persist that token. This differs from the
 Codex quota worker, for which Lineup never opens Codex auth files. Document
 scope across all Kimi panes, destination restrictions, transient in-memory
 handling, error/log exclusions, and the behavior of an expired or rotated
-token. This assignment only lists the required disclosure; `SECURITY.md` is
-outside its touching scope.
+token. The standalone client disclosure is now in `SECURITY.md`; worker
+behavior remains planned.
 
-## Open questions for the owner
+## Decisions (owner, 2026-10-18)
 
-1. Which exact official Kimi origins beyond the default `.com` host should be
-   enabled initially, and how will a custom `KIMI_CODE_BASE_URL` be approved?
-2. Should any transient failure clear a reset-bearing sample immediately,
-   rather than retaining it until the known reset? The existing Codex/Grok
-   worker boundary permits retention until expiry.
-3. How should a credential change be detected promptly between polls without
-   retaining a token or account identifier? File identity/fingerprint can be
-   compared, but the implementation and race behavior need fixture coverage.
+1. Read only `access_token` and `expires_at` from the selected file under
+   `KIMI_CODE_HOME/credentials/`. Missing, unreadable, malformed, or expired
+   credentials make weekly unavailable. Lineup does not log in, refresh, or
+   write credentials, and it does not retain or output the token.
+2. Send only to `https://api.kimi.com/coding/v1/usages`. A different
+   `KIMI_CODE_BASE_URL` makes weekly unavailable; neither `.ai` nor a custom
+   origin is enabled. Reject redirects and responses above 64 KiB, using the
+   configured timeout.
+3. The client distinguishes transient network/5xx failures from immediate
+   clear conditions (401/403, invalid schema, unavailable credentials, or
+   destination mismatch). The worker owns sample retention and expiry.

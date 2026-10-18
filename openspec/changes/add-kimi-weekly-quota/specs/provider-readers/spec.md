@@ -181,13 +181,11 @@ override is unavailable. It SHALL select the managed OAuth credential from
 that home and read only its `access_token` and `expires_at` from a regular,
 nonsymlinked file. It SHALL never refresh, log, or persist the token.
 
-#### Scenario: Select the configured credential slot
-- **WHEN** `providers["managed:kimi-code"].oauth.key` is present in that
-  home's `config.toml`
-- **THEN** map it with the installed CLI's `resolveKimiTokenStorageName` rule
-- **AND** do not guess the default file when another slot is selected
-- **AND** the default `oauth/kimi-code` key maps to
-  `credentials/kimi-code.json`
+#### Scenario: Select the default managed credential slot
+- **WHEN** the selected account uses the default `oauth/kimi-code` key
+- **THEN** read `credentials/kimi-code.json`
+- **AND** a configured different OAuth key is unavailable rather than
+  guessing another slot
 
 #### Scenario: Selected token is missing or expired
 - **WHEN** the selected credential file is absent, unreadable, malformed,
@@ -214,7 +212,8 @@ nonsymlinked file. It SHALL never refresh, log, or persist the token.
 
 ### Requirement: Kimi managed request is bounded and destination restricted
 When both opt-in gates are true, the worker MAY issue only `GET
-{KIMI_CODE_BASE_URL}/usages`, defaulting to
+{KIMI_CODE_BASE_URL}/usages`, with the only approved base URL
+`https://api.kimi.com/coding/v1` and endpoint
 `https://api.kimi.com/coding/v1/usages`, with `Accept: application/json` and
 transient OAuth Bearer authorization. The destination SHALL be an approved
 HTTPS managed API with a matching OAuth credential slot. Requests SHALL be
@@ -222,10 +221,8 @@ bounded and SHALL not delay refresh.
 
 #### Scenario: Select a bounded destination
 - **WHEN** `KIMI_CODE_BASE_URL` overrides the default
-- **THEN** trim trailing slashes and require an approved HTTPS origin/path
-  and matching OAuth credential slot
-- **AND** recognize `https://api.kimi.ai/coding/v1` only with its matching
-  global-region slot; custom origins remain unavailable pending approval
+- **THEN** require the exact base `https://api.kimi.com/coding/v1`
+- **AND** `https://api.kimi.ai/coding/v1` and custom origins are unavailable
 - **AND** reject userinfo, query, fragment, nonstandard ports, redirects,
   and fallback hosts
 

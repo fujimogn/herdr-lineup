@@ -85,6 +85,24 @@ stale after shutdown. Diagnostics do not make provider queries.
 Development tests use only temporary fake credentials and loopback HTTP servers.
 Authenticated production provider requests are not run during development.
 
+## Kimi managed usage client (not yet connected to the daemon)
+
+The standalone `quota_kimi::Client` is for a future explicit Kimi weekly
+opt-in. When polled, Lineup reads the selected Kimi OAuth `access_token` and
+`expires_at` from the daemon home's `credentials/kimi-code.json` and sends the
+token as a Bearer header only to
+`https://api.kimi.com/coding/v1/usages`. A different
+`KIMI_CODE_BASE_URL` is unavailable. Unlike the Codex quota client, Lineup
+opens this OAuth credential file itself. It does not refresh, save, or change
+the credential; the token exists only in temporary request memory.
+
+The HTTPS client validates certificates, rejects redirects, and bounds the
+response to 64 KiB and the configured timeout. Errors expose fixed categories,
+never token values, headers, URLs, credential paths, response bodies, or
+upstream messages. An absent, invalid, or expired token, 401/403, or invalid
+response yields unavailable. The future worker will own sample caching and
+sharing across Kimi panes. No Kimi request is scheduled by the current daemon.
+
 ## Local usage data access
 
 Usage readers and the publisher have separate local-data boundaries. This
