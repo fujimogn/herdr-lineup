@@ -4,6 +4,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Feature: **Kimi weekly quota** adds a separate, default-off managed account query, shared across Kimi panes with bounded request and cache expiry; doctor records fixed result categories including expired credentials.
 - Maintenance: **Toolchain** is pinned to Rust 1.99.1.
 - Security: **Dependencies** update rustls to 0.23.46 for RUSTSEC-2026-0346 to 0349.
 - Maintenance: **Release workflow** pins actions to commit SHAs, verifies before build that release tags point to successful main CI commits and match changelog dates, and does not fail on reruns for existing tags.

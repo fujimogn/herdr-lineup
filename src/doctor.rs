@@ -24,6 +24,7 @@ pub(crate) enum WeeklyResult {
     AuthMissing,
     AuthIo,
     AuthShape,
+    AuthExpired,
     AuthAmbiguous,
     Unauthorized,
     Transient,
@@ -40,6 +41,7 @@ impl WeeklyResult {
             Self::AuthMissing => "auth_missing",
             Self::AuthIo => "auth_io",
             Self::AuthShape => "auth_shape",
+            Self::AuthExpired => "auth_expired",
             Self::AuthAmbiguous => "auth_ambiguous",
             Self::Unauthorized => "unauthorized",
             Self::Transient => "transient",
@@ -54,12 +56,14 @@ impl WeeklyResult {
 pub(crate) enum WeeklyProvider {
     Codex,
     Grok,
+    Kimi,
 }
 impl WeeklyProvider {
     fn name(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::Kimi => "kimi",
         }
     }
     fn path(self, root: &std::path::Path) -> std::path::PathBuf {
@@ -111,9 +115,10 @@ fn read_weekly_result(root: &std::path::Path, provider: WeeklyProvider) -> &'sta
 
 pub(crate) fn weekly_diagnostics(root: &std::path::Path) -> String {
     format!(
-        "Last saved weekly query results: codex={}; grok={}",
+        "Last saved weekly query results: codex={}; grok={}; kimi={}",
         read_weekly_result(root, WeeklyProvider::Codex),
-        read_weekly_result(root, WeeklyProvider::Grok)
+        read_weekly_result(root, WeeklyProvider::Grok),
+        read_weekly_result(root, WeeklyProvider::Kimi)
     )
 }
 
@@ -442,6 +447,7 @@ mod tests {
             WeeklyResult::Ok,
             WeeklyResult::AuthMissing,
             WeeklyResult::AuthShape,
+            WeeklyResult::AuthExpired,
             WeeklyResult::AuthAmbiguous,
             WeeklyResult::Unauthorized,
             WeeklyResult::Transient,
@@ -452,6 +458,8 @@ mod tests {
             let text = weekly_diagnostics(dir.path());
             assert!(text.contains(&format!("grok={}", result.label())));
             assert!(text.contains("codex=not_observed"));
+            write_weekly_result(dir.path(), WeeklyProvider::Kimi, result).unwrap();
+            assert!(weekly_diagnostics(dir.path()).contains(&format!("kimi={}", result.label())));
         }
         std::fs::write(
             dir.path().join("weekly-grok.json"),

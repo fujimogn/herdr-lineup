@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,6 +48,7 @@ pub enum Failure {
     AuthMissing,
     AuthIo,
     AuthShape,
+    AuthExpired,
     AuthAmbiguous,
     Unauthorized,
     Request,
@@ -65,6 +67,7 @@ impl Failure {
             Self::AuthMissing => WeeklyResult::AuthMissing,
             Self::AuthIo => WeeklyResult::AuthIo,
             Self::AuthShape => WeeklyResult::AuthShape,
+            Self::AuthExpired => WeeklyResult::AuthExpired,
             Self::AuthAmbiguous => WeeklyResult::AuthAmbiguous,
             Self::Unauthorized => WeeklyResult::Unauthorized,
             Self::Request => WeeklyResult::Request,
@@ -116,6 +119,7 @@ pub struct Client {
     agent: ureq::Agent,
     next_request: Option<Instant>,
     last_result: crate::doctor::WeeklyResult,
+    last_auth_expiry: Option<SystemTime>,
 }
 
 impl Client {
@@ -123,6 +127,25 @@ impl Client {
         validate_base_url(std::env::var_os("KIMI_CODE_BASE_URL"))?;
         let path = auth_path(std::env::var_os("KIMI_CODE_HOME"), std::env::var_os("HOME"))?;
         Ok(Self::new(path, settings))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_endpoint(
+        settings: Settings,
+        endpoint: String,
+    ) -> Result<Self, Failure> {
+        let port = endpoint
+            .strip_prefix("http://127.0.0.1:")
+            .and_then(|value| value.strip_suffix("/usages"))
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .ok_or(Failure::Request)?;
+        let path = auth_path(std::env::var_os("KIMI_CODE_HOME"), std::env::var_os("HOME"))?;
+        Ok(Self::with_endpoint(
+            path,
+            settings,
+            format!("http://127.0.0.1:{port}/usages"),
+        ))
     }
 
     pub fn new(auth_file: PathBuf, settings: Settings) -> Self {
@@ -143,12 +166,20 @@ impl Client {
             agent,
             next_request: None,
             last_result: crate::doctor::WeeklyResult::Pending,
+            last_auth_expiry: None,
         }
     }
 
-    #[allow(dead_code)] // Used when the Kimi worker is wired in the next assignment.
     pub(crate) fn last_result(&self) -> crate::doctor::WeeklyResult {
         self.last_result
+    }
+
+    pub(crate) fn auth_expiry(&self) -> Option<SystemTime> {
+        self.last_auth_expiry
+    }
+
+    pub(crate) fn source_stamp(&self) -> Option<SourceStamp> {
+        source_stamp(&self.auth_file)
     }
 
     /// At most one request per interval; the caller owns any sample retention.
@@ -170,7 +201,8 @@ impl Client {
         outcome
     }
 
-    fn fetch(&self, wall_now: SystemTime) -> Outcome {
+    fn fetch(&mut self, wall_now: SystemTime) -> Outcome {
+        self.last_auth_expiry = None;
         if let Err(failure) = validate_slot(&self.auth_file) {
             return Outcome::Unavailable(failure);
         }
@@ -178,6 +210,8 @@ impl Client {
             Ok(token) => token,
             Err(failure) => return Outcome::Unavailable(failure),
         };
+        self.last_auth_expiry =
+            UNIX_EPOCH.checked_add(Duration::from_secs(token.expires_at as u64));
         let mut response = match self
             .agent
             .get(&self.endpoint)
@@ -216,6 +250,55 @@ impl Client {
             Err(failure) => Outcome::Unavailable(failure),
         }
     }
+}
+
+/// Non-secret file identity; a changed credential or OAuth selector invalidates a sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceStamp {
+    credential: FileStamp,
+    selector: Option<FileStamp>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    Some(FileStamp {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        size: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+pub(crate) fn source_stamp(auth_file: &Path) -> Option<SourceStamp> {
+    let home = auth_file.parent()?.parent()?;
+    if !std::fs::symlink_metadata(auth_file)
+        .ok()?
+        .file_type()
+        .is_file()
+    {
+        return None;
+    }
+    let credential = file_stamp(auth_file)?;
+    Some(SourceStamp {
+        credential,
+        selector: file_stamp(&home.join("config.toml")),
+    })
 }
 
 #[derive(Deserialize)]
@@ -297,11 +380,14 @@ fn read_credentials(path: &Path, now: SystemTime) -> Result<Credential, Failure>
             .access_token
             .bytes()
             .all(|byte| (0x20..=0x7e).contains(&byte))
-        || UNIX_EPOCH
-            .checked_add(Duration::from_secs(expiry))
-            .is_none_or(|time| time <= now)
     {
         return Err(Failure::AuthShape);
+    }
+    if UNIX_EPOCH
+        .checked_add(Duration::from_secs(expiry))
+        .is_none_or(|time| time <= now)
+    {
+        return Err(Failure::AuthExpired);
     }
     Ok(credential)
 }
@@ -457,7 +543,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             read_credentials(&path, now),
-            Err(Failure::AuthShape)
+            Err(Failure::AuthExpired)
         ));
         std::fs::write(&path, "x".repeat(65537)).unwrap();
         assert!(matches!(
@@ -522,6 +608,32 @@ mod tests {
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
         assert_eq!(client.poll(), Outcome::Unavailable(Failure::AuthMissing));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn expired_credential_is_distinct_and_never_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimi-code.json");
+        std::fs::write(
+            &path,
+            r#"{"access_token":"fake-token","expires_at":1600000000}"#,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = Client::with_endpoint(
+            path,
+            Settings::default(),
+            format!("http://{}/usages", listener.local_addr().unwrap()),
+        );
+        assert_eq!(client.poll(), Outcome::Unavailable(Failure::AuthExpired));
+        assert_eq!(
+            client.last_result(),
+            crate::doctor::WeeklyResult::AuthExpired
+        );
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );

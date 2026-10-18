@@ -19,7 +19,7 @@ resolved by the usage-source research before enabling another adapter.
 | `codex` | Exact native-session rollout context with the 12,000-token UI baseline or unavailable | Subscription seven-day remaining from the daemon home, with network opt-in | Implemented local context and background app-server quota; Lineup never opens Codex auth files |
 | `grok` | Exact native-session `signals.json` context or unavailable | Account-wide WEEKLY billing remaining with network opt-in | Implemented local context and background authenticated billing; MONTHLY is unavailable |
 | `agy` | Validated statusLine context or unavailable | Active-pool weekly remaining or unavailable | Implemented capture and local reader; hook opt-in required |
-| `kimi` | Completed-turn context from the exact local session, or unavailable | Account-wide rolling-seven-day remaining from the daemon's Kimi home when separately opted in, or unavailable | Implemented local context; proposed credential-read and background managed API quota worker |
+| `kimi` | Completed-turn context from the exact local session, or unavailable | Account-wide rolling-seven-day remaining from the daemon's Kimi home when separately opted in, or unavailable | Implemented local context and default-off, read-only managed API quota worker |
 | `hermes` | Unavailable in stage one | Unavailable in stage one | TBD; enable only after confirmed source |
 
 #### Scenario: Kimi weekly stays unavailable

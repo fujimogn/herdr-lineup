@@ -13,9 +13,11 @@ pub struct Config {
     pub logo_mode: String,
     pub non_first_pane_logo_indent: u8,
     pub providers: Vec<String>,
-    /// Opt in to Codex app-server account queries and authenticated Grok billing.
+    /// Opt in to Codex app-server account queries and authenticated quota APIs.
     /// Local context/statusLine reads remain available when this is false.
     pub allow_network: bool,
+    /// Kimi requires this additional, default-off credential-read opt-in.
+    pub kimi_weekly_enabled: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -27,6 +29,7 @@ impl Default for Config {
             non_first_pane_logo_indent: 0,
             providers: Agent::ALL.iter().map(|entry| entry.id.to_owned()).collect(),
             allow_network: false,
+            kimi_weekly_enabled: false,
         }
     }
 }
@@ -109,6 +112,7 @@ mod tests {
             ["claude", "codex", "grok", "agy", "kimi", "hermes"]
         );
         assert!(!dir.path().join("config.toml").exists());
+        assert!(!config.kimi_weekly_enabled);
     }
 
     #[test]
@@ -134,5 +138,16 @@ mod tests {
         let config = Config::parse("refresh_interval_ms = 1000\nreader_timeout_ms = 100\nusage_max_age_ms = 1000\nproviders = []\nlogo_mode = 'text'").unwrap();
         assert!(config.providers.is_empty());
         assert!(Config::parse("refresh_interval_ms = 3600000\nreader_timeout_ms = 30000\nusage_max_age_ms = 86400000").is_ok());
+    }
+
+    #[test]
+    fn kimi_weekly_requires_explicit_boolean() {
+        assert!(
+            Config::parse("kimi_weekly_enabled = true")
+                .unwrap()
+                .kimi_weekly_enabled
+        );
+        assert!(!Config::parse("").unwrap().kimi_weekly_enabled);
+        assert!(Config::parse("kimi_weekly_enabled = 'true'").is_err());
     }
 }

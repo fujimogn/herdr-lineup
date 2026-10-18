@@ -137,6 +137,82 @@ fn fresh_grok_weekly(
     })
 }
 
+fn kimi_sample_after_poll(
+    previous: Option<model::WeeklySample>,
+    outcome: crate::quota_kimi::Outcome,
+    now: SystemTime,
+) -> Option<model::WeeklySample> {
+    match outcome {
+        crate::quota_kimi::Outcome::Weekly(weekly) => Some(model::WeeklySample {
+            used_percent: weekly.used_percent,
+            resets_at: weekly.resets_at,
+        }),
+        crate::quota_kimi::Outcome::Throttled => previous,
+        crate::quota_kimi::Outcome::Unavailable(failure) if failure.is_transient() => {
+            previous.filter(|sample| sample.resets_at.is_some_and(|reset| reset > now))
+        }
+        crate::quota_kimi::Outcome::Unavailable(_) => None,
+    }
+}
+
+fn fresh_kimi_weekly(
+    sample: Option<model::WeeklySample>,
+    observed: Option<Instant>,
+    now: Instant,
+    max_age_ms: u64,
+    refresh_interval_ms: u64,
+) -> Option<model::WeeklySample> {
+    let settings = crate::quota_kimi::Settings::default();
+    let query_cycle =
+        settings.interval() + settings.timeout() + Duration::from_millis(refresh_interval_ms);
+    let max_age = Duration::from_millis(max_age_ms).max(query_cycle);
+    sample.filter(|value| {
+        value.resets_at.is_some()
+            || observed.is_some_and(|observed| now.saturating_duration_since(observed) <= max_age)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct KimiSnapshot {
+    sample: model::WeeklySample,
+    stamp: crate::quota_kimi::SourceStamp,
+    auth_expiry: SystemTime,
+    observed: Instant,
+}
+
+fn current_kimi_weekly(
+    source: &std::sync::Mutex<Option<KimiSnapshot>>,
+    home: Option<&Path>,
+    config: &Config,
+    now: SystemTime,
+    instant: Instant,
+) -> Option<model::WeeklySample> {
+    let enabled = config.allow_network
+        && config.kimi_weekly_enabled
+        && config.providers.iter().any(|provider| provider == "kimi");
+    let current_stamp = home
+        .and_then(|home| crate::quota_kimi::source_stamp(&home.join("credentials/kimi-code.json")));
+    let snapshot = source.try_lock().ok().and_then(|mut source| {
+        if !enabled
+            || source.is_some_and(|snapshot| {
+                Some(snapshot.stamp) != current_stamp
+                    || snapshot.auth_expiry <= now
+                    || snapshot.sample.resets_at.is_some_and(|reset| reset <= now)
+            })
+        {
+            *source = None;
+        }
+        *source
+    });
+    fresh_kimi_weekly(
+        snapshot.map(|snapshot| snapshot.sample),
+        snapshot.map(|snapshot| snapshot.observed),
+        instant,
+        config.usage_max_age_ms,
+        config.refresh_interval_ms,
+    )
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointRow {
@@ -165,8 +241,10 @@ pub struct MetadataPublisher {
     shutdown: Option<Arc<AtomicBool>>,
     codex_weekly: Option<model::WeeklyWorker>,
     grok_weekly: Option<model::WeeklyWorker>,
+    kimi_weekly: Option<model::WeeklyWorker>,
     weekly_diagnostics_initialized: bool,
     grok_observed: Arc<std::sync::Mutex<Option<Instant>>>,
+    kimi_source: Arc<std::sync::Mutex<Option<KimiSnapshot>>>,
     codex_control: Arc<crate::quota_codex::QueryControl>,
     headings: BTreeMap<String, HeadingCache>,
     local_readings: BTreeMap<String, model::UsageReading>,
@@ -196,8 +274,10 @@ impl MetadataPublisher {
             shutdown: None,
             codex_weekly: None,
             grok_weekly: None,
+            kimi_weekly: None,
             weekly_diagnostics_initialized: false,
             grok_observed: Arc::new(std::sync::Mutex::new(None)),
+            kimi_source: Arc::new(std::sync::Mutex::new(None)),
             codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
             headings: BTreeMap::new(),
             local_readings: BTreeMap::new(),
@@ -258,8 +338,11 @@ impl MetadataPublisher {
             for (provider, name) in [
                 (WeeklyProvider::Codex, "codex"),
                 (WeeklyProvider::Grok, "grok"),
+                (WeeklyProvider::Kimi, "kimi"),
             ] {
-                let result = if config.allow_network && config.providers.iter().any(|id| id == name)
+                let result = if config.allow_network
+                    && config.providers.iter().any(|id| id == name)
+                    && (name != "kimi" || config.kimi_weekly_enabled)
                 {
                     WeeklyResult::Pending
                 } else {
@@ -317,7 +400,7 @@ impl MetadataPublisher {
             let directory = self.directory.clone();
             let observed = self.grok_observed.clone();
             self.grok_weekly = Some(model::WeeklyWorker::start(
-                shutdown,
+                shutdown.clone(),
                 settings.interval(),
                 move || {
                     let (sample, result) = match client.as_mut() {
@@ -331,6 +414,70 @@ impl MetadataPublisher {
                         Err(failure) => (None, failure.diagnostic()),
                     };
                     let _ = write_weekly_result(&directory, WeeklyProvider::Grok, result);
+                    sample
+                },
+            )?);
+        }
+        if config.kimi_weekly_enabled
+            && self.kimi_weekly.is_none()
+            && config.providers.iter().any(|id| id == "kimi")
+        {
+            let settings = crate::quota_kimi::Settings::default();
+            #[cfg(not(test))]
+            let mut client = crate::quota_kimi::Client::from_env(settings);
+            #[cfg(test)]
+            let mut client = crate::quota_kimi::Client::from_test_endpoint(
+                settings,
+                std::env::var("LINEUP_TEST_KIMI_ENDPOINT").unwrap_or_default(),
+            );
+            let directory = self.directory.clone();
+            let source = self.kimi_source.clone();
+            let mut previous = None;
+            let mut previous_stamp = None;
+            let mut last_success = None;
+            self.kimi_weekly = Some(model::WeeklyWorker::start(
+                shutdown,
+                settings.interval(),
+                move || {
+                    let now = SystemTime::now();
+                    let (sample, result) = match client.as_mut() {
+                        Ok(client) => {
+                            let before = client.source_stamp();
+                            if before != previous_stamp {
+                                previous = None;
+                            }
+                            let outcome = client.poll();
+                            let after = client.source_stamp();
+                            if matches!(outcome, crate::quota_kimi::Outcome::Weekly(_)) {
+                                last_success = Some(Instant::now());
+                            }
+                            let sample = if before == after && after.is_some() {
+                                kimi_sample_after_poll(previous, outcome, now)
+                            } else {
+                                None
+                            };
+                            previous_stamp = after;
+                            if let Ok(mut source) = source.lock() {
+                                *source = sample.and_then(|sample| {
+                                    Some(KimiSnapshot {
+                                        sample,
+                                        stamp: after?,
+                                        auth_expiry: client.auth_expiry()?,
+                                        observed: last_success?,
+                                    })
+                                });
+                            }
+                            (sample, client.last_result())
+                        }
+                        Err(failure) => {
+                            if let Ok(mut source) = source.lock() {
+                                *source = None;
+                            }
+                            (None, failure.diagnostic())
+                        }
+                    };
+                    previous = sample;
+                    let _ = write_weekly_result(&directory, WeeklyProvider::Kimi, result);
                     sample
                 },
             )?);
@@ -642,6 +789,13 @@ impl MetadataPublisher {
             config.usage_max_age_ms,
             config.refresh_interval_ms,
         );
+        let kimi_weekly = current_kimi_weekly(
+            &self.kimi_source,
+            self.homes.kimi.as_deref(),
+            config,
+            now,
+            Instant::now(),
+        );
         let mode = match config.logo_mode.as_str() {
             "font" => tokens::LogoMode::Font,
             "text" => tokens::LogoMode::Text,
@@ -709,7 +863,9 @@ impl MetadataPublisher {
                     pane_id: pane.pane_id.clone(),
                 };
                 let native = match who.agent {
-                    Agent::Agy | Agent::Grok => who.native_session.clone().unwrap_or_default(),
+                    Agent::Agy | Agent::Grok | Agent::Kimi => {
+                        who.native_session.clone().unwrap_or_default()
+                    }
                     _ => who.native_session.clone()?,
                 };
                 let (provider, home, reader): (_, _, &dyn UsageReader) = match who.agent {
@@ -731,7 +887,7 @@ impl MetadataPublisher {
                     ),
                     Agent::Kimi => (
                         model::Provider::Kimi,
-                        self.homes.kimi.as_ref()?,
+                        self.homes.kimi.as_ref().unwrap_or(&self.directory),
                         &KimiReader,
                     ),
                     _ => return None,
@@ -755,12 +911,19 @@ impl MetadataPublisher {
                     timeout: deadline.saturating_duration_since(Instant::now()),
                     shutdown: self.shutdown.as_deref(),
                 };
-                let mut reading = if who.agent == Agent::Grok && self.homes.grok.is_none() {
+                let missing_home = (who.agent == Agent::Grok && self.homes.grok.is_none())
+                    || (who.agent == Agent::Kimi && self.homes.kimi.is_none());
+                let mut reading = if missing_home || (who.agent == Agent::Kimi && native.is_empty())
+                {
                     // Billing account attribution does not require a local session
                     // home. Do not search plugin state as a substitute for context.
                     model::UsageReading::missing(
                         &request,
-                        model::SourceKind::GrokSignals,
+                        if who.agent == Agent::Kimi {
+                            model::SourceKind::KimiSession
+                        } else {
+                            model::SourceKind::GrokSignals
+                        },
                         model::MissingReason::NotFound,
                     )
                 } else {
@@ -811,6 +974,7 @@ impl MetadataPublisher {
                         // Grok has one configured account, shared across all its
                         // panes even when no local context/native id is available.
                         Agent::Grok => grok_weekly,
+                        Agent::Kimi if config.kimi_weekly_enabled => kimi_weekly,
                         _ => None,
                     };
                     if let Some(weekly) = weekly {
@@ -818,7 +982,7 @@ impl MetadataPublisher {
                             model::UsageOutcome::Available(100.0 - weekly.used_percent);
                         reading.weekly_window = Some(model::WeeklyWindow::RollingSevenDays);
                         reading.weekly_resets_at = weekly.resets_at;
-                        if who.agent == Agent::Grok {
+                        if matches!(who.agent, Agent::Grok | Agent::Kimi) {
                             reading.binding = Some(model::UsageBinding::Pane(pane.pane_id.clone()));
                         }
                     }
@@ -932,6 +1096,7 @@ impl daemon::Publisher for MetadataPublisher {
         self.codex_control.stop();
         self.codex_weekly.take();
         self.grok_weekly.take();
+        self.kimi_weekly.take();
     }
     fn clear(&mut self, transport: &mut Transport) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1883,13 +2048,199 @@ mod tests {
         publisher.start_weekly(&Config::default()).unwrap();
         assert_eq!(
             crate::doctor::weekly_diagnostics(dir.path()),
-            "Last saved weekly query results: codex=disabled; grok=disabled"
+            "Last saved weekly query results: codex=disabled; grok=disabled; kimi=disabled"
+        );
+    }
+
+    #[test]
+    fn kimi_worker_needs_both_opt_ins_and_provider() {
+        let Some(root) = std::env::var_os("LINEUP_FAKE_KIMI_GATES_CHILD") else {
+            let dir = tempfile::tempdir().unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "publish::tests::kimi_worker_needs_both_opt_ins_and_provider",
+                ])
+                .env("LINEUP_FAKE_KIMI_GATES_CHILD", dir.path())
+                .env("HOME", dir.path())
+                .env("KIMI_CODE_HOME", dir.path().join("missing-kimi-home"))
+                .env(
+                    "LINEUP_TEST_KIMI_ENDPOINT",
+                    format!("http://{}/usages", listener.local_addr().unwrap()),
+                )
+                .env_remove("KIMI_CODE_BASE_URL")
+                .env_remove("GROK_HOME")
+                .env_remove("GROK_AUTH_FILE")
+                .output()
+                .unwrap();
+            assert!(child.status.success(), "isolated Kimi worker test failed");
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            return;
+        };
+        let root = PathBuf::from(root);
+        for (index, (network, kimi_enabled, providers, expected)) in [
+            (false, false, vec!["kimi".into()], false),
+            (true, false, vec!["kimi".into()], false),
+            (false, true, vec!["kimi".into()], false),
+            (true, true, vec!["grok".into()], false),
+            (true, true, vec!["kimi".into()], true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = root.join(index.to_string());
+            std::fs::create_dir(&directory).unwrap();
+            let mut publisher =
+                MetadataPublisher::new(directory.clone(), "fake".into(), Homes::default()).unwrap();
+            publisher.set_shutdown(Arc::new(AtomicBool::new(false)));
+            publisher
+                .start_weekly(&Config {
+                    allow_network: network,
+                    kimi_weekly_enabled: kimi_enabled,
+                    providers,
+                    ..Config::default()
+                })
+                .unwrap();
+            assert_eq!(publisher.kimi_weekly.is_some(), expected);
+            if !expected {
+                assert!(crate::doctor::weekly_diagnostics(&directory).contains("kimi=disabled"));
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_poll_retains_only_future_reset_on_transient_failure() {
+        use crate::quota_kimi::{Failure, Outcome, WeeklyUsage};
+        let now = SystemTime::now();
+        let future = now + Duration::from_secs(60);
+        let with_reset = kimi_sample_after_poll(
+            None,
+            Outcome::Weekly(WeeklyUsage {
+                used_percent: 25.0,
+                resets_at: Some(future),
+            }),
+            now,
+        );
+        assert_eq!(
+            kimi_sample_after_poll(with_reset, Outcome::Throttled, now),
+            with_reset
+        );
+        assert_eq!(
+            kimi_sample_after_poll(with_reset, Outcome::Unavailable(Failure::Transient), now),
+            with_reset
+        );
+        assert!(
+            kimi_sample_after_poll(with_reset, Outcome::Unavailable(Failure::Transient), future)
+                .is_none()
+        );
+        assert!(
+            kimi_sample_after_poll(with_reset, Outcome::Unavailable(Failure::AuthExpired), now)
+                .is_none()
+        );
+        let without_reset = kimi_sample_after_poll(
+            None,
+            Outcome::Weekly(WeeklyUsage {
+                used_percent: 25.0,
+                resets_at: None,
+            }),
+            now,
+        );
+        assert!(
+            kimi_sample_after_poll(without_reset, Outcome::Unavailable(Failure::Transient), now)
+                .is_none()
+        );
+        let instant = Instant::now();
+        assert!(
+            fresh_kimi_weekly(
+                without_reset,
+                Some(instant),
+                instant + Duration::from_secs(316),
+                60_000,
+                5_000
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn kimi_cache_clears_on_opt_out_credential_change_and_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let credentials = home.join("credentials");
+        std::fs::create_dir(&credentials).unwrap();
+        let auth_file = credentials.join("kimi-code.json");
+        std::fs::write(&auth_file, "fake-credential-one").unwrap();
+        let stamp = crate::quota_kimi::source_stamp(&auth_file).unwrap();
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let snapshot = KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 25.0,
+                resets_at: Some(now + Duration::from_secs(60)),
+            },
+            stamp,
+            auth_expiry: now + Duration::from_secs(120),
+            observed: instant,
+        };
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+        let cache = std::sync::Mutex::new(Some(snapshot));
+        assert!(current_kimi_weekly(&cache, Some(home), &enabled, now, instant).is_some());
+        for config in [
+            Config {
+                allow_network: false,
+                ..enabled.clone()
+            },
+            Config {
+                kimi_weekly_enabled: false,
+                ..enabled.clone()
+            },
+            Config {
+                providers: vec!["grok".into()],
+                ..enabled.clone()
+            },
+        ] {
+            *cache.lock().unwrap() = Some(snapshot);
+            assert!(current_kimi_weekly(&cache, Some(home), &config, now, instant).is_none());
+            assert!(cache.lock().unwrap().is_none());
+        }
+        *cache.lock().unwrap() = Some(snapshot);
+        std::fs::write(&auth_file, "fake-credential-two-longer").unwrap();
+        assert!(current_kimi_weekly(&cache, Some(home), &enabled, now, instant).is_none());
+        assert!(cache.lock().unwrap().is_none());
+        *cache.lock().unwrap() = Some(KimiSnapshot {
+            stamp: crate::quota_kimi::source_stamp(&auth_file).unwrap(),
+            ..snapshot
+        });
+        assert!(
+            current_kimi_weekly(
+                &cache,
+                Some(home),
+                &enabled,
+                now + Duration::from_secs(120),
+                instant
+            )
+            .is_none()
         );
     }
 
     #[test]
     fn fake_socket_weekly_cache_publishes_without_waiting_for_queries() {
         let dir = tempfile::tempdir().unwrap();
+        let kimi_home = dir.path().join("kimi-home");
+        std::fs::create_dir_all(kimi_home.join("credentials")).unwrap();
+        std::fs::write(
+            kimi_home.join("credentials/kimi-code.json"),
+            r#"{"access_token":"fake-token","expires_at":4102444800}"#,
+        )
+        .unwrap();
         let socket = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
@@ -1901,11 +2252,13 @@ mod tests {
                 {"pane_id":"w1:p1","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"agent":"codex","kind":"id","value":"synthetic-session"}},
                 {"pane_id":"w1:p2","workspace_id":"w1","agent":"grok","agent_status":"idle"},
                 {"pane_id":"w1:p3","workspace_id":"w1","agent":"grok","agent_status":"idle"},
-                {"pane_id":"w1:p4","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"agent":"codex","kind":"id","value":"foreign-session"}}
+                {"pane_id":"w1:p4","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"agent":"codex","kind":"id","value":"foreign-session"}},
+                {"pane_id":"w1:p5","workspace_id":"w1","agent":"kimi","agent_status":"idle"},
+                {"pane_id":"w1:p6","workspace_id":"w1","agent":"kimi","agent_status":"working","agent_session":{"agent":"kimi","kind":"id","value":"missing-local"}}
             ]);
             writeln!(stream.get_mut(), "{response}").unwrap();
             let mut reports = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..7 {
                 let report = receive(&mut stream);
                 writeln!(
                     stream.get_mut(),
@@ -1920,7 +2273,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut releases = Vec::new();
         let mut workers = Vec::new();
-        for used_percent in [27.0, 42.0] {
+        for used_percent in [27.0, 42.0, 10.0] {
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let mut calls = 0;
@@ -1947,12 +2300,24 @@ mod tests {
             Homes {
                 codex: Some(dir.path().join("codex")),
                 grok: None,
+                kimi: Some(kimi_home.clone()),
                 ..Homes::default()
             },
         )
         .unwrap();
         publisher.codex_weekly = Some(workers.remove(0));
         publisher.grok_weekly = Some(workers.remove(0));
+        publisher.kimi_weekly = Some(workers.remove(0));
+        *publisher.kimi_source.lock().unwrap() = Some(KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 10.0,
+                resets_at: Some(SystemTime::now() + Duration::from_secs(86400)),
+            },
+            stamp: crate::quota_kimi::source_stamp(&kimi_home.join("credentials/kimi-code.json"))
+                .unwrap(),
+            auth_expiry: SystemTime::now() + Duration::from_secs(86400),
+            observed: Instant::now(),
+        });
         publisher.set_shutdown(shutdown.clone());
         struct AssociatedReader;
         impl UsageReader for AssociatedReader {
@@ -1970,6 +2335,7 @@ mod tests {
             &mut transport,
             &Config {
                 allow_network: true,
+                kimi_weekly_enabled: true,
                 ..Config::default()
             },
             &AssociatedReader,
@@ -1999,6 +2365,17 @@ mod tests {
             "—\u{2800}\u{2800}"
         );
         assert_eq!(reports[3]["params"]["tokens"]["lineup_weekly_text"], "—");
+        for report in &reports[4..6] {
+            let tokens = &report["params"]["tokens"];
+            assert_eq!(tokens["lineup_weekly_pct"], "90");
+            assert!(
+                tokens["lineup_weekly_text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("7d 90% ")
+            );
+            assert_eq!(tokens["lineup_context_text"], "—\u{2800}\u{2800}");
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@
 
 - **One row per agent pane.** Keep vendor logos, state, context, and weekly remaining quota together in the sidebar.
 - **Session-bound usage.** Read local Codex/Grok files and opt-in Claude/Antigravity statusLine observations for the matching pane.
-- **Account quota by choice.** Enable Codex/Grok account queries with `allow_network = true`; network access is off by default.
+- **Account quota by choice.** Enable Codex/Grok account queries with `allow_network = true`; Kimi also requires `kimi_weekly_enabled = true`. Network access is off by default.
 
 ## What it does
 
@@ -29,11 +29,11 @@ reset.
 | Codex | Shown without setup | Shown with `allow_network = true` (opt-in) |
 | Grok | Shown without setup | Shown with `allow_network = true` (opt-in); weekly window only |
 | Antigravity | Shown after statusLine setup (opt-in) | Shown after statusLine setup (opt-in) |
-| Kimi | Shown without setup (value at the completed turn) | Not available |
+| Kimi | Shown without setup (value at the completed turn) | Shown with both `allow_network = true` and `kimi_weekly_enabled = true` (opt-in) |
 | Hermes | Not available | Not available |
 
 `Shown without setup` requires that agent's pane to be bound to its native
-session. See [Account quota](#account-quota-opt-in) to enable Codex and Grok
+session. See [Account quota](#account-quota-opt-in) to enable Codex, Grok, and Kimi
 weekly quota, and [statusLine setup](#claude-and-antigravity-statusline-opt-in)
 for Claude and Antigravity. See [Sidebar tokens](#sidebar-tokens) for display
 formatting and terminal-cell alignment, and [Source research](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/usage-sources.md) for usage inputs.
@@ -395,6 +395,22 @@ and reads Grok's existing auth key from `GROK_AUTH_FILE` when set, otherwise
 It does not try another source if the selected file cannot be read. No
 credentials are displayed or persisted by Lineup. Do not restart the Herdr server.
 
+Kimi weekly quota needs a separate opt-in in the same file:
+
+```toml
+allow_network = true
+kimi_weekly_enabled = true
+```
+
+The daemon reads only the selected `KIMI_CODE_HOME/credentials/kimi-code.json`
+OAuth access token and its expiry; it does not log in, refresh, or write the
+credential. It sends the token only to `https://api.kimi.com/coding/v1/usages`.
+An expired or invalid token leaves weekly at `—` while local context remains
+available. The account sample is shared across all Kimi panes. A different
+`KIMI_CODE_BASE_URL` is unavailable before any request. Older Lineup binaries
+reject the new config key; remove it before downgrading. Restart only the
+Lineup daemon after changing either opt-in or the selected Kimi account.
+
 ### Claude and Antigravity statusLine (opt-in)
 
 Codex, Grok, and Kimi context are read from local session files. Claude and
@@ -592,7 +608,8 @@ paths for state, socket, config, and provider homes.
 | `XDG_CONFIG_HOME` | Font actions' kitty/Ghostty config base; an absolute value replaces `~/.config`. Does not select Herdr's sidebar config. |
 | `CODEX_HOME` | Codex local session home and account-quota client home; defaults to `~/.codex`. A non-absolute override makes the local home unavailable. |
 | `GROK_HOME` | Grok local session home (default `~/.grok`) and fallback base for `auth.json`. A non-absolute override makes the local session home unavailable. |
-| `KIMI_CODE_HOME` | Kimi local session home; defaults to `~/.kimi-code`. An empty value uses that default. A non-absolute override makes the local home unavailable. |
+| `KIMI_CODE_HOME` | Kimi local session and managed OAuth home; defaults to `~/.kimi-code`. An empty value uses that default. A non-absolute override makes local context and weekly unavailable. The daemon reads only the default managed credential slot. |
+| `KIMI_CODE_BASE_URL` | Kimi managed API base; unset or exactly `https://api.kimi.com/coding/v1` is allowed for weekly quota. Other values disable Kimi weekly before a token is sent. |
 | `GROK_AUTH_FILE` | Explicit Grok billing auth file. When set, it takes precedence without retrying another file on read failure; used only with network opt-in. |
 
 `HOME` supplies the per-user defaults above and must be absolute for font
@@ -701,9 +718,9 @@ not proof of a deployment.
 One background worker per enabled provider polls its client every five minutes,
 independently of refresh. Client request intervals are bounded to 1..=60 minutes.
 Refresh reads memory only for quota and never waits for a provider request.
-`doctor` reads the session state directory and prints the last saved Codex/Grok
+`doctor` reads the session state directory and prints the last saved Codex/Grok/Kimi
 query categories (`ok`, `auth_missing`, `auth_io`, `auth_shape`,
-`auth_ambiguous`, `unauthorized`, `transient`, `invalid_response`, `request`,
+`auth_expired`, `auth_ambiguous`, `unauthorized`, `transient`, `invalid_response`, `request`,
 `non_weekly`, `disabled`, or `pending`). `not_observed` means no saved result;
 `invalid_diagnostic` means the local record cannot be safely decoded. These are
 last query results, not cache availability or a new provider query. Values,
@@ -718,8 +735,8 @@ is shown without a countdown and expires after the greater of `usage_max_age_ms`
 and Grok's five-minute query interval plus its query timeout and one sidebar
 refresh interval from the last successful query. Codex quota without a reset
 follows its client interval and clears after a failed query. Environment proxies
-are inherited; redirects stay disabled. Disabled network access also keeps Codex
-and Grok weekly at `—`
+are inherited; redirects stay disabled. Disabled network access also keeps Codex,
+Grok, and Kimi weekly at `—`
 while preserving local context.
 
 Codex context uses `max(total_tokens - 12000, 0) / (model_context_window - 12000)`.
@@ -732,6 +749,11 @@ Lineup daemon after changing authentication or profiles to discard cached accoun
 quota. Grok context is read from the exact native session's `signals.json`.
 Grok has one configured auth source, so its weekly quota is shared by all
 Grok panes, even without local context.
+Kimi likewise shares one daemon-home weekly sample across its panes, including
+panes without local context. Only a transient network or server failure can
+retain a Kimi sample with a future reset; a reset-less Kimi sample clears on
+failure and otherwise expires after the greater of `usage_max_age_ms` and one
+poll interval, timeout, and refresh interval.
 
 Kimi context uses one regular, nonsymlinked `state.json` under `KIMI_CODE_HOME`
 whose `id` equals the pane's nonempty native session id and whose normalized
@@ -759,7 +781,8 @@ token, and API-key values are not retained or logged. An unchanged
 `wire.jsonl` is not read again; the reader uses the same fingerprint cache as
 Codex. A completed turn stays available regardless of age. A timestamp later
 than the comparison clock is unavailable. A timeout keeps that context through
-the same retention path as Codex and Grok. Kimi weekly remains unavailable.
+the same retention path as Codex and Grok. Kimi weekly requires the separate
+account opt-in above.
 
 Workers stop scheduling queries on daemon shutdown. Stop does not join a pending
 Grok HTTP request (process exit ends it), and it kills/reaps the in-flight Codex
@@ -944,7 +967,7 @@ They open the current `main` branch, which may differ from an older archive.
 - [Usage sources](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/usage-sources.md) — provider inputs and availability.
 - [Codex context drift](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/codex-context-drift.md) — evidence for the one-point display gap.
 - [Plugin conventions](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/plugin-conventions.md) — packaging and installation research.
-- [Kimi usage](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/kimi-usage.md) — local context evidence, and why weekly quota stays unavailable.
+- [Kimi usage](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/kimi-usage.md) — local context source research; its older weekly proposal predates the managed API opt-in described here.
 - [Plugin directory](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/plugin-directory.md) — 2026-10-13 marketplace listing notes, with the v0.1.1 status at the top.
 - [Code review](https://github.com/fujimogn/herdr-lineup/blob/main/docs/reviews/code-review-2026-10-13.md) — 2026-10-13 ballot and the status of each finding.
 - [Security](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md) — local data, credentials, and network boundaries.

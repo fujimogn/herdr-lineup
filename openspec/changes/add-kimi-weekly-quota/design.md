@@ -2,10 +2,10 @@
 
 ## Status and source
 
-**Proposed; the standalone Kimi client is implemented but not wired to the
-publisher.** The shipped Kimi reader
-supplies completed-turn context for an exact local session and always returns
-unavailable weekly. This design instead uses the managed Kimi account logged in
+**Implemented behind separate network and Kimi opt-ins; live authenticated
+verification is still pending.** The local Kimi reader
+supplies completed-turn context for an exact local session. The weekly worker
+uses the managed Kimi account logged in
 under the daemon's Kimi home for an account-wide weekly sample shared by every
 Kimi pane. A pane's session does not identify its account; the selected daemon
 home is the account scope, as with the existing Grok quota source. Local context
@@ -129,8 +129,8 @@ managed API; it does not refresh or persist that token. This differs from the
 Codex quota worker, for which Lineup never opens Codex auth files. Document
 scope across all Kimi panes, destination restrictions, transient in-memory
 handling, error/log exclusions, and the behavior of an expired or rotated
-token. The standalone client disclosure is now in `SECURITY.md`; worker
-behavior remains planned.
+token. The standalone client disclosure is now in `SECURITY.md`; the worker
+uses that read-only route when both opt-ins are enabled.
 
 ## Decisions (owner, 2026-10-18)
 

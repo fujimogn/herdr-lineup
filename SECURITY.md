@@ -10,12 +10,13 @@ backports. Upgrade to the latest patch release to receive security fixes.
 
 Local usage reads and explicit configuration actions are described in the README.
 `allow_network` defaults to false. Only explicit `allow_network = true` enables
-one Codex account worker and one Grok billing worker for configured providers.
+Codex and Grok account workers for configured providers. Kimi also requires
+`kimi_weekly_enabled = true`, which defaults to false.
 Install/startup never edits this setting or the user's credentials. Quota queries
 run on background threads; refresh only reads their non-secret in-memory cache.
 
 On shutdown, no further queries are scheduled. Stop keeps its five-second
-deadline and does not join a pending Grok HTTP request; daemon process exit ends
+deadline and does not join a pending Grok or Kimi HTTP request; daemon process exit ends
 that I/O. When a live daemon accepts shutdown, stop records that process before
 the request and returns only after it has exited. It does not signal the
 process. If the process is still alive at five seconds, stop fails. After
@@ -74,7 +75,8 @@ source supplies weekly quota to all Grok panes independently of local context.
 Restart the Lineup daemon after account changes to discard cached quota.
 
 The daemon saves only fixed query-result categories in private per-session
-`weekly-codex.json` and `weekly-grok.json` files under `HERDR_PLUGIN_STATE_DIR`.
+`weekly-codex.json`, `weekly-grok.json`, and `weekly-kimi.json` files under
+`HERDR_PLUGIN_STATE_DIR`.
 Atomic writes replace records without following destination symlinks. `doctor`
 reads at most 128 bytes per regular file without following symlinks and validates
 the closed enum before displaying it. No quota values, account identities,
@@ -85,10 +87,10 @@ stale after shutdown. Diagnostics do not make provider queries.
 Development tests use only temporary fake credentials and loopback HTTP servers.
 Authenticated production provider requests are not run during development.
 
-## Kimi managed usage client (not yet connected to the daemon)
+## Kimi managed usage client
 
-The standalone `quota_kimi::Client` is for a future explicit Kimi weekly
-opt-in. When polled, Lineup reads the selected Kimi OAuth `access_token` and
+Only when both opt-ins are true and `kimi` is configured, the daemon starts one
+Kimi weekly worker. When polled, Lineup reads the selected Kimi OAuth `access_token` and
 `expires_at` from the daemon home's `credentials/kimi-code.json` and sends the
 token as a Bearer header only to
 `https://api.kimi.com/coding/v1/usages`. A different
@@ -100,8 +102,12 @@ The HTTPS client validates certificates, rejects redirects, and bounds the
 response to 64 KiB and the configured timeout. Errors expose fixed categories,
 never token values, headers, URLs, credential paths, response bodies, or
 upstream messages. An absent, invalid, or expired token, 401/403, or invalid
-response yields unavailable. The future worker will own sample caching and
-sharing across Kimi panes. No Kimi request is scheduled by the current daemon.
+response yields unavailable. The worker shares one account sample across all
+Kimi panes, including panes without local context. A transient request failure
+retains only a sample with a future reset; other failures clear it. A sample
+without a reset expires after the bounded age cap. Credential file or OAuth
+selector changes and token expiry invalidate the cached sample before
+publication. Refresh reads the cache and never waits for the HTTP request.
 
 ## Local usage data access
 
@@ -136,8 +142,9 @@ does not select the other window. A completed turn stays available regardless
 of age, including when a timeout restores the previous local reading. A
 timestamp later than the comparison clock is unavailable. An unchanged
 `wire.jsonl` is not reread; the reader uses the same fingerprint cache as the
-Codex rollout reader. Weekly
-Kimi quota stays unavailable. Development tests use synthetic fixtures only.
+Codex rollout reader. The local reader never supplies weekly quota; the separate
+opt-in worker overlays account quota without reading session contents.
+Development tests use synthetic fixtures only.
 
 ## Repository heading Git queries
 

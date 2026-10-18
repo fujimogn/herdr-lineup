@@ -111,7 +111,7 @@ pub trait UsageReader {
 }
 
 /// Account quota only; no credentials, raw responses or conversation data.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WeeklySample {
     pub used_percent: f64,
     pub resets_at: Option<SystemTime>,
