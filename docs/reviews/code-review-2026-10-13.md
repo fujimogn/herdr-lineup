@@ -14,7 +14,7 @@ Line numbers are the ones in the ballots and refer to reviewed commit `fca5bbcbd
 | Agreement | Counted as n/2. Agy submitted no ballot, so the denominator is 2. Dedup key is file:line plus kind. No pair shared both, so every finding below is 1/2. Overlapping substance with a different kind or line range is kept separate and called out under Differences. |
 | Counts | 6 High, 15 Medium, 1 Low–Medium, 21 Low. 43 findings after the dedup key. |
 | Highest priority before a tag | The ballots' pre-tag priorities (C1–C8, the Codex uninstall and manifest notes, and Codex `account/read` failure classes) were addressed by v0.1.0. Remaining follow-ups are identified in the statuses below. |
-| Status at this main | 34 findings addressed, 2 deferred, and 7 with shipped and deferred parts; ballot severity and agreement counts above are unchanged. |
+| Status at this main | 36 findings addressed, 2 deferred, and 5 with shipped and deferred parts; ballot severity and agreement counts above are unchanged. |
 | Agy | Absent for both rounds. agent-room rejected the runs with `headless_payload_malformed` and `headless_payload_invalid_terminal` before a ballot existed. Those format errors are recorded here and are not treated as a review of the repository. |
 
 Status vocabulary: **Shipped** plus a short sha names a commit on `main` that addresses the finding or the named part. **Already fixed in** names an earlier commit whose behavior was confirmed later. **Deferred** names a remaining part and gives the reason. A mixed status lists each part separately. Status describes the implementation and documentation, not a new ballot.
