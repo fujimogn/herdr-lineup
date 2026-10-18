@@ -6,10 +6,9 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## 0.2.0 (2026-10-19)
 
-Lineup adds opt-in Kimi weekly quota and improves daemon recovery, local usage reads, and sidebar update latency.
+Lineup adds opt-in Kimi weekly quota, strengthens daemon recovery, and removes redundant work from local usage reads and sidebar updates.
 
-- Feature: **Kimi weekly quota** adds a separate, default-off managed account query, shared across Kimi panes with bounded request and cache expiry; doctor records fixed result categories including expired credentials.
-- Feature: **Kimi weekly quota** now has a verified live response shape; the Kimi CLI access token lasts 15 minutes, so weekly quota becomes unavailable after the CLI closes and its token expires.
+- Feature: **Kimi weekly quota** adds a separate, default-off managed account query, shared across Kimi panes with bounded request and cache expiry; doctor records fixed result categories including expired credentials. Its live response shape was verified; the Kimi CLI access token lasts 15 minutes, so weekly quota becomes unavailable after the CLI closes and its token expires.
 - Fix: **Daemon recovery** retries transient reconnect and transport-ping failures without dropping the publisher; it exits if the socket stays missing beyond the token TTL and waits for a replaced endpoint owner before starting another publisher.
 - Fix: **Daemon stop** preserves the metadata clear when shutdown races with control-worker completion.
 - Fix: **Grok context and quota** accepts a valid context observation changed during discovery, and refuses blocking FIFO or other non-regular credential files while retaining final-symlink support.
@@ -17,7 +16,7 @@ Lineup adds opt-in Kimi weekly quota and improves daemon recovery, local usage r
 - Fix: **Codex context** rejects array-shaped token records instead of treating them as valid usage.
 - Fix: **Repository headings** preserve common-directory paths containing newlines.
 - Maintenance: **Daemon idle work** reduces wakeups through poll-based control listening and longer main-loop waits.
-- Maintenance: **StatusLine** removes unnecessary fsyncs before the chained display command, reducing its measured latency while retaining atomic record replacement.
+- Maintenance: **StatusLine** removes unnecessary fsyncs before the chained display command while retaining atomic record replacement.
 - Maintenance: **Repository headings** poll Git children instead of repeatedly sleeping, combine repository checks, and reuse results for the same cwd within each refresh cycle.
 - Maintenance: **Local usage readers** cache Kimi state and model metadata and parse Codex and Kimi session tails with typed records, reducing repeated file work while keeping malformed completed records unavailable.
 - Maintenance: **Toolchain** is pinned to Rust 1.99.1.
