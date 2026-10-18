@@ -28,10 +28,11 @@ None.
 ### Modified Capabilities
 
 - `provider-readers`: optional Kimi account quota worker and shared publication.
+- `daemon-lifecycle`: Kimi query diagnostics and the separate default-off option.
 
 ## Impact
 
-This change is a design and specification only. It does not implement a worker,
-enable network access, read credentials, call Kimi endpoints, or change user
-configuration. Implementation remains subject to the security and endpoint
-questions in `design.md`.
+The default-off client and daemon worker are implemented, but this change has
+not been archived. It does not enable network access or change user
+configuration. A live managed `/usages` response schema has not been verified;
+no authenticated Kimi endpoint was called during implementation or tests.

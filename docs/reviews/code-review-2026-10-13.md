@@ -205,7 +205,9 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 - Impact: Not stated as a separate sentence beyond the extra fsyncs.
 - Proposed change: Remove `persist()` at line 452. Reserve sequence numbers in blocks.
 - Test: Not given as a separate line.
-- Status: Shipped `8b8f2c4`
+- Status: Shipped `8b8f2c4` for the duplicate `persist()` removal. Block-based
+  sequence reservation was not implemented; the remaining checkpoint cost is
+  tracked as PERF-01 in the [2026-10-18 survey](2026-10-18-survey.md).
 
 #### 14. Checkpoint rows are never deleted
 

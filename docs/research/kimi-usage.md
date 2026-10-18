@@ -2,7 +2,7 @@
 
 ## Decision
 
-**Lineup reads Kimi context from a matching local session's completed turn. Weekly remaining is unavailable because it requires account usage, which the Kimi reader does not query.** The installed bundle persists `token_counting.turn_recorded.tokens`, computed by the same `statusSize` method as live status; neither `token_counting.measured.tokens` alone nor `usage.record` is a current context percentage. The sampled files contain no `agent.status.updated`, `context_tokens`, `max_context_tokens`, `context_usage`, or account quota snapshot. A verified idle Kimi pane displayed 11% after the reader landed; this runtime observation was reported by the integration owner, not reproduced in this research lane.
+**Lineup reads Kimi context from a matching local session's completed turn. A separate, default-off managed-account worker can supply weekly remaining.** It requires both `allow_network = true` and `kimi_weekly_enabled = true`, with `kimi` selected in `providers`. The live `/usages` response schema has not been verified, so implementation and live availability are distinct. The installed bundle persists `token_counting.turn_recorded.tokens`, computed by the same `statusSize` method as live status; neither `token_counting.measured.tokens` alone nor `usage.record` is a current context percentage. The sampled files contain no `agent.status.updated`, `context_tokens`, `max_context_tokens`, `context_usage`, or account quota snapshot. A verified idle Kimi pane displayed 11% after the reader landed; this runtime observation was reported by the integration owner, not reproduced in this research lane.
 
 ## Local evidence
 
@@ -26,13 +26,13 @@ The [official server API reference](https://www.kimi.com/en/help/kimi-code/cli-s
 
 Lineup's Herdr snapshot parses an exact `agent_session` ID (agent `kimi`, kind `id`) and pane `cwd`/`foreground_cwd`; its `Pane` does not expose a PID. Kimi's `state.json` provides `id` and `cwd`, and `session_index.jsonl` has `sessionId` and `workDir`. The reader selects one regular, nonsymlinked state file under `KIMI_CODE_HOME` (default `~/.kimi-code`) whose `id` equals the pane's nonempty native ID and whose lexically normalized `cwd` equals the pane's `cwd`. Duplicates, mismatches, unknown homes, and symlinks below the home are unavailable. Cwd or PID alone cannot choose a session. The existing Codex and Grok readers likewise require an exact native ID and reject ambiguous local matches. A matching file does not establish server or account identity for weekly quota.
 
-## Implemented reader and remaining quota gap
+## Implemented context reader and account quota worker
 
 `src/reader_kimi.rs` is dispatched from `src/publish.rs` for a Kimi pane with an exact native session ID. It reads that session's regular `agents/main/wire.jsonl` without following symlinks, selects the last main-agent `token_counting.turn_recorded.tokens` and its preceding `profile.bind.modelAlias` or `config.update.modelAlias`, and rejects later events that invalidate the completed turn. It parses `config.toml` and retains only that alias's `max_input_size` and `max_context_size` integers, requires positive consistent values, and computes `100 × tokens / window` within 0–100%. Credential values in that file are not retained or logged. An unchanged wire file uses a fingerprint cache; a changed file is checked again. Missing or ambiguous bindings, an invalid tail, an unknown model, and future timestamps remain unavailable.
 
-The completed-turn context observation **does not expire by age while the same pane/session binding remains valid**, including while idle. Timeout retention uses the same rule as Codex and Grok. Kimi weekly always remains unavailable, even when context is numeric. The reader makes no network request and does not retain credential values. See the [README usage source](../../README.md) and [provider reader specification](../../openspec/specs/provider-readers/spec.md) for the shipped contract.
+The completed-turn context observation **does not expire by age while the same pane/session binding remains valid**, including while idle. Timeout retention uses the same rule as Codex and Grok. The local reader makes no network request and does not retain credential values. The separately opted-in worker uses the managed account selected by the daemon's `KIMI_CODE_HOME` (default `~/.kimi-code`), not the pane session or cwd. It reads only `access_token` and `expires_at` from the selected regular credential file and sends a bounded `GET https://api.kimi.com/coding/v1/usages`. A valid `limit_7d.used_ratio` supplies one account sample to all Kimi panes, even when local context is unavailable. Invalid credentials, destination, or response leave weekly at `—`; the worker does not log in, refresh credentials, or write user settings. See the [README usage source](../../README.md) and the unarchived [Kimi quota change](../../openspec/changes/add-kimi-weekly-quota/proposal.md) for the implemented contract.
 
-The documented `GET /api/v1/oauth/usage` could provide a managed account's `quota.usages.limit7d.usedRatio` and optional `resetAt`, but no Kimi weekly worker exists. Any future quota integration would need an explicitly enabled credential route, a proved account binding, a bounded refresh, and separate freshness/error handling. A separately started server is not proven to own a pane's CLI session; the status API can resume a cold session. No Kimi API or credential endpoint was called in this research.
+The experimental local server's documented `GET /api/v1/oauth/usage` is a different route and is not called by Lineup. A separately started server is not proven to own a pane's CLI session; the status API can resume a cold session. The managed worker's strict `limit_7d` parser was tested with synthetic responses, but no live managed response schema or account accuracy was verified. No Kimi API or credential endpoint was called in this research.
 
 ## Hermes check
 
@@ -41,7 +41,7 @@ The documented `GET /api/v1/oauth/usage` could provide a managed account's `quot
 ## Unverified points
 
 - The research lane did not reproduce the integration owner's 11% idle-pane observation or test accuracy against a live Kimi status response.
-- The server's generated OpenAPI/AsyncAPI output and real account quota response were not requested. A pane-to-account binding for weekly quota is unproven.
+- The server's generated OpenAPI/AsyncAPI output and real account quota response were not requested. The managed worker deliberately uses the daemon home's account for all Kimi panes; whether that matches each pane's CLI account is unproven.
 - A historical turn's denominator after a model catalog or config change is not independently recoverable from the session files. No durable Hermes context record was confirmed.
 
 ## Commands and limits

@@ -784,8 +784,8 @@ than the comparison clock is unavailable. A timeout keeps that context through
 the same retention path as Codex and Grok. Kimi weekly requires the separate
 account opt-in above.
 
-Workers stop scheduling queries on daemon shutdown. Stop does not join a pending
-Grok HTTP request (process exit ends it), and it kills/reaps the in-flight Codex
+Workers stop scheduling queries on daemon shutdown. Stop does not join pending
+Grok or Kimi HTTP requests (process exit ends them), and it kills/reaps the in-flight Codex
 app-server process group. The existing five-second stop deadline is preserved.
 
 ### Sidebar tokens
@@ -881,11 +881,16 @@ time, and model alias, and that model's window keys. It does not retain other
 `config.toml` values.
 
 Network access stays disabled unless you set `allow_network = true`. That opt-in
-enables only the configured Codex account-quota and Grok billing workers.
+enables the configured Codex account-quota and Grok billing workers. Kimi's
+managed-account worker also requires `kimi_weekly_enabled = true` and `kimi` in
+`providers`.
 Lineup sends no conversation/session data or telemetry. Codex app-server uses
 its existing authentication and may maintain its own authentication state;
 Lineup never opens Codex `auth.json`. Grok reads its existing auth key without
-writing or refreshing credentials.
+writing or refreshing credentials. Kimi reads only the selected managed OAuth
+access token and expiry without writing or refreshing credentials. The Grok and
+Kimi HTTP clients inherit environment proxy settings through ureq's default
+agent configuration.
 
 Account-quota values stay in memory. For quota diagnostics, the daemon saves
 only fixed query-result categories for `doctor`, without values, account
@@ -915,11 +920,14 @@ See [SECURITY.md](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md
   `herdr-lineup statusline claude` or `herdr-lineup statusline agy`, that
   `HERDR_PLUGIN_STATE_DIR` is the same absolute directory the daemon uses, and
   that Claude's `session_id` or Antigravity's `HERDR_PANE_ID` matches the pane.
-- **Codex or Grok weekly quota stays `—`:** check `allow_network = true`, the
-  selected `providers`, and the last query category with
+- **Codex, Grok, or Kimi weekly quota stays `—`:** check `allow_network = true`,
+  the selected `providers`, and, for Kimi, `kimi_weekly_enabled = true`. Inspect
+  the last query category with
   `herdr plugin action invoke herdr-lineup.doctor`, then read the plugin log.
-  No successful query, an expired reset, or Grok MONTHLY data leaves weekly
-  unavailable. Restart only Lineup after authentication or profile changes.
+  No successful query, an expired reset, Grok MONTHLY data, or an invalid Kimi
+  managed credential leaves weekly unavailable. Kimi's live `/usages` response
+  schema has not yet been verified. Restart only Lineup after authentication,
+  account, or profile changes.
 - **Icon rendering shows boxes:** run the opt-in
   `herdr-lineup.install-font` action and check the terminal's codepoint map,
   or set `logo_mode = "text"`. `auto` currently uses the same text labels as
@@ -967,9 +975,10 @@ They open the current `main` branch, which may differ from an older archive.
 - [Usage sources](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/usage-sources.md) — provider inputs and availability.
 - [Codex context drift](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/codex-context-drift.md) — evidence for the one-point display gap.
 - [Plugin conventions](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/plugin-conventions.md) — packaging and installation research.
-- [Kimi usage](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/kimi-usage.md) — local context source research; its older weekly proposal predates the managed API opt-in described here.
+- [Kimi usage](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/kimi-usage.md) — local context research and the default-off managed account quota route.
 - [Plugin directory](https://github.com/fujimogn/herdr-lineup/blob/main/docs/research/plugin-directory.md) — 2026-10-13 marketplace listing notes, with the v0.1.1 status at the top.
 - [Code review](https://github.com/fujimogn/herdr-lineup/blob/main/docs/reviews/code-review-2026-10-13.md) — 2026-10-13 ballot and the status of each finding.
+- [2026-10-18 survey](https://github.com/fujimogn/herdr-lineup/blob/main/docs/reviews/2026-10-18-survey.md) — consolidated follow-up findings and evidence.
 - [Security](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md) — local data, credentials, and network boundaries.
 - [Changelog](https://github.com/fujimogn/herdr-lineup/blob/main/CHANGELOG.md) — user-visible changes.
 
