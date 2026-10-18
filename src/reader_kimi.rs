@@ -144,7 +144,7 @@ fn state_binding(budget: &Budget, path: &Path) -> Result<Option<(String, PathBuf
                 .map(|(id, cwd)| (id.to_owned(), cwd))
         });
     let mut cache = STATE_CACHE.lock().map_err(|_| MissingReason::SourceError)?;
-    if cache.len() >= 4096 {
+    if cache.len() >= MAX_DIRECTORY_ENTRIES {
         cache.clear();
     }
     cache.insert(path.to_path_buf(), (before, binding.clone()));

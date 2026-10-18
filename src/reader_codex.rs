@@ -1,6 +1,8 @@
 //! Codex UI context percentage from exact-session rollout token_count observations.
 use crate::model::*;
 use serde::Deserialize;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{MapAccess, Visitor};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -154,8 +156,32 @@ fn read_tail(file: &mut fs::File, size: u64, id: &str, budget: &Budget) -> Obser
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ObjectOrOther<T> {
-    Object(T),
+    Object(MapOnly<T>),
     Other(Value),
+}
+
+// Derived struct deserialization also accepts a sequence in field order.
+// JSONL bindings and token records require an object, not an array.
+struct MapOnly<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for MapOnly<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MapVisitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for MapVisitor<T> {
+            type Value = MapOnly<T>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                T::deserialize(MapAccessDeserializer::new(map)).map(MapOnly)
+            }
+        }
+
+        deserializer.deserialize_map(MapVisitor(std::marker::PhantomData))
+    }
 }
 
 #[derive(Deserialize)]
@@ -214,13 +240,13 @@ fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Obse
             Err(_) => return Err(MissingReason::Invalid),
         };
         let recovered_payload = match value.payload.as_ref() {
-            Some(ObjectOrOther::Other(raw)) => {
+            Some(ObjectOrOther::Other(raw)) if raw.is_object() => {
                 serde_json::from_value::<CodexPayload>(raw.clone()).ok()
             }
             _ => None,
         };
         let payload = match value.payload.as_ref() {
-            Some(ObjectOrOther::Object(payload)) => Some(payload),
+            Some(ObjectOrOther::Object(payload)) => Some(&payload.0),
             _ => recovered_payload.as_ref(),
         };
         match value.kind.as_ref().and_then(Value::as_str) {
@@ -248,26 +274,26 @@ fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Obse
                     continue;
                 }
                 let recovered_info = match info {
-                    Some(ObjectOrOther::Other(raw)) => {
+                    Some(ObjectOrOther::Other(raw)) if raw.is_object() => {
                         serde_json::from_value::<CodexInfo>(raw.clone()).ok()
                     }
                     _ => None,
                 };
                 let info = match info {
-                    Some(ObjectOrOther::Object(info)) => Some(info),
+                    Some(ObjectOrOther::Object(info)) => Some(&info.0),
                     _ => recovered_info.as_ref(),
                 };
                 let Some(info) = info else {
                     return Err(MissingReason::Invalid);
                 };
                 let recovered_usage = match info.last_token_usage.as_ref() {
-                    Some(ObjectOrOther::Other(raw)) => {
+                    Some(ObjectOrOther::Other(raw)) if raw.is_object() => {
                         serde_json::from_value::<CodexUsage>(raw.clone()).ok()
                     }
                     _ => None,
                 };
                 let used = match info.last_token_usage.as_ref() {
-                    Some(ObjectOrOther::Object(usage)) => usage.total_tokens.as_ref(),
+                    Some(ObjectOrOther::Object(usage)) => usage.0.total_tokens.as_ref(),
                     _ => recovered_usage
                         .as_ref()
                         .and_then(|usage| usage.total_tokens.as_ref()),
@@ -338,6 +364,24 @@ mod tests {
                 - 7.0)
                 .abs()
                 < 1e-9
+        );
+        let array_payload = text.replace("{\"id\":\"session-1\"}", "[\"session-1\",null,null]");
+        assert_eq!(
+            parse_records(&array_payload, "session-1", &budget, false),
+            Err(MissingReason::Unassociated)
+        );
+        let array_info = text.replace(
+            "{\"last_token_usage\":{\"total_tokens\":26000},\"model_context_window\":212000}",
+            "[{\"total_tokens\":26000},212000]",
+        );
+        assert_eq!(
+            parse_records(&array_info, "session-1", &budget, false),
+            Err(MissingReason::Invalid)
+        );
+        let array_usage = text.replace("{\"total_tokens\":26000}", "[26000]");
+        assert_eq!(
+            parse_records(&array_usage, "session-1", &budget, false),
+            Err(MissingReason::Invalid)
         );
     }
 
