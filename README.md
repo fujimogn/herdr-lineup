@@ -963,8 +963,10 @@ herdr plugin link .
 
 Linking registers the manifest. Build the release binary before expecting
 commands to run.
-The CI workflow runs formatting, Clippy, tests, and release builds on Linux and
-macOS, with a dependency audit on pushes and weekly. Keep package versions in
+The CI workflow runs formatting, Clippy, tests, and release builds on Linux,
+with a dependency audit on pushes and weekly. Before a release, the platform
+check workflow builds and tests on every OS declared in `.develop-tools.json`
+(Linux and macOS). Keep package versions in
 `Cargo.toml`, `Cargo.lock`, and `herdr-plugin.toml` aligned; release tags use `v*`.
 Documents and comments are written in English. See [AGENTS.md](https://github.com/fujimogn/herdr-lineup/blob/main/AGENTS.md).
 

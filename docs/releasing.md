@@ -66,7 +66,17 @@ pushes the tag. The workflow never tags or pushes on its own.
 5. **Land the release preparation.** Commit the version, changelog, and lockfile
    together using the conventions in `AGENTS.md`, and land the reviewed changes
    on `main` through the repository's approved integration path. Confirm CI is
-   green for that release commit.
+   green for that release commit. CI runs on Linux only; check every declared OS
+   on the release commit before tagging:
+   ```sh
+   .develop-tools/resolve release release check
+   ```
+   It dispatches `.github/workflows/platform-check.yml` on `main` (the
+   `release.preflightWorkflow` in `.develop-tools.json`) and waits for that run.
+   The workflow calls the shared platform check, which runs Clippy, a release
+   build, nextest, and doc tests on each OS in `platforms` (`linux` and
+   `macos`). The commit must already be on `origin/main`, and `gh` must be
+   authenticated. Tag only after that run succeeds.
 6. **Push the release tag.** Before tagging, confirm that the changelog heading's
    date matches the tag date: the tagger date of an annotated tag, or the commit
    date of a lightweight tag. If release preparation happened

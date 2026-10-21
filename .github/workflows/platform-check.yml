@@ -1,0 +1,15 @@
+name: platform check
+
+# Check every OS that `.develop-tools.json` declares in `platforms` before a release.
+# `release check` dispatches this workflow and `release <bump>` reads its `platform (<os>)` jobs.
+# The OS list and the runners live only in the shared workflow; this copy names neither.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    uses: fujimogn/develop-tools-action/.github/workflows/platform-check.yml@c5fd99441093039cb47d3a2501795788801686c1 # v0.3.1
