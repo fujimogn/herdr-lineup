@@ -48,7 +48,7 @@ and vendored C terms.
 | `rustix@1.1.5` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `rustls@0.23.46` | `Apache-2.0 OR ISC OR MIT` | `MIT` | linux, macos |
 | `rustls-pki-types@1.15.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `rustls-webpki@0.103.15` | `ISC` | `ISC` | linux, macos |
+| `rustls-webpki@0.103.16` | `ISC` | `ISC` | linux, macos |
 | `serde@1.0.229` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `serde_core@1.0.229` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `serde_json@1.0.154` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
@@ -67,7 +67,7 @@ and vendored C terms.
 | `ureq-proto@0.6.4` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `utf8-zero@0.8.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `utf8parse@0.2.2` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
-| `webpki-roots@1.0.9` | `CDLA-Permissive-2.0` | `CDLA-Permissive-2.0` | linux, macos |
+| `webpki-roots@1.0.10` | `CDLA-Permissive-2.0` | `CDLA-Permissive-2.0` | linux, macos |
 | `winnow@0.7.15` | `MIT` | `MIT` | linux, macos |
 | `winnow@1.0.4` | `MIT` | `MIT` | linux, macos |
 | `zeroize@1.9.1` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
@@ -1226,7 +1226,7 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
-- rustls-webpki@0.103.15 `LICENSE`
+- rustls-webpki@0.103.16 `LICENSE`
 
 ````text
 Except as otherwise noted, this project is licensed under the following
@@ -1494,7 +1494,7 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
-- webpki-roots@1.0.9 `LICENSE`
+- webpki-roots@1.0.10 `LICENSE`
 
 ````text
 # Community Data License Agreement - Permissive - Version 2.0
