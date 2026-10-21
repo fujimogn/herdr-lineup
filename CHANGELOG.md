@@ -4,6 +4,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Maintenance: **CI** runs on Linux only; a platform check workflow builds and tests on Linux and macOS before a release.
 - Security: **Dependencies** update rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 for RUSTSEC-2026-0381 and 0382.
 
 ## 0.2.0 (2026-10-19)
