@@ -2,7 +2,9 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/fujimogn/herdr-lineup/releases)
 
-## Unreleased
+## 0.2.2 (2026-10-21)
+
+The 0.2.1 tag was pushed without a GitHub Release because its changelog section was undated; 0.2.2 carries the same changes.
 
 - Maintenance: **CI** runs on Linux only; a platform check workflow builds and tests on Linux and macOS before a release.
 - Security: **Dependencies** update rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 for RUSTSEC-2026-0381 and 0382.
