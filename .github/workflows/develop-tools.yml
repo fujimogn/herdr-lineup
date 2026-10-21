@@ -24,8 +24,3 @@ jobs:
           command -v check-staged-docs
           command -v check-staged-adr
           command -v develop-secrets
-      - name: Check changed documentation
-        env:
-          BASE_SHA: ${{ github.event.before || '0000000000000000000000000000000000000000' }}
-          HEAD_SHA: ${{ github.sha }}
-        run: develop-docs-check --range "$BASE_SHA" "$HEAD_SHA"

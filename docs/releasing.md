@@ -3,7 +3,7 @@
 Maintainer-facing release process, following the structure of
 [graphify's release guide](https://github.com/Graphify-Labs/graphify/blob/v8/RELEASING.md).
 
-Pushing an annotated `v*` tag triggers `.github/workflows/release.yml`, which
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which
 builds the binaries and creates a GitHub Release in this public repository. Marketplace
 discovery is automatic for public repositories with the `herdr-plugin` topic
 and a valid manifest; a listing is not a Herdr review. A human creates and
@@ -34,7 +34,9 @@ pushes the tag. The workflow never tags or pushes on its own.
    The version check must exit 0; before the tag exists it compares the version
    files declared under `release.versionFiles` in `.develop-tools.json`. The
    resolver downloads the pinned public develop-tools release and verifies its
-   SHA-256 against `.develop-tools.json`. The extractor accepts
+   SHA-256 against `.develop-tools.json`. This repository does not apply the
+   shared documentation rules of `develop-docs-check`; the Develop tools workflow
+   only checks that the resolver fetches the pinned tools. The extractor accepts
    an optional changelog path: `scripts/extract-release-notes.sh X.Y.Z CHANGELOG.md`.
    Its output includes the dated version heading through the line before the
    next `## ` heading, trimming surrounding blank lines. A missing section or
@@ -66,10 +68,10 @@ pushes the tag. The workflow never tags or pushes on its own.
    on `main` through the repository's approved integration path. Confirm CI is
    green for that release commit.
 6. **Push the release tag.** Before tagging, confirm that the changelog heading's
-   date matches the annotated tag's tagger date. If release preparation happened
+   date matches the tag date: the tagger date of an annotated tag, or the commit
+   date of a lightweight tag. If release preparation happened
    earlier, update the date and land that reviewed change first. A human tags
-   the verified release commit on `main` with an annotated tag and pushes only
-   the tag:
+   the verified release commit on `main` and pushes only the tag:
    ```sh
    git tag -a vX.Y.Z <release-commit> -m 'Release vX.Y.Z'
    git push origin vX.Y.Z
@@ -77,8 +79,8 @@ pushes the tag. The workflow never tags or pushes on its own.
    Before any build, the workflow requires the tag's commit to be reachable
    from `origin/main`, the latest CI `push` run for that commit on `main` to
    have succeeded, and the `## X.Y.Z (YYYY-MM-DD)` heading to match the
-   annotated tag's tagger date. The gate explicitly refetches the tag object
-   because checkout may replace the pushed annotated tag with a lightweight
+   tag date. The gate explicitly refetches the tag
+   because checkout may replace a pushed annotated tag with a lightweight
    local ref; it also checks that the fetched tag points to the checked-out
    commit. It reads CI runs with `actions: read`; if a
    check fails or the API is unavailable, the release stops. The workflow
