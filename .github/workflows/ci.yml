@@ -24,6 +24,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # A tag push needs origin/main for check-release-version.
+          fetch-depth: ${{ github.ref_type == 'tag' && '0' || '1' }}
       - name: Read pinned toolchain
         id: rust
         run: |
@@ -40,7 +43,11 @@ jobs:
       - name: Test
         run: cargo test --locked
       - name: Check version consistency
-        run: .develop-tools/resolve ci check-release-version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            git update-ref refs/heads/main refs/remotes/origin/main
+          fi
+          .develop-tools/resolve ci check-release-version
       - name: Test release notes extraction
         run: scripts/test-extract-release-notes.sh
       - name: Test release gate
