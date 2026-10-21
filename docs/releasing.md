@@ -64,9 +64,11 @@ pushes the tag. The workflow never tags or pushes on its own.
    Do not stop or restart the Herdr server or attach a client to a user's
    running session during verification.
 5. **Land the release preparation.** Commit the version, changelog, and lockfile
-   together using the conventions in `AGENTS.md`, and land the reviewed changes
-   on `main` through the repository's approved integration path. Confirm CI is
-   green for that release commit. CI runs on Linux only; check every declared OS
+   together using the conventions in `AGENTS.md`, and push them to `develop`,
+   where day-to-day changes land and `ci-develop.yml` runs the light checks.
+   Then fast-forward `main` to that reviewed `develop` commit and push `main`;
+   the push runs the full checks in `ci.yml`. Confirm CI is green for that
+   release commit. CI runs on Linux only; check every declared OS
    on the release commit before tagging:
    ```sh
    .develop-tools/resolve release release check
