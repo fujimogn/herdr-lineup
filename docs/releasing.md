@@ -27,11 +27,14 @@ pushes the tag. The workflow never tags or pushes on its own.
 4. **Verify before committing.** Check the version and preview the exact release
    notes from the repository root:
    ```sh
-   scripts/check-version.sh vX.Y.Z
+   .develop-tools/resolve ci check-release-version
    scripts/extract-release-notes.sh X.Y.Z
    scripts/test-check-release-gate.sh
    ```
-   The version check must print `version check passed`. The extractor accepts
+   The version check must exit 0; before the tag exists it compares the version
+   files declared under `release.versionFiles` in `.develop-tools.json`. The
+   resolver downloads the pinned public develop-tools release and verifies its
+   SHA-256 against `.develop-tools.json`. The extractor accepts
    an optional changelog path: `scripts/extract-release-notes.sh X.Y.Z CHANGELOG.md`.
    Its output includes the dated version heading through the line before the
    next `## ` heading, trimming surrounding blank lines. A missing section or
@@ -160,7 +163,9 @@ checkout locally; an archive checksum alone does not establish publisher trust.
 
 Follow Semantic Versioning. The release tag `vX.Y.Z`, `Cargo.toml`,
 `herdr-plugin.toml`, and the `herdr-lineup` entry in `Cargo.lock` must agree.
-`scripts/check-version.sh` enforces consistency in CI and the release workflow.
+`check-release-version`, run through `.develop-tools/resolve`, enforces consistency
+in CI and the release workflow. On a tagged commit it also requires the tag to
+match the declared version and the commit to be on `main`.
 An unpublished local version bump does not constitute a release; choose the next
 version against the actual tags and GitHub Releases.
 

@@ -1,0 +1,14 @@
+{
+  "version": "0.6.1",
+  "sha256": {
+    "x86_64-unknown-linux-gnu": "9189cf1efe9ad86744a0326bee0f7ff11e6583f58232d8f54556f14f459a5a8b",
+    "aarch64-apple-darwin": "cbb8a9dc6fef3283b3dab28bcf9c9345fea21efe96c6ffb40b437c1a7e2f8dc1"
+  },
+  "release": {
+    "versionFiles": [
+      { "path": "Cargo.toml", "kind": "cargo-package" },
+      { "path": "herdr-plugin.toml", "kind": "toml-root" },
+      { "path": "Cargo.lock", "kind": "cargo-lock" }
+    ]
+  }
+}
