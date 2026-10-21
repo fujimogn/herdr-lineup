@@ -1,8 +1,11 @@
 name: CI
 
+# Full checks for pushes to main and release tags. Pushes to develop and pull
+# requests run the light checks in ci-develop.yml.
 on:
   push:
-  pull_request:
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 1"
