@@ -309,6 +309,14 @@ impl ProcessExit {
     }
 }
 
+/// Test fixtures that bind a control socket need a short root: the macOS
+/// per-user TMPDIR (`/private/var/folders/...`) leaves no room under the
+/// 103-byte socket path limit once `state/session-<key>/control.sock` is added.
+#[cfg(test)]
+pub(crate) fn socket_test_dir() -> tempfile::TempDir {
+    tempfile::tempdir_in("/tmp").unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

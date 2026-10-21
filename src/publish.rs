@@ -3596,7 +3596,7 @@ mod tests {
 
     #[test]
     fn daemon_hook_publishes_missing_usage_heading_and_clears_on_stop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::lock::socket_test_dir();
         let options = crate::daemon::Options {
             socket: dir.path().join("fake.sock"),
             state: dir.path().join("state"),

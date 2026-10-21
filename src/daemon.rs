@@ -725,7 +725,7 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::lock::socket_test_dir();
         let options = Options {
             socket: dir.path().join("herdr.sock"),
             state: dir.path().join("state"),
