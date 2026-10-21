@@ -1,0 +1,31 @@
+name: Develop tools
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install develop tools
+        uses: fujimogn/develop-tools-action@ce060b139009df9efed5d4b023b3081bf17d958d # v0.3.0
+      - name: Smoke installed binaries
+        run: |
+          develop-docs-check --version
+          command -v check-staged-docs
+          command -v check-staged-adr
+          command -v develop-secrets
+      - name: Check changed documentation
+        env:
+          BASE_SHA: ${{ github.event.before || '0000000000000000000000000000000000000000' }}
+          HEAD_SHA: ${{ github.sha }}
+        run: develop-docs-check --range "$BASE_SHA" "$HEAD_SHA"

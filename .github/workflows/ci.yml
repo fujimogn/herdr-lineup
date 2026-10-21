@@ -40,7 +40,7 @@ jobs:
       - name: Test
         run: cargo test --locked
       - name: Check version consistency
-        run: scripts/check-version.sh
+        run: .develop-tools/resolve ci check-release-version
       - name: Test release notes extraction
         run: scripts/test-extract-release-notes.sh
       - name: Test release gate

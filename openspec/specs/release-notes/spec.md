@@ -64,7 +64,7 @@ SHALL verify versions, build checked artifacts, and publish a GitHub Release.
 - **THEN** it follows these packaging, permission, and publication rules:
 
 The release workflow SHALL run on a human-pushed `v*` tag, verify version
-consistency using `scripts/check-version.sh`, and create a GitHub Release titled
+consistency using `check-release-version` through `.develop-tools/resolve`, and create a GitHub Release titled
 `vX.Y.Z` with the extractor output as its body. It SHALL attach Linux and macOS
 archives named `herdr-lineup-<tag>-<os>-<arch>.tar.gz` and `SHA256SUMS.txt`
 covering those archives. Each archive SHALL contain `herdr-lineup`, `LICENSE`,
@@ -126,6 +126,6 @@ dates, adjacent-section boundaries, and surrounding blank lines.
 #### Scenario: Preview the publication body before tagging
 
 - **WHEN** a maintainer follows the guide to prepare X.Y.Z
-- **THEN** they run `scripts/check-version.sh vX.Y.Z` and
+- **THEN** they run `.develop-tools/resolve ci check-release-version` and
   `scripts/extract-release-notes.sh X.Y.Z` before committing and tagging
 - **AND** the preview uses the same extraction contract as publication

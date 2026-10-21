@@ -1,0 +1,255 @@
+#!/bin/sh
+# Usage: resolve <pre-commit|pre-push|ci|release> <binary> [args...]
+#        resolve bin-dir <pre-commit|pre-push|ci|release>
+set -u
+CONNECT_TIMEOUT=5
+MAX_TIME=30
+RETRY_COUNT=2
+
+fail() {
+  printf 'develop-tools resolve: %s\n' "$1" >&2
+  exit 1
+}
+
+unavailable() {
+  printf 'develop-tools resolve: 取得できません: %s\n' "$1" >&2
+  if [ "$mode" = pre-commit ]; then
+    printf 'develop-tools resolve: 検査を省きます (CI で検査してください)\n' >&2
+    exit 0
+  fi
+  exit 1
+}
+
+checksum() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    fail 'sha256sum または shasum が必要です'
+  fi
+}
+
+bin_dir=0
+if [ "$#" -ge 1 ] && [ "$1" = bin-dir ]; then
+  [ "$#" -eq 2 ] || fail 'usage: resolve bin-dir <pre-commit|pre-push|ci|release>'
+  bin_dir=1
+  mode=$2
+  binary=
+  shift 2
+else
+  [ "$#" -ge 2 ] || fail 'usage: resolve <pre-commit|pre-push|ci|release> <binary> [args...]'
+  mode=$1
+  binary=$2
+  shift 2
+fi
+case "$mode" in
+  pre-commit|pre-push|ci|release) ;;
+  *) fail "未知の mode: $mode" ;;
+esac
+if [ "$bin_dir" -eq 0 ]; then
+  case "$binary" in
+    ''|*[!a-zA-Z0-9._-]*) fail "不正な binary 名: $binary" ;;
+  esac
+fi
+
+if [ "${DEVELOP_TOOLS_BIN_DIR+x}" = x ]; then
+  if [ "$bin_dir" -eq 1 ]; then
+    [ -d "$DEVELOP_TOOLS_BIN_DIR" ] || fail "指定先に bin dir がありません: $DEVELOP_TOOLS_BIN_DIR"
+    printf '%s\n' "$DEVELOP_TOOLS_BIN_DIR"
+    exit 0
+  fi
+  local_binary=$DEVELOP_TOOLS_BIN_DIR/$binary
+  [ -x "$local_binary" ] || fail "指定先に binary がありません: $local_binary"
+  printf 'develop-tools resolve: 手元の binary を使用: %s\n' "$local_binary" >&2
+  exec "$local_binary" "$@"
+fi
+
+case "$(uname -s 2>/dev/null)/$(uname -m 2>/dev/null)" in
+  Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+  Darwin/arm64|Darwin/aarch64) target=aarch64-apple-darwin ;;
+  *) unavailable '対象外の target' ;;
+esac
+
+[ -f .develop-tools.json ] || fail '.develop-tools.json がありません'
+cache_root=${XDG_CACHE_HOME:-$HOME/.cache}/develop-tools
+manifest_digest=$(checksum .develop-tools.json) || fail 'manifest の sha256 を計算できません'
+index=$cache_root/.manifest-$target-$manifest_digest
+index_hit=0
+if [ -f "$index" ]; then
+  read -r indexed_digest version expected < "$index" || :
+  if [ "$indexed_digest" = "$manifest_digest" ]; then
+    case "$version" in
+      ''|*[!0-9.]*|.*|*..*|*.|*.*.*.*) ;;
+      *.*.*)
+        case "$expected" in
+          *[!a-f0-9]*) ;;
+          *) [ "${#expected}" -eq 64 ] && index_hit=1 ;;
+        esac
+        ;;
+    esac
+  fi
+fi
+if [ "$index_hit" -eq 0 ]; then
+  command -v jq >/dev/null 2>&1 || fail 'jq が必要です'
+  manifest_snapshot=$(mktemp "${TMPDIR:-/tmp}/develop-tools-manifest.XXXXXXXX") || unavailable 'manifest の一時 file を作れません'
+  trap 'rm -f "$manifest_snapshot"' 0
+  trap 'exit 1' 1 2 3 15
+  cp .develop-tools.json "$manifest_snapshot" || unavailable 'manifest を写せません'
+  manifest_digest=$(checksum "$manifest_snapshot") || fail 'manifest の sha256 を計算できません'
+  index=$cache_root/.manifest-$target-$manifest_digest
+  version=$(jq -er '.version | select(type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$manifest_snapshot" 2>/dev/null) || fail 'version を読めません'
+  expected=$(jq -er --arg target "$target" '.sha256[$target] | select(type == "string" and test("^[a-fA-F0-9]{64}$"))' "$manifest_snapshot" 2>/dev/null) || unavailable "$target の sha256 がありません"
+  expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+  rm -f "$manifest_snapshot" || fail 'manifest の一時 file を消せません'
+  trap - 0 1 2 3 15
+fi
+
+cache_base=$cache_root/$version
+cache_dir=$cache_base/$target
+marker=$cache_dir/.sha256
+write_index() {
+  [ "$index_hit" -eq 0 ] || return 0
+  current_digest=$(checksum .develop-tools.json) || return 0
+  [ "$current_digest" = "$manifest_digest" ] || return 0
+  printf '%s %s %s\n' "$manifest_digest" "$version" "$expected" > "$index" || :
+}
+finish() {
+  if [ "$bin_dir" -eq 1 ]; then
+    printf '%s\n' "$cache_dir"
+    exit 0
+  fi
+  exec "$cache_dir/$binary" "$@"
+}
+ready() {
+  if [ "$bin_dir" -eq 1 ]; then
+    [ -d "$cache_dir" ] || return 1
+  else
+    [ -x "$cache_dir/$binary" ] || return 1
+  fi
+  [ -f "$marker" ] && [ "$(cat "$marker")" = "$expected" ]
+}
+if ready; then
+  write_index
+  finish "$@"
+fi
+
+mkdir -p "$cache_base" || fail "cache を作れません: $cache_base"
+lock=$cache_dir.lock
+old_empty_dir() {
+  modified=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null) || return 1
+  now=$(date +%s) || return 1
+  [ "$((now - modified))" -ge 30 ]
+}
+stale_lock() {
+  if [ -f "$lock/pid" ]; then
+    owner=$(cat "$lock/pid" 2>/dev/null) || return 1
+    case "$owner" in ''|*[!0-9]*) old_empty_dir "$lock"; return ;; esac
+    ! kill -0 "$owner" 2>/dev/null
+    return
+  fi
+  old_empty_dir "$lock"
+}
+attempt=0
+until mkdir "$lock" 2>/dev/null; do
+  if ready; then
+    write_index
+    finish "$@"
+  fi
+  if [ -d "$lock.reap" ] && old_empty_dir "$lock.reap"; then
+    rmdir "$lock.reap" 2>/dev/null || :
+  fi
+  if stale_lock && mkdir "$lock.reap" 2>/dev/null; then
+    reclaimed=0
+    if stale_lock; then
+      rm -f "$lock/pid"
+      if rmdir "$lock" 2>/dev/null; then
+        reclaimed=1
+      fi
+    fi
+    rmdir "$lock.reap" 2>/dev/null || :
+    if [ "$reclaimed" -eq 1 ]; then
+      continue
+    fi
+  fi
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 30 ] || unavailable "cache の待機が時間切れです: $cache_dir"
+  sleep 1
+done
+printf '%s\n' "$$" > "$lock/pid" || { rmdir "$lock" 2>/dev/null || :; fail 'lock の pid を記録できません'; }
+
+tmp=$(mktemp -d "$cache_base/.resolve.XXXXXXXX") || {
+  rm -f "$lock/pid"
+  rmdir "$lock" 2>/dev/null || :
+  fail '一時 dir を作れません'
+}
+cleanup() {
+  for directory in "$tmp/extract" "$tmp/old-cache"; do
+    if [ -d "$directory" ]; then
+      rm -f "$directory/.sha256"
+      for entry in "$directory"/*; do
+        [ -e "$entry" ] && rm -f "$entry"
+      done
+      rmdir "$directory" 2>/dev/null || :
+    fi
+  done
+  rm -f "$tmp"/*
+  rmdir "$tmp" 2>/dev/null || :
+  rm -f "$lock/pid"
+  rmdir "$lock" 2>/dev/null || :
+}
+trap cleanup 0
+trap 'exit 1' 1 2 3 15
+
+if ready; then
+  write_index
+  cleanup
+  trap - 0 1 2 3 15
+  finish "$@"
+fi
+
+asset=develop-tools-v$version-$target.tar.gz
+url=https://github.com/fujimogn/develop-tools/releases/download/v$version
+command -v curl >/dev/null 2>&1 || fail 'curl が必要です'
+command -v tar >/dev/null 2>&1 || fail 'tar が必要です'
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+  fail 'sha256sum または shasum が必要です'
+fi
+curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" --retry "$RETRY_COUNT" -o "$tmp/$asset" "$url/$asset" || unavailable "$asset"
+curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" --retry "$RETRY_COUNT" -o "$tmp/SHA256SUMS" "$url/SHA256SUMS" || unavailable 'SHA256SUMS'
+
+# Accept sha256sum text (`hash  name`) and binary (`hash *name`) records.
+published=$(awk -v name="$asset" '($2 == name || $2 == "*" name) && NF == 2 { print $1; count++ } END { if (count != 1) exit 1 }' "$tmp/SHA256SUMS") || fail "SHA256SUMS の行が不正です: $asset"
+published=$(printf '%s' "$published" | tr 'A-F' 'a-f')
+actual=$(checksum "$tmp/$asset") || fail "sha256 を計算できません: $asset"
+if [ "$actual" != "$published" ] || [ "$actual" != "$expected" ]; then
+  fail "sha256 が一致しません: $asset"
+fi
+
+# Archive entries are flat binary names. This also keeps cleanup bounded to files.
+tar -tzf "$tmp/$asset" | awk '
+  /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/ { next }
+  { invalid = 1 }
+  END { exit invalid }
+' || fail "asset の内容が不正です: $asset"
+mkdir "$tmp/extract" || fail '展開先を作れません'
+tar -xzf "$tmp/$asset" -C "$tmp/extract" || fail "展開できません: $asset"
+if [ "$bin_dir" -eq 0 ]; then
+  [ -x "$tmp/extract/$binary" ] || fail "asset に binary がありません: $binary"
+fi
+printf '%s\n' "$actual" > "$tmp/extract/.sha256"
+
+if [ ! -e "$cache_dir" ]; then
+  mv "$tmp/extract" "$cache_dir" || fail "cache へ配置できません: $cache_dir"
+else
+  mv "$cache_dir" "$tmp/old-cache" || fail "古い cache を退避できません: $cache_dir"
+  mv "$tmp/extract" "$cache_dir" || {
+    mv "$tmp/old-cache" "$cache_dir" 2>/dev/null || :
+    fail "cache を更新できません: $cache_dir"
+  }
+fi
+
+write_index
+cleanup
+trap - 0 1 2 3 15
+finish "$@"
