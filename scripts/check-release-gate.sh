@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Reject a release tag unless it names a tested main commit with matching notes.
+# Annotated and lightweight tags are both accepted; the tag date is the tagger
+# date of an annotated tag or the commit date of a lightweight tag.
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 || ! $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -17,16 +19,15 @@ fail() {
 }
 
 git fetch --force --no-tags origin "refs/tags/$tag:refs/tags/$tag" || fail "cannot fetch $tag"
-[[ $(git cat-file -t "refs/tags/$tag" 2>/dev/null) == tag ]] || fail "$tag must be an annotated tag"
 commit=$(git rev-parse --verify "refs/tags/$tag^{commit}") || fail "cannot resolve $tag"
 checkout_commit=$(git rev-parse --verify HEAD) || fail 'cannot resolve checkout HEAD'
 [[ $commit == "$checkout_commit" ]] || fail "$tag does not point to checkout HEAD"
 git merge-base --is-ancestor "$commit" refs/remotes/origin/main || fail "$tag commit is not on origin/main"
 
-tag_date=$(git for-each-ref --format='%(taggerdate:short)' "refs/tags/$tag")
-[[ $tag_date =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "invalid tagger date"
+tag_date=$(git for-each-ref --format='%(creatordate:short)' "refs/tags/$tag")
+[[ $tag_date =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "invalid tag date"
 notes=$(scripts/extract-release-notes.sh "$version" "$changelog") || fail "missing release notes"
-[[ ${notes%%$'\n'*} == "## $version ($tag_date)" ]] || fail "CHANGELOG date differs from tagger date $tag_date"
+[[ ${notes%%$'\n'*} == "## $version ($tag_date)" ]] || fail "CHANGELOG date differs from tag date $tag_date"
 
 [[ ${GITHUB_REPOSITORY:-} =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail 'GITHUB_REPOSITORY is missing or invalid'
 runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$commit&event=push&per_page=100") || fail 'cannot read CI workflow runs'

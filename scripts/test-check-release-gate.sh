@@ -10,10 +10,9 @@ cat > "$fixture_dir/bin/git" <<'MOCK'
 #!/usr/bin/env bash
 case "$1" in
   fetch) [[ $* == 'fetch --force --no-tags origin refs/tags/v1.2.3:refs/tags/v1.2.3' && ${TEST_FETCH_OK:-yes} == yes ]] ;;
-  cat-file) [[ ${TEST_TAG_TYPE:-tag} == tag ]] && echo tag || echo commit ;;
   rev-parse) if [[ $3 == HEAD ]]; then echo "${TEST_CHECKOUT_SHA:-1111111111111111111111111111111111111111}"; else echo 1111111111111111111111111111111111111111; fi ;;
   merge-base) [[ ${TEST_ON_MAIN:-yes} == yes ]] ;;
-  for-each-ref) echo "${TEST_TAG_DATE:-2026-10-18}" ;;
+  for-each-ref) [[ $* == *'%(creatordate:short)'* ]] && echo "${TEST_TAG_DATE:-2026-10-18}" ;;
   *) echo "unexpected git command: $*" >&2; exit 1 ;;
 esac
 MOCK
@@ -53,6 +52,5 @@ unset TEST_TAG_DATE
 TEST_CI_RUNS='{"workflow_runs":[]}' failure 'CI is not green'
 TEST_CI_RUNS='{"workflow_runs":[{"head_sha":"1111111111111111111111111111111111111111","head_branch":"main","event":"push","run_number":2,"status":"completed","conclusion":"failure"}]}' failure 'CI is not green'
 TEST_CI_RUNS='{"workflow_runs":[{"head_sha":"1111111111111111111111111111111111111111","head_branch":"main","event":"push","run_number":1,"status":"completed","conclusion":"success"},{"head_sha":"1111111111111111111111111111111111111111","head_branch":"main","event":"push","run_number":2,"status":"completed","conclusion":"failure"}]}' failure 'CI is not green'
-TEST_TAG_TYPE=commit failure 'must be an annotated tag'
 
 echo 'release gate tests passed'
