@@ -58,8 +58,9 @@ The daemon control worker clones health, existing observations, P deadline
 snapshot and handle under the existing state mutex, then releases it.
 Call `snapshots()` only after releasing that mutex. Its source uses per-slot
 `try_lock`, returning promptly without retry, sleeping, or joining workers.
-No control mutex is held during sampling, JSON conversion, allocation or socket
-I/O; provider locks end before serialization. No new nested lock ordering.
+Except for snapshot cloning, no control mutex is held during sampling, JSON
+construction, serialization or socket I/O; provider locks end before serialization.
+No new nested lock ordering.
 Sampling errors affect only diagnostics and cannot request shutdown/reconnect.
 The handle may outlive the publisher until control teardown; it owns no worker
 join, permit, file or query. Preserve existing shutdown and teardown order.
