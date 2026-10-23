@@ -9,11 +9,20 @@
 | Environment | Linux 7.2.10-1-cachyos / x86_64, AMD Ryzen 9 9955HX (16 Cores), synthetic isolated `tmpfs` fixtures (`/tmp`) |
 | Primary touching path | `docs/reviews/reader-discovery-latency-2026-10-23.md` |
 
-Later status: the local integration line (`d95e5b5`) adds a per-cycle `ReadCycle` discovery API (`f7abe35`), but publication does not pass one cycle across panes yet. The measurements below describe `b5fc311` and remain tmpfs-only.
+Current local candidate source: `0220da64f8545f89b6daca211553f486b271057f`.
+Publication now passes one diagnostics-bearing `ReadCycle` across each
+refresh; actual Codex/Kimi reader fixtures assert shared scans, and the next
+refresh starts with a new cycle. Discovery still re-proves ancestors,
+uniqueness and validity. C1 retains a combined 4,096-entry budget across
+Codex roots with cumulative fallback charges and the original deadline.
+See `review-followup-coverage.md` L4/C1 for current source and fixtures.
+
+Everything below is historical evidence on `b5fc311`, tmpfs-only. It does
+not measure the wired candidate, a real disk, macOS or live Herdr latency.
 
 ---
 
-## 1. Executive Summary
+## 1. Historical executive summary
 
 This review measures candidate discovery latency, scaling dynamics, and fail-closed safety behaviors of `CodexReader` and `KimiReader` in `herdr-lineup`.
 

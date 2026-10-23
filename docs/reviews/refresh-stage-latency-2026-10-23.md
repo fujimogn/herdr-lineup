@@ -1,6 +1,6 @@
 # Refresh stage latency, 2026-10-23
 
-## Scope and reproduction
+## Historical baseline: scope and reproduction
 
 The original measurement candidate, `4afc9d42b9bab850576ffb3bd42d44accf2d21c2`,
 was based directly on `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`.
@@ -25,9 +25,9 @@ user session, or change user configuration.
 The test uses `Instant` for the entire refresh cycle, the snapshot, workspace
 heading/Git work, injected reader calls, sequence checkpoint persistence, and
 socket exchanges. It counts successful metadata responses and the final number
-of checkpoint rows. All counters and timing branches are compiled only for
-Rust tests (`cfg(test)`); the normal runtime does not emit metrics or change
-metadata. Run it with:
+of checkpoint rows. On that historical source, the counters and timing branches were compiled
+only for Rust tests (`cfg(test)`); production stage sampling and diagnostics
+were wired later. These historical numbers are not observations of that wiring. Run it with:
 
 ```sh
 LINEUP_BENCH_ROOT=/tmp LINEUP_BENCH_REPEATS=3 cargo test --locked measure_refresh_stages -- --ignored --nocapture
@@ -42,7 +42,7 @@ residue, not plugin state. Results below are debug test builds with the pinned
 toolchain, on the same host and test binary. The two filesystem runs were
 sequential, so cache and host load were not controlled experimentally.
 
-## Results
+## Historical baseline results
 
 Times are milliseconds. The three cycle totals show all runs in order; stage
 columns are independent medians of the same three runs. The cycle includes
@@ -120,7 +120,7 @@ release build, not a replacement for the historical latency results above.
 The ext4 experiment was not repeated. Independent review of the carry-forward
 diff and shipment remain outstanding.
 
-## Sequence reservation window benchmark (2026-10-24)
+## Historical sequence-window benchmark (2026-10-24)
 
 After implementing the endpoint-wide sequence reservation window, the synthetic
 measurements were re-run using the exact same commands and parameters:
@@ -172,3 +172,58 @@ fixture.
   socket exchanges.
 - Shipment remains on hold; this record is not approval for integration or
   push.
+
+## Wired candidate synthetic observations (2026-10-24)
+
+These are new observations, separate from both historical runs above.
+The measured candidate was `9d2b4a23eca9d0e46839d54a0a84d9920c749c7f`;
+its Rust source was byte-identical to
+`6be18304d6e39a0eb6d88164a866b449d9396946`. The later source snapshot
+`0220da64f8545f89b6daca211553f486b271057f` changes comments only; it was
+not the measured binary. Commander-owned evidence outside the repository:
+`reviews/final-refresh-measurements-2026-10-24.md` and `.json` (raw rows,
+medians and log SHA256s); raw artifacts are in
+`reviews/final-source-verification-2026-10-24-logs/`.
+
+The existing ignored `publish::tests::measure_refresh_stages` used pinned
+Rust 1.99.1 in a debug test build, one synthetic workspace/Git repository,
+SampleReader and a fake Unix socket. Each cold publisher was independent;
+there were three runs per pane count and filesystem, with filesystem runs
+performed sequentially. No real Herdr, provider files/account, user session
+or configuration was contacted. This fixture does not exercise actual reader
+file discovery or sidebar rendering.
+
+The tmpfs run succeeded first. The initial ext4 root exceeded the Unix socket
+`SUN_LEN` path limit before its first measurement. Only that failed filesystem
+case was rerun with a short ext4 root,
+`/home/fujimogn/Develop/herdr-lineup/target/lineup-bench-20261024`, with no code
+change or extra build. Both successful runs used the same test executable
+identifier (`herdr_lineup-897e4d11a82345ed`), exited zero and produced 15 rows
+each. Failed-attempt logs were retained alongside the successful logs.
+The retained fixture root is measurement residue, not plugin state.
+
+Times are milliseconds; each stage column is its independent median over
+three runs. All 30 rows recorded `reports = panes + 1` and `checkpoint_rows = 1`.
+The current CSV does not include a separate persist-write counter; do not
+infer that count from the row count alone.
+
+| Filesystem | Panes | Cycle median | Snapshot | Heading/Git | Reader | Persist | Socket | Reports | Checkpoint rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tmpfs | 1 | 9.348 | 0.343 | 4.265 | 0.003 | 0.062 | 3.874 | 2 | 1 |
+| tmpfs | 8 | 24.528 | 0.957 | 3.938 | 0.015 | 0.050 | 18.814 | 9 | 1 |
+| tmpfs | 32 | 78.079 | 2.732 | 4.367 | 0.071 | 0.053 | 67.557 | 33 | 1 |
+| tmpfs | 128 | 297.973 | 12.762 | 4.631 | 0.284 | 0.059 | 270.544 | 129 | 1 |
+| tmpfs | 256 | 579.669 | 11.910 | 4.423 | 0.543 | 0.061 | 533.039 | 257 | 1 |
+| ext4 | 1 | 21.281 | 0.401 | 4.113 | 0.004 | 12.375 | 4.224 | 2 | 1 |
+| ext4 | 8 | 32.442 | 0.601 | 4.100 | 0.019 | 9.257 | 18.350 | 9 | 1 |
+| ext4 | 32 | 86.669 | 3.296 | 4.297 | 0.076 | 9.195 | 67.689 | 33 | 1 |
+| ext4 | 128 | 310.503 | 7.046 | 4.741 | 0.293 | 19.405 | 266.005 | 129 | 1 |
+| ext4 | 256 | 598.761 | 19.587 | 4.923 | 0.582 | 9.929 | 538.883 | 257 | 1 |
+
+Stage intervals overlap: snapshot includes socket work, and persistence runs
+within report processing. Never sum the columns. Host load and cache state
+were uncontrolled; the old and new binaries were not alternated. These
+observations establish neither a speed multiplier nor a stable tail estimate,
+SLO, strict 7 s wall-clock guarantee, macOS result, live Herdr result or
+event-to-visible latency. The controlled comparison and other outstanding
+measurements remain in `../../TODO.md` N1/N3/N4/L5/N5.

@@ -8,7 +8,7 @@ failure rows" below have test evidence; the others remain design intent. No
 live Herdr session, user configuration, or production checkpoint was used for
 this record.
 
-## Fixed sources and current behavior
+## Historical sources and pre-window behavior
 
 This audit uses commit `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`, notably
 `src/tokens.rs`, `src/publish.rs`, `src/protocol.rs`, `src/socket.rs`,
@@ -27,7 +27,7 @@ last accepted value for the same source is accepted by the API but ignored by
 the resource. Thus an `ok` envelope alone does not prove token application.
 Socket metadata is not restored after a Herdr server restart.
 
-Current flow (verified from the fixed code):
+Historical pre-window flow (verified from the fixed code):
 
 1. The daemon holds an exclusive session lock keyed by socket path. It loads
    `HERDR_PLUGIN_STATE_DIR`'s per-session `sequences.json` only after taking
@@ -166,7 +166,8 @@ high-water mark is not a safe rollback.
 ## Implementation status (2026-10-24)
 
 The endpoint-wide reservation window is implemented in `src/tokens.rs` and
-`src/publish.rs`. It is not shipped.
+`src/publish.rs`. Current source: `0220da64f8545f89b6daca211553f486b271057f`;
+see `review-followup-coverage.md` L1 for the current candidate. It is not shipped.
 
 1. **State separation**: `endpoint_floors` holds the durable upper bound `U`
    per endpoint and `endpoint_cursors` holds the in-memory cursor `C`. Loading

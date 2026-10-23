@@ -5,6 +5,13 @@ Baseline: `894d2f25f3bc44e59a31ea48a6995c7cee1e6455`. Checked on 2026-10-24.
 This change documents the boundary; it does not change readers, capture, binding,
 publication, configuration, or the Herdr host.
 
+Current follow-up status: the owner explicitly assigned C2 to a separate
+Herdr host task: generation distribution, same-generation conditional apply,
+and display invalidation on replacement. None is implemented by this Lineup
+candidate. The planned contract below and the current pane-bound behavior
+remain; `../../TODO.md` keeps the unresolved item. Current source mapping:
+`review-followup-coverage.md` C2.
+
 ## Primary evidence and limits
 
 The starting official URL is the pinned wire-contract link in

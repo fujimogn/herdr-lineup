@@ -860,7 +860,7 @@ inactive state dots are cleared with JSON null.
 
 | Workspace token | Value |
 | --- | --- |
-| `lineup_repo` | Repository name, or `—` outside Git |
+| `lineup_repo` | Repository name, or cleared when unresolved |
 | `lineup_ship_unix` | Local `origin/main` commit timestamp, or cleared |
 | `lineup_ship_text` | `HH:MM` today, otherwise `M/D`, or `—` |
 
@@ -874,14 +874,23 @@ and uses `—` for its ship-time text. The full pane contract has 14 keys, withi
 Herdr's 16 keys per report and 32 stored keys per resource; unrelated keys are
 preserved and counted before publication.
 
-`doctor` distinguishes metadata capacity skips from refresh failures. It shows
-the number of resources skipped during the latest refresh; skips alone do not
-make it fail. A real refresh failure still exits nonzero. It also checks the
-control socket path length before trying to connect. Before that result it
-prints the latest, minimum, and maximum refresh duration in microseconds, a
-fixed duration histogram, and attempt, success, error, and capacity-skip
-counts. `last refresh <N> ms after startup` is the time since the daemon
-started, not the duration of a refresh.
+`doctor` distinguishes capacity skips, deadline deferrals and refresh errors.
+Skips alone are healthy; a real refresh error still exits nonzero. Before that
+result it prints total and per-stage duration histograms (snapshot, Git,
+reader, checkpoint persistence, socket), report/checkpoint counts and outcomes.
+Stages overlap, so their durations must not be added. `last refresh <N> ms
+after startup` is uptime, not refresh duration.
+
+Reader diagnostics cover Claude, Agy, Codex, Grok and Kimi bounded workers:
+attempts, BUSY rejections, caller deadline/shutdown ends, accepted completions,
+waits and retained-worker gauges. They are live best-effort samples taken for
+the control request, independent of completed refresh metrics; providers and
+fields are not transactional. A completion may contain missing usage. Hermes
+has no bounded worker, so its empty slot is not a read measurement. Missing,
+legacy, contended or invalid diagnostics show unavailable, not measured zero.
+Deadline-skip diagnostics are separate from reader deadline counters and keep
+the latest skip attempt across later attempts. The control socket path length
+is checked before connect.
 
 ### Per-session publisher
 
@@ -902,6 +911,23 @@ to a replaced server. Deadlines use
 non-blocking I/O and `poll` against one monotonic deadline. On macOS,
 `setsockopt` on a socket the peer has closed returns `EINVAL`, so the deadline
 is not applied with `setsockopt`.
+The local candidate uses a cooperative refresh envelope of
+`2 s + 1 s + reader_timeout_ms + 2 s` (7 s by default). Git headings share a
+one-second cycle budget and use an attempt-based fair queue. The persistent
+Git cache stores only worktree root/name; a hit still runs three children,
+and interrupted reads can use a confirmed heading for at most 30 s without
+renewing that age on a cache hit. No speed improvement has been measured.
+One discovery cycle is shared across panes in each refresh, with the existing
+combined 4,096-entry Codex cap and cumulative fallback accounting.
+
+Panes and workspaces share a fair send queue. A required report with less
+than 2 s of envelope remaining is deferred without writing a frame. An
+admitted exchange that fails can be ambiguous: its sequence is burned, never
+replayed. Sequence windows are durable before send; an uncertain checkpoint
+write stops publication until a new daemon instance reloads it. The envelope
+cannot interrupt synchronous filesystem work, fsync or process reaping, and
+is not an SLO or a strict wall-clock bound. Deferred renewals may expire and
+disappear in degraded cycles. The default refresh interval stays 5 s.
 See the [Herdr plugin documentation](https://herdr.dev/docs/plugins/)
 and [SECURITY.md](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md).
 

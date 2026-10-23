@@ -247,9 +247,13 @@ checks use exact deadline/cap relations and error/state assertions rather than
 tight elapsed-time upper bounds. Existing legacy timing tests remain intact.
 No real Herdr session, configuration, credentials, or provider API is used.
 
-This is a transport API seam. **Planned:** publisher/refresh-cycle budget
-creation and wiring through `publish::exchange`, snapshot, metadata sends, and
-shutdown. This change does not edit `publish.rs`, bound an entire refresh, or
-establish macOS runtime evidence; the portable implementation is verified on
-Linux here. Application-level sequence reservation and uncertainty handling
-remain the publisher's responsibility.
+Production publication now passes the shared envelope through snapshot and
+metadata exchanges. Clear passes its own 3 s deadline. The default refresh
+envelope is 7 s, derived from local caps; it is cooperative and can be
+exceeded by synchronous OS work or scheduling. A refused admission writes
+no frame; an admitted ambiguous exchange burns its sequence and ends the
+cycle. See [runtime wiring](plans/publisher-runtime-wiring.md) and the
+[source/fixture map](reviews/review-followup-coverage.md) L3 for the current
+contract, deadline-skip versus capacity/error behavior, and fair queues.
+Linux fixtures do not establish macOS runtime behavior or a visible-latency
+SLO. Sequence reservation and uncertainty remain the publisher's responsibility.

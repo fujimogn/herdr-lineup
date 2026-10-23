@@ -1,19 +1,19 @@
 # Font action atomicity policy (2026-10-23)
 
-## Current status (integration snapshot `d95e5b5`)
+## Current local candidate status
 
 The owner chose the conservative policy: when ownership is uncertain, stop and
 leave recovery to the user. It is implemented on the local integration line,
-which is not shipped:
+which is not shipped (source `0220da64f8545f89b6daca211553f486b271057f`):
 
 - `f319f52` and `ead231d` remove automatic rollback. A failure after the
   `pending` journal is written leaves earlier writes, any partially written
   font, and the journal in place, and the error states that no automatic
   rollback or deletion was attempted and names the paths to inspect
-  (`src/font.rs:608`, `:650`).
+  (`apply_with_font_and_remove` in `src/font.rs`).
 - Planned original bytes are compared before each terminal write, and the
   installed font is stamped again immediately before removal (`75865cd`,
-  `src/font.rs:632-638`).
+  `apply_with_font_and_remove`).
 - `885194b` types the ownership journal at load and separates planning from
   application; a `pending` journal still refuses every further action.
 

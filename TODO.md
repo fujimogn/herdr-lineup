@@ -1,79 +1,74 @@
 # TODO
 
-Open work after the 2026-10-23 whole-repository review and latency
-investigation. IDs refer to `docs/reviews/review-followup-coverage.md`, which
-holds the evidence and judgment conditions. `docs/plans/review-followups-plan.md`
-holds the working rules. Nothing here is released: the integration line is
-local and unshipped, and the version stays 0.2.2.
-
-## In progress on other lanes (not integrated)
-
-- Publisher runtime wiring (P): cycle and stage samples from
-  `MetadataPublisher`, the Git heading cache, fair queue, cycle budget, 30 s
-  confirmed fallback, shared socket deadlines, and one `ReadCycle` per
-  refresh (L2, L3, L4). Plan: `docs/plans/publisher-runtime-wiring.md`.
-- Reader worker diagnostics in control and `doctor` (D, after P; L5).
+Open work after the 2026-10-23 reviews. Finding IDs, implementation source
+`0220da64f8545f89b6daca211553f486b271057f`, fixtures and limits are mapped in
+`docs/reviews/review-followup-coverage.md`. Working rules are in
+`docs/plans/review-followups-plan.md`. This is a local unshipped candidate;
+all release versions remain 0.2.2.
 
 ## Open
 
-- [ ] Final inclusive GPT-6.1 Sol high review from `d3ccbc17` to the fixed
-  final head, owned by the commander. Re-run the default parallel test suite
-  on that head (M8).
-- [ ] Remeasure stage timings on the wired head, running old and new binaries
-  alternately on one host, tmpfs and a real disk (N1). No timing claim before
-  that.
-- [ ] Measure Git heading latency and child counts on the wired head (L2, N3).
-- [ ] Measure reader discovery on a real disk with pane and candidate counts
-  separated (L4, N4).
-- [ ] Record stuck-worker frequency from the wired diagnostics (L5). The
-  bounded fixtures are not that measurement.
-- [ ] Specify the Codex discovery cap (per-root or shared) and the duplicate-ID
-  rule before changing it (C1, survey item 19).
-- [ ] Verify the remaining sequence-window failure rows where feasible: second
-  allocator, competing same-source writer, config change during refresh,
-  rollback to an older binary, macOS disk (L1).
-- [ ] Font check-then-rename and check-then-unlink races (H1, M1) stay open.
-  Any closing design needs owner approval; recovery stays manual.
+- [ ] Commander-owned inclusive GPT-6.1 Sol high review from full base
+  `d3ccbc17d3f8344d466015fac580cd0fe3b60269` to the fixed final head. The
+  final candidate must pass the mandatory Rust and documentation checks.
+- [ ] Controlled old/new stage timing comparison, with binaries alternated
+  on one host and filesystem (N1). Historical and new-candidate synthetic
+  observations are separate records, not a speed-up or SLO.
+- [ ] Wired-head Git heading latency and child-count matrix (L2, N3).
+- [ ] Real-disk reader discovery with independent pane/candidate counts
+  (L4, N4); the historical matrix is tmpfs-only.
+- [ ] Stuck-worker frequency using the connected diagnostics (L5). Bounded
+  channel fixtures are not OS-stall or live-frequency measurements.
+- [ ] Remaining sequence-window failure rows: kernel crash/power loss,
+  concurrent ensure or second allocator, competing same-source writer,
+  config change during refresh, old-binary rollback, macOS disks (L1/N2).
+- [ ] Font check-then-rename and check-then-unlink races (H1, M1). Closing
+  them needs an owner-approved design; partial-state recovery stays manual.
 
-## Conditional (not obligations)
+## Conditional
 
-Start only when the stated condition is met.
+Start only when the named condition is met; these are not obligations.
 
-- Refresh period or event-driven refresh (L6): needs an event-to-visible
-  definition and a Linux and macOS measurement without a live Herdr (N5).
-- Whole-refresh deadline (L3): needs a written contract that keeps sequence
-  durability and endpoint identity.
-- `statusline --then` and `configure` child timeouts or direct exec (L7):
-  needs a host deadline, recovery, and compatibility contract.
-- Socket connection reuse (L8): needs a syscall trace and an adversarial
-  replacement fixture; path identity stays.
-- Reader process isolation (L5): needs a measured stuck-worker frequency.
+- Period/event-driven refresh (L6/N5): event-to-visible definition and Linux
+  and macOS measurements without contacting a live Herdr.
+- `statusline --then` / `configure` child timeouts or direct exec (L7): host
+  deadline, recovery and compatibility contract.
+- Socket reuse (L8): syscall trace and adversarial endpoint replacement
+  fixture, preserving the pathname identity check.
+- Reader process isolation (L5): measured stuck-worker frequency and a
+  resource/privacy/restart contract.
 
-## Separate task
+## Separate Herdr host task
 
-- Agy occupant generation (C2, survey item 15): owner-assigned to a separate
-  Herdr host task. Current behavior and the constraint in
-  `openspec/specs/provider-readers/spec.md` stay; this list never marks it
-  resolved. See `docs/reviews/agy-occupant-generation.md`.
+- [ ] C2 / survey item 15 remains unresolved by owner assignment: distribute
+  occupant generation, apply only to the same generation, and invalidate
+  displayed metadata on replacement. Current pane-bound Agy behavior stays.
+  See `docs/reviews/agy-occupant-generation.md` for the planned host contract.
 
-## Completed in the local integration line (unshipped)
+## Completed in the local candidate (unshipped)
 
-Integrated up to `1787386`; see the coverage table for evidence.
-
-- M2 Kimi `O_CLOEXEC`, M3 Kimi transient stat, M4 exact Grok weekly kinds,
-  C3 Grok credential change, C5 release-gate failure classes.
-- M5 existing-key update and FIFO single eviction.
-- M6 typed publisher stages; M7 typed font journal with separate planning.
-- M8 socket test waits for EOF.
-- C4 doctor capped scan and `readdir` error versus end.
-- L1 endpoint sequence window, poison after an uncertain write, and failure
-  fixtures.
-- L3 refresh duration, histogram, and outcome counts in doctor; per-stage
-  histogram aggregation (production stage samples wait for P); socket
-  absolute-deadline API and refusal of ambiguous reuse.
-- L5 reader-side routing: Codex and Kimi readers use the observed path when a
-  cycle carries diagnostics (no production caller yet).
-- API only, unwired: L2 Git heading cache, L4 `ReadCycle`, L5 reader
-  diagnostics.
-- H1 and M1 partial: automatic rollback removed and a recheck before font
-  removal; the residual races above remain.
+- [x] M2 close-on-exec, M3 transient Kimi stat, M4 exact Grok weekly kinds,
+  C3 credential-change invalidation, C5 release-gate failure categories.
+- [x] M5 existing-key replacement and FIFO single eviction; M6 typed publisher
+  stages; M7 typed font journal/plan; M8 bounded EOF-wait regression; C4
+  capped counts and directory EOF/error distinction.
+- [x] L1 sequence windows, uncertain-write poison and verified failure rows.
+- [x] L2 publisher-owned Git cache, attempt-based fair queue, 1 s cycle Git
+  budget and finite 30 s confirmed fallback. Hit and miss still use three
+  children; no measured speed improvement is claimed.
+- [x] L3 total/stage histograms, production stage samples and counts, shared
+  socket deadlines, default 7 s cooperative refresh envelope and separate
+  deadline skips. Unavailable/legacy diagnostics are distinct from zero.
+- [x] L4 one `ReadCycle` per refresh and actual-reader shared-scan fixtures.
+- [x] L5 all five observed worker producers, control live sampling and doctor
+  output. Hermes has no worker; an empty slot is not a successful read.
+- [x] C1 combined 4,096-entry cap, duplicate-ID refusal and cumulative
+  fallback accounting documented and covered by boundary fixtures.
+- [x] Canonical runtime specs synchronized and change archived; P/D plans
+  record implemented local status.
+- [x] H1/M1 partial mitigation: no automatic rollback, pre-removal recheck;
+  the residual races remain open above.
+- [x] N1 wired synthetic cold-refresh observations: tmpfs and ext4, five pane
+  counts, n=3 each. The new results are separated from historical baselines
+  in `docs/reviews/refresh-stage-latency-2026-10-23.md`; controlled timing
+  comparison remains open above.
