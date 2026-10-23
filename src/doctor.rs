@@ -356,31 +356,49 @@ Refresh stages: unavailable"
         observation.capacity_skip_count
     );
     let histogram = match &observation.duration {
-        Some(stats) => {
-            let buckets = REFRESH_DURATION_BUCKET_LABELS
-                .iter()
-                .zip(stats.histogram)
-                .map(|(label, count)| format!("{label}={count}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("Refresh histogram: {buckets}")
-        }
+        Some(stats) => format!("Refresh histogram: {}", histogram_counts(stats.histogram)),
         None => "Refresh histogram: unavailable".to_owned(),
     };
-    let stages = match observation.stages {
+    let stages = match &observation.stages {
         Some(stages) => format!(
-            "Refresh stage duration: snapshot {} us; git {} us; reader {} us; persist {} us; socket {} us\nRefresh stage counts: reports {}; checkpoints {}",
-            stages.durations.snapshot_us,
-            stages.durations.git_us,
-            stages.durations.reader_us,
-            stages.durations.persist_us,
-            stages.durations.socket_us,
-            stages.counts.reports,
-            stages.counts.checkpoints
+            "{}\n{}\n{}\n{}\n{}\nRefresh stages latest: {}\nRefresh counts: reports {}; checkpoints {}",
+            stage_metrics_line("snapshot", &stages.snapshot),
+            stage_metrics_line("git", &stages.git),
+            stage_metrics_line("reader", &stages.reader),
+            stage_metrics_line("persist", &stages.persist),
+            stage_metrics_line("socket", &stages.socket),
+            if stages.latest_measured {
+                "measured"
+            } else {
+                "unmeasured"
+            },
+            stages.reports,
+            stages.checkpoints
         ),
         None => "Refresh stages: unavailable".to_owned(),
     };
     format!("{duration}\n{attempts}\n{histogram}\n{stages}")
+}
+
+fn histogram_counts(histogram: [u64; crate::daemon::REFRESH_DURATION_BUCKETS]) -> String {
+    REFRESH_DURATION_BUCKET_LABELS
+        .iter()
+        .zip(histogram)
+        .map(|(label, count)| format!("{label}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn stage_metrics_line(label: &str, stats: &crate::daemon::StageDurationStats) -> String {
+    format!(
+        "Refresh stage {label}: count {count}; last {last} us; min {min} us; max {max} us; sum {sum} us\nRefresh stage {label} histogram: {buckets}",
+        count = stats.count,
+        last = stats.duration.last_us,
+        min = stats.duration.min_us,
+        max = stats.duration.max_us,
+        sum = stats.sum_us,
+        buckets = histogram_counts(stats.duration.histogram),
+    )
 }
 
 fn daemon_diagnostic_text(view: &ControlView) -> Result<String, (String, io::Error)> {
@@ -876,9 +894,35 @@ mod tests {
     #[test]
     fn refresh_metrics_use_fixed_labels_and_hide_secrets() {
         use crate::daemon::{
-            REFRESH_DURATION_BUCKETS, RefreshDuration, RefreshStageCounts, RefreshStageDurations,
-            RefreshStages, control_view_from_frame,
+            REFRESH_DURATION_BUCKETS, RefreshDuration, RefreshStageAggregate, StageDurationStats,
+            control_view_from_frame,
         };
+        fn one_stage(duration_us: u64) -> StageDurationStats {
+            let mut histogram = [0; REFRESH_DURATION_BUCKETS];
+            histogram[0] = 1;
+            StageDurationStats {
+                count: 1,
+                sum_us: duration_us,
+                duration: RefreshDuration {
+                    last_us: duration_us,
+                    min_us: duration_us,
+                    max_us: duration_us,
+                    histogram,
+                },
+            }
+        }
+        fn measured_stage_report() -> RefreshStageAggregate {
+            RefreshStageAggregate {
+                snapshot: one_stage(10),
+                git: one_stage(0),
+                reader: one_stage(20),
+                persist: one_stage(30),
+                socket: one_stage(40),
+                latest_measured: true,
+                reports: 2,
+                checkpoints: 1,
+            }
+        }
         let nonce = "a".repeat(64);
         let path = "/tmp/lineup-secret-not-for-doctor.sock";
         let mut legacy = serde_json::json!({
@@ -929,19 +973,7 @@ Refresh stages: unavailable"
                 max_us: 80_000,
                 histogram,
             }),
-            stages: Some(RefreshStages {
-                durations: RefreshStageDurations {
-                    snapshot_us: 10,
-                    git_us: 0,
-                    reader_us: 20,
-                    persist_us: 30,
-                    socket_us: 40,
-                },
-                counts: RefreshStageCounts {
-                    reports: 2,
-                    checkpoints: 1,
-                },
-            }),
+            stages: Some(measured_stage_report()),
         };
         let report = refresh_metrics_report(Some(&observation));
         assert_eq!(
@@ -950,8 +982,18 @@ Refresh stages: unavailable"
 Refresh duration: last 12400 us; min 400 us; max 80000 us
 Refresh attempts: 3; ok 2; error 1; capacity skip 0
 Refresh histogram: <1ms=1 <5ms=0 <10ms=0 <50ms=1 <100ms=1 <500ms=0 <1000ms=0 <5000ms=0 >=5000ms=0
-Refresh stage duration: snapshot 10 us; git 0 us; reader 20 us; persist 30 us; socket 40 us
-Refresh stage counts: reports 2; checkpoints 1"
+Refresh stage snapshot: count 1; last 10 us; min 10 us; max 10 us; sum 10 us
+Refresh stage snapshot histogram: <1ms=1 <5ms=0 <10ms=0 <50ms=0 <100ms=0 <500ms=0 <1000ms=0 <5000ms=0 >=5000ms=0
+Refresh stage git: count 1; last 0 us; min 0 us; max 0 us; sum 0 us
+Refresh stage git histogram: <1ms=1 <5ms=0 <10ms=0 <50ms=0 <100ms=0 <500ms=0 <1000ms=0 <5000ms=0 >=5000ms=0
+Refresh stage reader: count 1; last 20 us; min 20 us; max 20 us; sum 20 us
+Refresh stage reader histogram: <1ms=1 <5ms=0 <10ms=0 <50ms=0 <100ms=0 <500ms=0 <1000ms=0 <5000ms=0 >=5000ms=0
+Refresh stage persist: count 1; last 30 us; min 30 us; max 30 us; sum 30 us
+Refresh stage persist histogram: <1ms=1 <5ms=0 <10ms=0 <50ms=0 <100ms=0 <500ms=0 <1000ms=0 <5000ms=0 >=5000ms=0
+Refresh stage socket: count 1; last 40 us; min 40 us; max 40 us; sum 40 us
+Refresh stage socket histogram: <1ms=1 <5ms=0 <10ms=0 <50ms=0 <100ms=0 <500ms=0 <1000ms=0 <5000ms=0 >=5000ms=0
+Refresh stages latest: measured
+Refresh counts: reports 2; checkpoints 1"
         );
         let mut zero_histogram = [0; REFRESH_DURATION_BUCKETS];
         zero_histogram[0] = 1;
@@ -977,6 +1019,42 @@ Refresh stage counts: reports 2; checkpoints 1"
         assert!(!report.contains("credential"));
         assert!(!report.contains("identity"));
         assert!(!report.contains("usage"));
+        let mut unmeasured = measured_stage_report();
+        unmeasured.latest_measured = false;
+        let kept = refresh_metrics_report(Some(&RefreshObservation {
+            stages: Some(unmeasured),
+            ..observation
+        }));
+        assert!(kept.contains("Refresh stages latest: unmeasured"));
+        assert!(
+            kept.contains("Refresh stage git: count 1; last 0 us; min 0 us; max 0 us; sum 0 us")
+        );
+        assert!(kept.contains("Refresh stage git histogram: <1ms=1 "));
+        assert!(!kept.contains(&nonce));
+        assert!(!kept.contains(path));
+        legacy["refresh_observation"] = serde_json::json!({
+            "attempt_count": 1,
+            "success_count": 1,
+            "error_count": 0,
+            "capacity_skip_count": 0,
+            "duration": {"last_us": 0, "min_us": 0, "max_us": 0, "histogram": [1, 0, 0, 0, 0, 0, 0, 0, 0]},
+            "stages": {
+                "durations": {
+                    "snapshot_us": 1,
+                    "git_us": 1,
+                    "reader_us": 1,
+                    "persist_us": 1,
+                    "socket_us": 1
+                },
+                "counts": {"reports": 1, "checkpoints": 1}
+            }
+        });
+        let legacy_stages = control_view_from_frame(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy_report = refresh_metrics_report(legacy_stages.observation.as_ref());
+        assert!(legacy_report.contains("Refresh duration: last 0 us"));
+        assert!(legacy_report.ends_with("Refresh stages: unavailable"));
+        assert!(!legacy_report.contains("Refresh stage snapshot"));
+        assert!(!legacy_report.contains(&nonce));
     }
 
     #[test]
@@ -1018,8 +1096,11 @@ Refresh stage counts: reports 2; checkpoints 1"
         .unwrap_err();
         assert_eq!(failed.1.to_string(), "daemon refresh is unhealthy");
         assert!(failed.0.starts_with("Refresh duration: last 200 us"));
+        assert!(failed.0.contains("Refresh histogram: <1ms=1 "));
+        assert!(failed.0.contains("Refresh stages: unavailable"));
         assert!(!failed.0.contains("last refresh"));
         assert!(!failed.0.contains(&health.nonce));
+        assert!(!failed.0.contains(&health.socket_path.display().to_string()));
         health.refresh_failed = false;
         health.last_refresh_ms = None;
         let starting = daemon_diagnostic_text(&ControlView {
