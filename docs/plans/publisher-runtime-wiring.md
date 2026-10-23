@@ -1,9 +1,31 @@
 # Publisher runtime wiring plan
 
-**Status:** design candidate only. No production code implements any part of
-it. The commander's decisions in `note-publisher-design-decisions-01` are
+**Status:** task P implemented on branch `worktree-publisher-runtime-impl`
+(base `1787386`), not yet reviewed or integrated. Task D is not started. The
+commander's decisions in `note-publisher-design-decisions-01` are
 incorporated. Design GO on `86ea771` (`note-publisher-design-go-handoff-01`).
-Implementation starts only with a new task.
+The spec delta is `openspec/changes/wire-publisher-runtime/`.
+
+Task P differs from the text below in these points, each approved by the
+commander:
+
+- Deadline skips are not added to `RefreshObservation`. They travel in a
+  separate optional control field, `refresh_deadline_skips`, so older peers
+  keep parsing the frame and doctor's existing literals stay valid
+  (`note-publisher-runtime-api-go-01`). Deadline-skip attempts are in the
+  attempt total, duration and stage histograms, but not in the success, error
+  or capacity counts. A mixed cycle keeps both counts.
+- `ControlView` is unchanged; `daemon::deadline_skips_from_frame` is the typed
+  seam that task D consumes.
+- Task P already builds each refresh's `ReadCycle` with the publisher-owned
+  `Arc<ReaderDiagnostics>`. Task D only exposes the snapshots.
+- Clear also passes its own three-second deadline to the socket calls.
+- An Unknown heading publishes null for all three workspace keys.
+- `ship_time::read_repository_controlled` keeps a local `allow(dead_code)` as
+  the compatible uncached seam (touching approval for `src/ship_time.rs`).
+- F10 checks that both panes of a refresh share one cycle and that each
+  refresh starts from an empty one; reuse of the scan inside a refresh is the
+  reader's choice, as the reader tests already allow.
 
 **Base:** local integration `64ace031ab5b17615a2cebef46f916bf4defd79c`.
 
