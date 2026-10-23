@@ -690,7 +690,6 @@ struct RefreshInventory {
     codex_weekly: Option<model::WeeklySample>,
     grok_weekly: Option<model::WeeklySample>,
     kimi_weekly: Option<model::WeeklySample>,
-    deadline: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -1411,8 +1410,6 @@ impl MetadataPublisher {
             .into_iter()
             .map(String::from)
             .collect();
-        // A single budget for the cycle prevents N panes multiplying the reader wait.
-        let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
         Ok(RefreshInventory {
             snapshot,
             now_unix,
@@ -1421,7 +1418,6 @@ impl MetadataPublisher {
             codex_weekly,
             grok_weekly,
             kimi_weekly,
-            deadline,
         })
     }
 
@@ -1493,6 +1489,7 @@ impl MetadataPublisher {
         inventory: &RefreshInventory,
         config: &Config,
         pane: &protocol::Pane,
+        deadline: Instant,
         codex: &dyn UsageReader,
         grok: &dyn UsageReader,
     ) -> io::Result<PaneObservation> {
@@ -1550,7 +1547,7 @@ impl MetadataPublisher {
                 home,
                 now,
                 max_age: Duration::from_millis(config.usage_max_age_ms),
-                timeout: inventory.deadline.saturating_duration_since(Instant::now()),
+                timeout: deadline.saturating_duration_since(Instant::now()),
                 shutdown: self.shutdown.as_deref(),
             };
             let missing_home = (who.agent == Agent::Grok && self.homes.grok.is_none())
@@ -1789,9 +1786,12 @@ impl MetadataPublisher {
         let headings = self.resolve_headings(&inventory)?;
         let mut skipped_resources = 0u64;
 
+        // A single budget for the cycle prevents N panes multiplying the reader wait.
+        let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
+
         for pane in &inventory.snapshot.panes {
             self.check_shutdown()?;
-            let observation = self.observe_pane(&inventory, config, pane, codex, grok)?;
+            let observation = self.observe_pane(&inventory, config, pane, deadline, codex, grok)?;
             self.check_shutdown()?;
             let report = self.plan_pane_report(&inventory, config, &headings, observation)?;
             if let Some(skip) = self.send_pane_report(transport, &report)? {
@@ -5135,6 +5135,105 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         // Earlier fast pane was already published and acknowledged before second reader shutdown.
         assert_eq!(received_panes, vec!["w1:p1"]);
+    }
+
+    #[test]
+    fn slow_heading_does_not_consume_reader_timeout_budget() {
+        if let Some(root) = std::env::var_os("LINEUP_TEST_SLOW_HEADING") {
+            let root = PathBuf::from(root);
+            let recorded_timeout = Arc::new(std::sync::Mutex::new(None));
+            let recorded = recorded_timeout.clone();
+            struct RecordingReader(Arc<std::sync::Mutex<Option<Duration>>>);
+            impl UsageReader for RecordingReader {
+                fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                    *self.0.lock().unwrap() = Some(request.timeout);
+                    TimeoutReader.read(request)
+                }
+            }
+            let socket = root.join("slow-heading.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server_root = root.clone();
+            let server = std::thread::spawn(move || {
+                let mut stream = OneShotServer::new(listener, Duration::from_millis(1000));
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                writeln!(stream.get_mut(), "{}", json!({"id":request["id"],"result":{
+                    "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                    "workspaces":[{"workspace_id":"w1","checkout_path":server_root.to_str().unwrap()}],
+                    "panes":[{
+                        "pane_id":"w1:p1","workspace_id":"w1","agent":"codex",
+                        "agent_session":{"agent":"codex","kind":"id","value":"synthetic-native"},"agent_status":"idle"
+                    }]}
+                }})).unwrap();
+                loop {
+                    line.clear();
+                    if stream.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    writeln!(
+                        stream.get_mut(),
+                        "{}",
+                        json!({"id":request["id"],"result":{"type":"ok"}})
+                    )
+                    .unwrap();
+                }
+            });
+            let mut transport = Transport::connect(&socket).unwrap();
+            let mut publisher = MetadataPublisher::new(
+                root.join("state"),
+                "fake".into(),
+                Homes {
+                    codex: Some(root.join("synthetic-home")),
+                    ..Homes::default()
+                },
+            )
+            .unwrap();
+            let config = Config {
+                reader_timeout_ms: 100,
+                ..Config::default()
+            };
+            let result = publisher.refresh_with_readers(
+                &mut transport,
+                &config,
+                &RecordingReader(recorded),
+                &TimeoutReader,
+            );
+            drop(transport);
+            server.join().unwrap();
+            assert!(result.is_ok(), "refresh failed: {:?}", result);
+            let captured = recorded_timeout.lock().unwrap().unwrap();
+            // Git mock slept for ~150ms. If reader deadline were computed before resolve_headings,
+            // the 100ms reader budget would have expired before the first reader even began.
+            assert!(
+                captured > Duration::from_millis(70),
+                "reader timeout was consumed by headings stage: {captured:?}"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let script = bin.join("git");
+        crate::test_support::write_executable(&script, "#!/bin/sh\n/bin/sleep 0.15\nexit 1\n")
+            .unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "publish::tests::slow_heading_does_not_consume_reader_timeout_budget",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", &bin)
+            .env("LINEUP_TEST_SLOW_HEADING", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
