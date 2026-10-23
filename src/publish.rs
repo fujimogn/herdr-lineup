@@ -2395,6 +2395,20 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
+        let wait_diagnostic = |pattern: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let diagnostics = crate::quota_diagnostic::weekly_diagnostics(&state);
+                if diagnostics.contains(pattern) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for diagnostic {pattern}: {diagnostics}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
         let publish = |script: &BTreeMap<String, FixtureReply>| {
             let bytes = serde_json::to_vec(script).unwrap();
             let temporary = replies.with_extension("tmp");
@@ -2418,7 +2432,7 @@ mod tests {
         publisher.start_weekly(&enabled).unwrap();
         let sample = wait_percent(&publisher, 25.0);
         assert!(sample.resets_at.is_some());
-        assert!(crate::quota_diagnostic::weekly_diagnostics(&state).contains("kimi=ok"));
+        wait_diagnostic("kimi=ok");
         assert!(
             publisher
                 .kimi_weekly
@@ -2461,7 +2475,7 @@ mod tests {
         script.insert("phase-resetless".into(), FixtureReply::status(500));
         publish(&script);
         wait_cleared(&publisher);
-        assert!(crate::quota_diagnostic::weekly_diagnostics(&state).contains("kimi=transient"));
+        wait_diagnostic("kimi=transient");
 
         let reset =
             chrono::DateTime::<chrono::Utc>::from(SystemTime::now() + Duration::from_secs(4))
