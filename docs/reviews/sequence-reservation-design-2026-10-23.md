@@ -210,7 +210,7 @@ process; a real power loss or kernel crash was not simulated.
 | Process exits with unused slots | `process_exit_after_reservation_discards_unused_window`: a self-spawned test child reserves a 32-slot window, sends seq 1, and calls `process::exit` without `Drop`; the parent's new instance sends seq 33. |
 | Shutdown-clear deadline after reservation | `clear_deadline_after_reservation_burns_the_unsent_seq`: `report` with an expired deadline reserves and allocates seq 1, then sends nothing; the next report uses seq 2 and a restart uses seq 33. |
 | Pruning write fails | `failed_pruning_persist_poisons_refresh_clear_and_reconnect`: the poison survives refresh, `reconnected`, and clear; only a new instance sends again, above the old bound. |
-| Lost checkpoint (negative control) | Same test: a publisher without the checkpoint sends `seq = 1`, which is answered `ok` but not applied. |
+| Lost checkpoint (negative control) | `stale_sequence_server_applies_reports_across_window_restart_and_reuse`: a publisher without the checkpoint sends `seq = 1`, which is answered `ok` but not applied. |
 | Error response | `rejected_report_burns_sequence_and_clear_preserves_other_keys`: the next report uses a fresh number. |
 | Endpoint replaced | `checkpoint_pruning_persists_floor_and_drops_replaced_endpoint`. |
 | Overflow | `checked_overflow_fails_closed_in_reservation_and_allocation`, `reservation_checked_overflow_fails_closed_before_send`. |

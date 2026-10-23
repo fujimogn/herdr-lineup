@@ -4,13 +4,20 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
-Development after v0.2.2 updates CI, release tooling, the locked dependency set, and three P2 fixes.
+Development after v0.2.2 updates CI, release tooling, and the locked dependency set, and carries fixes from the 2026-10-23 reviews. None of it is released.
 
 - Fix: **Kimi weekly quota** adds end-to-end wiring tests and shares reset and retention helpers across providers while removing the unused `WeeklyWorker` sample cache. Credential-change handling remains provider-specific and is covered by the Kimi wiring tests.
 - Fix: **Font apply** compares planned original bytes before each write and refuses observed external edits. After the `pending` journal is written, a later failure leaves earlier writes, any partially written font, and the journal for manual recovery; it does not automatically delete or roll back files. An external edit between a check and a rename or unlink can still race the action.
-- Performance: **Codex and Kimi fingerprint cache** is shared in one implementation, reducing duplicate cache code while preserving duplicate and symlink rejection and the 4,096-entry traversal boundary.
+- Fix: **Kimi local reads** open session directories and files with close-on-exec, so child processes do not inherit those descriptors.
+- Fix: **Kimi weekly quota** keeps the last weekly value until its expiry when the credential file cannot be checked because of a transient I/O or permission error; a confirmed missing or changed file still clears it.
+- Fix: **Grok weekly quota** accepts only the confirmed period names `WEEKLY` and `BILLING_PERIOD_TYPE_WEEKLY`; other names such as `NON_WEEKLY` or `BIWEEKLY` stay unavailable. After an observed credential switch, the previous account's weekly value is cleared and cannot be published again.
+- Fix: **Doctor** marks a statusLine count that reached the 1,024-entry scan limit as counted in scanned entries, and reports `scan incomplete` instead of a partial count when the directory read fails.
+- Feature: **Doctor** reports the duration of the latest refresh, its minimum and maximum, a fixed duration histogram, and refresh outcome counts. `last refresh ... ms after startup` remains the time since daemon start.
+- Performance: **Publisher** reserves sequence numbers per endpoint in windows and syncs the checkpoint once per window instead of before every report. If a checkpoint write may have been left incomplete, the daemon stops publishing until it is restarted, so a number that may have reached Herdr is never reused.
+- Performance: **Codex and Kimi fingerprint cache** is shared in one implementation, reducing duplicate cache code while preserving duplicate and symlink rejection and the 4,096-entry traversal boundary. Updating an existing entry no longer empties a full cache, and a new entry evicts only the oldest one.
 - Maintenance: **CI** runs light checks on pushes to `develop` and on pull requests: Actionlint, gitleaks, formatting, Clippy, and `cargo test` (unit, integration, and doc tests). Pushes to `main` and `v*` tags keep the full checks, including the release build, binary-license check, CLI help, version and release-note gates, and the dependency audit.
-- Maintenance: **Release tooling** pins develop-tools to 0.6.2, takes English release notes from the dated changelog section, and runs the release version check from the pre-push hook on a tag-only push.
+- Maintenance: **Release tooling** pins develop-tools to 0.6.2, takes release notes from a nonempty annotated tag message and otherwise from the dated changelog section, and runs the release version check from the pre-push hook on a tag-only push.
+- Maintenance: **Release gate** reports rate limits, authentication failures, missing resources, server errors, and connection failures from the GitHub API as separate messages without printing response bodies.
 - Maintenance: **Dependencies** refresh nine locked crates, including ureq 3.5.0 and webpki-roots 1.0.11, for the pinned Rust 1.99.1 toolchain.
 
 ## 0.2.2 (2026-10-21)

@@ -1,9 +1,9 @@
-# Review follow-up coverage (2026-10-23)
+# Review follow-up coverage (2026-10-23 reviews)
 
 This record maps every adopted, conditional, and rejected finding from the
-2026-10-23 whole-repository review and latency investigation onto local
-candidate `96829df7e6fc51af327b448f5b8b3596f0a96d3f`. It does not accept,
-integrate, or ship that candidate.
+2026-10-23 whole-repository review and latency investigation onto the local
+integration snapshot named below. It does not accept, integrate, push, or
+ship that snapshot.
 
 The review originals live outside the repository:
 
@@ -11,148 +11,124 @@ The review originals live outside the repository:
 - `reviews/latency-2026-10-23/consolidated.md`
 - `reviews/implementation-queue-2026-10-23.md`
 
-Those files are the primary evidence for what the reviews said. Line numbers
-below were read from the candidate with `git show 96829df7e6fc51af327b448f5b8b3596f0a96d3f:path`.
-Uncommitted work in other worktrees, including
-`.claude/worktrees/refresh-measure-resume`, is not evidence that a finding is
-done. `develop` and `origin/develop` are `d3ccbc17d3f8344d466015fac580cd0fe3b60269`,
-which does not contain this candidate. Shipment stays on hold.
+Those files are the primary evidence for what the reviews said. This record
+keeps only the finding ID, the code evidence, the remaining limit, and the
+judgment condition.
+
+## Source snapshot
+
+- Source snapshot: `d95e5b5b9fe703e5e0259887d47a52470d6055a2`, the commander's
+  latest local integration. Line numbers and commit IDs below were read from
+  that commit. A later documentation commit is not an implementation SHA.
+- Review target of both reviews: `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`.
+  The previous version of this record used `96829df7e6fc51af327b448f5b8b3596f0a96d3f`.
+- `develop` and `origin/develop` are `b9d1a6d290d7a153f4743d284a5d9839d1658233`
+  (a hook configuration move, `d3ccbc17..b9d1a6d`). Neither contains the
+  snapshot. The commander integrates the two lines.
+- `Cargo.toml` and `herdr-plugin.toml` stay at 0.2.2. Nothing below is
+  released. Shipment stays on hold until the owner lifts it.
+- Work in progress on other lanes (stage-histogram fix, publisher wiring of
+  the Git cache and shared deadlines, reader and diagnostics wiring) is not in
+  the snapshot and is not counted here.
 
 ## Status classes
 
 | Class | Meaning | Completion rule |
 | --- | --- | --- |
-| `fixed-in-candidate` | The reviewed behavior is present at the candidate and a regression check exists in tree. | Not shipped. Do not describe it as released or as independently reviewed for shipment. |
-| `partial` | Part of the finding is in the candidate. The named remainder is still open. | Do not mark the finding closed. |
-| `measurement-only` | An isolated fixture result is recorded. Product behavior is unchanged. | Do not treat the numbers as a budget or as a macOS or live Herdr result. |
-| `design-only` | A contract is written and explicitly not implemented. | Do not implement from the prose alone, and do not mark the design as approved behavior. |
-| `unimplemented` | The candidate still has the reviewed shape. | A later change needs its own regression evidence. |
+| `fixed-in-candidate` | The reviewed behavior is present at the snapshot and a regression check exists in tree. | Not shipped. Do not describe it as released or as accepted by the ship gate. |
+| `partial` | Part of the finding is in the snapshot. The named remainder is still open. | Do not mark the finding closed. |
+| `api-unwired` | A tested internal API exists at the snapshot, but production refresh does not call it. | Do not claim a runtime effect until the wiring lands with its own evidence. |
+| `measurement-only` | An isolated fixture result is recorded. Product behavior is unchanged. | Do not treat the numbers as a budget, a speed-up, or a macOS or live Herdr result. |
+| `conditional` | The review proposed it only under a condition that is not met. | Not an implementation obligation. Keep the reason and the open condition. |
+| `separate-task` | Owner-assigned to a different task outside this follow-up. | Keep current behavior and the open item. Never mark it resolved here. |
 | `spec-waiting` | The safe behavior is not decided. | Do not code a guess, and do not mark the row done. |
 | `rejected-wrong-basis` | The original claim does not match the reviewed code. | Keep the rejection. Do not reopen it as an implementation task. |
 
 ## Whole-repository findings
 
-Review target: `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`. Agreement denominator: 4.
+Agreement denominator: 4.
 
-| ID | Status | Evidence at the candidate | Remaining work | Planned owner | Doc update | Judgment condition |
-| --- | --- | --- | --- | --- | --- | --- |
-| H1 font rollback can restore pre-write bytes over a later external edit | `partial` | `f319f52` and `ead231d` stop automatic rollback. On failure, `src/font.rs:526-530` reports that no automatic rollback or deletion was attempted and names the journal for manual inspection. `CHANGELOG.md` Unreleased and survey item 16 say the same. | Check-then-rename and check-then-unlink races remain. `src/font.rs:486-491` stamps the font and then calls `remove_file`. `docs/reviews/font-atomicity-policy-2026-10-23.md` still says the conservative policy was not implemented; that sentence is stale against this candidate and must be corrected in a later docs commit. | No current lane. Do not reopen destructive recovery unless the owner asks. | `CHANGELOG.md` already describes the no-rollback policy. Later: correct the stale policy doc under `docs/reviews/`. | Closed only if a test shows an external edit made after a successful owned write survives a later failure, and the doc no longer claims an atomic rename. The residual race stays open until an owner-approved design says otherwise. |
-| M1 uninstall can delete a font replaced after the content check | `partial` | `75865cd` rechecks identity immediately before removal: `src/font.rs:485-491` calls `before_font_remove`, compares `stamp` with `original_font`, and conflicts on mismatch. | A replacement after that stamp and before `remove_file` can still be deleted. The policy doc records this gap. | No current lane. | Same stale policy doc as H1. Survey item 16 already states the race. | Not closed while removal is a separate pathname operation. A future fix needs an injected replacement after the recheck hook. |
-| M2 Kimi `openat` lacked `O_CLOEXEC` | `fixed-in-candidate` | `2aa1ddc`. `src/reader_kimi.rs:203-204` ORs `O_CLOEXEC` into both directory and file `openat` calls. The commit is inside the local Sol high code range below. That read found no implementation blocker for `O_CLOEXEC`. | No product change and no reimplementation. The local read is not a queue acceptance. | `lane_commander`, final inclusive review in the plan. | `CHANGELOG.md` Unreleased does not mention this fix. Add one bullet when the integration candidate is documented. | The code stays fixed while both `openat` sites keep `O_CLOEXEC`. The review gap stays open until that commander review is GO. Do not treat the local read as shipped. |
-| M3 Kimi transient credential stat cleared the weekly sample | `fixed-in-candidate` | `800cef5`. `src/quota_kimi.rs:280-283` and `:347-361` return `SourceState::Transient` for non-`NotFound` stat errors. `src/publish.rs:317` does not treat credential-less transient state as a stamp change. Regression: `source_state_distinguishes_present_missing_symlink_and_transient_permission_error`. The commit is inside the same local Sol high code range as M2. | No product change and no reimplementation. The local read is not a queue acceptance. | `lane_commander`, same final inclusive review as M2. | Add a CHANGELOG bullet with the integration docs. | The code stays fixed while transient I/O keeps the previous sample until expiry and a confirmed missing file can still clear it. The review gap stays open until the commander review is GO. |
-| M4 Grok weekly kind used substring match | `fixed-in-candidate` | `2aa1ddc` and `bd83a22`. `src/quota_grok.rs:306-308` accepts only `WEEKLY` and `BILLING_PERIOD_TYPE_WEEKLY`. Tests cover `NON_WEEKLY`, `BIWEEKLY`, and `WEEK`. | None unless a real API adds another confirmed weekly name. | None. | CHANGELOG bullet plus `SECURITY.md` if the shipped text still describes `contains`. | Stays fixed only while unknown kinds stay unavailable. Do not widen the match without a confirmed API name. |
-| M5 full fingerprint cache cleared on an existing-key update | `partial` | `ea41b3c`. `src/reader_cache.rs:26-31` clears only when the key is new and `len >= limit`. `full_cache_updates_existing_key_without_clearing_other_entries` covers the reviewed case. | A new key at capacity still clears every entry (`src/reader_cache.rs:88-92`). The review asked for a measured eviction choice before keeping that full clear. No hit-rate measurement is recorded. | Commander assigns after measurement. Not part of the current four lanes. | CHANGELOG should mention the existing-key fix and say the new-key full clear is still unmeasured. | The reviewed bug is fixed. The finding is closed only after a recorded measurement either keeps the full clear or replaces it, with a test at the limit. |
-| M6 `refresh_with_readers` mixes inventory, heading, observation, desired report, and send | `unimplemented` | `src/publish.rs:1264-1302` still enters `refresh_with_readers_inner`. Per-report `persist` remains at `src/publish.rs:1191-1193`. | Split into explicit snapshot, heading, observation, desired-report, and send stages without changing sequence reservation, capacity skip, partial reader failure, in-flight generation, or ambiguous-response stop. | `lane_sequence` assignment `asg_publisher_stages`, in progress on its own worktree. This coverage commit does not count that work. | Stage names belong in the publisher spec only after the split lands. | Done only when the stage types are in the reviewed diff and the existing boundary tests pass. A file split that preserves one mixed procedure is not enough. |
-| M7 font journal invariants live in dynamic JSON | `unimplemented` | `src/font.rs:200` still requires `font_owned` to be a JSON boolean and returns `serde_json::Value`. Pending refusal is `src/font.rs:317`. | Type the journal and entries at load. Keep version 1, unknown fields, pending refusal, original bytes, and manual recovery. Do not change the no-automatic-rollback policy. | `lane_font` assignment `asg_font_journal_types`, in progress on its own worktree. | Survey item 16 stays as written until the typed load boundary exists. | Done only when malformed journals fail at load, version and unknown fields survive, and pending state still refuses another action. |
-| M8 socket reconnect test required an immediate EOF | `fixed-in-candidate` | `ea41b3c`. `src/socket.rs:376-386` waits until a 500 ms monotonic deadline for `check_connection` to observe peer EOF, then checks endpoint identity. | Re-run the default parallel test on the final integration head before shipment. This record did not re-run it. | None for the code change. | CHANGELOG bullet with the integration docs. | Stays fixed only while the test waits for EOF and still rejects a replaced socket path. |
+| ID | Status | Evidence at the snapshot | Remaining limit | Judgment condition |
+| --- | --- | --- | --- | --- |
+| H1 font rollback can restore pre-write bytes over a later external edit | `partial` | `f319f52`, `ead231d`: automatic rollback is gone. `src/font.rs:608` and `:650` keep partial files and report that no automatic rollback or deletion was attempted, naming the journal for manual recovery. Planned original bytes are compared before each write. | Each check stays separate from the following pathname `rename`, so an external edit between them can still be replaced. Recovery after a failure is manual, never automatic. | Not closed while a check and its `rename` are separate operations. A closing design needs owner approval. |
+| M1 uninstall can delete a font replaced after the content check | `partial` | `75865cd`: `src/font.rs:632-638` calls `before_font_remove`, compares `stamp` with the planned original, conflicts on mismatch, and only then calls `remove_file`. | A replacement after that stamp and before `remove_file` can still be deleted. | Same as H1: not closed while removal is a separate pathname operation. |
+| M2 Kimi `openat` lacked `O_CLOEXEC` | `fixed-in-candidate` | `2aa1ddc`. `src/reader_kimi.rs:214-215` ORs `O_CLOEXEC` into the shared `openat` helper used for the directory and the file. | None in code. | Stays fixed while every `openat` in that reader keeps `O_CLOEXEC`. |
+| M3 Kimi transient credential stat cleared the weekly sample | `fixed-in-candidate` | `800cef5`. `src/quota_kimi.rs` returns `SourceState::Transient` for non-`NotFound` stat errors; publication does not treat that as a stamp change. Regression: `source_state_distinguishes_present_missing_symlink_and_transient_permission_error`. | None in code. | Stays fixed while transient I/O keeps the sample until expiry and a confirmed missing file still clears it. |
+| M4 Grok weekly kind used substring match | `fixed-in-candidate` | `2aa1ddc`, `bd83a22`. `src/quota_grok.rs:308` accepts only `WEEKLY` and `BILLING_PERIOD_TYPE_WEEKLY`. Tests cover `NON_WEEKLY`, `BIWEEKLY`, and `WEEK`. `SECURITY.md` states the exact rule. | Another confirmed API name would need its own change. | Stays fixed while unknown kinds stay unavailable. |
+| M5 full fingerprint cache cleared on an existing-key update | `fixed-in-candidate` | `ea41b3c` replaces an existing key in place. `2c162fb` evicts one entry in insertion (FIFO) order for a new key at capacity (`src/reader_cache.rs:35-45`). Tests: `full_cache_updates_existing_key_without_clearing_other_entries`, `capacity_boundaries_preserve_all_but_the_oldest_entry`, `fixed_trace_preserves_hot_entries_during_new_key_churn`. | The fixed 128-entry trace records 4,096 hits / 64 misses for FIFO against 4,032 / 128 for the old full clear. That is a deterministic trace only, not a runtime hit-rate or speed claim. | Stays fixed while an update never evicts and a new key evicts exactly one entry. |
+| M6 `refresh_with_readers` mixes inventory, heading, observation, desired report, and send | `fixed-in-candidate` | `90c0630`, `e5555ec`, `6d357ad`: `refresh_cycle_with_readers` (`src/publish.rs:1438`) passes typed stages (`RefreshInventory`, `Headings` from `resolve_headings`, per-pane observations, send). Sequence, capacity-skip, and ambiguous-response behavior are kept by the existing boundary tests. | None for the split. Later wiring tasks add to these stages. | Stays fixed while the stages remain typed and the boundary tests pass. |
+| M7 font journal invariants live in dynamic JSON | `fixed-in-candidate` | `885194b`: `load_journal` returns a typed `OwnershipJournal` (`src/font.rs:241`), planning (`JournalPlan`) is separate from `apply`, and `pending_presence_always_requires_manual_recovery` keeps the refusal. The no-rollback policy is unchanged. | The H1 and M1 residual races are unchanged by typing. | Stays fixed while malformed journals fail at load and pending state still refuses another action. |
+| M8 socket reconnect test required an immediate EOF | `fixed-in-candidate` | `ea41b3c`: the test waits up to a 500 ms monotonic deadline for `check_connection` to observe EOF, then checks endpoint identity. | Re-run the default parallel suite on the final integration head before shipment. | Stays fixed while the test waits for EOF and still rejects a replaced socket path. |
 
-## Conditional findings
+## Conditional and specification findings
 
-| ID | Status | Evidence at the candidate | Remaining work | Planned owner | Doc update | Judgment condition |
-| --- | --- | --- | --- | --- | --- | --- |
-| C1 Codex `sessions` and `archived_sessions` share one 4,096 entry budget | `spec-waiting` | `src/model.rs:46` `MAX_DIRECTORY_ENTRIES = 4096`. `src/reader_codex.rs:80` spends that budget on `archived_sessions` as well. The shared cap is still intentional until specified. | Choose per-root versus shared cap, and the duplicate-id rule, before editing the limit. Add 4,096+1 and duplicate-id tests only for the chosen rule. | Commander, after `lane_git_reader` finishes the separate Git contract. Reader discovery measurement is `measurement-only` and does not decide the cap. | `docs/reviews/2026-10-18-survey.md` item 18 stays partial. TODO: record the chosen cap. Do not mark item 18 implemented. | Done only when the spec names the cap and a fixture exceeds it without dropping an already accepted session unless the spec says to drop it. |
-| C2 Agy statusLine observations stay bound to a pane id across occupant replacement | `spec-waiting` | Survey item 15 is still Open. No occupant generation is read. | Confirm which occupant generation Herdr exposes. Design the binding before changing `src/reader_agy.rs`. | Commander. No current lane. | Survey item 15 stays Open. | Done only when a fixture swaps occupants in one pane and B cannot observe A's sample after refresh and restart. Unknown generation must fail closed. |
-| C3 Grok transient HTTP failure after a credential switch kept the previous sample | `fixed-in-candidate` | `6551aa7`, clarified by `43ea14e` and `12f4584`. `src/publish.rs:197-203` clears the sample when the observed `SourceStamp` changes and bumps `generation`. `publish` accepts a new sample only for the same generation and source (`src/publish.rs:213-216`). Those commits are inside the local Sol high code range below. That read checked credential changes, shared sample invalidation, and in-flight generation, and found no additional implementation blocker. | No product change and no reimplementation. The chosen contract is immediate clear on observed source change. The local read is not a queue acceptance. | `lane_commander`, same final inclusive review as M2. | CHANGELOG does not mention the clear. Add a bullet. Do not reopen the restart-versus-generation question unless the owner rejects this contract. | The code stays fixed while a changed stamp cannot publish the previous account's sample. The review gap stays open until the commander review is GO. |
-| C4 `doctor` statusLine count stops at 1,024 entries but looked exact | `partial` | `5fe4ad6`. `src/doctor.rs:47-51` says `in scanned entries` and `scan limit reached` when the scan stops early. | `readdir` still treats a null pointer as the end (`src/doctor.rs:95-99`) and does not distinguish an error from a clean end. | Commander, low priority, after the current wave. | README already describes the scan cap. CHANGELOG should mention the capped doctor line. | The display finding is fixed. The row is closed only if error-versus-end is either implemented or explicitly left out of scope by the commander. |
-| C5 release-gate GitHub API failures collapsed to one message | `fixed-in-candidate` | `380b770`. `scripts/check-release-gate.sh:33-49` separates rate limit, authentication, 404, 5xx, and connection failure. Unclassified failures still say `cannot read CI workflow runs`. Shell fixture: `scripts/test-check-release-gate.sh`. | None unless a new failure class is specified. Do not print response bodies. | None. | CHANGELOG bullet for the classifier. | Stays fixed only while the classified messages stay free of response bodies and the shell fixture passes. This record did not re-run it. |
+| ID | Status | Evidence at the snapshot | Remaining limit | Judgment condition |
+| --- | --- | --- | --- | --- |
+| C1 Codex `sessions` and `archived_sessions` share one 4,096-entry budget | `spec-waiting` | `src/model.rs` `DiscoveryKind::Codex` walks both roots under one budget. `894d2f2` keeps consumed budget during fallback scans. | Choose per-root or shared cap and the duplicate-ID rule before editing the limit. Survey item 19 stays partial. | Done only when the spec names the cap and a fixture over the cap behaves as specified. |
+| C2 Agy statusLine observations stay bound to a pane across occupant replacement | `separate-task` | `docs/reviews/agy-occupant-generation.md` (`8af53c1`, `6f02a36`) records the host limits; `openspec/specs/provider-readers/spec.md` states the current constraint. No occupant generation is read. | The owner assigned host generation, conditional apply, and retirement on replacement to a separate Herdr host task. Current behavior is kept. Survey item 15 stays Open. | Never resolved by this follow-up. Done only when a fixture swaps occupants in one pane and B cannot observe A's sample after refresh and restart, with unknown generation failing closed. |
+| C3 Grok transient HTTP failure after a credential switch kept the previous sample | `fixed-in-candidate` | `6551aa7`, `43ea14e`, `12f4584`: an observed `SourceStamp` change clears the sample and bumps the generation; a sample is accepted only for the same generation and source. | Contract chosen: immediate clear on an observed source change. | Stays fixed while a changed stamp cannot publish the previous account's sample. |
+| C4 `doctor` statusLine count stopped at 1,024 entries but looked exact | `fixed-in-candidate` | `5fe4ad6` marks a capped scan (`in scanned entries`, `scan limit reached`). `3576412` treats a null `readdir` as EOF only when `errno` stays clear and prints `StatusLine records: scan incomplete` on a read or `fstat` error (`src/doctor.rs:41-90`). `0fe9f37` isolates the fd-release check. | None. | Stays fixed while a partial count is never printed as exact. |
+| C5 release-gate GitHub API failures collapsed to one message | `fixed-in-candidate` | `380b770`: `scripts/check-release-gate.sh` separates rate limit, authentication, 404, 5xx, and connection failure without printing response bodies. Fixture: `scripts/test-check-release-gate.sh`. | None unless a new class is specified. | Stays fixed while messages stay free of response bodies and the fixture passes. |
 
 ## Rejected findings
 
-| ID | Status | Evidence | Remaining work | Planned owner | Doc update | Judgment condition |
-| --- | --- | --- | --- | --- | --- | --- |
-| R1 `src/statusline.rs:236-243` `write_record` leaves a `.tmp` file | `rejected-wrong-basis` | The review found no such function on `b5fc311`. `git grep write_record 96829df7e6fc51af327b448f5b8b3596f0a96d3f -- src/statusline.rs` still finds no match. The cited range is a read path. | None. | None. | Do not add a TODO. | Reopen only if a write path with that temporary-file behavior exists. Absence on this candidate keeps the rejection. |
-| R2 `git rev-parse` is replaced by a same-named user alias | `rejected-wrong-basis` | The review ran `git -c alias.rev-parse='!false' rev-parse --is-inside-work-tree` on the reviewed worktree and got `true`. Builtin precedence was the reason for rejection. This record does not repeat that command. Other Git config effects were not certified then and are still not certified. | None for this alias claim. Real invalidation conditions are latency row L2, not this rejection. | None. | Do not add a TODO for alias overriding `rev-parse`. | Reopen only with a command that shows this Git replacing builtin `rev-parse` before the builtin. |
+| ID | Status | Evidence | Judgment condition |
+| --- | --- | --- | --- |
+| R1 `src/statusline.rs:236-243` `write_record` leaves a `.tmp` file | `rejected-wrong-basis` | No such function on `b5fc311`; `git grep write_record` on the snapshot still finds none in `src/statusline.rs`. The cited range is a read path. | Reopen only if a write path with that behavior appears. |
+| R2 `git rev-parse` is replaced by a same-named user alias | `rejected-wrong-basis` | The review showed `git -c alias.rev-parse='!false' rev-parse --is-inside-work-tree` returns `true`: the builtin wins. This record does not repeat the command. Other Git configuration effects are not certified. | Reopen only with a Git that runs the alias before the builtin. |
 
 ## Latency findings
 
-Latency target: the same `b5fc311` candidate. Default `refresh_interval_ms` remains 5,000 (`src/config.rs:25`). Do not change it in these follow-ups.
+The default `refresh_interval_ms` stays 5,000 (`src/config.rs:25`).
 
-| ID | Status | Evidence at the candidate | Remaining work | Planned owner | Doc update | Judgment condition |
-| --- | --- | --- | --- | --- | --- | --- |
-| L1 P1 per-report `persist` rewrites and syncs the whole ledger | `design-only` | `src/publish.rs:1054-1089` still clones, writes, and `sync_all`s the file and directory. `src/publish.rs:1191-1193` still persists before each report. `docs/reviews/sequence-reservation-design-2026-10-23.md` says to keep that behavior. `a01cc92` is design, not code. | Implement one endpoint reservation window only after isolated fixtures cover crash, partial send, ambiguous response, restart, endpoint change, resource reuse, pruning, and monotonicity. | Commander assigns after `lane_sequence` lands the stage split without changing this behavior. | Survey item 17 stays Open. The design doc stays the contract until a new reviewed doc replaces it. | Not done while `persist` runs once per report. A benchmark without the failure table is not acceptance. |
-| L2 P1 three sequential Git children per unique cwd, every cycle | `measurement-only` | `src/ship_time.rs:62`, `:72`, and `:81` still run `rev-parse`, `worktree list`, and `for-each-ref`. `docs/reviews/git-heading-latency-2026-10-23.md` records the 0/1/8/32 isolated Linux fixture. No cross-cycle cache exists. HEAD-mtime caching is not acceptable. | Write the full invalidation contract, then implement the chosen low-risk design. Keep the 1 second child budget, kill, and reap. | `lane_git_reader` assignment `asg_git_cache_design` is the design task. Implementation waits for a commander decision on that contract. | The Git latency doc is the measurement record. A new `docs/reviews/git-cache-design.md` is that lane's touching path, not this commit. | Design is done only when every invalidation listed in that assignment is accepted or explicitly unknown. Code is done only when fixtures show a cache miss after ref, config, and worktree changes. |
-| L3 P1 no whole-refresh deadline or stage histogram in product behavior | `measurement-only` | `src/daemon.rs:387` arms the next interval only after refresh returns. `last_refresh_ms` is uptime (`src/daemon.rs:90-109`). Test-only stage timers exist (`src/publish.rs:1210-1216`) and `docs/reviews/refresh-stage-latency-2026-10-23.md` records Linux fake-socket runs from `4afc9d4`, not a remeasure of this candidate. | Remeasure 1/8/32/128/256 on this candidate, tmpfs and a real disk, before choosing a deadline. Preserve sequence durability and endpoint identity. | Commander assigns after L1's design gate. | Refresh doc stays a record of `4afc9d4`. Do not copy its medians into a budget. | A product deadline is unimplemented until the contract and tests exist. The carried numbers are not that contract. |
-| L4 P2 Codex and Kimi discovery repeats per pane | `measurement-only` | Discovery still walks candidates per pane. `docs/reviews/reader-discovery-latency-2026-10-23.md` is a tmpfs fixture (`dc637c3`). Fail-closed duplicate and symlink behavior stayed in place. | Separate pane count from candidate count on a real disk. Do not skip the full walk by trusting the previous path. Cap changes wait on C1. | Commander after C1 is specified. | Reader doc stays the tmpfs record. | Sharing or an index is unimplemented until moved, duplicate, and invalid-file fixtures still fail closed. |
-| L5 P2 a stuck provider read can hold the BUSY permit | `unimplemented` | `src/model.rs` still holds the provider permit until the worker returns. No new stuck-worker counter is in this candidate. | Observe wait, BUSY, timeout, and stuck-worker frequency in an isolated fixture before any process isolation. | Commander. No current lane. | Add a measurement note under `docs/reviews/` only after a fixture exists. | Isolation stays unimplemented. The row is not done by a comment. |
-| L6 P2 5 second refresh and 100 ms idle poll | `spec-waiting` | Default remains 5,000 ms. Idle polling remains. `9aa1bfc` measured statusline and configure, not this cycle's visible delay. | Define event-to-visible on an isolated fixture before debounce or a default change. | Commander. No current lane. | README keeps 5 seconds. | Not done by lowering the default. A change needs a written freshness and load contract. |
-| L7 P3 `statusline --then` and `configure` have no child timeout | `measurement-only` | `docs/reviews/statusline-configure-latency-2026-10-23.md` (`9aa1bfc`) records synthetic Linux medians: statusline 0.981 ms, `--then` 16.609 ms, configure change 31.388 ms. Neither path grew a timeout. | Decide the host deadline and failure recovery before adding a timeout. Direct exec of `--then` is out of scope until compatibility is specified. | Commander. No current lane. | The measurement doc is the record. Do not put these medians in user docs as service latency. | A timeout is unimplemented. The row stays open until the contract and tests exist. |
-| L8 P3 one socket connection per response | `spec-waiting` | `src/socket.rs` still reconnects and checks path identity. The replacement test still rejects a substituted socket. Per-response cost is unmeasured. | Syscall trace and an adversarial replacement fixture come before any connection reuse. `fstat` on a live fd must not replace the path check. | Commander. No current lane. | None until a contract exists. | Not done while each response connects again. Reuse without the replacement test is a failure. |
+| ID | Status | Evidence at the snapshot | Remaining limit | Judgment condition |
+| --- | --- | --- | --- | --- |
+| L1 P1 per-report `persist` rewrites and syncs the whole ledger | `fixed-in-candidate` | `32d5863` reserves an endpoint-wide sequence window (32 to 4,096 slots, `src/publish.rs:728-733`) and persists the durable upper bound once per window. `027bade` poisons the publisher after an uncertain checkpoint write until a new instance starts. `64ace03` adds lost-response, process-exit, clear-deadline, and pruning-failure fixtures. The verified rows are listed in `docs/reviews/sequence-reservation-design-2026-10-23.md`. | Kernel crash or power loss, a second allocator, a competing same-source writer, config change during refresh, rollback to an older binary, and macOS disks are not verified. A cold cycle writes once instead of `panes + 1` times; no elapsed-time speed-up is claimed. | Stays fixed while every verified failure row passes. The unverified rows stay design intent. |
+| L2 P1 three sequential Git children per unique cwd, every cycle | `api-unwired` | `223de0a`, `8e8639e`, `d95e5b5`: `RepositoryCache::observe` in `src/ship_time.rs` caches only the worktree root and name (64 entries, 30 s TTL). `rev-parse` and `for-each-ref` run on every read, and a hit replaces `worktree list` with a native common-directory `rev-parse`, so a hit and a miss both run 3 children. `src/publish.rs:1557` still calls `read_repository_controlled`, a fresh cache per call. | Publication wiring, the fair queue, the cycle budget, and the 30 s confirmed fallback (`docs/reviews/git-cache-design.md` §9) are not in the snapshot. No process-count reduction and no latency improvement are claimed. | Runtime effect only after the wiring lands with the F-13 to F-18 fixtures. |
+| L3 P1 no whole-refresh deadline or stage histogram in product behavior | `partial` | `4f7044a` records each refresh's monotonic duration with a fixed histogram and outcome counts; `doctor` prints them before any failure exit, and `last refresh ... ms after startup` stays uptime. `da1242c` adds absolute-deadline socket APIs (`Transport::connect_before`, `reconnect_same_endpoint_before`, `send_line_before`, `receive_line_before`) and refuses reuse after a failed or ambiguous exchange. | No whole-refresh deadline exists. Publication does not call the `_before` socket APIs. The stage-duration lines are under revision on another lane. | A product deadline needs a written contract, the wiring, and tests that keep sequence durability and endpoint identity. |
+| L4 P2 Codex and Kimi discovery repeats per pane | `api-unwired` | `f7abe35`, `988aea7`, `894d2f2`: `ReadCycle` (`src/model.rs:123`) shares validated discovery within one cycle and re-proves ancestors. Publication does not pass a cycle: `read` creates `ReadCycle::new()` for each pane. | Wiring one `ReadCycle` per refresh is not in the snapshot. Cap changes wait on C1. | Runtime effect only after wiring, with moved, duplicate, and invalid-file fixtures still failing closed. |
+| L5 P2 a stuck provider read can hold the BUSY permit | `api-unwired` | `98a57de`: `bounded_read_observed` and `ReaderDiagnostics` count attempts, BUSY rejections, deadline and shutdown ends, and active workers (`docs/reviews/reader-worker-observations.md`). Existing readers still call the unobserved wrapper. | The bounded fixtures (about 30 ms for a 30 ms budget) are single debug-build observations of a blocked closure, not an OS-stalled read and not a live frequency. No cancellation or process isolation. | Measured frequency needs the wiring and a recorded run. Process isolation stays `conditional` on that measurement. |
+| L6 P2 5 second refresh and 100 ms idle poll | `conditional` | Default 5,000 ms and idle polling are unchanged. | The review proposed a change only after an event-to-visible definition and measurement. None exists, so no change is owed. | Not done by lowering the default. A change needs a written freshness and load contract. |
+| L7 P3 `statusline --then` and `configure` have no child timeout | `conditional` | `docs/reviews/statusline-configure-latency-2026-10-23.md` records synthetic Linux medians. Neither path has a timeout. | A timeout or direct exec needs a host deadline, recovery contract, and compatibility review first. | Not owed until that contract exists. |
+| L8 P3 one socket connection per response | `conditional` | Each response still reconnects and checks path identity. `da1242c` forbids reuse after a failed or ambiguous exchange; it does not add connection reuse. | Reuse needs a syscall trace and an adversarial replacement fixture. `fstat` on a live fd must not replace the path check. | Not owed until those exist. Reuse without the replacement test is a failure. |
 
 ## Next latency checks
 
-The investigation listed five checks. Their state at this candidate:
-
 | Check | Status | Evidence | Judgment condition |
 | --- | --- | --- | --- |
-| N1 Stage timers for 1/8/32/128/256 on tmpfs and a real disk | `measurement-only` | Recorded from `4afc9d4` and carried forward. Not remeasured on `96829df`. macOS and live Herdr were not measured. n=3 at 256 panes. | Repeat on the current integration head before the numbers justify a budget. |
-| N2 Compare a batch sequence reservation with the current code, including crash and lost responses | `design-only` | The failure table is in the sequence design doc. No reservation implementation and no comparison run exist. | L1's judgment condition. |
-| N3 Git fixtures for 0/1/8/32 cwd, same and different repos, before and after changes, and a slow Git | `measurement-only` | The Git heading doc covers the count matrix on Linux. Slow-Git and invalidation fixtures for a cache are not done. | L2's judgment condition. |
-| N4 Orthogonal Codex and Kimi candidate counts and pane counts, including fail-closed cases | `measurement-only` | Tmpfs matrix only. | L4's judgment condition. |
-| N5 Linux and macOS isolated report-complete time and visible delay, without a live Herdr | `unimplemented` | Linux synthetic pieces exist. No macOS run and no visible-delay definition. | L3 and L6 stay open until this fixture exists. |
+| N1 Stage timers for 1/8/32/128/256 on tmpfs and a real disk | `measurement-only` | `docs/reviews/refresh-stage-latency-2026-10-23.md`: `4afc9d4` baseline and a 2026-10-24 window run on Linux. Elapsed times were not taken under controlled conditions; only the checkpoint write count is a controlled comparison. | Repeat both binaries alternately on one host before any timing claim. |
+| N2 Compare batch sequence reservation with the old code, including crash and lost responses | `fixed-in-candidate` for the verified rows | L1 fixtures. | Unverified rows stay open as listed in L1. |
+| N3 Git fixtures for 0/1/8/32 cwd, changes, and slow Git | `measurement-only` | `docs/reviews/git-heading-latency-2026-10-23.md` (counts) and the cache API fixtures (invalidation). | Runtime comparison waits for L2 wiring. |
+| N4 Orthogonal Codex and Kimi candidate and pane counts | `measurement-only` | Tmpfs matrix only (`dc637c3`). | Real disk after L4 wiring. |
+| N5 Linux and macOS report-complete time and visible delay, without a live Herdr | `conditional` | No visible-delay definition and no macOS run. | L6 and the L3 deadline stay open until this exists. |
 
 ## Local Sol high evidence and the queue
 
-These reads are owner-authorized local GPT-6.1 Sol high reviews. None is a queue
-run, and none is acceptance by the automated ship gate. `fixed-in-candidate`
-does not mean the row is ready to ship. `2aa1ddc`, `800cef5`, `6551aa7`, and
-`43ea14e` are ancestors of `12f4584`, which is an ancestor of `96829df`.
+Owner-authorized local GPT-6.1 Sol high reads are evidence only. None is a
+queue run or acceptance by the automated ship gate.
 
-Code record `reviews/sol-high-code-review-2026-10-23.md`:
+- `reviews/sol-high-code-review-2026-10-23.md`: `d3ccbc17..12f4584` NO-GO on
+  font wording, resolved by `12f4584..2dc1ef1` GO; `2dc1ef1..a6cddcc` GO for
+  five records.
+- `reviews/sol-high-record-review-2026-10-23.md`: `e10cfca..9f5d194` NO-GO,
+  resolved by `9f5d194..0d801d0` GO.
+- `reviews/refresh-stage-carry-forward-sol-high-2026-10-23.md`:
+  `a6cddcc..819ede0` NO-GO, resolved by `a6cddcc..96829df` GO.
+- `reviews/git-cache-code-sol61-high.md`: `da1242c..b00da5b` NO-GO,
+  `b00da5b..f1c627e` NO-GO, `f1c627e..d7183b8` GO (integrated as
+  `223de0a..d95e5b5`).
+- Each other lane integrated after `96829df` has its own local record under
+  `reviews/` (font journal types, publisher stages, reader cycle, Agy
+  generation, doctor scan, model fixtures, single eviction, socket deadline,
+  runtime metrics, sequence window, reader worker diagnostics). Their NO-GO
+  and GO chains are collected by the commander, not restated here.
 
-- `d3ccbc17d3f8344d466015fac580cd0fe3b60269..12f458407d076375294583870aa4d21c0e246670` was NO-GO. The finding was font wording in `CHANGELOG.md` and the survey. The same read checked Kimi and Grok credential changes, shared sample invalidation, in-flight generation, cache boundaries, `O_CLOEXEC`, finite EOF waiting, and release diagnostics, and found no additional implementation blocker.
-- `12f458407d076375294583870aa4d21c0e246670..2dc1ef186a5f40fa05546c873f588086624f284c` was GO. The font-document NO-GO is resolved there.
-- `2dc1ef186a5f40fa05546c873f588086624f284c..a6cddcca01873c9f30f0632b20d1b28108562129` was GO for the five measurement and design documents. `0d801d05d885001231b2f903f14aeb8fae423b47` is not an ancestor of `a6cddcc`. The review says those blobs match that record candidate. This file does not re-hash them.
+The commander closes the remaining gap with one GPT-6.1 Sol high review of the
+full diff from `d3ccbc17d3f8344d466015fac580cd0fe3b60269` to the final head
+fixed when that review starts.
 
-Record `reviews/sol-high-record-review-2026-10-23.md`:
+## Verification of this record
 
-- `e10cfca28a30cae31e9d909bc8dbc5c5c607175f..9f5d1940d8223998624047d9534c893fdd5931c7` was NO-GO on a Git-heading lower bound.
-- `9f5d1940d8223998624047d9534c893fdd5931c7..0d801d05d885001231b2f903f14aeb8fae423b47` was GO. That local NO-GO is resolved. It is still not a queue acceptance.
-
-Refresh record `reviews/refresh-stage-carry-forward-sol-high-2026-10-23.md`:
-
-- `a6cddcca01873c9f30f0632b20d1b28108562129..819ede0de87125bb149ec15ead84862dff276bd5` was NO-GO because benchmark cleanup could delete a non-`/tmp` fixture.
-- `a6cddcca01873c9f30f0632b20d1b28108562129..96829df7e6fc51af327b448f5b8b3596f0a96d3f` was GO after `disable_cleanup`. The parent recorded fmt, Clippy, 320 passed and 6 ignored tests, one integration pass, a release build, help, and encoding and diff checks. This worktree later ran the suite once; see below. That run is not a new review of the refresh diff.
-
-`lane_commander` closes the remaining review gap with one GPT-6.1 Sol high
-review of the full diff from `d3ccbc17d3f8344d466015fac580cd0fe3b60269` to the
-final head fixed when that review starts. The range includes every uncovered
-commit, and every NO-GO in the chain must be resolved. This lane does not
-start that review.
-
-## Already assigned work
-
-Formation `fm-lineup-reviews-resume-20261023` has four implementation lanes. Their
-uncommitted or later commits are outside this coverage snapshot:
-
-| Lane | Assignment | Rows | Base |
-| --- | --- | --- | --- |
-| `lane_font` | `asg_font_journal_types` | M7, while keeping H1 and M1 residuals | `96829df7e6fc51af327b448f5b8b3596f0a96d3f` |
-| `lane_sequence` | `asg_publisher_stages` | M6, without changing L1 | same |
-| `lane_git_reader` | `asg_git_cache_design` | L2 design first | same |
-| `lane_inventory` | `asg_review_coverage` | this record | same |
-
-## Document drift to correct later
-
-Do not mark these corrections as done in this commit. They are the ordered
-documentation follow-up in `docs/plans/review-followups-plan.md`.
-
-- `CHANGELOG.md` Unreleased omits M2, M3, M4, the M5 existing-key fix, M8, C3, the C4 display fix, and C5.
-- `docs/reviews/font-atomicity-policy-2026-10-23.md` says the no-rollback policy was not implemented. `src/font.rs:526-530` and the changelog contradict that sentence.
-- Survey item 15 stays Open. Item 16 matches the partial font fix. Item 17 stays Open.
-- The external implementation queue says `develop` was one commit behind `d3ccbc17`. At this inspection, `develop` is `d3ccbc17d3f8344d466015fac580cd0fe3b60269`. The unshipped line is this candidate, not a stale `develop` branch.
-- There is no repository `TODO` file at this candidate. Follow-ups live in this record and the plan until a real TODO file is introduced on purpose.
-
-## Verification on this worktree
-
-Ran once on 2026-10-24 in `.claude/worktrees/review-followup-coverage`. The Rust tree was still `96829df7e6fc51af327b448f5b8b3596f0a96d3f`. Other lanes' worktrees were not included. No second suite was run after this document edit, because the edit does not change Rust sources.
-
-- `cargo fmt --all --check`: exit 0.
-- `cargo clippy --locked --all-targets -- -D warnings`: exit 0.
-- `cargo test --locked`: exit 0. Library 320 passed, 6 ignored. `tests/resource-lifecycle.rs` 1 passed. Binary unit tests 0. Doc-tests 0.
-- `cargo build --release --locked`: exit 0.
-- `target/release/herdr-lineup --help`: exit 0.
-- `check-encoding` on the three coverage documents: exit 0.
-- `git diff --check` on those documents: exit 0.
-- `target/` apparent size after the run: 1330571749 bytes. It was left in place. No manual `cargo clean`.
-
-This suite does not turn the local Sol high reads into queue acceptance, and it does not replace the commander's final review.
+This record changes documentation only. It was checked with
+`check-encoding`, `git diff --check`, and a link check against the snapshot.
+No Rust build or test suite was re-run for it.

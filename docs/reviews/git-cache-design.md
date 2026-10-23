@@ -7,7 +7,7 @@
 | Touched components | `src/ship_time.rs`, `src/publish.rs`, `docs/reviews/git-cache-design.md` |
 | Author | agy (`lane_git_reader`) |
 | Review History | Sol-6.1 high v1–v5 NO-GO -> v6 NO-GO -> v7 (Final Simple Guard: Unconditional Non-Cache on Replacement Directory Presence) |
-| Status | DESIGN / PROPOSAL v7 (Absolute Replacement Ref Invalidation Guard & Clean Truth Table) |
+| Status | Contract v7, narrowed and implemented as an API in `src/ship_time.rs` on the local integration line (`223de0a`, `8e8639e`, `d95e5b5`); publication is not wired and nothing is shipped. §9 supersedes earlier sections where they differ. |
 
 ---
 
@@ -209,7 +209,7 @@ The following 20 isolated fixture scenarios specify verification requirements in
 
 ## 8. Current Code Baseline vs. Pending Implementation
 
-| Capability | Current Code (`96829df`) | Proposed Implementation (Pending) |
+| Capability | Baseline Code (`96829df`) | Contract (cache API implemented, publication wiring pending; see §9) |
 |---|---|---|
 | `cwd` Identity & Security | Native Git in all 3 processes | Native Git preserved in mandatory `rev-parse` |
 | Subprocess Execution | 3 processes unconditionally per `cwd` | 3 processes per `cwd` on a downstream hit: `worktree list` is replaced by a common-directory `rev-parse`; no process-count reduction is claimed (§9) |
