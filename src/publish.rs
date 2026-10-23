@@ -29,27 +29,108 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Debug)]
-pub(crate) struct CapacitySkip {
-    pub skipped_resources: u64,
+/// Resources one refresh skipped without an error. Both counts are kept as
+/// observed, so a cycle that hit both limits never reports either as zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RefreshSkip {
+    pub capacity_skipped: u64,
+    /// Resources whose needed send the cycle deadline prevented, counted once
+    /// per resource ID per refresh, independent of queue rotation.
+    pub deadline_skipped: u64,
 }
 
-impl std::fmt::Display for CapacitySkip {
+impl std::fmt::Display for RefreshSkip {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "metadata capacity exhausted; affected resources skipped"
+            "metadata refresh skipped resources (capacity {}, deadline {})",
+            self.capacity_skipped, self.deadline_skipped
         )
     }
 }
 
-impl std::error::Error for CapacitySkip {}
+impl std::error::Error for RefreshSkip {}
 
-pub(crate) fn capacity_skip_count(error: &io::Error) -> Option<u64> {
+impl RefreshSkip {
+    fn into_error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, self)
+    }
+}
+
+/// The typed skip payload of a refresh result, if the refresh was a skip.
+pub(crate) fn refresh_skip(error: &io::Error) -> Option<RefreshSkip> {
     error
         .get_ref()
-        .and_then(|source| source.downcast_ref::<CapacitySkip>())
-        .map(|skip| skip.skipped_resources)
+        .and_then(|source| source.downcast_ref::<RefreshSkip>())
+        .copied()
+}
+
+/// Initial cooperative budget terms of one refresh. These are the existing
+/// local caps, not measurements: a snapshot round trip, the whole-cycle Git
+/// budget, and one metadata round trip, which is also the admission threshold.
+#[derive(Clone, Copy, Debug)]
+struct CycleTerms {
+    snapshot: Duration,
+    git: Duration,
+    metadata: Duration,
+}
+
+impl Default for CycleTerms {
+    fn default() -> Self {
+        Self {
+            snapshot: Duration::from_secs(2),
+            git: Duration::from_secs(1),
+            metadata: Duration::from_secs(2),
+        }
+    }
+}
+
+/// A heading not confirmed by Git for this long is no longer published.
+const HEADING_FALLBACK: Duration = Duration::from_secs(30);
+/// Clear runs at shutdown under its own deadline, never a refresh envelope.
+const CLEAR_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Round-robin order shared across refreshes. Each refresh walks one copy of
+/// the order taken right after `sync`, so an item is visited at most once per
+/// cycle; `rotate` moves an item to the tail when its first budgeted I/O
+/// starts and is never undone.
+struct FairQueue<K> {
+    order: std::collections::VecDeque<K>,
+}
+
+impl<K> Default for FairQueue<K> {
+    fn default() -> Self {
+        Self {
+            order: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<K: Ord + Clone> FairQueue<K> {
+    /// Drop vanished keys, keep survivors in order, append new keys in the
+    /// given order, and return this cycle's pass.
+    fn sync(&mut self, current: impl IntoIterator<Item = K>) -> Vec<K> {
+        let mut live = BTreeSet::new();
+        let mut arrivals = Vec::new();
+        for key in current {
+            if live.insert(key.clone()) {
+                arrivals.push(key);
+            }
+        }
+        self.order.retain(|key| live.contains(key));
+        let known: BTreeSet<K> = self.order.iter().cloned().collect();
+        self.order
+            .extend(arrivals.into_iter().filter(|key| !known.contains(key)));
+        self.order.iter().cloned().collect()
+    }
+
+    fn rotate(&mut self, key: &K) {
+        if let Some(index) = self.order.iter().position(|item| item == key)
+            && let Some(item) = self.order.remove(index)
+        {
+            self.order.push_back(item);
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -650,20 +731,34 @@ fn current_kimi_weekly_with_stamp(
     })
 }
 
-fn repository_read_once(
-    readings: &mut BTreeMap<PathBuf, Result<Option<ship_time::Repository>, ()>>,
-    cwd: &Path,
-    read: impl FnOnce(&Path) -> ship_time::RepositoryRead,
-) -> ship_time::RepositoryRead {
-    let cached = readings
-        .entry(cwd.to_owned())
-        .or_insert_with(|| match read(cwd) {
-            ship_time::RepositoryRead::Complete(repository) => Ok(repository),
-            ship_time::RepositoryRead::Interrupted => Err(()),
-        });
-    match cached {
-        Ok(repository) => ship_time::RepositoryRead::Complete(repository.clone()),
-        Err(()) => ship_time::RepositoryRead::Interrupted,
+/// What one cycle learned about a workspace heading from Git.
+#[derive(Clone, Debug)]
+enum HeadingRead {
+    /// Git returned a repository together with its verification instant.
+    Confirmed {
+        repository: ship_time::Repository,
+        verified_at: Instant,
+    },
+    Interrupted,
+    /// The cycle's Git budget ran out before this workspace was read.
+    NotAttempted,
+    /// No cwd, no repository, a rejection, or a result without verification.
+    Unknown,
+}
+
+impl From<ship_time::RepositoryObservation> for HeadingRead {
+    fn from(observation: ship_time::RepositoryObservation) -> Self {
+        match (observation.read, observation.verified_at) {
+            (ship_time::RepositoryRead::Complete(Some(repository)), Some(verified_at)) => {
+                Self::Confirmed {
+                    repository,
+                    verified_at,
+                }
+            }
+            (ship_time::RepositoryRead::Interrupted, _) => Self::Interrupted,
+            // `Complete(None)` also covers rejection and unreadable state.
+            _ => Self::Unknown,
+        }
     }
 }
 
@@ -680,6 +775,8 @@ struct HeadingCache {
     cwd: PathBuf,
     occupants: Vec<(String, Option<tokens::Occupant>)>,
     repository: ship_time::Repository,
+    /// The original Git verification instant; a fallback never renews it.
+    confirmed: Instant,
 }
 
 struct RefreshInventory {
@@ -761,13 +858,36 @@ pub struct MetadataPublisher {
     codex_control: Arc<crate::quota_codex::QueryControl>,
     headings: BTreeMap<String, HeadingCache>,
     local_readings: BTreeMap<String, model::UsageReading>,
+    terms: CycleTerms,
+    git_queue: FairQueue<String>,
+    send_queue: FairQueue<ResourceId>,
+    repositories: ship_time::RepositoryCache,
+    /// Shared by every refresh's reader cycle for the publisher's lifetime.
+    reader_diagnostics: Arc<model::ReaderDiagnostics>,
+    /// Reset at the start of each refresh; `None` before the first one.
+    stages: std::sync::Mutex<Option<StageTimes>>,
     /// Successful `sequences.json` writes. Tests assert one write per report.
     #[cfg(test)]
     checkpoint_persists: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     persist_fault: std::sync::Mutex<Option<PersistStage>>,
     #[cfg(test)]
-    stages: std::sync::Mutex<StageTimes>,
+    hooks: TestHooks,
+}
+
+/// Replaces one heading's Git observation; receives the cwd and deadline.
+#[cfg(test)]
+type GitHook = dyn FnMut(&Path, Instant) -> ship_time::RepositoryObservation + Send;
+
+/// Injection points that let tests place time and I/O at exact boundaries.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    git: Option<Box<GitHook>>,
+    /// Runs after any reservation persist, before the admission check.
+    before_admission: Option<Box<dyn FnMut() + Send>>,
+    /// Runs after admission passed, right before the exchange starts.
+    before_exchange: Option<Box<dyn FnMut() + Send>>,
 }
 
 /// Checkpoint write steps where tests inject a failure.
@@ -779,33 +899,74 @@ enum PersistStage {
     DirectorySync,
 }
 
-#[cfg(test)]
+/// Stage timings of one refresh. Stages overlap: the snapshot exchange is in
+/// both `snapshot` and `socket`, and `persist` runs inside the send loop, so
+/// the sum is not the refresh duration.
 #[derive(Default, Clone, Debug)]
 struct StageTimes {
     snapshot: Duration,
     git: Duration,
     reader: Duration,
+    /// Successful and failed checkpoint writes, including pruning.
     persist: Duration,
     socket: Duration,
-    refresh: Duration,
-    pipeline: Duration,
+    /// Acknowledged metadata reports.
     reports: u64,
+    /// Successful `sequences.json` writes, not rows.
+    checkpoints: u64,
+    #[cfg(test)]
+    refresh: Duration,
+    #[cfg(test)]
+    pipeline: Duration,
+    #[cfg(test)]
     checkpoint_rows: usize,
 }
 
-#[cfg(test)]
-impl StageTimes {
-    fn add(&mut self, stage: &str, elapsed: Duration) {
-        match stage {
-            "snapshot" => self.snapshot += elapsed,
-            "git" => self.git += elapsed,
-            "reader" => self.reader += elapsed,
-            "persist" => self.persist += elapsed,
-            "socket" => self.socket += elapsed,
-            "refresh" => self.refresh += elapsed,
-            "pipeline" => self.pipeline += elapsed,
-            _ => unreachable!(),
-        }
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Whether a metadata request may start or the resource is skipped.
+#[derive(Clone, Copy)]
+enum ReportMode {
+    /// Refresh: admission needs `terms.metadata` left before `envelope`.
+    /// `rotate` moves the resource to the send queue tail when the exchange
+    /// starts, unless its reader call already did.
+    Refresh { envelope: Instant, rotate: bool },
+    /// Clear keeps its own deadline and runs after shutdown.
+    Clear { deadline: Instant },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportOutcome {
+    NoFrame,
+    Acknowledged,
+    CapacitySkipped,
+    DeadlineSkipped,
+}
+
+/// The shared reader deadline of one refresh, already capped by its envelope,
+/// and that refresh's reader cycle.
+struct ReaderBudget<'a> {
+    deadline: Instant,
+    cycle: &'a model::ReadCycle,
+}
+
+/// One resource of the send pass.
+#[derive(Clone, Copy)]
+enum SendItem<'a> {
+    Pane(&'a protocol::Pane),
+    Workspace(&'a protocol::Workspace),
+}
+
+fn source_kind(provider: model::Provider) -> model::SourceKind {
+    match provider {
+        model::Provider::Claude => model::SourceKind::ClaudeStatusline,
+        model::Provider::Agy => model::SourceKind::AgyStatusline,
+        model::Provider::Codex => model::SourceKind::CodexRollout,
+        model::Provider::Grok => model::SourceKind::GrokSignals,
+        model::Provider::Kimi => model::SourceKind::KimiSession,
+        model::Provider::Hermes => model::SourceKind::HermesUnsupported,
     }
 }
 impl MetadataPublisher {
@@ -841,21 +1002,48 @@ impl MetadataPublisher {
             codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
             headings: BTreeMap::new(),
             local_readings: BTreeMap::new(),
+            terms: CycleTerms::default(),
+            git_queue: FairQueue::default(),
+            send_queue: FairQueue::default(),
+            repositories: ship_time::RepositoryCache::default(),
+            reader_diagnostics: Arc::new(model::ReaderDiagnostics::default()),
+            stages: std::sync::Mutex::new(None),
             #[cfg(test)]
             checkpoint_persists: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             persist_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
-            stages: std::sync::Mutex::new(StageTimes::default()),
+            hooks: TestHooks::default(),
         })
     }
 
+    /// Update the current refresh's stage sample, if a refresh started.
+    fn record_stage(&self, update: impl FnOnce(&mut StageTimes)) {
+        let mut stages = self
+            .stages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(stages) = stages.as_mut() {
+            update(stages);
+        }
+    }
+
+    fn reset_stages(&self) {
+        *self
+            .stages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(StageTimes::default());
+    }
+
+    /// Decide the published repository: Confirmed, a bounded Fallback for an
+    /// interrupted or unattempted read, or `None` for Unknown.
     fn heading_repository(
         &mut self,
         workspace: &str,
         cwd: Option<&Path>,
         occupants: &[(String, Option<tokens::Occupant>)],
-        reading: ship_time::RepositoryRead,
+        read: HeadingRead,
+        now: Instant,
     ) -> Option<ship_time::Repository> {
         let Some(cwd) = cwd else {
             self.headings.remove(workspace);
@@ -868,27 +1056,50 @@ impl MetadataPublisher {
         {
             self.headings.remove(workspace);
         }
-        match reading {
-            ship_time::RepositoryRead::Interrupted => self
-                .headings
-                .get(workspace)
-                .map(|previous| previous.repository.clone()),
-            ship_time::RepositoryRead::Complete(Some(repository)) => {
+        match read {
+            HeadingRead::Confirmed {
+                repository,
+                verified_at,
+            } => {
                 self.headings.insert(
                     workspace.into(),
                     HeadingCache {
                         cwd: cwd.to_owned(),
                         occupants: occupants.to_vec(),
                         repository: repository.clone(),
+                        confirmed: verified_at,
                     },
                 );
                 Some(repository)
             }
-            ship_time::RepositoryRead::Complete(None) => {
+            HeadingRead::Interrupted | HeadingRead::NotAttempted => {
+                let fresh = self.headings.get(workspace).is_some_and(|previous| {
+                    now.saturating_duration_since(previous.confirmed) < HEADING_FALLBACK
+                });
+                if fresh {
+                    self.headings
+                        .get(workspace)
+                        .map(|previous| previous.repository.clone())
+                } else {
+                    self.headings.remove(workspace);
+                    None
+                }
+            }
+            HeadingRead::Unknown => {
                 self.headings.remove(workspace);
                 None
             }
         }
+    }
+
+    fn read_heading(&mut self, cwd: &Path, deadline: Instant) -> HeadingRead {
+        #[cfg(test)]
+        if let Some(hook) = self.hooks.git.as_mut() {
+            return hook(cwd, deadline).into();
+        }
+        self.repositories
+            .observe(cwd, self.shutdown.as_deref(), deadline)
+            .into()
     }
 
     fn start_weekly(&mut self, config: &Config) -> io::Result<()> {
@@ -1149,7 +1360,16 @@ impl MetadataPublisher {
 
     fn write_checkpoint(&mut self, floors: BTreeMap<String, u64>) -> io::Result<()> {
         self.ensure_publishable()?;
+        let started = Instant::now();
         let result = self.write_checkpoint_file(floors);
+        let elapsed = started.elapsed();
+        let written = result.is_ok();
+        self.record_stage(|stages| {
+            stages.persist += elapsed;
+            if written {
+                stages.checkpoints = stages.checkpoints.saturating_add(1);
+            }
+        });
         if result.is_err() {
             self.persistence_poisoned = true;
         }
@@ -1157,8 +1377,6 @@ impl MetadataPublisher {
     }
 
     fn write_checkpoint_file(&self, floors: BTreeMap<String, u64>) -> io::Result<()> {
-        #[cfg(test)]
-        let stage_start = Instant::now();
         let mut rows: Vec<_> = self
             .planner
             .checkpoint()
@@ -1196,9 +1414,8 @@ impl MetadataPublisher {
         #[cfg(test)]
         {
             let _ = self.checkpoint_persists.fetch_add(1, Ordering::Relaxed);
-            let mut stages = self.stages.lock().unwrap();
-            stages.add("persist", stage_start.elapsed());
-            stages.checkpoint_rows = rows.len();
+            let row_count = rows.len();
+            self.record_stage(|stages| stages.checkpoint_rows = row_count);
         }
         Ok(())
     }
@@ -1223,18 +1440,41 @@ impl MetadataPublisher {
         Ok(())
     }
 
-    fn request(&mut self, transport: &mut Transport, method: &str) -> io::Result<(String, Value)> {
+    fn request_before(
+        &mut self,
+        transport: &mut Transport,
+        method: &str,
+        deadline: Instant,
+    ) -> io::Result<(String, Value)> {
         self.request_seq = self
             .request_seq
             .checked_add(1)
             .ok_or_else(|| io::Error::other("request sequence exhausted"))?;
         let id = format!("lineup-{}", self.request_seq);
-        let response = exchange(transport, &json!({"id":id,"method":method,"params":{}}))?;
+        let response = exchange_before(
+            transport,
+            &json!({"id":id,"method":method,"params":{}}),
+            deadline,
+        )?;
         Ok((id, response))
     }
 
+    #[cfg(test)]
+    fn request(&mut self, transport: &mut Transport, method: &str) -> io::Result<(String, Value)> {
+        self.request_before(transport, method, unbounded_test_deadline())
+    }
+
+    #[cfg(test)]
     fn snapshot(&mut self, transport: &mut Transport) -> io::Result<protocol::Snapshot> {
-        #[cfg(test)]
+        self.snapshot_before(transport, unbounded_test_deadline())
+    }
+
+    /// The caller's absolute deadline also bounds the implicit reconnect.
+    fn snapshot_before(
+        &mut self,
+        transport: &mut Transport,
+        deadline: Instant,
+    ) -> io::Result<protocol::Snapshot> {
         let stage_start = Instant::now();
         self.ensure_publishable()?;
         self.load_checkpoint()?;
@@ -1248,21 +1488,15 @@ impl MetadataPublisher {
             return Err(io::Error::other("publisher endpoint changed"));
         }
         self.endpoint = Some(endpoint);
-        #[cfg(test)]
         let socket_start = Instant::now();
-        let (id, response) = self.request(transport, "session.snapshot")?;
-        #[cfg(test)]
-        self.stages
-            .lock()
-            .unwrap()
-            .add("socket", socket_start.elapsed());
+        let response = self.request_before(transport, "session.snapshot", deadline);
+        let socket_elapsed = socket_start.elapsed();
+        self.record_stage(|stages| stages.socket += socket_elapsed);
+        let (id, response) = response?;
         let result = protocol::parse_snapshot(&id, &response)
             .map_err(|_| io::Error::other("invalid snapshot response"))?;
-        #[cfg(test)]
-        self.stages
-            .lock()
-            .unwrap()
-            .add("snapshot", stage_start.elapsed());
+        let snapshot_elapsed = stage_start.elapsed();
+        self.record_stage(|stages| stages.snapshot += snapshot_elapsed);
         self.reservation_window =
             compute_reservation_window(result.panes.len(), result.workspaces.len());
         Ok(result)
@@ -1276,6 +1510,9 @@ impl MetadataPublisher {
         }
     }
 
+    /// Test entry with the previous shape: `None` is a refresh-mode report
+    /// without an envelope, `Some` is a clear deadline. Skips become errors.
+    #[cfg(test)]
     fn report(
         &mut self,
         transport: &mut Transport,
@@ -1285,8 +1522,39 @@ impl MetadataPublisher {
         desired: &tokens::Tokens,
         deadline: Option<Instant>,
     ) -> io::Result<()> {
+        let mode = match deadline {
+            Some(deadline) => ReportMode::Clear { deadline },
+            None => ReportMode::Refresh {
+                envelope: unbounded_test_deadline(),
+                rotate: false,
+            },
+        };
+        match self.send_report(transport, resource, keys, occupant, desired, mode)? {
+            ReportOutcome::CapacitySkipped => Err(RefreshSkip {
+                capacity_skipped: 1,
+                deadline_skipped: 0,
+            }
+            .into_error()),
+            ReportOutcome::DeadlineSkipped => Err(RefreshSkip {
+                capacity_skipped: 0,
+                deadline_skipped: 1,
+            }
+            .into_error()),
+            ReportOutcome::NoFrame | ReportOutcome::Acknowledged => Ok(()),
+        }
+    }
+
+    fn send_report(
+        &mut self,
+        transport: &mut Transport,
+        resource: &ResourceId,
+        keys: &BTreeSet<String>,
+        occupant: Option<&tokens::Occupant>,
+        desired: &tokens::Tokens,
+        mode: ReportMode,
+    ) -> io::Result<ReportOutcome> {
         self.ensure_publishable()?;
-        if deadline.is_none() {
+        if matches!(mode, ReportMode::Refresh { .. }) {
             self.check_shutdown()?;
         }
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -1302,14 +1570,9 @@ impl MetadataPublisher {
             now_ms,
             self.refresh_ms,
         ) {
-            Ok(false) => return Ok(()),
+            Ok(false) => return Ok(ReportOutcome::NoFrame),
             Err(tokens::PatchError::ResourceCapacity | tokens::PatchError::ReportCapacity) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    CapacitySkip {
-                        skipped_resources: 1,
-                    },
-                ));
+                return Ok(ReportOutcome::CapacitySkipped);
             }
             Err(_) => return Err(io::Error::other("metadata planning failed")),
             Ok(true) => {}
@@ -1322,29 +1585,20 @@ impl MetadataPublisher {
             self.reserve_window_for_endpoint(&resource.endpoint_session, self.reservation_window)?;
         }
 
-        let Some(report) = self
-            .planner
-            .prepare(
-                resource,
-                &snapshot,
-                occupant,
-                desired,
-                now_ms,
-                self.refresh_ms,
-            )
-            .map_err(|error| match error {
-                tokens::PatchError::ResourceCapacity | tokens::PatchError::ReportCapacity => {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        CapacitySkip {
-                            skipped_resources: 1,
-                        },
-                    )
-                }
-                _ => io::Error::other("metadata planning failed"),
-            })?
-        else {
-            return Ok(());
+        let report = match self.planner.prepare(
+            resource,
+            &snapshot,
+            occupant,
+            desired,
+            now_ms,
+            self.refresh_ms,
+        ) {
+            Ok(Some(report)) => report,
+            Ok(None) => return Ok(ReportOutcome::NoFrame),
+            Err(tokens::PatchError::ResourceCapacity | tokens::PatchError::ReportCapacity) => {
+                return Ok(ReportOutcome::CapacitySkipped);
+            }
+            Err(_) => return Err(io::Error::other("metadata planning failed")),
         };
         self.request_seq = self
             .request_seq
@@ -1353,23 +1607,43 @@ impl MetadataPublisher {
         let id = format!("lineup-{}", self.request_seq);
         let request = protocol::metadata_request(&id, &report)
             .map_err(|_| io::Error::other("invalid metadata request"))?;
-        // Persistence may consume the budget checked by clear's caller. Recheck
-        // at the last possible point before starting the bounded socket exchange.
-        if let Some(deadline) = deadline {
-            check_clear_deadline(deadline)?;
-        } else {
-            // Clear must still run after shutdown. Refresh finishes a complete
-            // in-flight exchange but does not begin a new metadata frame.
-            self.check_shutdown()?;
-        }
         #[cfg(test)]
+        if let Some(hook) = self.hooks.before_admission.as_mut() {
+            hook();
+        }
+        // Persistence may consume the budget. Recheck at the last possible
+        // point before starting the bounded socket exchange. A request that is
+        // not started leaves its prepared sequence unused, never replayed.
+        let deadline = match mode {
+            ReportMode::Clear { deadline } => {
+                check_clear_deadline(deadline)?;
+                deadline
+            }
+            ReportMode::Refresh { envelope, rotate } => {
+                // Clear must still run after shutdown. Refresh finishes a complete
+                // in-flight exchange but does not begin a new metadata frame.
+                self.check_shutdown()?;
+                // Admission only reads the remaining budget: synchronous work
+                // or scheduling after it can still let `envelope` expire in
+                // flight, which is then an ambiguous error, not a skip.
+                if envelope.saturating_duration_since(Instant::now()) < self.terms.metadata {
+                    return Ok(ReportOutcome::DeadlineSkipped);
+                }
+                if rotate {
+                    self.send_queue.rotate(resource);
+                }
+                envelope
+            }
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.hooks.before_exchange.as_mut() {
+            hook();
+        }
         let socket_start = Instant::now();
-        let response = exchange(transport, &request)?;
-        #[cfg(test)]
-        {
-            let mut stages = self.stages.lock().unwrap();
-            stages.add("socket", socket_start.elapsed());
-        }
+        let response = exchange_before(transport, &request, deadline);
+        let socket_elapsed = socket_start.elapsed();
+        self.record_stage(|stages| stages.socket += socket_elapsed);
+        let response = response?;
         let result = protocol::response_result(&id, &response)
             .map_err(|_| io::Error::other("metadata report rejected"))?;
         if result.get("type").and_then(Value::as_str) != Some("ok") {
@@ -1378,14 +1652,11 @@ impl MetadataPublisher {
         self.planner
             .acknowledge(&report, now_ms)
             .map_err(|_| io::Error::other("invalid metadata reservation"))?;
-        #[cfg(test)]
-        {
-            self.stages.lock().unwrap().reports += 1;
-        }
+        self.record_stage(|stages| stages.reports = stages.reports.saturating_add(1));
         // `acknowledge` records acceptance only. `checkpoint()` is the high-water
         // sequence already saved before the send, so another persist would
         // rewrite the same bytes.
-        Ok(())
+        Ok(ReportOutcome::Acknowledged)
     }
 
     fn reconcile_missing(&mut self, snapshot: &protocol::Snapshot) -> io::Result<()> {
@@ -1427,10 +1698,10 @@ impl MetadataPublisher {
         let stage_start = Instant::now();
         let result = self.refresh_with_readers_inner(transport, config, codex, grok);
         #[cfg(test)]
-        self.stages
-            .lock()
-            .unwrap()
-            .add("pipeline", stage_start.elapsed());
+        {
+            let elapsed = stage_start.elapsed();
+            self.record_stage(|stages| stages.pipeline += elapsed);
+        }
         result
     }
 
@@ -1443,14 +1714,13 @@ impl MetadataPublisher {
         grok: &dyn UsageReader,
     ) -> io::Result<()> {
         let stage_start = Instant::now();
+        self.reset_stages();
         let result = config
             .validate()
             .and_then(|_| self.start_weekly(config))
             .and_then(|_| self.refresh_with_readers(transport, config, codex, grok));
-        self.stages
-            .lock()
-            .unwrap()
-            .add("refresh", stage_start.elapsed());
+        let elapsed = stage_start.elapsed();
+        self.record_stage(|stages| stages.refresh += elapsed);
         result
     }
 
@@ -1458,11 +1728,12 @@ impl MetadataPublisher {
         &mut self,
         transport: &mut Transport,
         config: &Config,
+        envelope: Instant,
     ) -> io::Result<RefreshInventory> {
         self.check_shutdown()?;
         config.validate()?;
         self.refresh_ms = config.refresh_interval_ms;
-        let snapshot = self.snapshot(transport)?;
+        let snapshot = self.snapshot_before(transport, envelope)?;
         self.check_shutdown()?;
         self.reconcile_missing(&snapshot)?;
         // Keep cached association only while the authoritative pane identity matches.
@@ -1533,65 +1804,132 @@ impl MetadataPublisher {
         })
     }
 
-    fn resolve_headings(&mut self, inventory: &RefreshInventory) -> io::Result<Headings> {
-        let local_now = chrono::Local::now();
-        let mut by_workspace = BTreeMap::new();
-        let mut repository_readings = BTreeMap::new();
-        for workspace in &inventory.snapshot.workspaces {
-            #[cfg(test)]
-            let stage_start = Instant::now();
-            self.check_shutdown()?;
-            let panes: Vec<_> = inventory
-                .snapshot
-                .panes
-                .iter()
-                .filter(|pane| pane.workspace_id == workspace.workspace_id)
+    fn resolve_headings(
+        &mut self,
+        inventory: &RefreshInventory,
+        envelope: Instant,
+    ) -> io::Result<Headings> {
+        let started = Instant::now();
+        let result = self.resolve_headings_in_budget(inventory, envelope, started);
+        let elapsed = started.elapsed();
+        self.record_stage(|stages| stages.git += elapsed);
+        result
+    }
+
+    fn resolve_headings_in_budget(
+        &mut self,
+        inventory: &RefreshInventory,
+        envelope: Instant,
+        started: Instant,
+    ) -> io::Result<Headings> {
+        let git_deadline = (started + self.terms.git).min(envelope);
+        let snapshot = &inventory.snapshot;
+        let mut panes_by_workspace: BTreeMap<&str, Vec<&protocol::Pane>> = BTreeMap::new();
+        for pane in &snapshot.panes {
+            panes_by_workspace
+                .entry(pane.workspace_id.as_str())
+                .or_default()
+                .push(pane);
+        }
+        let workspace_cwd = |workspace: &protocol::Workspace| {
+            let panes: Vec<_> = panes_by_workspace
+                .get(workspace.workspace_id.as_str())
+                .into_iter()
+                .flatten()
                 .map(|pane| (pane.pane_id.as_str(), pane.cwd.as_deref().map(Path::new)))
                 .collect();
-            let cwd = ship_time::resolve_workspace_cwd(
+            ship_time::resolve_workspace_cwd(
                 workspace.checkout_path.as_deref().map(Path::new),
                 &panes,
-            );
-            let reading = cwd.map_or(ship_time::RepositoryRead::Complete(None), |cwd| {
-                repository_read_once(&mut repository_readings, cwd, |cwd| {
-                    ship_time::read_repository_controlled(cwd, self.shutdown.as_deref())
-                })
-            });
-            let occupants = inventory
-                .snapshot
-                .panes
+            )
+            .map(Path::to_path_buf)
+        };
+        let workspaces: BTreeMap<&str, &protocol::Workspace> = snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.workspace_id.as_str(), workspace))
+            .collect();
+        let pass = self.git_queue.sync(
+            snapshot
+                .workspaces
                 .iter()
-                .filter(|pane| pane.workspace_id == workspace.workspace_id)
+                .map(|workspace| workspace.workspace_id.clone()),
+        );
+        // `reads` doubles as the visited set: no workspace is read twice.
+        let mut reads: BTreeMap<String, HeadingRead> = BTreeMap::new();
+        let mut by_cwd: BTreeMap<PathBuf, HeadingRead> = BTreeMap::new();
+        for id in pass {
+            if reads.contains_key(&id) {
+                continue;
+            }
+            let Some(workspace) = workspaces.get(id.as_str()) else {
+                continue;
+            };
+            self.check_shutdown()?;
+            let read = match workspace_cwd(workspace) {
+                None => HeadingRead::Unknown,
+                Some(cwd) => match by_cwd.get(&cwd) {
+                    // A shared result starts no Git I/O, so it does not rotate.
+                    Some(shared) => shared.clone(),
+                    None if Instant::now() >= git_deadline => HeadingRead::NotAttempted,
+                    None => {
+                        self.git_queue.rotate(&id);
+                        let read = self.read_heading(&cwd, git_deadline);
+                        by_cwd.insert(cwd, read.clone());
+                        read
+                    }
+                },
+            };
+            reads.insert(id, read);
+        }
+
+        let local_now = chrono::Local::now();
+        let now = Instant::now();
+        let mut by_workspace = BTreeMap::new();
+        for workspace in &snapshot.workspaces {
+            let cwd = workspace_cwd(workspace);
+            let occupants = panes_by_workspace
+                .get(workspace.workspace_id.as_str())
+                .into_iter()
+                .flatten()
                 .map(|pane| (pane.pane_id.clone(), pane.occupant.clone()))
                 .collect::<Vec<_>>();
-            let repository =
-                self.heading_repository(&workspace.workspace_id, cwd, &occupants, reading);
-            let ship = repository.as_ref().and_then(|repo| repo.ship_unix);
+            let read = reads
+                .remove(&workspace.workspace_id)
+                .unwrap_or(HeadingRead::NotAttempted);
+            let repository = self.heading_repository(
+                &workspace.workspace_id,
+                cwd.as_deref(),
+                &occupants,
+                read,
+                now,
+            );
             let resolved = repository.is_some();
-            let desired = BTreeMap::from([
-                (
-                    "lineup_repo".into(),
-                    Some(
-                        repository
-                            .map(|repo| repo.name)
-                            .unwrap_or_else(|| "—".into()),
+            // Unknown publishes null, never `—`: absence was not confirmed.
+            let desired = match repository {
+                Some(repository) => BTreeMap::from([
+                    (
+                        "lineup_ship_unix".into(),
+                        repository.ship_unix.map(|unix| unix.to_string()),
                     ),
-                ),
-                ("lineup_ship_unix".into(), ship.map(|unix| unix.to_string())),
-                (
-                    "lineup_ship_text".into(),
-                    Some(ship_time::format_ship_time(ship, &local_now)),
-                ),
-            ]);
+                    (
+                        "lineup_ship_text".into(),
+                        Some(ship_time::format_ship_time(
+                            repository.ship_unix,
+                            &local_now,
+                        )),
+                    ),
+                    ("lineup_repo".into(), Some(repository.name)),
+                ]),
+                None => tokens::WORKSPACE_KEYS
+                    .iter()
+                    .map(|key| ((*key).into(), None))
+                    .collect(),
+            };
             by_workspace.insert(
                 workspace.workspace_id.clone(),
                 WorkspaceHeading { resolved, desired },
             );
-            #[cfg(test)]
-            self.stages
-                .lock()
-                .unwrap()
-                .add("git", stage_start.elapsed());
         }
         Ok(Headings { by_workspace })
     }
@@ -1601,10 +1939,11 @@ impl MetadataPublisher {
         inventory: &RefreshInventory,
         config: &Config,
         pane: &protocol::Pane,
-        deadline: Instant,
+        budget: &ReaderBudget<'_>,
         codex: &dyn UsageReader,
         grok: &dyn UsageReader,
-    ) -> io::Result<PaneObservation> {
+    ) -> io::Result<(PaneObservation, bool)> {
+        let mut reader_called = false;
         let occupant = pane
             .occupant
             .clone()
@@ -1659,7 +1998,7 @@ impl MetadataPublisher {
                 home,
                 now,
                 max_age: Duration::from_millis(config.usage_max_age_ms),
-                timeout: deadline.saturating_duration_since(Instant::now()),
+                timeout: budget.deadline.saturating_duration_since(Instant::now()),
                 shutdown: self.shutdown.as_deref(),
             };
             let missing_home = (who.agent == Agent::Grok && self.homes.grok.is_none())
@@ -1676,15 +2015,22 @@ impl MetadataPublisher {
                     },
                     model::MissingReason::NotFound,
                 )
+            } else if request.timeout.is_zero() {
+                // The shared reader budget is spent: skip only the reader I/O.
+                // The timeout below restores a valid cached observation.
+                model::UsageReading::missing(
+                    &request,
+                    source_kind(provider),
+                    model::MissingReason::Timeout,
+                )
             } else {
-                #[cfg(test)]
+                // Calling the reader is the pane's attempt, even if it returns
+                // at once (for example BUSY).
+                reader_called = true;
                 let stage_start = Instant::now();
-                let result = reader.read(&request);
-                #[cfg(test)]
-                self.stages
-                    .lock()
-                    .unwrap()
-                    .add("reader", stage_start.elapsed());
+                let result = reader.read_in_cycle(&request, budget.cycle);
+                let elapsed = stage_start.elapsed();
+                self.record_stage(|stages| stages.reader += elapsed);
                 result
             };
             if reading.identity != identity {
@@ -1763,14 +2109,17 @@ impl MetadataPublisher {
                     .and_then(|age| i64::try_from(age.as_secs()).ok()),
             })
         });
-        Ok(PaneObservation {
-            pane_id: pane.pane_id.clone(),
-            workspace_id: pane.workspace_id.clone(),
-            stored_keys: pane.stored_keys.clone(),
-            occupant,
-            state: pane.state.clone(),
-            usage,
-        })
+        Ok((
+            PaneObservation {
+                pane_id: pane.pane_id.clone(),
+                workspace_id: pane.workspace_id.clone(),
+                stored_keys: pane.stored_keys.clone(),
+                occupant,
+                state: pane.state.clone(),
+                usage,
+            },
+            reader_called,
+        ))
     }
 
     fn plan_pane_report(
@@ -1826,28 +2175,6 @@ impl MetadataPublisher {
         })
     }
 
-    fn send_pane_report(
-        &mut self,
-        transport: &mut Transport,
-        report: &PlannedPaneReport,
-    ) -> io::Result<Option<u64>> {
-        if let Err(error) = self.report(
-            transport,
-            &report.resource,
-            &report.stored_keys,
-            report.occupant.as_ref(),
-            &report.desired,
-            None,
-        ) {
-            if capacity_skip_count(&error).is_some() {
-                return Ok(Some(1));
-            }
-            // Do not continue I/O after an ambiguous response: reconnect/reconcile.
-            return Err(error);
-        }
-        Ok(None)
-    }
-
     fn plan_workspace_report(
         &self,
         headings: &Headings,
@@ -1866,27 +2193,6 @@ impl MetadataPublisher {
         }
     }
 
-    fn send_workspace_report(
-        &mut self,
-        transport: &mut Transport,
-        report: &PlannedWorkspaceReport,
-    ) -> io::Result<Option<u64>> {
-        if let Err(error) = self.report(
-            transport,
-            &report.resource,
-            &report.stored_keys,
-            None,
-            &report.desired,
-            None,
-        ) {
-            if capacity_skip_count(&error).is_none() {
-                return Err(error);
-            }
-            return Ok(Some(1));
-        }
-        Ok(None)
-    }
-
     fn refresh_with_readers_inner(
         &mut self,
         transport: &mut Transport,
@@ -1894,38 +2200,135 @@ impl MetadataPublisher {
         codex: &dyn UsageReader,
         grok: &dyn UsageReader,
     ) -> io::Result<()> {
-        let inventory = self.collect_inventory(transport, config)?;
-        let headings = self.resolve_headings(&inventory)?;
-        let mut skipped_resources = 0u64;
+        let reader_timeout = Duration::from_millis(config.reader_timeout_ms);
+        let envelope = Instant::now()
+            + self.terms.snapshot
+            + self.terms.git
+            + reader_timeout
+            + self.terms.metadata;
+        let inventory = self.collect_inventory(transport, config, envelope)?;
+        let headings = self.resolve_headings(&inventory, envelope)?;
 
-        // A single budget for the cycle prevents N panes multiplying the reader wait.
-        let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
+        // A single reader budget for the cycle prevents N panes multiplying the
+        // reader wait. It starts after headings and never outlives `envelope`.
+        let cycle = model::ReadCycle::with_diagnostics(self.reader_diagnostics.clone());
+        let budget = ReaderBudget {
+            deadline: (Instant::now() + reader_timeout).min(envelope),
+            cycle: &cycle,
+        };
 
-        for pane in &inventory.snapshot.panes {
+        let snapshot = &inventory.snapshot;
+        let mut items = BTreeMap::new();
+        for pane in &snapshot.panes {
+            items.insert(
+                self.resource(ResourceKind::Pane, &pane.pane_id),
+                SendItem::Pane(pane),
+            );
+        }
+        for workspace in &snapshot.workspaces {
+            items.insert(
+                self.resource(ResourceKind::Workspace, &workspace.workspace_id),
+                SendItem::Workspace(workspace),
+            );
+        }
+        let arrivals =
+            snapshot
+                .panes
+                .iter()
+                .map(|pane| self.resource(ResourceKind::Pane, &pane.pane_id))
+                .chain(snapshot.workspaces.iter().map(|workspace| {
+                    self.resource(ResourceKind::Workspace, &workspace.workspace_id)
+                }))
+                .collect::<Vec<_>>();
+        let pass = self.send_queue.sync(arrivals);
+        let mut skip = RefreshSkip::default();
+        for resource in pass {
+            // `remove` makes the item map the visited set for this pass.
+            let Some(item) = items.remove(&resource) else {
+                continue;
+            };
             self.check_shutdown()?;
-            let observation = self.observe_pane(&inventory, config, pane, deadline, codex, grok)?;
-            self.check_shutdown()?;
-            let report = self.plan_pane_report(&inventory, config, &headings, observation)?;
-            if let Some(skip) = self.send_pane_report(transport, &report)? {
-                skipped_resources = skipped_resources.saturating_add(skip);
+            let outcome = match item {
+                SendItem::Pane(pane) => {
+                    let (observation, reader_called) =
+                        self.observe_pane(&inventory, config, pane, &budget, codex, grok)?;
+                    if reader_called {
+                        self.send_queue.rotate(&resource);
+                    }
+                    self.check_shutdown()?;
+                    let report =
+                        self.plan_pane_report(&inventory, config, &headings, observation)?;
+                    self.send_report(
+                        transport,
+                        &report.resource,
+                        &report.stored_keys,
+                        report.occupant.as_ref(),
+                        &report.desired,
+                        ReportMode::Refresh {
+                            envelope,
+                            rotate: !reader_called,
+                        },
+                    )?
+                }
+                SendItem::Workspace(workspace) => {
+                    let report = self.plan_workspace_report(&headings, workspace);
+                    self.send_report(
+                        transport,
+                        &report.resource,
+                        &report.stored_keys,
+                        None,
+                        &report.desired,
+                        ReportMode::Refresh {
+                            envelope,
+                            rotate: true,
+                        },
+                    )?
+                }
+            };
+            // An error above ends the cycle: never continue I/O after an
+            // ambiguous response; the daemon reconnects and reconciles.
+            match outcome {
+                ReportOutcome::CapacitySkipped => {
+                    skip.capacity_skipped = skip.capacity_skipped.saturating_add(1);
+                }
+                ReportOutcome::DeadlineSkipped => {
+                    skip.deadline_skipped = skip.deadline_skipped.saturating_add(1);
+                }
+                ReportOutcome::NoFrame | ReportOutcome::Acknowledged => {}
             }
         }
 
-        for workspace in &inventory.snapshot.workspaces {
-            self.check_shutdown()?;
-            let report = self.plan_workspace_report(&headings, workspace);
-            if let Some(skip) = self.send_workspace_report(transport, &report)? {
-                skipped_resources = skipped_resources.saturating_add(skip);
-            }
-        }
-
-        if skipped_resources > 0 {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                CapacitySkip { skipped_resources },
-            ))
-        } else {
+        if skip == RefreshSkip::default() {
             Ok(())
+        } else {
+            Err(skip.into_error())
+        }
+    }
+}
+
+impl MetadataPublisher {
+    fn clear_report(
+        &mut self,
+        transport: &mut Transport,
+        resource: &ResourceId,
+        keys: &BTreeSet<String>,
+        desired: &tokens::Tokens,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        match self.send_report(
+            transport,
+            resource,
+            keys,
+            None,
+            desired,
+            ReportMode::Clear { deadline },
+        )? {
+            ReportOutcome::CapacitySkipped => Err(RefreshSkip {
+                capacity_skipped: 1,
+                deadline_skipped: 0,
+            }
+            .into_error()),
+            _ => Ok(()),
         }
     }
 }
@@ -1939,10 +2342,31 @@ impl daemon::Publisher for MetadataPublisher {
         return self.refresh_cycle_with_readers(transport, config, &CodexReader, &GrokReader);
         #[cfg(not(test))]
         {
+            // Reset first so validation and worker errors still report a sample.
+            self.reset_stages();
             config.validate()?;
             self.start_weekly(config)?;
             self.refresh_with_readers(transport, config, &CodexReader, &GrokReader)
         }
+    }
+    fn refresh_stages(&self) -> Option<daemon::RefreshStages> {
+        let stages = self
+            .stages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stages.as_ref().map(|stages| daemon::RefreshStages {
+            durations: daemon::RefreshStageDurations {
+                snapshot_us: duration_us(stages.snapshot),
+                git_us: duration_us(stages.git),
+                reader_us: duration_us(stages.reader),
+                persist_us: duration_us(stages.persist),
+                socket_us: duration_us(stages.socket),
+            },
+            counts: daemon::RefreshStageCounts {
+                reports: stages.reports,
+                checkpoints: stages.checkpoints,
+            },
+        })
     }
     fn shutdown(&mut self) {
         self.codex_control.stop();
@@ -1951,8 +2375,9 @@ impl daemon::Publisher for MetadataPublisher {
         self.kimi_weekly.take();
     }
     fn clear(&mut self, transport: &mut Transport) -> io::Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let snapshot = self.snapshot(transport)?;
+        // Independent of any refresh envelope; shutdown does not stop clear.
+        let deadline = Instant::now() + CLEAR_DEADLINE;
+        let snapshot = self.snapshot_before(transport, deadline)?;
         for pane in snapshot.panes {
             check_clear_deadline(deadline)?;
             let resource = self.resource(ResourceKind::Pane, &pane.pane_id);
@@ -1960,14 +2385,7 @@ impl daemon::Publisher for MetadataPublisher {
                 .iter()
                 .map(|key| ((*key).into(), None))
                 .collect();
-            self.report(
-                transport,
-                &resource,
-                &pane.stored_keys,
-                None,
-                &desired,
-                Some(deadline),
-            )?;
+            self.clear_report(transport, &resource, &pane.stored_keys, &desired, deadline)?;
         }
         for workspace in snapshot.workspaces {
             check_clear_deadline(deadline)?;
@@ -1976,13 +2394,12 @@ impl daemon::Publisher for MetadataPublisher {
                 .iter()
                 .map(|key| ((*key).into(), None))
                 .collect();
-            self.report(
+            self.clear_report(
                 transport,
                 &resource,
                 &workspace.stored_keys,
-                None,
                 &desired,
-                Some(deadline),
+                deadline,
             )?;
         }
         Ok(())
@@ -2029,10 +2446,23 @@ fn check_clear_deadline(deadline: Instant) -> io::Result<()> {
     }
 }
 
-fn exchange(transport: &mut Transport, request: &Value) -> io::Result<Value> {
-    transport.send_line(&serde_json::to_vec(request)?)?;
-    serde_json::from_slice(&transport.receive_line()?)
+/// One request and response under the caller's absolute deadline. The
+/// transport also caps connect, write and read locally and reconnects only
+/// after a complete response, so an unanswered request is never replayed.
+fn exchange_before(
+    transport: &mut Transport,
+    request: &Value,
+    deadline: Instant,
+) -> io::Result<Value> {
+    transport.send_line_before(&serde_json::to_vec(request)?, deadline)?;
+    serde_json::from_slice(&transport.receive_line_before(deadline)?)
         .map_err(|_| io::Error::other("invalid Herdr JSON response"))
+}
+
+/// Far enough that only the transport's local caps apply.
+#[cfg(test)]
+fn unbounded_test_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(3600)
 }
 fn unix(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
@@ -2781,6 +3211,9 @@ mod tests {
             reader_timeout_ms: 100,
             ..Config::default()
         };
+        // This fixture is about timeout restore, not fairness: keep the
+        // exhausting Codex pane first, as in snapshot order.
+        publisher.send_queue = FairQueue::default();
         publisher
             .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
             .unwrap();
@@ -2790,6 +3223,9 @@ mod tests {
         let cached = publisher.local_readings.get_mut("w1:p2").unwrap();
         // Inject an elapsed reset into the prior observation without real waits.
         cached.weekly_resets_at = Some(SystemTime::now() - Duration::from_secs(1));
+        // This fixture is about timeout restore, not fairness: keep the
+        // exhausting Codex pane first, as in snapshot order.
+        publisher.send_queue = FairQueue::default();
         publisher
             .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
             .unwrap();
@@ -2802,6 +3238,9 @@ mod tests {
         cached.weekly_window = Some(WeeklyWindow::RollingSevenDays);
         cached.weekly_resets_at = None;
         cached.observed_at = Some(SystemTime::now() - Duration::from_secs(61));
+        // This fixture is about timeout restore, not fairness: keep the
+        // exhausting Codex pane first, as in snapshot order.
+        publisher.send_queue = FairQueue::default();
         publisher
             .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
             .unwrap();
@@ -2810,6 +3249,9 @@ mod tests {
             .unwrap();
         template.lock().unwrap()["result"]["snapshot"]["panes"][1]["agent_session"]["value"] =
             json!("other-session");
+        // This fixture is about timeout restore, not fairness: keep the
+        // exhausting Codex pane first, as in snapshot order.
+        publisher.send_queue = FairQueue::default();
         publisher
             .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
             .unwrap();
@@ -2947,6 +3389,13 @@ mod tests {
         }
     }
 
+    fn confirmed(repository: &ship_time::Repository, verified_at: Instant) -> HeadingRead {
+        HeadingRead::Confirmed {
+            repository: repository.clone(),
+            verified_at,
+        }
+    }
+
     #[test]
     fn heading_timeout_retains_only_the_same_workspace_and_occupant() {
         let dir = tempfile::tempdir().unwrap();
@@ -2964,31 +3413,19 @@ mod tests {
                 native_session: Some("native-one".into()),
             }),
         )];
+        let t0 = Instant::now();
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &occupant,
-                ship_time::RepositoryRead::Complete(Some(repo.clone()))
-            ),
+            publisher.heading_repository("w1", Some(cwd), &occupant, confirmed(&repo, t0), t0),
             Some(repo.clone())
         );
+        for read in [HeadingRead::Interrupted, HeadingRead::NotAttempted] {
+            assert_eq!(
+                publisher.heading_repository("w1", Some(cwd), &occupant, read, t0),
+                Some(repo.clone())
+            );
+        }
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &occupant,
-                ship_time::RepositoryRead::Interrupted
-            ),
-            Some(repo)
-        );
-        assert_eq!(
-            publisher.heading_repository(
-                "w2",
-                Some(cwd),
-                &occupant,
-                ship_time::RepositoryRead::Interrupted
-            ),
+            publisher.heading_repository("w2", Some(cwd), &occupant, HeadingRead::Interrupted, t0),
             None
         );
         let changed = vec![(
@@ -2999,14 +3436,81 @@ mod tests {
             }),
         )];
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &changed,
-                ship_time::RepositoryRead::Interrupted
-            ),
+            publisher.heading_repository("w1", Some(cwd), &changed, HeadingRead::Interrupted, t0),
             None
         );
+    }
+
+    // F14 and F18: the fallback is bounded by the original verification
+    // instant, even when the occupants never change.
+    #[test]
+    fn heading_fallback_expires_thirty_seconds_after_the_original_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().to_owned(), "fake".into(), Homes::default()).unwrap();
+        let cwd = Path::new("/synthetic/repo");
+        let repo = ship_time::Repository {
+            name: "repo".into(),
+            ship_unix: Some(123),
+        };
+        let t0 = Instant::now();
+        let at = |seconds: u64| t0 + Duration::from_secs(seconds);
+        publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, t0), t0);
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(29)),
+            Some(repo.clone()),
+            "fallback must hold just before 30 s"
+        );
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(30)),
+            None,
+            "fallback must end at 30 s"
+        );
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(31)),
+            None,
+            "an expired heading is not retained by occupant equality"
+        );
+
+        // A cache hit inherits its root's old verification and does not renew it.
+        let root_verified = t0.checked_sub(Duration::from_secs(25)).unwrap();
+        publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, root_verified), t0);
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::NotAttempted, at(4)),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::NotAttempted, at(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn heading_read_needs_a_verification_instant_to_be_confirmed() {
+        let repo = ship_time::Repository {
+            name: "repo".into(),
+            ship_unix: None,
+        };
+        let now = Instant::now();
+        let read = |read, verified_at| {
+            HeadingRead::from(ship_time::RepositoryObservation { read, verified_at })
+        };
+        assert!(matches!(
+            read(ship_time::RepositoryRead::Complete(Some(repo.clone())), Some(now)),
+            HeadingRead::Confirmed { verified_at, .. } if verified_at == now
+        ));
+        assert!(matches!(
+            read(ship_time::RepositoryRead::Complete(Some(repo)), None),
+            HeadingRead::Unknown
+        ));
+        assert!(matches!(
+            read(ship_time::RepositoryRead::Complete(None), None),
+            HeadingRead::Unknown
+        ));
+        assert!(matches!(
+            read(ship_time::RepositoryRead::Interrupted, None),
+            HeadingRead::Interrupted
+        ));
     }
 
     #[test]
@@ -3019,45 +3523,23 @@ mod tests {
             name: "repo".into(),
             ship_unix: Some(123),
         };
+        let now = Instant::now();
         for replacement in [Some(Path::new("/synthetic/other")), None] {
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &[],
-                ship_time::RepositoryRead::Complete(Some(repo.clone())),
-            );
+            publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, now), now);
             assert_eq!(
-                publisher.heading_repository(
-                    "w1",
-                    replacement,
-                    &[],
-                    ship_time::RepositoryRead::Interrupted
-                ),
+                publisher.heading_repository("w1", replacement, &[], HeadingRead::Interrupted, now),
                 None
             );
         }
-        publisher.heading_repository(
-            "w1",
-            Some(cwd),
-            &[],
-            ship_time::RepositoryRead::Complete(Some(repo)),
-        );
+        // F16: a completed read without a repository (including rejection)
+        // clears at once and starts no fallback.
+        publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, now), now);
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &[],
-                ship_time::RepositoryRead::Complete(None)
-            ),
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Unknown, now),
             None
         );
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &[],
-                ship_time::RepositoryRead::Interrupted
-            ),
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, now),
             None
         );
     }
@@ -4421,25 +4903,16 @@ mod tests {
     }
 
     #[test]
-    fn same_cwd_is_read_once_per_cycle_and_refreshed_next_cycle() {
-        let cwd = Path::new("/synthetic/repo");
-        let mut calls = 0;
-        for cycle in 0..2 {
-            let mut readings = BTreeMap::new();
-            for _ in 0..2 {
-                let reading = repository_read_once(&mut readings, cwd, |_| {
-                    calls += 1;
-                    ship_time::RepositoryRead::Complete(Some(ship_time::Repository {
-                        name: format!("cycle-{cycle}"),
-                        ship_unix: Some(cycle),
-                    }))
-                });
-                assert!(
-                    matches!(reading, ship_time::RepositoryRead::Complete(Some(repo)) if repo.name == format!("cycle-{cycle}"))
-                );
-            }
-            assert_eq!(calls, cycle + 1);
-        }
+    fn fair_queue_syncs_rotates_and_never_revisits_in_one_pass() {
+        let mut queue = FairQueue::default();
+        assert_eq!(queue.sync(["a", "b", "c"]), ["a", "b", "c"]);
+        queue.rotate(&"a");
+        assert_eq!(queue.sync(["a", "b", "c"]), ["b", "c", "a"]);
+        // F13: removed IDs leave, survivors keep order, new IDs go to the tail
+        // in snapshot order, and duplicates in one snapshot appear once.
+        assert_eq!(queue.sync(["d", "a", "c", "e", "d"]), ["c", "a", "d", "e"]);
+        queue.rotate(&"missing");
+        assert_eq!(queue.sync(["d", "a", "c", "e"]), ["c", "a", "d", "e"]);
     }
 
     #[test]
@@ -4740,7 +5213,9 @@ mod tests {
             cycles[2]["w1:p2"],
             json!({"lineup_group":null,"lineup_group_ship_text":null})
         );
-        assert_eq!(cycles[2]["w1"]["lineup_repo"], "—");
+        // An Unknown heading clears the workspace keys instead of showing `—`.
+        assert!(cycles[2]["w1"]["lineup_repo"].is_null());
+        assert!(cycles[2]["w1"]["lineup_ship_text"].is_null());
     }
 
     #[test]
@@ -4918,7 +5393,8 @@ mod tests {
         assert!(result.is_ok(), "real one-shot response failed: {result:?}");
         let report = report.unwrap();
         assert_eq!(report["method"], "workspace.report_metadata");
-        assert_eq!(report["params"]["tokens"]["lineup_repo"], "—");
+        // No repository is an Unknown heading: its stored keys are cleared.
+        assert!(report["params"]["tokens"]["lineup_repo"].is_null());
     }
 
     #[test]
@@ -5744,7 +6220,7 @@ mod tests {
                     )
                     .unwrap();
                 let external = external_start.elapsed();
-                let stages = publisher.stages.lock().unwrap().clone();
+                let stages = publisher.stages.lock().unwrap().clone().unwrap();
                 let us = |duration: Duration| duration.as_micros();
                 println!(
                     "{panes},{run},{},{},{},{},{},{},{},{},{},{}",
@@ -6279,11 +6755,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let mut reports = Vec::new();
+            // The workspace has no repository: its Unknown heading publishes
+            // nulls once in cycle 1 and needs no clear frame afterwards.
             for cycle in 0..3 {
                 let request = receive(&mut stream);
                 let response = snapshot(&request["id"], true);
                 writeln!(stream.get_mut(), "{response}").unwrap();
-                for _ in 0..if cycle == 0 { 1 } else { 2 } {
+                for _ in 0..if cycle == 1 { 2 } else { 1 } {
                     let request = receive(&mut stream);
                     let response = if cycle == 0 {
                         json!({"id":request["id"],"error":{"code":"rejected","message":"synthetic rejection"}})
@@ -6304,10 +6782,14 @@ mod tests {
         publisher.refresh(&mut transport, &config).unwrap();
         publisher.clear(&mut transport).unwrap();
         let reports = server.join().unwrap();
+        assert_eq!(reports.len(), 4);
         assert_eq!(reports[0]["params"]["seq"], 1);
         assert_eq!(reports[1]["params"]["seq"], 2);
         assert_eq!(reports[3]["params"]["seq"], 4);
-        for request in &reports[3..] {
+        // Cycle 1 visits the workspace first because the rejected pane rotated;
+        // the workspace frame and the clear frame carry only nulls.
+        assert_eq!(reports[1]["method"], "workspace.report_metadata");
+        for request in [&reports[1], &reports[3]] {
             let tokens = request["params"]["tokens"].as_object().unwrap();
             assert!(tokens.values().all(Value::is_null));
             assert!(tokens.keys().all(|key| key.starts_with("lineup_")));
@@ -6335,7 +6817,7 @@ mod tests {
         )
         .unwrap();
         let result = publisher.refresh(&mut transport, &crate::config::Config::default());
-        assert_eq!(capacity_skip_count(result.as_ref().unwrap_err()), None);
+        assert_eq!(refresh_skip(result.as_ref().unwrap_err()), None);
         server.join().unwrap();
     }
 
@@ -6435,7 +6917,13 @@ mod tests {
         let mut publisher =
             MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
         let result = publisher.refresh(&mut transport, &crate::config::Config::default());
-        assert_eq!(capacity_skip_count(result.as_ref().unwrap_err()), Some(1));
+        assert_eq!(
+            refresh_skip(result.as_ref().unwrap_err()),
+            Some(RefreshSkip {
+                capacity_skipped: 1,
+                deadline_skipped: 0
+            })
+        );
         let mut health = crate::daemon::Health {
             plugin: crate::daemon::PLUGIN_ID.into(),
             socket_path: socket,
