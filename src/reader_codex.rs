@@ -1,10 +1,10 @@
 //! Codex UI context percentage from exact-session rollout token_count observations.
 use crate::model::*;
+use crate::reader_cache::FingerprintCache;
 use serde::Deserialize;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{MapAccess, Visitor};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -13,14 +13,10 @@ use std::time::SystemTime;
 const CACHE_ENTRIES: usize = 128;
 type Observation = Result<(f64, SystemTime), MissingReason>;
 
-struct CachedRollout {
-    fingerprint: Fingerprint,
-    observation: Observation,
-}
 // Only paths, exact session IDs and derived observations are retained in memory.
 // Discovery still runs on cache hits to reject duplicate and symlinked sources.
-static CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), CachedRollout>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CACHE: LazyLock<Mutex<FingerprintCache<(PathBuf, String), Observation>>> =
+    LazyLock::new(|| Mutex::new(FingerprintCache::new(CACHE_ENTRIES)));
 
 pub struct CodexReader;
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -92,11 +88,10 @@ fn read_session_with_hooks(
     if let Some(cached) = CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .get(&key)
-        && cached.fingerprint == fingerprint
+        .get(&key, fingerprint)
     {
         budget.check()?;
-        return cached.observation;
+        return cached;
     }
     let result = if path.extension().is_some_and(|e| e == "zst") {
         // Keep the existing 16 MiB decompressed limit (SourceError on overflow).
@@ -127,17 +122,10 @@ fn read_session_with_hooks(
         result,
         Err(MissingReason::Timeout | MissingReason::SourceError | MissingReason::PermissionDenied)
     ) {
-        let mut cache = CACHE.lock().map_err(|_| MissingReason::SourceError)?;
-        if cache.len() >= CACHE_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(
-            key,
-            CachedRollout {
-                fingerprint,
-                observation: result,
-            },
-        );
+        CACHE
+            .lock()
+            .map_err(|_| MissingReason::SourceError)?
+            .insert(key, fingerprint, result);
     }
     result
 }
