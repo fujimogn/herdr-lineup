@@ -1,8 +1,8 @@
 # Publisher runtime wiring plan
 
-**Status:** design candidate only. No production code in this commit implements
-any part of it. The deadline values in "Cycle budget" are a proposal awaiting
-the commander's decision; they are not adopted.
+**Status:** design candidate only. No production code implements any part of
+it. The commander's decisions in `note-publisher-design-decisions-01` are
+incorporated. Implementation starts only after a design GO and a new task.
 
 **Base:** local integration `64ace031ab5b17615a2cebef46f916bf4defd79c`.
 
@@ -19,8 +19,13 @@ the sequence, endpoint, or shutdown guarantees that are already proven.
 | Outputs | `report_metadata` frames, `sequences.json`, `daemon::RefreshStages`, a typed refresh skip outcome for daemon health, reader diagnostics snapshot. |
 | Sources of truth | Token, heading and expiry behavior: `openspec/specs/sidebar-tokens/spec.md`. Reader deadline: `openspec/specs/provider-readers/spec.md`. Socket frames and daemon health: `openspec/specs/daemon-lifecycle/spec.md`. Git cache contract: commander note `note-git-cache-nogo-01`, which supersedes `docs/reviews/git-cache-design.md` v7 where they differ. Sequence safety: `docs/reviews/sequence-reservation-design-2026-10-23.md`. |
 
-Every behavior change below that a spec states differently needs an
-`openspec/changes/<change>/` delta in the same task, validated before the code.
+Every behavior change below that a spec states differently needs an openspec
+change delta in the same task, validated before the code. Proposed path (to be
+confirmed by the commander; the repository has no active change today, and
+archived names add a date only when archived):
+`openspec/changes/wire-publisher-runtime/` with deltas under
+`specs/sidebar-tokens/`, `specs/provider-readers/` and
+`specs/daemon-lifecycle/`.
 
 ## 2. Current state at the base
 
@@ -42,7 +47,7 @@ Every behavior change below that a spec states differently needs an
    clears or masks poison.
 3. The durable upper bound `U` never decreases.
 4. Ambiguous exchange, no replay: a request that may have reached Herdr is never
-   resent on the same or a new stream. The cycle ends with an error and the
+   resent on the same or a new stream. Its sequence is burned. The cycle ends with an error and the
    daemon reconnects.
 5. Endpoint pin: the endpoint bound by the first snapshot never changes.
 6. Shutdown and clear: refresh does not start a new frame after shutdown; clear
@@ -50,7 +55,7 @@ Every behavior change below that a spec states differently needs an
 7. Per-pane order: each pane runs observe → plan → send before the next pane is
    observed. A reader for pane k+1 may see files written while pane k was sent.
 
-## 4. Cycle budget (proposal, decision requested)
+## 4. Cycle budget (adopted as initial cooperative budget)
 
 ### 4.1 Derivation from existing local caps
 
@@ -66,84 +71,82 @@ used to size anything here.
 | Readers | `reader_timeout_ms` (default 2 s, at most `refresh_interval_ms`) | provider-readers spec, starts after heading resolution |
 | One metadata request | 2 s | same caps as the snapshot request |
 
-Proposal A (commander's candidate): at cycle start `t0`, the envelope is
+Adopted (option A): at cycle start `t0`, the envelope is
 `E = t0 + 2 s + 1 s + reader_timeout + 2 s` (7 s by default, 35 s at the
 maximum reader timeout). Every real I/O receives
 `min(its local cap, E − now)`.
 
-### 4.2 Admission rule that separates skips from errors
+`E` is a conservative cooperative budget. It is not an SLO, not a strict
+wall-clock bound, and not a bound on physical fsync time. Synchronous
+filesystem work (checkpoint fsync and rename, reader `stat`/read, Git kill and
+reap) and scheduler delay are checked before and after, never interrupted, and
+can overrun `E`.
+
+### 4.2 Admission threshold, skips and errors
 
 A metadata request is admitted only while `E − now ≥ 2 s`, checked at the last
 point before the exchange (after any reservation persist, beside today's
-shutdown check). Because an admitted request always has its whole local-cap
-worst case left, the cycle deadline is never what cuts an in-flight exchange.
-Therefore:
+shutdown check). The threshold only reads the remaining budget. Synchronous I/O
+or scheduling delay between the check and the exchange can still let `E`
+expire while the request is in flight, so the design does **not** guarantee
+that the cycle deadline never cuts an in-flight exchange.
 
-- Not admitted: `DeadlineSkip`. No bytes were written. Not an error, no
-  reconnect, the resource is not rotated (§5).
-- Admitted, then `TimedOut` or any other failure inside the exchange: a real,
-  possibly ambiguous error. Invariant 4 applies.
+- Not admitted: a deadline skip. No frame was written. Not an error, no
+  reconnect, the item is not rotated (§5).
+- Admitted, then the exchange fails for any reason, including `E` or a local
+  cap expiring after the frame may have been written: an ambiguous error. The
+  prepared sequence is burned, the request is never resent (invariant 4), the
+  cycle ends with an error, and the daemon reconnects.
 
-The snapshot request is always started at cycle start with deadline `E`; with
-`E − t0 ≥ 5 s` its local caps bind first.
+The snapshot request is always started at cycle start with deadline `E`.
 
-Synchronous filesystem work (checkpoint fsync and rename, reader `stat`/read,
-Git kill and reap) is cooperative: it is checked before and after, never
-interrupted. `E` is therefore not a strict wall-clock guarantee.
-
-### 4.3 Conflict with key expiry (finding)
+### 4.3 Expiry gap in degraded cycles
 
 Live keys carry `ttl_ms = 3 × refresh_interval_ms` (15 s by default) and are
 renewed once a resource is at least one interval old. The daemon schedules the
-next refresh one interval after the previous one ends. For a resource sent at
-offset `a` in cycle k and offset `b` in cycle k+1, the gap between sends is at
-most `D + I + b`, where `D` is the cycle duration and `I` the interval. With
-admission ending at `E − 2 s`:
+next refresh one interval after the previous one ends. The gap between two
+sends of one resource is at most `D + I + b`, where `D` is the cycle duration,
+`I` the interval and `b` the resource's offset in the next cycle. At defaults
+with admission ending at `E − 2 s`, the gap can reach 17 s, above the 15 s
+TTL, and rotation (§5) makes that ordering likely when cycles run long.
 
-- A at defaults: `D ≤ 7 s`, `b ≤ 5 s`, gap ≤ 17 s > 15 s TTL. A resource sent
-  first in one degraded cycle and last in the next can expire for up to 2 s.
-  Rotation (§5) makes exactly that ordering likely.
-- Clamping (alternative B) to keep the gap ≤ TTL needs the admission end at
-  `t0 + min(3 s + reader_timeout, I − 1 s)`. It holds the bound at defaults
-  only under these caps, can admit nothing in the worst case for `I ≤ 3 s` unless a floor of one
-  admitted request per cycle is added, and with that floor it cannot hold the
-  bound for small intervals.
-- Under a uniform slowdown, more admitted requests per cycle shorten the time
-  until every resource is renewed again. A longer envelope (A) is better for
-  that, and B is better only for the reordering case above.
-
-Both options fail safe: an expired key disappears, it never shows a wrong
-value. My recommendation is A, with the expiry gap written into the spec as a
-degraded-mode property, because it does not change the reader deadline's
-meaning and gives more renewals under uniform slowness. The commander decides.
-Changing the refresh period, a `timeout` executable, process isolation and
-socket reuse stay out of scope as instructed.
+This is accepted degraded behavior and goes into the spec delta: the key
+expires and disappears; it never shows a wrong value. The refresh period, the
+TTL multiplier and their defaults are not changed. The clamp alternative was
+rejected. A `timeout` executable, process isolation and socket reuse stay out
+of scope.
 
 ## 5. Fair queues
 
-Both queues use the same rule set, so one helper type `FairQueue<K>` (private
-to `publish.rs`) serves both.
+Both queues use one private helper type `FairQueue<K>` in `publish.rs`.
 
-- **Sync:** each cycle takes the current ID set from the snapshot. IDs that
+- **Sync:** at cycle start, take the current ID set from the snapshot. IDs that
   disappeared are removed; survivors keep their relative order; new IDs are
   appended at the tail in snapshot order.
-- **Attempt:** iterate from the head. When an item's first budgeted I/O starts,
-  move it to the tail at that moment, even if the attempt then times out or
-  fails.
-- **Skip:** an item that is not started because the budget is exhausted stays
-  where it is. Iteration stops at the first such skip.
-- **Progress:** the head always gets the full initial budget of its stage, so
-  each cycle rotates at least one item, and every item reaches the head within
-  N cycles.
+- **Pass:** iteration walks a copy of the queue order taken right after sync
+  (`pass`), once, with a `visited` set for this cycle. Rotation moves items
+  inside the real queue but never adds to `pass`, so no item is revisited in
+  the same cycle and the loop ends after at most N steps.
+- **Attempt:** when an item's first budgeted I/O starts, move it to the tail of
+  the real queue at that moment, even if the attempt then times out or fails.
+- **Skip:** an item not started because its stage budget is exhausted stays
+  where it is. Once one item is skipped for budget, the rest of `pass` is
+  skipped too (counted, not started, not rotated, not revisited).
+- **Progress (conditional):** if the cycle reaches the stage with its initial
+  budget, is not shut down, and the publisher is not poisoned, the first item of
+  `pass` is started, so at least one item rotates per such cycle and every item
+  is started within N such cycles. A cycle that ends earlier (snapshot error,
+  shutdown, poison, ambiguous exchange) gives no progress guarantee.
 
 ### 5.1 Git queue (key: workspace ID)
 
 - Cycle Git deadline `G = min(t_git + 1 s, E)`. Each query runs with
   `min(1 s, G − now)`.
-- `repository_read_once` keeps sharing results between workspaces with the same
-  cwd within one cycle. A shared result is not a new attempt and does not rotate
-  the second workspace.
-- Workspaces left in the queue this cycle get `HeadingState::NotAttempted`.
+- Results are shared between workspaces with the same cwd within one cycle
+  (today's `repository_read_once`). A workspace served from that shared result
+  starts no Git I/O, is marked visited, and is not rotated. Only the workspace
+  that started the read is rotated.
+- Workspaces left in `pass` get `HeadingState::NotAttempted`.
 
 Git cache contract (`note-git-cache-nogo-01` and
 `note-publisher-design-contract-update-01`, owned by `lane_git_implementation`,
@@ -165,9 +168,13 @@ not change it.
 
 Panes and workspaces share one queue so workspace reports cannot starve behind
 panes. A pane item runs observe → plan → send (invariant 7). A workspace item
-runs plan → send from the already-resolved headings. An item's first budgeted
-I/O is its reader call or, if it has none, its metadata exchange. An item whose
-planner needs no report does no socket I/O and is not an attempt.
+runs plan → send from the already-resolved headings.
+
+An item's first budgeted I/O is its reader call, or its metadata exchange if it
+has no reader call. A pane whose reader I/O started is an attempt and rotates
+even if its planner then needs no report. An item that starts neither is not
+an attempt. A report skipped for budget after the reader ran leaves the item
+already rotated by the reader attempt; it is not revisited this cycle.
 
 `first_pane_ids` keeps using snapshot order, never queue order, so heading
 placement and logo indentation do not move with rotation.
@@ -179,19 +186,23 @@ placement and logo indentation do not move with rotation.
 
 | State | Condition | Workspace keys | First-pane group keys |
 |---|---|---|---|
-| Confirmed | `Complete(Some)` with `verified_at` | name and ship text | copied |
-| Absent | `Complete(None)` (confirmed non-repository) | `—` | null |
-| Fallback | `Interrupted` or `NotAttempted`, same cwd and occupants, `now − confirmed < 30 s` | previous values | copied |
-| Unknown | otherwise | null | null |
+| Confirmed | `Complete(Some(repository))` with `verified_at` | name; ship text, or `—` when `ship_unix` is `None` (confirmed absence of `origin/main`) | copied |
+| Fallback | `Interrupted` or `NotAttempted`, previous Confirmed, same cwd and occupants, `now − confirmed < 30 s` | previous values | copied |
+| Unknown | everything else, including `Complete(None)` | null | null |
 
-- Fallback never refreshes `confirmed`. A cache hit that inherits an old root
-  `verified_at` expires 30 s after that root check, not after the hit.
-- Unknown sends null, not `—`. `—` claims a confirmed absence; null says
-  nothing. A stale heading with the same occupant is therefore cleared at 30 s
-  instead of being retained indefinitely, as it is today.
-- This changes the sidebar-tokens requirement "the previous heading SHALL be
-  kept when the workspace cwd and occupants are unchanged" and needs a spec
-  delta.
+- `Complete(None)` from the Git API also covers rejection (`safe.directory`,
+  ownership) and unreadable filesystem state, and carries no `verified_at`. It
+  is therefore not treated as a confirmed non-repository: it sends null, not
+  `—`, and it discards the previous heading rather than starting a fallback.
+- Only `Interrupted` and `NotAttempted` may use the fallback, and only for 30 s
+  from the last real confirmation. Fallback never refreshes `confirmed`. A
+  cache hit that inherits an old root `verified_at` expires 30 s after that
+  root check, not after the hit.
+- A stale heading with the same occupant is cleared at 30 s instead of being
+  retained indefinitely, as it is today.
+- This changes the sidebar-tokens requirements "An unresolved/non-working
+  repository SHALL show `—`" and "The previous heading SHALL be kept when the
+  workspace cwd and occupants are unchanged", and needs a spec delta.
 
 Panes not reached in a cycle send nothing. Their keys keep the expiry from
 their last accepted report. No workspace value is derived from pane
@@ -214,9 +225,14 @@ The daemon classifies by payload before error kind. `deadline_skipped > 0`
 does not set `refresh_failed`, does not reconnect, and logs
 `refresh_skipped: cycle_deadline`. Shutdown still yields `Interrupted`,
 checked before skip classification. Poison and ambiguous-exchange errors stay
-errors. Doctor prints both counts; the control wire field is optional, matching
-how `stages` was added. Check the version-skew behavior of
-`deny_unknown_fields` against that precedent before adding it.
+errors.
+
+The existing `Health` Rust struct keeps its fields and meaning. The deadline
+count is added as optional diagnostics next to the existing observation data,
+compatible with the typed skip, so a deadline skip is distinguishable from both
+a capacity skip and an error. The control wire field is optional, matching how
+`stages` was added; check the version-skew behavior of `deny_unknown_fields`
+against that precedent before adding it.
 
 ## 8. Stage timing in production
 
@@ -224,19 +240,18 @@ Replace the `cfg(test)` `StageTimes` with an always-built value that is reset at
 the start of each refresh and returned by `refresh_stages()` after every
 attempt, including errors and skips.
 
-| Field | Measures |
-|---|---|
-| `snapshot_us` | `session.snapshot` request and parse |
-| `git_us` | heading resolution stage, wall time |
-| `reader_us` | sum of reader calls |
-| `persist_us` | sum of successful and failed checkpoint writes |
-| `socket_us` | snapshot and metadata exchanges |
-| `reports` | acknowledged metadata reports |
-| `checkpoints` | successful `sequences.json` writes in this refresh, not rows |
+| Field | Measures | Overlaps with |
+|---|---|---|
+| `snapshot_us` | `session.snapshot` request and parse | includes the snapshot's share of `socket_us` |
+| `git_us` | heading resolution stage, wall time | none |
+| `reader_us` | sum of reader calls | none |
+| `persist_us` | sum of successful and failed checkpoint writes, including reservation and pruning | inside the pane/workspace loop, not inside `socket_us` |
+| `socket_us` | snapshot and metadata exchanges | snapshot exchange also counted in `snapshot_us` |
+| `reports` | acknowledged metadata reports | — |
+| `checkpoints` | successful `sequences.json` writes in this refresh, not rows | — |
 
-Stages overlap (`snapshot_us` includes its socket time) and are not additive;
-doctor's wording must say so. Measurement uses `Instant` only and writes no
-files.
+Stages are not additive and their sum is not the cycle duration; doctor's
+wording must say so. Measurement uses `Instant` only and writes no files.
 
 ## 9. Reader cycle and diagnostics
 
@@ -250,62 +265,67 @@ files.
   `bounded_read_observed(..., &ReaderDiagnostics, job)`, and snapshots for the
   fixed provider set where a failed `try_lock` reads as unavailable. Names are
   taken from the integrated commit, not from `b2239ff`.
-- After that API is integrated, `MetadataPublisher` owns one
-  `Arc<ReaderDiagnostics>` for its lifetime and builds each refresh's cycle with
-  the diagnostics constructor. Selecting `bounded_read_observed` inside readers
-  belongs to the reader wiring task, not to W2. A new `Publisher` method with a
-  `None` default, like `refresh_stages`, exposes the provider snapshots to the
-  daemon control state and doctor. An unavailable or skipped sample must stay
-  distinct from zero.
+- Task P builds the per-refresh cycle without diagnostics. Task D (after P)
+  makes `MetadataPublisher` own one `Arc<ReaderDiagnostics>` for its lifetime,
+  builds each cycle with the diagnostics constructor, and adds a `Publisher`
+  method with a `None` default, like `refresh_stages`, that exposes the
+  provider snapshots to the daemon control state and doctor. An unavailable or
+  skipped sample must stay distinct from zero. Selecting
+  `bounded_read_observed` inside readers belongs to another member's reader
+  task.
 
 ## 10. Tasks, ownership and order
 
-All tasks touch `src/publish.rs`, so they run one after another, never in
-parallel. Each is one commit with its own spec delta and can be reverted alone.
-
-| Task | Files | Depends on | Owner of fixtures |
+| Task | Files | Starts after | Owner of fixtures |
 |---|---|---|---|
-| W1 cycle budget, send queue, `RefreshSkip`, socket `*_before` | `publish.rs`, `daemon.rs`, spec deltas | commander's §4 decision | publish tests (fake socket) and daemon health tests |
-| W2 per-refresh `ReadCycle` | `publish.rs` | none | publish tests |
-| W3 Git queue and heading states | `publish.rs`, sidebar-tokens delta | `lane_git_implementation` observation API integrated | publish tests with real temporary Git |
-| W4 runtime stages and reader diagnostics consumer | `publish.rs`, `daemon.rs`, `doctor.rs` | W1; reader observability integrated | daemon and doctor tests |
+| P publish runtime wiring: cycle budget, admission, socket `*_before`, send fair queue, Git fair queue and heading states on the Git observation API, per-refresh `ReadCycle`, production stages, `RefreshSkip` classification | `src/publish.rs`, `src/daemon.rs`, the openspec change of §1 | design GO, a new task, a base that contains the completed stage histogram lane and the integrated Git observation API | publish tests (fake socket, real temporary Git) and daemon health tests |
+| D reader diagnostics consumer: publisher-owned `Arc<ReaderDiagnostics>`, `Publisher` accessor, daemon control state, doctor output | `src/publish.rs`, `src/daemon.rs`, `src/doctor.rs` | P integrated and the diagnostics source API integrated | daemon and doctor tests |
+| Reader selection of `bounded_read_observed` (another member) | the two reader-side files that member owns | its own assignment | that member |
 
-`model.rs`, the readers and `ship_time.rs` belong to the reader and Git lanes
-and are not edited by these tasks. Clear is unchanged. Its existing 1 s
-admission guard is smaller than the 2 s worst-case round trip. That is a
-pre-existing overrun, reported here, not fixed in this plan.
+P and D overlap on `publish.rs` and `daemon.rs`, so they run in series. P runs
+in parallel with the reader task because their files do not overlap. P and D
+do not edit `model.rs`, the readers, or `ship_time.rs`; those belong to the
+reader and Git lanes. Clear is unchanged. Its existing 1 s admission guard is
+smaller than the 2 s worst-case round trip; that is a pre-existing overrun,
+reported here, not fixed in this plan.
 
 ### Rollback
 
 No on-disk format changes: the checkpoint is untouched, and the queues, heading
 states and stage values are memory-only. Rolling back is reverting the task's
-commit. A daemon restart then returns to today's behavior, and the checkpoint
-written by the new code is valid for the old code.
+commit. A daemon restart then returns to the previous behavior, and the
+checkpoint written by the new code is valid for the old code.
 
 ## 11. Required fixtures
 
 | # | Task | Fixture | Proves |
 |---|---|---|---|
-| F1 | W1 | Fake socket delays every report by 400 ms; 12 panes, a 5 s envelope | Result is `deadline_skipped > 0`; no reconnect; every resource is acknowledged within ⌈N/k⌉ cycles; unstarted items keep their order |
-| F2 | W1 | Server reads a report and never replies | Error, not skip; single request ID observed; sequence not reused; daemon reconnects |
-| F3 | W1 | Admission evaluated after a reservation persist that consumes the budget (injected slow persist) | Skip with no frame written; `U` unchanged or higher; next cycle continues above it |
-| F4 | W1 | Checkpoint fault during a budgeted cycle | Poisoned; later cycles return the poison error, never a skip |
-| F5 | W1 | Shutdown set mid-cycle | `Interrupted`, not a deadline skip; clear still uses its own deadline |
-| F6 | W1 | Workspaces placed after many panes, budget for half | Workspace reports are sent within the queue bound |
-| F7 | W1 | Reader for pane 2 checks a file written by the fake socket when it acknowledges pane 1 | observe → plan → send order kept |
-| F8 | W2 | Two Codex panes, same home | One discovery scan per refresh; a new refresh starts with an empty cycle |
-| F9 | W3 | Three repositories, the first stalls Git past 1 s | Queue `[A,B,C]` → `[B,C,A]` after cycle 1, with B and C not rotated while skipped; every workspace is attempted within 3 cycles |
-| F10 | W3 | Queue sync with removed and new workspaces | Survivors keep order; new IDs at the tail |
-| F11 | W3 | Injected clock: confirmed at t0, then `Interrupted` | Heading kept at 29 s, null at 30 s; a cache hit whose root was verified at t0 − 25 s expires at t0 + 5 s |
-| F12 | W3 | New workspace not attempted in its first cycle | Null keys, never `—` |
-| F13 | W3 | Same occupant, Git failing for 31 s | Heading cleared; not retained by occupant equality |
-| F14 | W4 | One refresh with known reports and one reservation | `reports` equals acknowledgements; `checkpoints` equals 1; stages present after an error |
-| F15 | W4 | Diagnostics skipped sample | Doctor shows unavailable, not 0 |
+| F1 | P | Fake socket delays every report by 400 ms; 12 panes; reader timeout set so few reports fit | Result has `deadline_skipped > 0`; no reconnect; every resource is acknowledged within ⌈N/k⌉ cycles; unstarted items keep their order |
+| F2 | P | Server reads a report and never replies | Error, not skip; single request ID observed; sequence burned, not reused; daemon reconnects |
+| F3 | P | Injected slow reservation persist that leaves `E − now < 2 s` | Skip with no frame written; `U` unchanged or higher; next cycle continues above it |
+| F4 | P | Injected delay between admission and exchange so `E` expires in flight | Ambiguous error, never a skip; no resend; sequence burned |
+| F5 | P | Checkpoint fault during a budgeted cycle | Poisoned; later cycles return the poison error, never a skip |
+| F6 | P | Shutdown set mid-cycle | `Interrupted`, not a deadline skip; clear still uses its own deadline |
+| F7 | P | Workspaces placed after many panes, budget for half | Workspace reports are sent within the queue bound |
+| F8 | P | Reader for pane 2 checks a file written by the fake socket when it acknowledges pane 1 | observe → plan → send order kept |
+| F9 | P | Pane whose reader runs but needs no report, followed by a budget skip | Reader pane rotated; skipped panes keep order; no item visited twice in the cycle |
+| F10 | P | Two Codex panes, same home | One discovery scan per refresh; a new refresh starts with an empty cycle |
+| F11 | P | Three repositories, the first stalls Git past 1 s | Queue `[A,B,C]` → `[B,C,A]` after cycle 1, B and C not rotated while skipped; every workspace started within 3 cycles that reach Git with full budget |
+| F12 | P | Two workspaces share one cwd that stalls Git | One Git read per cycle; only the starting workspace rotates; the loop ends after N steps |
+| F13 | P | Queue sync with removed and new workspaces | Survivors keep order; new IDs at the tail |
+| F14 | P | Injected clock: confirmed at t0, then `Interrupted` | Heading kept at 29 s, null at 30 s; a cache hit whose root was verified at t0 − 25 s expires at t0 + 5 s |
+| F15 | P | New workspace not attempted in its first cycle | Null keys, never `—` |
+| F16 | P | Confirmed heading, then `Complete(None)` from a `safe.directory` rejection | Null immediately, never `—`, no fallback |
+| F17 | P | Repository without `origin/main` | Name plus `—` ship text (confirmed absence) |
+| F18 | P | Same occupant, Git interrupted for 31 s | Heading cleared; not retained by occupant equality |
+| F19 | P | One refresh with known reports and one reservation; one refresh that errors | `reports` equals acknowledgements; `checkpoints` equals 1; stages present after the error |
+| F20 | D | Diagnostics sample skipped or `try_lock` failed | Doctor shows unavailable, not 0 |
 
-## 12. Decisions for the commander
+## 12. Commander decisions applied
 
-1. §4: proposal A (recommended) or clamp B, and whether the expiry gap is
-   written into the spec as degraded-mode behavior.
-2. §6: null rather than `—` for the Unknown heading state.
-3. §10: whether W1 may touch `daemon.rs` together with `publish.rs`, so that a
-   deadline skip is never recorded as a failure in between commits.
+`note-publisher-design-decisions-01`: option A adopted as a cooperative initial
+budget with the expiry gap as specified degraded behavior; Unknown headings
+send null and `Complete(None)` is Unknown; `publish.rs` and `daemon.rs` change
+together in task P from a base after the stage histogram lane; reader
+diagnostics wiring is the later task D. Open item: confirm the openspec change
+path proposed in §1.
