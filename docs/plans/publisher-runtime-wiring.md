@@ -1,10 +1,25 @@
 # Publisher runtime wiring plan
 
-**Status:** task P implemented on branch `worktree-publisher-runtime-impl`
-(base `1787386`), not yet reviewed or integrated. Task D is not started. The
-commander's decisions in `note-publisher-design-decisions-01` are
-incorporated. Design GO on `86ea771` (`note-publisher-design-go-handoff-01`).
-The spec delta is `openspec/changes/wire-publisher-runtime/`.
+**Status:** P runtime wiring, D control/doctor diagnostics, and all local reader
+worker producers are implemented in the local candidate at
+`6be18304d6e39a0eb6d88164a866b449d9396946`, after their recorded review chains.
+This is not shipment or live verification; final combined verification belongs
+to the commander and the verification lane. The commander's decisions in
+`note-publisher-design-decisions-01` are incorporated. Design GO on `86ea771`
+(`note-publisher-design-go-handoff-01`). The synchronized spec delta is archived
+at `openspec/changes/archive/2026-10-24-wire-publisher-runtime/`.
+
+D exposes live best-effort, nontransactional provider samples independently of
+completed-attempt refresh metrics; see `docs/plans/reader-diagnostics-control.md`.
+Claude, Agy, Grok, Codex and Kimi select observed reads when diagnostics are
+present; Hermes has no worker, so its empty slot is not a successful read
+measurement. Codex retains the combined 4096-entry cap and cumulative fallback
+accounting (C1). The separate Herdr host task (C2) remains unresolved: no host
+change or live acceptance is claimed here. The envelope is cooperative and does
+not guarantee interruption of synchronous OS work. Git cache hits and misses
+still run three children; no speed improvement has been measured for this
+candidate. The historical base, design sequence and remaining constraints below
+are preserved as design history, not claims of outstanding P/D implementation.
 
 Task P differs from the text below in these points, each approved by the
 commander:
@@ -27,7 +42,7 @@ commander:
   refresh starts from an empty one; reuse of the scan inside a refresh is the
   reader's choice, as the reader tests already allow.
 
-**Base:** local integration `64ace031ab5b17615a2cebef46f916bf4defd79c`.
+**Historical design base:** local integration `64ace031ab5b17615a2cebef46f916bf4defd79c`.
 
 **Goal:** Connect the bounded-I/O pieces that already exist as APIs or test-only
 code to the production refresh path of `MetadataPublisher`, without weakening
@@ -43,14 +58,12 @@ the sequence, endpoint, or shutdown guarantees that are already proven.
 | Sources of truth | Token, heading and expiry behavior: `openspec/specs/sidebar-tokens/spec.md`. Reader deadline: `openspec/specs/provider-readers/spec.md`. Socket frames and daemon health: `openspec/specs/daemon-lifecycle/spec.md`. Git cache contract: commander note `note-git-cache-nogo-01`, which supersedes `docs/reviews/git-cache-design.md` v7 where they differ. Sequence safety: `docs/reviews/sequence-reservation-design-2026-10-23.md`. |
 
 Every behavior change below that a spec states differently needs an openspec
-change delta in the same task, validated before the code. Proposed path (to be
-confirmed by the commander; the repository has no active change today, and
-archived names add a date only when archived):
-`openspec/changes/wire-publisher-runtime/` with deltas under
+change delta in the same task, validated before the code. The approved change is now archived at
+`openspec/changes/archive/2026-10-24-wire-publisher-runtime/` with deltas under
 `specs/sidebar-tokens/`, `specs/provider-readers/` and
 `specs/daemon-lifecycle/`.
 
-## 2. Current state at the base
+## 2. Historical state at the design base
 
 | Piece | State at `64ace03` | Production gap |
 |---|---|---|

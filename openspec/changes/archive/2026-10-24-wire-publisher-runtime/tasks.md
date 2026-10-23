@@ -24,3 +24,7 @@
 - [x] Print fixed reader and retained deadline-skip diagnostics before errors.
 - [x] Verify live release, contention, skew, saturation and frame boundaries
       in normal isolated tests and run the mandatory checks.
+
+- [x] Wire observed diagnostics for every local reader worker, preserving the
+      shared busy permit and Hermes no-worker behavior, and verify the Codex
+      combined 4096-entry cap with cumulative fallback accounting (C1).
