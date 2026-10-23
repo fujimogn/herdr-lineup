@@ -406,11 +406,13 @@ and reads Grok's existing auth key from `GROK_AUTH_FILE` when set, otherwise
 It does not try another source if the selected file cannot be read. No
 credentials are displayed or persisted by Lineup. Do not restart the Herdr server.
 Lineup compares the selected key and optional user ID in memory on each sidebar
-refresh and before and after a billing request. A changed or unreadable auth
-source clears the previous weekly value; a failed request for the new account
-cannot reuse it. A temporary failure for the same source keeps a previous
-weekly value only while its known reset remains in the future. No daemon restart
-is needed to discard the old Grok weekly value after an account switch.
+refresh and before and after a billing request. Once a refresh observes a
+changed or unreadable auth source, it clears the previous weekly value; a
+failed request for the new account cannot reuse it. A change immediately after
+the source read can remain visible until the next refresh. A temporary failure
+for the same source keeps a previous weekly value only while its known reset
+remains in the future. No daemon restart is needed to discard the old Grok
+weekly value after the switch is observed.
 
 Kimi weekly quota needs a separate opt-in in the same file:
 

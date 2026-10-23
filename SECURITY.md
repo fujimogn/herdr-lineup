@@ -74,13 +74,15 @@ missing data. All failure paths are throttled; expired reset times clear cached
 usage. The synchronous client runs only on its worker. Its one configured auth
 source supplies weekly quota to all Grok panes independently of local context.
 The client and foreground publisher compare the exact selected key and optional
-user ID in memory. A change, unreadable source, or unknown source clears the
-old sample. The worker checks the source before and after HTTP and publishes
-only if the foreground has not observed another source in the meantime. A
+user ID in memory. Once the foreground refresh observes a change, unreadable
+source, or unknown source, it clears the old sample. A file change immediately
+after that refresh's source read can remain visible until the next refresh. The
+worker checks the source before and after HTTP and publishes only if the
+foreground has not observed another source in the meantime. A
 failed request retains an old sample only for the same source and only with a
 still-future known reset. A daemon restart is not needed to discard an old
-Grok weekly value after an account switch. Source identities, response bodies,
-and credentials are never written to diagnostics or plugin state.
+Grok weekly value after an observed account switch. Source identities, response
+bodies, and credentials are never written to diagnostics or plugin state.
 
 The foreground rereads the selected auth file once per refresh, with the
 existing 64 KiB file bound and nonblocking open. A synthetic 48-byte auth file
