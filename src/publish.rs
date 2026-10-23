@@ -5111,6 +5111,7 @@ mod tests {
             for run in 0..repeats {
                 let dir = tempfile::Builder::new()
                     .prefix("herdr-lineup-refresh-")
+                    .disable_cleanup(root != Path::new("/tmp"))
                     .tempdir_in(root)
                     .unwrap();
                 let repo = dir.path().join("repo");
