@@ -219,3 +219,32 @@ The following 20 isolated fixture scenarios specify verification requirements in
 | Starvation Prevention | Fixed array index traversal | `WorkspaceFairQueue` attempt-based rotation in `publish.rs` |
 | Query Deadline Clamping | Static 1.0s deadline per workspace | $\min(\text{now} + 1.0\text{s}, \text{cycle\_budget\_deadline})$ in `publish.rs` |
 | Finite Fallback Age | Indefinite fallback on `Interrupted` | 30s staleness timeout clearing heading to `"—"` |
+
+---
+
+## 9. Production Implementation Status
+
+The downstream cache in `src/ship_time.rs` implements this contract. **Publication is not wired yet**: `src/publish.rs` still calls `read_repository_controlled`, which observes through a fresh `RepositoryCache` on every call and therefore always performs the full Git read. The `WorkspaceFairQueue`, cycle budget, and `HeadingCache.confirmed` fallback (§5, F-14 to F-18) belong to the follow-up wiring task, which also removes the `dead_code` allowance on `RepositoryObservation::verified_at`.
+
+### 9.1 API
+
+- `RepositoryCache::observe(cwd, shutdown, deadline) -> RepositoryObservation`. The effective deadline is `min(now + 1 s, deadline)` for the caller's absolute deadline. Git children are killed and reaped at that deadline exactly as before; synchronous `stat` and config reads are bounded only cooperatively.
+- Cache hits update only `last_access` and return the entry's original `verified_at`. Full reads, including uncacheable successes, return `verified_at = now`. Rejections, discards, and interruptions return `None`.
+- Capacity is 64 entries with least-recently-accessed eviction; the verified TTL is 30 s.
+
+### 9.2 Refinements Made During Implementation
+
+| Point | Implemented rule | Reason |
+|---|---|---|
+| `rev-parse` refusal (`safe.directory`, broken `.git`, unsupported format) | Clear **every** entry and return `Complete(None)` | A refused cwd reveals no common directory to key the purge on. Commander ruling: clear all (at most 64 entries) rather than keep old entries; every repository is then verified again by a full read. |
+| Ref backend | `rev-parse --show-ref-format` must print `files`; otherwise always full read | Covers reftable and unknown backends. Git without the option echoes it back, which is treated as an unknown backend. The `reftable/` stat remains as a second guard. |
+| Included configuration | A common `config` mentioning `include` (case-insensitive, also `includeIf`) is never cached | The fingerprint cannot follow included files. |
+| Object alternates | `objects/info/alternates` is part of the fingerprint | Object availability can change through alternates. |
+| Loose `origin/main` symlink | Never cached | A symlinked loose ref changes with an untracked target. |
+| `origin/main` symref | Detected with `%(symref)` in the slow query; never cached | The symref file does not change when its target moves. |
+| Main root stat | Kept as defense in depth | Git derives the main root from the common directory, so the common fingerprint already covers it (a `--separate-git-dir` main root is the common directory itself). |
+| Pre/post comparison | The whole compound fingerprint (including `refs/replace` and `reftable`) must match; the main root must still exist | Mixed-state reads are discarded with the old entry. |
+
+### 9.3 Fixture Coverage
+
+`src/ship_time.rs` tests cover F-01 to F-13 and F-19 with full-query counts and verification instants, plus configuration change and include, refusal clearing all entries, unsupported repository format, re-initialization at the same path (ABA), missing objects, inaccessible dependencies, interruption by the caller deadline and after a completed full query, main root rename, and LRU eviction. Each guard was mutated once to confirm that at least one test fails; the `files` format check and the `reftable/` stat fail only when both are removed, and the main root stat cannot be isolated by a fixture.
