@@ -165,7 +165,7 @@ no credentials, real provider sessions, or authenticated API calls were used.
 This rerun establishes Linux metadata behavior at that older commit; it adds no
 macOS runtime or visual rendering evidence.
 
-## Current main rerun
+## Historical main rerun (2026-10-13)
 
 On 2026-10-13, on Linux with Herdr 0.9.3, the checks that do not attach to a
 user's session were re-run against
