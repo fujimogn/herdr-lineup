@@ -17,19 +17,23 @@ judgment condition.
 
 ## Source snapshot
 
-- Source snapshot: `d95e5b5b9fe703e5e0259887d47a52470d6055a2`, the commander's
-  latest local integration. Line numbers and commit IDs below were read from
-  that commit. A later documentation commit is not an implementation SHA.
+- Source snapshot: `17873866afedfa21f73315e2e4d39af8ce03a0dc`, the commander's
+  latest local integration foundation (draft; the final source SHA is fixed
+  after the publisher and diagnostics wiring lands). Line numbers were read
+  from `d95e5b5b9fe703e5e0259887d47a52470d6055a2` unless a row names a later
+  commit. A documentation commit is never an implementation SHA.
 - Review target of both reviews: `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`.
   The previous version of this record used `96829df7e6fc51af327b448f5b8b3596f0a96d3f`.
 - `develop` and `origin/develop` are `b9d1a6d290d7a153f4743d284a5d9839d1658233`
-  (a hook configuration move, `d3ccbc17..b9d1a6d`). Neither contains the
-  snapshot. The commander integrates the two lines.
+  (a hook configuration move, `d3ccbc17..b9d1a6d`). The foundation keeps that
+  move, but `develop` does not contain the foundation.
 - `Cargo.toml` and `herdr-plugin.toml` stay at 0.2.2. Nothing below is
   released. Shipment stays on hold until the owner lifts it.
-- Work in progress on other lanes (stage-histogram fix, publisher wiring of
-  the Git cache and shared deadlines, reader and diagnostics wiring) is not in
-  the snapshot and is not counted here.
+- Work in progress on other lanes is not counted here: publisher runtime
+  wiring (cycle and stage samples from `MetadataPublisher`, the Git cache,
+  shared deadlines, and one `ReadCycle` per refresh; plan in
+  `docs/plans/publisher-runtime-wiring.md`) and, after it, reader diagnostics
+  in control and `doctor`.
 
 ## Status classes
 
@@ -85,9 +89,9 @@ The default `refresh_interval_ms` stays 5,000 (`src/config.rs:25`).
 | --- | --- | --- | --- | --- |
 | L1 P1 per-report `persist` rewrites and syncs the whole ledger | `fixed-in-candidate` | `32d5863` reserves an endpoint-wide sequence window (32 to 4,096 slots, `src/publish.rs:728-733`) and persists the durable upper bound once per window. `027bade` poisons the publisher after an uncertain checkpoint write until a new instance starts. `64ace03` adds lost-response, process-exit, clear-deadline, and pruning-failure fixtures. The verified rows are listed in `docs/reviews/sequence-reservation-design-2026-10-23.md`. | Kernel crash or power loss, a second allocator, a competing same-source writer, config change during refresh, rollback to an older binary, and macOS disks are not verified. A cold cycle writes once instead of `panes + 1` times; no elapsed-time speed-up is claimed. | Stays fixed while every verified failure row passes. The unverified rows stay design intent. |
 | L2 P1 three sequential Git children per unique cwd, every cycle | `api-unwired` | `223de0a`, `8e8639e`, `d95e5b5`: `RepositoryCache::observe` in `src/ship_time.rs` caches only the worktree root and name (64 entries, 30 s TTL). `rev-parse` and `for-each-ref` run on every read, and a hit replaces `worktree list` with a native common-directory `rev-parse`, so a hit and a miss both run 3 children. `src/publish.rs:1557` still calls `read_repository_controlled`, a fresh cache per call. | Publication wiring, the fair queue, the cycle budget, and the 30 s confirmed fallback (`docs/reviews/git-cache-design.md` §9) are not in the snapshot. No process-count reduction and no latency improvement are claimed. | Runtime effect only after the wiring lands with the F-13 to F-18 fixtures. |
-| L3 P1 no whole-refresh deadline or stage histogram in product behavior | `partial` | `4f7044a` records each refresh's monotonic duration with a fixed histogram and outcome counts; `doctor` prints them before any failure exit, and `last refresh ... ms after startup` stays uptime. `da1242c` adds absolute-deadline socket APIs (`Transport::connect_before`, `reconnect_same_endpoint_before`, `send_line_before`, `receive_line_before`) and refuses reuse after a failed or ambiguous exchange. | No whole-refresh deadline exists. Publication does not call the `_before` socket APIs. The stage-duration lines are under revision on another lane. | A product deadline needs a written contract, the wiring, and tests that keep sequence durability and endpoint identity. |
-| L4 P2 Codex and Kimi discovery repeats per pane | `api-unwired` | `f7abe35`, `988aea7`, `894d2f2`: `ReadCycle` (`src/model.rs:123`) shares validated discovery within one cycle and re-proves ancestors. Publication does not pass a cycle: `read` creates `ReadCycle::new()` for each pane. | Wiring one `ReadCycle` per refresh is not in the snapshot. Cap changes wait on C1. | Runtime effect only after wiring, with moved, duplicate, and invalid-file fixtures still failing closed. |
-| L5 P2 a stuck provider read can hold the BUSY permit | `api-unwired` | `98a57de`: `bounded_read_observed` and `ReaderDiagnostics` count attempts, BUSY rejections, deadline and shutdown ends, and active workers (`docs/reviews/reader-worker-observations.md`). Existing readers still call the unobserved wrapper. | The bounded fixtures (about 30 ms for a 30 ms budget) are single debug-build observations of a blocked closure, not an OS-stalled read and not a live frequency. No cancellation or process isolation. | Measured frequency needs the wiring and a recorded run. Process isolation stays `conditional` on that measurement. |
+| L3 P1 no whole-refresh deadline or stage histogram in product behavior | `partial` | `4f7044a` records each refresh's monotonic duration with a fixed histogram and outcome counts; `doctor` prints them before any failure exit, and `last refresh ... ms after startup` stays uptime. `b79e84e`..`1787386` aggregate per-stage histograms (snapshot, Git, reader, persist, socket) in the daemon and `doctor`, rejecting inconsistent or out-of-range samples. `da1242c` adds absolute-deadline socket APIs (`Transport::connect_before`, `reconnect_same_endpoint_before`, `send_line_before`, `receive_line_before`) and refuses reuse after a failed or ambiguous exchange. | No whole-refresh deadline exists. `MetadataPublisher` does not yet supply cycle or stage samples, so the stage lines stay `unavailable` in production, and publication does not call the `_before` socket APIs. | A product deadline needs a written contract, the wiring, and tests that keep sequence durability and endpoint identity. |
+| L4 P2 Codex and Kimi discovery repeats per pane | `api-unwired` | `f7abe35`, `988aea7`, `894d2f2`: `ReadCycle` (`src/model.rs:123`) shares validated discovery within one cycle and re-proves ancestors. Readers consume a supplied cycle (`a83d501`, `cefe544`), but publication does not pass one: `read` creates `ReadCycle::new()` for each pane. | Wiring one `ReadCycle` per refresh is not in the snapshot. Cap changes wait on C1. | Runtime effect only after wiring, with moved, duplicate, and invalid-file fixtures still failing closed. |
+| L5 P2 a stuck provider read can hold the BUSY permit | `api-unwired` | `98a57de`: `bounded_read_observed` and `ReaderDiagnostics` count attempts, BUSY rejections, deadline and shutdown ends, and active workers (`docs/reviews/reader-worker-observations.md`). `a83d501` makes the Codex and Kimi readers choose the observed path when their `ReadCycle` carries diagnostics. No production caller supplies diagnostics, and control and `doctor` do not report them. | The bounded fixtures (about 30 ms for a 30 ms budget) are single debug-build observations of a blocked closure, not an OS-stalled read and not a live frequency. No cancellation or process isolation. | Measured frequency needs the wiring and a recorded run. Process isolation stays `conditional` on that measurement. |
 | L6 P2 5 second refresh and 100 ms idle poll | `conditional` | Default 5,000 ms and idle polling are unchanged. | The review proposed a change only after an event-to-visible definition and measurement. None exists, so no change is owed. | Not done by lowering the default. A change needs a written freshness and load contract. |
 | L7 P3 `statusline --then` and `configure` have no child timeout | `conditional` | `docs/reviews/statusline-configure-latency-2026-10-23.md` records synthetic Linux medians. Neither path has a timeout. | A timeout or direct exec needs a host deadline, recovery contract, and compatibility review first. | Not owed until that contract exists. |
 | L8 P3 one socket connection per response | `conditional` | Each response still reconnects and checks path identity. `da1242c` forbids reuse after a failed or ambiguous exchange; it does not add connection reuse. | Reuse needs a syscall trace and an adversarial replacement fixture. `fstat` on a live fd must not replace the path check. | Not owed until those exist. Reuse without the replacement test is a failure. |
