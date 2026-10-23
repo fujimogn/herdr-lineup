@@ -24,4 +24,5 @@ reader results.
 
 #### Scenario: Two Codex panes in one refresh
 - **WHEN** two Codex panes share one home in a refresh
-- **THEN** rollout discovery runs once for that refresh and again in the next
+- **THEN** both reads use the same reader cycle, so the second read may reuse
+  the first read's discovery, and the next refresh starts with a fresh cycle

@@ -888,6 +888,8 @@ struct TestHooks {
     before_admission: Option<Box<dyn FnMut() + Send>>,
     /// Runs after admission passed, right before the exchange starts.
     before_exchange: Option<Box<dyn FnMut() + Send>>,
+    /// Replaces the refresh admission decision so fixtures need no timing.
+    admission: Option<Box<dyn FnMut() -> bool + Send>>,
 }
 
 /// Checkpoint write steps where tests inject a failure.
@@ -1629,7 +1631,14 @@ impl MetadataPublisher {
                 // Admission only reads the remaining budget: synchronous work
                 // or scheduling after it can still let `envelope` expire in
                 // flight, which is then an ambiguous error, not a skip.
-                if envelope.saturating_duration_since(Instant::now()) < self.terms.metadata {
+                let admitted =
+                    envelope.saturating_duration_since(Instant::now()) >= self.terms.metadata;
+                #[cfg(test)]
+                let admitted = match self.hooks.admission.as_mut() {
+                    Some(admission) => admission(),
+                    None => admitted,
+                };
+                if !admitted {
                     return Ok(ReportOutcome::DeadlineSkipped);
                 }
                 if rotate {
@@ -7982,6 +7991,8 @@ mod tests {
         stall_report: Option<usize>,
         /// Written before answering the first report for this resource.
         marker: Option<(String, PathBuf)>,
+        /// Milliseconds to wait before answering each snapshot.
+        snapshot_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     }
 
     fn budget_server(
@@ -7998,6 +8009,9 @@ mod tests {
                 let request = receive(&mut stream);
                 let response = match request["method"].as_str().unwrap() {
                     "session.snapshot" => {
+                        std::thread::sleep(Duration::from_millis(
+                            behavior.snapshot_delay_ms.load(Ordering::Acquire),
+                        ));
                         let mut response =
                             with_stored_tokens(template.lock().unwrap().clone(), &stored);
                         response["id"] = request["id"].clone();
@@ -8112,26 +8126,15 @@ mod tests {
         publisher.request(transport, "test.finish").unwrap();
     }
 
-    /// Records the native sessions it reads and answers with a fixed sample.
-    #[derive(Default)]
-    struct NativeLog {
-        reads: std::sync::Mutex<Vec<String>>,
-    }
-    impl UsageReader for NativeLog {
-        fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
-            self.reads
-                .lock()
-                .unwrap()
-                .push(request.identity.native_session_id.clone());
-            UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now)
-        }
-    }
-
-    // F1 and F7: slow reports exhaust admission. Refused frames are counted
-    // once each, nothing reconnects, untouched items keep their order, and
-    // every pane and the trailing workspaces are acknowledged within N cycles.
+    // F1 and F7: admission refuses every frame after the first two of a
+    // cycle. The admission seam makes the counts exact: refused frames count
+    // once each, nothing reconnects, only sent items rotate, and every pane
+    // and the trailing workspaces are acknowledged in ceil(14 / 2) cycles.
+    // Panes have no reader, so only exchanges rotate; a long interval keeps
+    // renewal out of this fixture. Real deadlines are covered by F2 to F4.
     #[test]
     fn deadline_skip_counts_refused_frames_and_rotates_only_started_items() {
+        const ADMITTED_PER_CYCLE: usize = 2;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fake.sock");
         let panes = (0..12)
@@ -8140,7 +8143,7 @@ mod tests {
                 budget_pane(
                     &format!("{workspace}:p{index}"),
                     workspace,
-                    Some("codex"),
+                    Some("claude"),
                     &format!("native-{index}"),
                 )
             })
@@ -8153,42 +8156,54 @@ mod tests {
         let server = budget_server(
             UnixListener::bind(&socket).unwrap(),
             template,
-            BudgetServer {
-                report_delay: Duration::from_millis(60),
-                ..BudgetServer::default()
-            },
+            BudgetServer::default(),
             log.clone(),
         );
         let mut transport = Transport::connect(&socket).unwrap();
-        // Admission closes 100 ms after headings; an admitted 60 ms report
-        // keeps a 300 ms margin, so load does not cut it in flight.
-        let mut publisher = budget_publisher(dir.path(), budget_terms(0, 0, 300));
-        let reader = NativeLog::default();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = admitted.clone();
+        publisher.hooks.admission = Some(Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst) < ADMITTED_PER_CYCLE
+        }));
+        let config = Config {
+            refresh_interval_ms: 3_600_000,
+            usage_max_age_ms: 3_600_000,
+            reader_timeout_ms: 100,
+            ..Config::default()
+        };
         let resources = 14;
         let mut acknowledged = BTreeSet::new();
         let mut cycles = 0;
         while acknowledged.len() < resources {
             cycles += 1;
-            assert!(cycles <= resources, "a resource starved: {acknowledged:?}");
+            assert!(
+                cycles <= resources.div_ceil(ADMITTED_PER_CYCLE),
+                "a resource starved"
+            );
+            admitted.store(0, Ordering::SeqCst);
             let before = queue_ids(&publisher);
             let first_report = log.lock().unwrap().len();
-            reader.reads.lock().unwrap().clear();
             let result = publisher.refresh_with_readers(
                 &mut transport,
-                &short_readers(),
-                &reader,
+                &config,
+                &TimeoutReader,
                 &TimeoutReader,
             );
             let sent: Vec<String> = log.lock().unwrap()[first_report..]
                 .iter()
                 .map(|(id, _)| id.clone())
                 .collect();
-            assert!(!sent.is_empty(), "cycle {cycles} made no progress");
+            let needed = resources - acknowledged.len();
+            assert_eq!(
+                sent.len(),
+                needed.min(ADMITTED_PER_CYCLE),
+                "cycle {cycles}: {result:?}"
+            );
             assert!(
                 sent.iter().all(|id| !acknowledged.contains(id)),
                 "an acknowledged resource was sent again: {sent:?}"
             );
-            let needed = resources - acknowledged.len();
             match result {
                 Ok(()) => assert_eq!(sent.len(), needed),
                 Err(error) => {
@@ -8198,28 +8213,17 @@ mod tests {
                 }
             }
             if cycles > 1 {
-                let read: BTreeSet<String> = reader
-                    .reads
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|native| {
-                        let index: usize = native.trim_start_matches("native-").parse().unwrap();
-                        format!("{}:p{index}", if index < 6 { "w1" } else { "w2" })
-                    })
-                    .collect();
-                let started = |id: &String| read.contains(id) || sent.contains(id);
                 let expected: Vec<String> = before
                     .iter()
-                    .filter(|id| !started(id))
-                    .chain(before.iter().filter(|id| started(id)))
+                    .filter(|id| !sent.contains(id))
+                    .chain(before.iter().filter(|id| sent.contains(id)))
                     .cloned()
                     .collect();
                 assert_eq!(queue_ids(&publisher), expected, "cycle {cycles}");
             }
             acknowledged.extend(sent);
         }
-        assert!(cycles > 1, "the fixture must exercise refused admission");
+        assert_eq!(cycles, resources.div_ceil(ADMITTED_PER_CYCLE));
         finish(&mut publisher, &mut transport);
         server.join().unwrap();
     }
@@ -8992,10 +8996,12 @@ mod tests {
     }
 
     // F19: production stage samples count acknowledged reports and successful
-    // checkpoint writes per refresh, and are present after an error.
+    // checkpoint writes per refresh, reset each attempt, and still record a
+    // failed snapshot's controlled delay.
     #[test]
     fn production_stages_count_reports_and_checkpoints_and_survive_errors() {
         use crate::daemon::Publisher as _;
+        const SNAPSHOT_DELAY_MS: u64 = 50;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fake.sock");
         let template = budget_template(
@@ -9003,11 +9009,12 @@ mod tests {
             vec![budget_workspace("w1", None)],
         );
         let log = BudgetLog::default();
+        let snapshot_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let server = budget_server(
             UnixListener::bind(&socket).unwrap(),
             template.clone(),
             BudgetServer {
-                stall_report: Some(2),
+                snapshot_delay_ms: snapshot_delay.clone(),
                 ..BudgetServer::default()
             },
             log.clone(),
@@ -9020,15 +9027,23 @@ mod tests {
         assert_eq!(first.counts.reports, log.lock().unwrap().len() as u64);
         assert_eq!(first.counts.reports, 2);
         assert_eq!(first.counts.checkpoints, 1);
-        assert!(
-            first.durations.snapshot_us <= first.durations.socket_us + first.durations.snapshot_us
-        );
-        template.lock().unwrap()["result"]["snapshot"]["panes"][0]["agent_status"] = json!("idle");
+        // The next attempt fails at the snapshot after a controlled delay.
+        let valid = template.lock().unwrap().clone();
+        template.lock().unwrap()["result"]["type"] = json!("not_a_snapshot");
+        snapshot_delay.store(SNAPSHOT_DELAY_MS, Ordering::Release);
         assert!(publisher.refresh(&mut transport, &short_readers()).is_err());
         let failed = publisher.refresh_stages().unwrap();
-        assert_eq!(failed.counts.reports, 0, "counts are per refresh");
+        let delay_us = SNAPSHOT_DELAY_MS * 1000;
+        assert!(failed.durations.snapshot_us >= delay_us, "{failed:?}");
+        assert!(failed.durations.socket_us >= delay_us, "{failed:?}");
+        // Counts and later stages restart from zero for each attempt.
+        assert_eq!(failed.counts.reports, 0);
         assert_eq!(failed.counts.checkpoints, 0);
-        assert!(failed.durations.socket_us > 0);
+        assert_eq!(failed.durations.git_us, 0);
+        assert_eq!(failed.durations.reader_us, 0);
+        assert_eq!(failed.durations.persist_us, 0);
+        *template.lock().unwrap() = valid;
+        snapshot_delay.store(0, Ordering::Release);
         finish(&mut publisher, &mut transport);
         server.join().unwrap();
     }
