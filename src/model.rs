@@ -283,7 +283,6 @@ impl ReadCycle {
         // either case reprove association with the original full traversal,
         // under the remaining deadline, and never cache that fallback result.
         if !discovery.unchanged(budget)? {
-            budget.entries = before;
             let mut paths = Vec::new();
             for (root, depth) in kind.roots() {
                 paths.extend(budget.files(&home.join(root), *depth, |path| kind.accepts(path))?);
@@ -1339,6 +1338,54 @@ pub(crate) mod tests {
             .unwrap();
         // Returning only A would hide B from the exact-session adapter.
         assert_eq!(paths.len(), 2);
+        assert!(cycle.discoveries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cycle_discovery_fallback_keeps_consumed_entries_and_original_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        fs::create_dir(&root).unwrap();
+        for index in 0..MAX_DIRECTORY_ENTRIES / 2 {
+            fs::write(root.join(format!("entry-{index}")), b"").unwrap();
+        }
+        let id = identity(Provider::Codex);
+        let mut request = request(&id, dir.path());
+        request.timeout = Duration::from_secs(10);
+        let cycle = ReadCycle::new();
+        let mut budget = Budget::new(&request);
+        let start = budget.start;
+        let result = cycle.files_with_hooks(
+            &mut budget,
+            dir.path(),
+            DiscoveryKind::Codex,
+            |_| {},
+            || {
+                fs::write(root.join("extra"), b"").unwrap();
+            },
+        );
+        // 2048 consumed + 2049 on the fallback, although each walk alone fits.
+        assert_eq!(result, Err(MissingReason::EntryLimit));
+        assert_eq!(budget.entries, MAX_DIRECTORY_ENTRIES + 1);
+        assert_eq!(budget.start, start);
+        assert!(cycle.discoveries.lock().unwrap().is_empty());
+
+        request.timeout = Duration::from_millis(20);
+        let mut budget = Budget::new(&request);
+        let start = budget.start;
+        let result = cycle.files_with_hooks(
+            &mut budget,
+            dir.path(),
+            DiscoveryKind::Codex,
+            |_| {},
+            || {
+                fs::write(root.join("another"), b"").unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+            },
+        );
+        assert_eq!(result, Err(MissingReason::Timeout));
+        assert_eq!(budget.start, start);
+        assert_eq!(budget.timeout, request.timeout);
         assert!(cycle.discoveries.lock().unwrap().is_empty());
     }
 }
