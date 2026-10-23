@@ -59,7 +59,7 @@ Agreement denominator: 4.
 | M5 full fingerprint cache cleared on an existing-key update | `fixed-in-candidate` | `ea41b3c` replaces an existing key in place. `2c162fb` evicts one entry in insertion (FIFO) order for a new key at capacity (`src/reader_cache.rs`). Tests: `full_cache_updates_existing_key_without_clearing_other_entries`, `capacity_boundaries_preserve_all_but_the_oldest_entry`, `fixed_trace_preserves_hot_entries_during_new_key_churn`. | The fixed 128-entry trace records 4,096 hits / 64 misses for FIFO against 4,032 / 128 for the old full clear. That is a deterministic trace only, not a runtime hit-rate or speed claim. | Stays fixed while an update never evicts and a new key evicts exactly one entry. |
 | M6 `refresh_with_readers` mixes inventory, heading, observation, desired report, and send | `fixed-in-candidate` | `90c0630`, `e5555ec`, `6d357ad`: the production refresh pipeline (`src/publish.rs`) passes typed stages (`RefreshInventory`, `Headings` from `resolve_headings`, per-pane observations, send). Sequence, capacity-skip, and ambiguous-response behavior are kept by the existing boundary tests. | The production path now uses these stages; the test-only cycle wrapper is not the runtime entry point. | Stays fixed while the stages remain typed and the boundary tests pass. |
 | M7 font journal invariants live in dynamic JSON | `fixed-in-candidate` | `885194b`: `load_journal` returns a typed `OwnershipJournal` (`src/font.rs`), planning (`JournalPlan`) is separate from `apply`, and `pending_presence_always_requires_manual_recovery` keeps the refusal. The no-rollback policy is unchanged. | The H1 and M1 residual races are unchanged by typing. | Stays fixed while malformed journals fail at load and pending state still refuses another action. |
-| M8 socket reconnect test required an immediate EOF | `fixed-in-candidate` | `ea41b3c`: the test waits up to a 500 ms monotonic deadline for `check_connection` to observe EOF, then checks endpoint identity. | The final candidate must pass the default parallel suite; historical serial runs alone do not satisfy this. | Stays fixed while the test waits for EOF and still rejects a replaced socket path. |
+| M8 socket reconnect test required an immediate EOF | `fixed-in-candidate` | `ea41b3c`: the test waits up to a 500 ms monotonic deadline for `check_connection` to observe EOF, then checks endpoint identity. | The default parallel suite passed with 441 unit passes, 1 integration pass and 6 existing ignored tests; historical serial runs are not the evidence. | Stays fixed while the test waits for EOF and still rejects a replaced socket path. |
 
 ## Conditional and specification findings
 
@@ -124,15 +124,20 @@ queue run or acceptance by the automated ship gate.
   runtime metrics, sequence window, reader worker diagnostics). Their NO-GO
   and GO chains are collected by the commander, not restated here.
 
-The commander closes the remaining gap with one GPT-6.1 Sol high review of the
-full diff from `d3ccbc17d3f8344d466015fac580cd0fe3b60269` to the final head
-fixed when that review starts.
+The commander recorded inclusive GPT-6.1 Sol high GO for the full fixed range
+`d3ccbc17d3f8344d466015fac580cd0fe3b60269..91268267f46061f5f0aaf46711ea10158bad0873`.
+The sole Dplan documentation NO-GO on the earlier head was resolved. This
+local review does not establish automated queue acceptance or shipment.
 
 ## Verification of this record
 
 The source delta after the integration base is comment-only in two Rust files
-and the release workflow. The final candidate still requires the mandatory
-Rust checks, Actionlint, strict canonical spec validation, encoding, whitespace,
-local links and scope checks. The commander's verification receipt records the
-actual final head and results; pending checks are not passes. Inclusive review,
-ACK, integration, push and shipment remain separate gates.
+and the release workflow. Mandatory source checks passed: formatting, strict
+locked all-target Clippy, default parallel tests (441 unit, 1 integration,
+6 existing ignored), locked release build and help. Actionlint, strict canonical
+spec validation (4/4), encoding, whitespace, local links and scope checks also
+passed. Dplan correction was documentation-only; its checks passed without
+rebuilding unchanged Rust. Evidence: external
+`reviews/final-docs-codex-2026-10-24.md` and commander's inclusive review record.
+The reviewed range above does not include later status-only documentation.
+Automated queue acceptance, push and shipment remain unclaimed.

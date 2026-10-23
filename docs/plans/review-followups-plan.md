@@ -39,6 +39,12 @@ strict wall-clock guarantee, host C2 fix, or shipment follows from this status.
 Owner: `lane_commander`. This is a completion condition for the integration
 candidate. A member lane does not launch it.
 
+Recorded outcome: inclusive Sol 6.1 high GO for fixed range
+`d3ccbc17d3f8344d466015fac580cd0fe3b60269..91268267f46061f5f0aaf46711ea10158bad0873`,
+with the Dplan NO-GO resolved. Mandatory checks passed as recorded in the
+coverage table. Automated queue acceptance and shipment are not established.
+The general procedure below applies to subsequent candidates.
+
 - Review the full diff from `d3ccbc17d3f8344d466015fac580cd0fe3b60269` to the
   final head fixed when the review starts, with GPT-6.1 Sol high.
 - Include every commit that an accepted review does not already cover, and
