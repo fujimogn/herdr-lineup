@@ -1487,6 +1487,29 @@ mod tests {
                 .unwrap();
                 return;
             }
+            if std::env::var_os("LINEUP_TEST_REFRESH_DEADLINE_SKIP").is_some() {
+                struct DeadlineSkip(PathBuf);
+                impl Publisher for DeadlineSkip {
+                    fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                        fs::write(self.0.join("refresh-entered"), "")?;
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            crate::publish::RefreshSkip {
+                                capacity_skipped: 1,
+                                deadline_skipped: 2,
+                            },
+                        ))
+                    }
+                    fn reconnected(&mut self) {
+                        let _ = fs::write(self.0.join("reconnected"), "");
+                    }
+                    fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                run_foreground(&options, true, &mut DeadlineSkip(options.state.clone())).unwrap();
+                return;
+            }
             if std::env::var_os("LINEUP_TEST_REFRESH_INTERRUPTED").is_some() {
                 struct InterruptedRefresh(Arc<AtomicBool>, PathBuf);
                 impl Publisher for InterruptedRefresh {
@@ -1615,6 +1638,65 @@ mod tests {
             pid.is_some()
         });
         pid.unwrap()
+    }
+
+    #[test]
+    fn deadline_skip_is_healthy_logged_and_reported_beside_the_observation() {
+        let (_dir, options, done, server) = fixture();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_REFRESH_DEADLINE_SKIP", "1");
+        ensure_command(&options, command).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| options.state.join("refresh-entered").exists());
+        let mut frame = Vec::new();
+        wait_until(|| {
+            let Ok(mut stream) = UnixStream::connect(&paths.control) else {
+                return false;
+            };
+            if write_frame(&mut stream, b"health").is_err() {
+                return false;
+            }
+            frame = read_frame(&mut BufReader::new(stream), 8192).unwrap_or_default();
+            deadline_skips_from_frame(&frame).is_some()
+        });
+        stop(&options).unwrap();
+        let log = fs::read_to_string(&paths.log).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(
+            deadline_skips_from_frame(&frame),
+            Some(DeadlineSkipObservation {
+                attempt_count: 1,
+                last_deadline_skipped: 2,
+                last_capacity_skipped: 1,
+            })
+        );
+        let view = control_view_from_frame(&frame).unwrap();
+        assert!(!view.health.refresh_failed);
+        assert_eq!(view.health.capacity_skipped_resources, 1);
+        let observation = view.observation.unwrap();
+        assert_eq!(observation.attempt_count, 1);
+        assert_eq!(
+            (
+                observation.success_count,
+                observation.error_count,
+                observation.capacity_skip_count
+            ),
+            (0, 0, 0)
+        );
+        assert!(
+            log.contains("event=refresh_skipped reason=cycle_deadline"),
+            "{log}"
+        );
+        assert!(
+            log.contains("event=refresh_skipped reason=metadata_capacity"),
+            "{log}"
+        );
+        assert!(!log.contains("event=refresh_failed"), "{log}");
+        assert!(
+            !options.state.join("reconnected").exists(),
+            "a deadline skip must not reconnect"
+        );
     }
 
     #[test]
@@ -3511,5 +3593,137 @@ mod tests {
         drop(client);
         drop(held);
         assert!(!worker.join().unwrap().unwrap());
+    }
+
+    fn skip(capacity_skipped: u64, deadline_skipped: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            crate::publish::RefreshSkip {
+                capacity_skipped,
+                deadline_skipped,
+            },
+        ))
+    }
+
+    #[test]
+    fn mixed_skip_keeps_both_counts_and_errors_never_become_skips() {
+        let mut state = ControlState::from(sample_health());
+        let attempt = |state: &mut ControlState, result: &io::Result<()>| {
+            note(
+                &mut state.health,
+                &mut state.observation,
+                result,
+                1,
+                Some(10),
+                Some(stages_us(1, 1, 1, 1, 1, 0, 0)),
+            );
+            note_deadline_skip(&mut state.deadline_skips, result);
+        };
+        attempt(&mut state, &skip(3, 2));
+        assert!(!state.health.refresh_failed);
+        assert_eq!(state.health.capacity_skipped_resources, 3);
+        assert_eq!(
+            state.deadline_skips,
+            Some(DeadlineSkipObservation {
+                attempt_count: 1,
+                last_deadline_skipped: 2,
+                last_capacity_skipped: 3,
+            })
+        );
+        // A capacity-only skip keeps its own classification and leaves the
+        // deadline totals as they were.
+        attempt(&mut state, &skip(1, 0));
+        assert_eq!(state.deadline_skips.as_ref().unwrap().attempt_count, 1);
+        for error in [
+            io::Error::new(io::ErrorKind::Interrupted, "shutdown"),
+            io::Error::other("sequence checkpoint persistence is uncertain; restart required"),
+            io::Error::new(io::ErrorKind::TimedOut, "ambiguous exchange"),
+        ] {
+            attempt(&mut state, &Err(error));
+            assert!(state.health.refresh_failed);
+        }
+        attempt(&mut state, &skip(0, 4));
+        let observation = state.observation.as_ref().unwrap();
+        // Deadline skips are in the attempt total, duration and stage samples,
+        // and in none of the other outcome counts.
+        assert_eq!(observation.attempt_count, 6);
+        assert_eq!(observation.success_count, 0);
+        assert_eq!(observation.error_count, 3);
+        assert_eq!(observation.capacity_skip_count, 1);
+        assert_eq!(
+            observation
+                .duration
+                .as_ref()
+                .unwrap()
+                .histogram
+                .iter()
+                .sum::<u64>(),
+            6
+        );
+        assert_eq!(observation.stages.as_ref().unwrap().snapshot.count, 6);
+        assert_eq!(
+            state.deadline_skips,
+            Some(DeadlineSkipObservation {
+                attempt_count: 2,
+                last_deadline_skipped: 4,
+                last_capacity_skipped: 0,
+            })
+        );
+        assert!(!state.health.refresh_failed);
+        assert_eq!(state.health.capacity_skipped_resources, 0);
+    }
+
+    #[test]
+    fn deadline_skip_field_is_optional_and_does_not_break_existing_readers() {
+        let mut state = ControlState::from(sample_health());
+        let fresh = control_frame(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fresh).unwrap();
+        assert!(
+            value.get("refresh_deadline_skips").is_none(),
+            "absent until the first skip"
+        );
+        assert_eq!(deadline_skips_from_frame(&fresh), None);
+        note(
+            &mut state.health,
+            &mut state.observation,
+            &skip(0, 1),
+            1,
+            Some(10),
+            None,
+        );
+        note_deadline_skip(&mut state.deadline_skips, &skip(0, 1));
+        let frame = control_frame(&state).unwrap();
+        // The existing reader and the bare `Health` shape still parse the frame.
+        let view = control_view_from_frame(&frame).unwrap();
+        assert_eq!(view.observation.unwrap().attempt_count, 1);
+        let legacy: Health = serde_json::from_slice(&frame).unwrap();
+        assert!(!legacy.refresh_failed);
+        assert_eq!(
+            deadline_skips_from_frame(&frame)
+                .unwrap()
+                .last_deadline_skipped,
+            1
+        );
+        let mut value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({"attempt_count": 1}),
+            serde_json::json!({"attempt_count": 1, "last_deadline_skipped": 1,
+                "last_capacity_skipped": 0, "unknown": 1}),
+        ] {
+            value["refresh_deadline_skips"] = invalid;
+            let frame = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                deadline_skips_from_frame(&frame),
+                None,
+                "unavailable, not zero"
+            );
+            assert!(
+                control_view_from_frame(&frame)
+                    .unwrap()
+                    .observation
+                    .is_some()
+            );
+        }
     }
 }

@@ -7964,4 +7964,1067 @@ mod tests {
         let tokens = fixture.finish(&mut publisher, &mut transport);
         assert_eq!(tokens["lineup_logo"], "b");
     }
+
+    // Runtime wiring fixtures (plan F1 to F19). Time thresholds use shrunken
+    // cycle terms and hooks at exact boundaries instead of long real waits.
+
+    /// One received report: resource ID and sequence.
+    type BudgetLog = Arc<std::sync::Mutex<Vec<(String, u64)>>>;
+
+    #[derive(Default)]
+    struct BudgetServer {
+        /// Delay before answering each report.
+        report_delay: Duration,
+        /// Zero-based index of a report that is read but never answered.
+        stall_report: Option<usize>,
+        /// Written before answering the first report for this resource.
+        marker: Option<(String, PathBuf)>,
+    }
+
+    fn budget_server(
+        listener: UnixListener,
+        template: Arc<std::sync::Mutex<Value>>,
+        behavior: BudgetServer,
+        log: BudgetLog,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let mut stored = BTreeMap::new();
+            let mut reports = 0usize;
+            loop {
+                let request = receive(&mut stream);
+                let response = match request["method"].as_str().unwrap() {
+                    "session.snapshot" => {
+                        let mut response =
+                            with_stored_tokens(template.lock().unwrap().clone(), &stored);
+                        response["id"] = request["id"].clone();
+                        response
+                    }
+                    "test.finish" => {
+                        writeln!(
+                            stream.get_mut(),
+                            "{}",
+                            json!({"id":request["id"],"result":{"type":"ok"}})
+                        )
+                        .unwrap();
+                        break;
+                    }
+                    _ => {
+                        let params = &request["params"];
+                        let id = params["pane_id"]
+                            .as_str()
+                            .or_else(|| params["workspace_id"].as_str())
+                            .unwrap()
+                            .to_owned();
+                        log.lock()
+                            .unwrap()
+                            .push((id.clone(), params["seq"].as_u64().unwrap()));
+                        let index = reports;
+                        reports += 1;
+                        if behavior.stall_report == Some(index) {
+                            // Read, never answered: the next accept drops it.
+                            continue;
+                        }
+                        if let Some((target, path)) = &behavior.marker
+                            && *target == id
+                            && !path.exists()
+                        {
+                            std::fs::write(path, b"acknowledged").unwrap();
+                        }
+                        std::thread::sleep(behavior.report_delay);
+                        remember_tokens(&mut stored, &request);
+                        json!({"id":request["id"],"result":{"type":"ok"}})
+                    }
+                };
+                writeln!(stream.get_mut(), "{response}").unwrap();
+            }
+        })
+    }
+
+    fn budget_pane(pane: &str, workspace: &str, agent: Option<&str>, native: &str) -> Value {
+        let mut value = json!({"pane_id": pane, "workspace_id": workspace, "agent": agent,
+            "agent_status": "working", "tokens": {}});
+        if let Some(agent) = agent {
+            value["agent_session"] = json!({"agent": agent, "kind": "id", "value": native});
+        }
+        value
+    }
+
+    fn budget_workspace(workspace: &str, checkout: Option<&str>) -> Value {
+        let mut value = json!({"workspace_id": workspace, "tokens": {}});
+        if let Some(checkout) = checkout {
+            value["worktree"] = json!({"checkout_path": checkout});
+        }
+        value
+    }
+
+    fn budget_template(panes: Vec<Value>, workspaces: Vec<Value>) -> Arc<std::sync::Mutex<Value>> {
+        Arc::new(std::sync::Mutex::new(json!({"id": "template", "result": {
+            "type": "session_snapshot", "snapshot": {"version": "0.9.3", "protocol": 17,
+            "workspaces": workspaces, "panes": panes}}})))
+    }
+
+    fn budget_terms(snapshot_ms: u64, git_ms: u64, metadata_ms: u64) -> CycleTerms {
+        CycleTerms {
+            snapshot: Duration::from_millis(snapshot_ms),
+            git: Duration::from_millis(git_ms),
+            metadata: Duration::from_millis(metadata_ms),
+        }
+    }
+
+    fn budget_publisher(dir: &Path, terms: CycleTerms) -> MetadataPublisher {
+        let mut publisher = MetadataPublisher::new(
+            dir.into(),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.join("codex-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        publisher.terms = terms;
+        publisher
+    }
+
+    fn short_readers() -> Config {
+        Config {
+            reader_timeout_ms: 100,
+            ..Config::default()
+        }
+    }
+
+    fn queue_ids(publisher: &MetadataPublisher) -> Vec<String> {
+        publisher
+            .send_queue
+            .order
+            .iter()
+            .map(|resource| resource.id.clone())
+            .collect()
+    }
+
+    fn finish(publisher: &mut MetadataPublisher, transport: &mut Transport) {
+        if transport.check_connection().is_err() {
+            transport.reconnect_same_endpoint().unwrap();
+        }
+        publisher.request(transport, "test.finish").unwrap();
+    }
+
+    /// Records the native sessions it reads and answers with a fixed sample.
+    #[derive(Default)]
+    struct NativeLog {
+        reads: std::sync::Mutex<Vec<String>>,
+    }
+    impl UsageReader for NativeLog {
+        fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+            self.reads
+                .lock()
+                .unwrap()
+                .push(request.identity.native_session_id.clone());
+            UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now)
+        }
+    }
+
+    // F1 and F7: slow reports exhaust admission. Refused frames are counted
+    // once each, nothing reconnects, untouched items keep their order, and
+    // every pane and the trailing workspaces are acknowledged within N cycles.
+    #[test]
+    fn deadline_skip_counts_refused_frames_and_rotates_only_started_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let panes = (0..12)
+            .map(|index| {
+                let workspace = if index < 6 { "w1" } else { "w2" };
+                budget_pane(
+                    &format!("{workspace}:p{index}"),
+                    workspace,
+                    Some("codex"),
+                    &format!("native-{index}"),
+                )
+            })
+            .collect();
+        let template = budget_template(
+            panes,
+            vec![budget_workspace("w1", None), budget_workspace("w2", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer {
+                report_delay: Duration::from_millis(60),
+                ..BudgetServer::default()
+            },
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(0, 0, 100));
+        let reader = NativeLog::default();
+        let resources = 14;
+        let mut acknowledged = BTreeSet::new();
+        let mut cycles = 0;
+        while acknowledged.len() < resources {
+            cycles += 1;
+            assert!(cycles <= resources, "a resource starved: {acknowledged:?}");
+            let before = queue_ids(&publisher);
+            let first_report = log.lock().unwrap().len();
+            reader.reads.lock().unwrap().clear();
+            let result = publisher.refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &reader,
+                &TimeoutReader,
+            );
+            let sent: Vec<String> = log.lock().unwrap()[first_report..]
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect();
+            assert!(!sent.is_empty(), "cycle {cycles} made no progress");
+            assert!(
+                sent.iter().all(|id| !acknowledged.contains(id)),
+                "an acknowledged resource was sent again: {sent:?}"
+            );
+            let needed = resources - acknowledged.len();
+            match result {
+                Ok(()) => assert_eq!(sent.len(), needed),
+                Err(error) => {
+                    let skip = refresh_skip(&error).expect("a deadline skip, never an error");
+                    assert_eq!(skip.capacity_skipped, 0);
+                    assert_eq!(skip.deadline_skipped as usize, needed - sent.len());
+                }
+            }
+            if cycles > 1 {
+                let read: BTreeSet<String> = reader
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|native| {
+                        let index: usize = native.trim_start_matches("native-").parse().unwrap();
+                        format!("{}:p{index}", if index < 6 { "w1" } else { "w2" })
+                    })
+                    .collect();
+                let started = |id: &String| read.contains(id) || sent.contains(id);
+                let expected: Vec<String> = before
+                    .iter()
+                    .filter(|id| !started(id))
+                    .chain(before.iter().filter(|id| started(id)))
+                    .cloned()
+                    .collect();
+                assert_eq!(queue_ids(&publisher), expected, "cycle {cycles}");
+            }
+            acknowledged.extend(sent);
+        }
+        assert!(cycles > 1, "the fixture must exercise refused admission");
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F2: an admitted report without a reply is an ambiguous error. Its
+    // sequence is burned and the request is never sent again.
+    #[test]
+    fn unanswered_admitted_report_is_an_error_and_never_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer {
+                stall_report: Some(0),
+                ..BudgetServer::default()
+            },
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(refresh_skip(&error), None, "{error}");
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::InvalidInput,
+            "the daemon must reconnect"
+        );
+        let stalled = log.lock().unwrap().clone();
+        assert_eq!(stalled.len(), 1);
+        transport.reconnect_same_endpoint().unwrap();
+        publisher.reconnected();
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let (stalled_id, stalled_seq) = stalled[0].clone();
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.iter().filter(|(_, seq)| *seq == stalled_seq).count(),
+            1,
+            "burned sequence reused: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .skip(1)
+                .filter(|(id, _)| *id == stalled_id)
+                .all(|(_, seq)| *seq > stalled_seq)
+        );
+    }
+
+    // F3: a slow persist after the reader leaves less than the admission
+    // threshold. Nothing is written, the pane stays rotated and is counted
+    // once, the durable upper bound holds, and the next cycle continues above it.
+    #[test]
+    fn refused_admission_after_reader_keeps_rotation_and_upper_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(0, 0, 100));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        publisher.hooks.before_admission = Some(Box::new(move || {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }));
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(
+            refresh_skip(&error),
+            Some(RefreshSkip {
+                capacity_skipped: 0,
+                deadline_skipped: 2
+            })
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a refused frame was written"
+        );
+        assert_eq!(queue_ids(&publisher), ["w1", "w1:p1"]);
+        let upper_bound = endpoint_upper_bound_on_disk(dir.path()).unwrap();
+        publisher.hooks.before_admission = None;
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        assert_eq!(endpoint_upper_bound_on_disk(dir.path()), Some(upper_bound));
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2);
+        // Sequences 1 and 2 were prepared for the refused frames and are burned.
+        assert!(log.iter().all(|(_, seq)| *seq > 2 && *seq <= upper_bound));
+    }
+
+    // F4: the envelope expires between admission and the exchange. That is an
+    // ambiguous error with a burned sequence, never a skip.
+    #[test]
+    fn envelope_expiring_after_admission_is_an_error_not_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(0, 0, 100));
+        publisher.hooks.before_exchange = Some(Box::new(|| {
+            std::thread::sleep(Duration::from_millis(250));
+        }));
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(refresh_skip(&error), None, "{error}");
+        publisher.hooks.before_exchange = None;
+        transport.reconnect_same_endpoint().unwrap();
+        publisher.reconnected();
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().all(|(_, seq)| *seq > 1),
+            "sequence 1 was sent after its deadline: {log:?}"
+        );
+    }
+
+    // F5: poison from a checkpoint fault is an error in every later cycle,
+    // even when the envelope would otherwise produce a deadline skip.
+    #[test]
+    fn poison_is_never_reported_as_a_deadline_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        *publisher.persist_fault.lock().unwrap() = Some(PersistStage::FileSync);
+        let first = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(refresh_skip(&first), None);
+        *publisher.persist_fault.lock().unwrap() = None;
+        // Admission could never pass with these terms; poison must still win.
+        publisher.terms = budget_terms(0, 0, 60_000);
+        let later = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(refresh_skip(&later), None);
+        assert!(later.to_string().contains("restart required"), "{later}");
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    // F6: shutdown during a budgeted cycle is an interruption, and clear then
+    // runs under its own deadline although the refresh terms admit nothing.
+    #[test]
+    fn shutdown_mid_cycle_interrupts_and_clear_keeps_its_own_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template.clone(),
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        publisher.set_shutdown(shutdown.clone());
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        let acknowledged = log.lock().unwrap().len();
+        template.lock().unwrap()["result"]["snapshot"]["panes"][0]["agent_status"] = json!("idle");
+        let flag = shutdown.clone();
+        publisher.hooks.before_admission = Some(Box::new(move || {
+            flag.store(true, Ordering::Release);
+        }));
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(refresh_skip(&error), None);
+        assert_eq!(log.lock().unwrap().len(), acknowledged);
+        publisher.hooks.before_admission = None;
+        publisher.terms = budget_terms(0, 0, 60_000);
+        publisher.clear(&mut transport).unwrap();
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let log = log.lock().unwrap();
+        assert!(
+            log[acknowledged..].iter().any(|(id, _)| id == "w1:p1"),
+            "clear sent nothing: {log:?}"
+        );
+    }
+
+    // F8: each pane is observed only after the previous pane was sent.
+    #[test]
+    fn next_pane_is_observed_after_the_previous_pane_was_acknowledged() {
+        struct MarkerReader {
+            marker: PathBuf,
+            seen: std::sync::Mutex<Option<bool>>,
+        }
+        impl UsageReader for MarkerReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                if request.identity.native_session_id == "native-2" {
+                    *self.seen.lock().unwrap() = Some(self.marker.exists());
+                }
+                UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let marker = dir.path().join("pane-1-acknowledged");
+        let template = budget_template(
+            vec![
+                budget_pane("w1:p1", "w1", Some("codex"), "native-1"),
+                budget_pane("w1:p2", "w1", Some("codex"), "native-2"),
+            ],
+            vec![budget_workspace("w1", None)],
+        );
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer {
+                marker: Some(("w1:p1".into(), marker.clone())),
+                ..BudgetServer::default()
+            },
+            BudgetLog::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        let reader = MarkerReader {
+            marker,
+            seen: std::sync::Mutex::new(None),
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &short_readers(), &reader, &TimeoutReader)
+            .unwrap();
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        assert_eq!(*reader.seen.lock().unwrap(), Some(true));
+    }
+
+    // F9: a pane whose reader ran but needs no frame rotates and is not
+    // counted; a refused pane is counted once; untouched items keep order.
+    #[test]
+    fn reader_attempt_without_frame_rotates_and_refused_frame_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![
+                budget_pane("w1:p1", "w1", Some("codex"), "native-1"),
+                budget_pane("w1:p2", "w1", Some("codex"), "native-2"),
+                budget_pane("w1:p3", "w1", None, ""),
+            ],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template.clone(),
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(300, 0, 100));
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        let sent = log.lock().unwrap().len();
+        publisher.send_queue = FairQueue::default();
+        template.lock().unwrap()["result"]["snapshot"]["panes"][1]["agent_status"] = json!("idle");
+        publisher.hooks.before_admission = Some(Box::new(|| {
+            std::thread::sleep(Duration::from_millis(450));
+        }));
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(
+            refresh_skip(&error),
+            Some(RefreshSkip {
+                capacity_skipped: 0,
+                deadline_skipped: 1
+            })
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            sent,
+            "a refused frame was written"
+        );
+        // p1 read without a frame and p2 read then refused both rotated; p3
+        // and the workspace started no I/O and keep their order.
+        assert_eq!(queue_ids(&publisher), ["w1:p3", "w1", "w1:p1", "w1:p2"]);
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F9a: once one pane spends the reader deadline, later panes skip only
+    // reader I/O. A cached pane restores and renews, the workspace and a
+    // no-reader pane still send, and a pane needing no frame keeps its place.
+    #[test]
+    fn spent_reader_budget_skips_only_reader_io_while_admission_remains() {
+        struct BudgetReader {
+            exhaust: AtomicBool,
+            reads: std::sync::Mutex<Vec<String>>,
+        }
+        impl UsageReader for BudgetReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                let native = request.identity.native_session_id.clone();
+                self.reads.lock().unwrap().push(native.clone());
+                if native == "native-a" && self.exhaust.load(Ordering::Acquire) {
+                    std::thread::sleep(request.timeout + Duration::from_millis(5));
+                    return TimeoutReader.read(request);
+                }
+                UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let repo = dir.path().join("repo");
+        let template = budget_template(
+            vec![
+                budget_pane("w1:pa", "w1", Some("codex"), "native-a"),
+                budget_pane("w1:pb", "w1", Some("codex"), "native-b"),
+                budget_pane("w1:pc", "w1", Some("claude"), "native-c"),
+                budget_pane("w1:pd", "w1", None, ""),
+            ],
+            vec![budget_workspace("w1", Some(repo.to_str().unwrap()))],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(300, 100, 100));
+        publisher.hooks.git = Some(Box::new(|_, _| ship_time::RepositoryObservation {
+            read: ship_time::RepositoryRead::Complete(Some(ship_time::Repository {
+                name: "repo".into(),
+                ship_unix: None,
+            })),
+            verified_at: Some(Instant::now()),
+        }));
+        let reader = BudgetReader {
+            exhaust: AtomicBool::new(false),
+            reads: std::sync::Mutex::default(),
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &short_readers(), &reader, &TimeoutReader)
+            .unwrap();
+        assert!(publisher.local_readings.contains_key("w1:pb"));
+        // Every live key is now one interval old and needs renewal.
+        publisher.started -= Duration::from_millis(5000);
+        publisher.send_queue = FairQueue::default();
+        reader.exhaust.store(true, Ordering::Release);
+        reader.reads.lock().unwrap().clear();
+        let first_report = log.lock().unwrap().len();
+        publisher
+            .refresh_with_readers(&mut transport, &short_readers(), &reader, &TimeoutReader)
+            .unwrap();
+        assert_eq!(*reader.reads.lock().unwrap(), ["native-a"]);
+        let sent: BTreeSet<String> = log.lock().unwrap()[first_report..]
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ["w1:pb", "w1:pc", "w1"] {
+            assert!(sent.contains(id), "{id} did not send: {sent:?}");
+        }
+        assert!(!sent.contains("w1:pd"));
+        assert_eq!(
+            queue_ids(&publisher),
+            ["w1:pd", "w1:pa", "w1:pb", "w1:pc", "w1"]
+        );
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F9b: a reader call that returns at once (BUSY) is still an attempt.
+    #[test]
+    fn immediate_busy_reader_result_counts_as_an_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            BudgetLog::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &TimeoutReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        publisher.send_queue = FairQueue::default();
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &TimeoutReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        assert_eq!(queue_ids(&publisher), ["w1", "w1:p1"]);
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F10: one reader cycle per refresh, shared by its panes and carrying the
+    // publisher-owned diagnostics; the next refresh starts with a fresh cycle.
+    #[test]
+    fn one_reader_cycle_per_refresh_shares_discovery_and_diagnostics() {
+        struct CycleProbe {
+            scans: std::sync::Mutex<Vec<(usize, usize)>>,
+            diagnostics: std::sync::Mutex<Vec<Arc<model::ReaderDiagnostics>>>,
+        }
+        impl UsageReader for CycleProbe {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                CodexReader.read(request)
+            }
+            fn read_in_cycle(
+                &self,
+                request: &ReadRequest<'_>,
+                cycle: &model::ReadCycle,
+            ) -> UsageReading {
+                let reading = CodexReader.read_in_cycle(request, cycle);
+                let address = std::ptr::from_ref(cycle) as usize;
+                self.scans
+                    .lock()
+                    .unwrap()
+                    .push((address, cycle.discovery_scan_count()));
+                self.diagnostics
+                    .lock()
+                    .unwrap()
+                    .push(cycle.diagnostics().expect("diagnostics attached").clone());
+                reading
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("codex-home/sessions")).unwrap();
+        let socket = dir.path().join("fake.sock");
+        // Codex associates a rollout only with a pane cwd.
+        let panes = ["1", "2"]
+            .map(|index| {
+                let mut pane = budget_pane(
+                    &format!("w1:p{index}"),
+                    "w1",
+                    Some("codex"),
+                    &format!("native-{index}"),
+                );
+                pane["cwd"] = json!("/synthetic/codex");
+                pane
+            })
+            .to_vec();
+        let template = budget_template(panes, vec![budget_workspace("w1", None)]);
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            BudgetLog::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        publisher.hooks.git = Some(Box::new(|_, _| ship_time::RepositoryObservation {
+            read: ship_time::RepositoryRead::Complete(None),
+            verified_at: None,
+        }));
+        let probe = CycleProbe {
+            scans: std::sync::Mutex::default(),
+            diagnostics: std::sync::Mutex::default(),
+        };
+        for _ in 0..2 {
+            publisher.send_queue = FairQueue::default();
+            publisher
+                .refresh_with_readers(&mut transport, &short_readers(), &probe, &TimeoutReader)
+                .unwrap();
+        }
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        // Both panes of a refresh read through the same cycle. A new refresh
+        // starts from an empty cycle, so its first read scans exactly once.
+        // Reuse inside a refresh is the reader's choice: a still-running
+        // worker may rescan, as the reader tests allow.
+        let scans = probe.scans.lock().unwrap().clone();
+        assert_eq!(scans.len(), 4);
+        for refresh in scans.chunks(2) {
+            assert_eq!(refresh[0].0, refresh[1].0, "panes used different cycles");
+            assert_eq!(
+                refresh[0].1, 1,
+                "a refresh did not start with an empty cycle"
+            );
+            assert!((1..=2).contains(&refresh[1].1));
+        }
+        assert!(
+            probe
+                .diagnostics
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|diagnostics| Arc::ptr_eq(diagnostics, &publisher.reader_diagnostics))
+        );
+    }
+
+    fn git_observation(name: &str, ship_unix: Option<i64>) -> ship_time::RepositoryObservation {
+        ship_time::RepositoryObservation {
+            read: ship_time::RepositoryRead::Complete(Some(ship_time::Repository {
+                name: name.into(),
+                ship_unix,
+            })),
+            verified_at: Some(Instant::now()),
+        }
+    }
+
+    // F11, F15 and F17: a stalled repository uses the cycle's Git budget and
+    // rotates; the others keep their place and publish null, never `—`, until
+    // read. A confirmed repository without origin/main shows its name and `—`.
+    #[test]
+    fn git_queue_rotates_a_stalled_repository_and_unread_headings_are_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![
+                budget_pane("wa:p1", "wa", None, ""),
+                budget_pane("wb:p1", "wb", None, ""),
+                budget_pane("wc:p1", "wc", None, ""),
+            ],
+            vec![
+                budget_workspace("wa", Some("/synthetic/a")),
+                budget_workspace("wb", Some("/synthetic/b")),
+                budget_workspace("wc", Some("/synthetic/c")),
+            ],
+        );
+        let tokens = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(2000, 100, 100));
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = reads.clone();
+        publisher.hooks.git = Some(Box::new(move |cwd, deadline| {
+            let name = cwd.file_name().unwrap().to_str().unwrap().to_owned();
+            seen.lock().unwrap().push(name.clone());
+            match name.as_str() {
+                "a" => {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    ship_time::RepositoryObservation {
+                        read: ship_time::RepositoryRead::Interrupted,
+                        verified_at: None,
+                    }
+                }
+                "b" => git_observation("repo-b", Some(1_700_000_000)),
+                _ => git_observation("repo-c", None),
+            }
+        }));
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        assert_eq!(*reads.lock().unwrap(), ["a"]);
+        assert_eq!(publisher.git_queue.order, ["wb", "wc", "wa"]);
+        let first = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap()
+            .1;
+        tokens.lock().unwrap().insert(0, first);
+        reads.lock().unwrap().clear();
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        assert_eq!(*reads.lock().unwrap(), ["b", "c", "a"]);
+        assert_eq!(publisher.git_queue.order, ["wb", "wc", "wa"]);
+        let second = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap()
+            .1;
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let workspace = |snapshot: &Value, index: usize| {
+            snapshot["result"]["snapshot"]["workspaces"][index]["tokens"].clone()
+        };
+        let first = tokens.lock().unwrap().remove(&0).unwrap();
+        for index in 0..3 {
+            let heading = workspace(&first, index);
+            assert!(heading.get("lineup_repo").is_none(), "{heading}");
+            assert!(heading.get("lineup_ship_text").is_none(), "{heading}");
+        }
+        assert_eq!(workspace(&second, 1)["lineup_repo"], "repo-b");
+        assert_eq!(workspace(&second, 2)["lineup_repo"], "repo-c");
+        assert_eq!(workspace(&second, 2)["lineup_ship_text"], "—");
+        assert!(workspace(&second, 2).get("lineup_ship_unix").is_none());
+        assert!(workspace(&second, 0).get("lineup_repo").is_none());
+    }
+
+    // F12: two workspaces share one stalled cwd: one Git read per cycle, only
+    // the workspace that started it rotates, and the pass ends.
+    #[test]
+    fn shared_stalled_cwd_is_read_once_and_rotates_only_its_starter() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![],
+            vec![
+                budget_workspace("w1", Some("/synthetic/shared")),
+                budget_workspace("w2", Some("/synthetic/shared")),
+            ],
+        );
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            BudgetLog::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(2000, 100, 100));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = reads.clone();
+        publisher.hooks.git = Some(Box::new(move |_, deadline| {
+            count.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            ship_time::RepositoryObservation {
+                read: ship_time::RepositoryRead::Interrupted,
+                verified_at: None,
+            }
+        }));
+        for cycle in 1..=2 {
+            publisher
+                .refresh_with_readers(
+                    &mut transport,
+                    &short_readers(),
+                    &SampleReader,
+                    &TimeoutReader,
+                )
+                .unwrap();
+            assert_eq!(reads.load(Ordering::SeqCst), cycle);
+        }
+        // w1 started cycle 1 and w2 started cycle 2.
+        assert_eq!(publisher.git_queue.order, ["w1", "w2"]);
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F19: production stage samples count acknowledged reports and successful
+    // checkpoint writes per refresh, and are present after an error.
+    #[test]
+    fn production_stages_count_reports_and_checkpoints_and_survive_errors() {
+        use crate::daemon::Publisher as _;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template.clone(),
+            BudgetServer {
+                stall_report: Some(2),
+                ..BudgetServer::default()
+            },
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        assert!(publisher.refresh_stages().is_none(), "no attempt yet");
+        publisher.refresh(&mut transport, &short_readers()).unwrap();
+        let first = publisher.refresh_stages().unwrap();
+        assert_eq!(first.counts.reports, log.lock().unwrap().len() as u64);
+        assert_eq!(first.counts.reports, 2);
+        assert_eq!(first.counts.checkpoints, 1);
+        assert!(
+            first.durations.snapshot_us <= first.durations.socket_us + first.durations.snapshot_us
+        );
+        template.lock().unwrap()["result"]["snapshot"]["panes"][0]["agent_status"] = json!("idle");
+        assert!(publisher.refresh(&mut transport, &short_readers()).is_err());
+        let failed = publisher.refresh_stages().unwrap();
+        assert_eq!(failed.counts.reports, 0, "counts are per refresh");
+        assert_eq!(failed.counts.checkpoints, 0);
+        assert!(failed.durations.socket_us > 0);
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
 }
