@@ -121,21 +121,40 @@ fn restore_local_after_timeout(
     reading
 }
 
-fn fresh_grok_weekly(
+fn kimi_worker_settings() -> crate::quota_kimi::Settings {
+    #[cfg(test)]
+    if let Ok(value) = std::env::var("LINEUP_TEST_KIMI_INTERVAL_MS")
+        && let Ok(millis) = value.parse::<u64>()
+        && (1..60_000).contains(&millis)
+    {
+        return crate::quota_kimi::Settings::exact_for_test(
+            Duration::from_millis(millis),
+            Duration::from_secs(2),
+        );
+    }
+    crate::quota_kimi::Settings::default()
+}
+
+fn account_query_max_age(max_age_ms: u64, refresh_interval_ms: u64) -> Duration {
+    let cadence = model::AccountCadence::default_account();
+    let query_cycle =
+        cadence.interval() + cadence.timeout() + Duration::from_millis(refresh_interval_ms);
+    Duration::from_millis(max_age_ms).max(query_cycle)
+}
+
+fn fresh_account_weekly(
     sample: Option<model::WeeklySample>,
     observed: Option<Instant>,
     now: Instant,
     max_age_ms: u64,
     refresh_interval_ms: u64,
 ) -> Option<model::WeeklySample> {
-    let settings = crate::quota_grok::Settings::default();
-    let query_cycle =
-        settings.interval() + settings.timeout() + Duration::from_millis(refresh_interval_ms);
-    let max_age = Duration::from_millis(max_age_ms).max(query_cycle);
-    sample.filter(|value| {
-        value.resets_at.is_some()
-            || observed.is_some_and(|observed| now.saturating_duration_since(observed) <= max_age)
-    })
+    model::fresh_until_reset_or_age(
+        sample,
+        observed,
+        now,
+        account_query_max_age(max_age_ms, refresh_interval_ms),
+    )
 }
 
 fn kimi_sample_after_poll(
@@ -150,7 +169,7 @@ fn kimi_sample_after_poll(
         }),
         crate::quota_kimi::Outcome::Throttled => previous,
         crate::quota_kimi::Outcome::Unavailable(failure) if failure.is_transient() => {
-            previous.filter(|sample| sample.resets_at.is_some_and(|reset| reset > now))
+            model::retain_known_reset_after_failure(previous, now)
         }
         crate::quota_kimi::Outcome::Unavailable(_) => None,
     }
@@ -163,14 +182,7 @@ fn fresh_kimi_weekly(
     max_age_ms: u64,
     refresh_interval_ms: u64,
 ) -> Option<model::WeeklySample> {
-    let settings = crate::quota_kimi::Settings::default();
-    let query_cycle =
-        settings.interval() + settings.timeout() + Duration::from_millis(refresh_interval_ms);
-    let max_age = Duration::from_millis(max_age_ms).max(query_cycle);
-    sample.filter(|value| {
-        value.resets_at.is_some()
-            || observed.is_some_and(|observed| now.saturating_duration_since(observed) <= max_age)
-    })
+    fresh_account_weekly(sample, observed, now, max_age_ms, refresh_interval_ms)
 }
 
 #[derive(Clone, Copy)]
@@ -213,7 +225,7 @@ fn current_kimi_weekly_with_stamp(
         if source.is_some_and(|snapshot| {
             Some(snapshot.stamp) != current_stamp
                 || snapshot.auth_expiry <= now
-                || snapshot.sample.resets_at.is_some_and(|reset| reset <= now)
+                || model::clear_expired_reset(Some(snapshot.sample), now).is_none()
         }) {
             *source = None;
         }
@@ -448,7 +460,7 @@ impl MetadataPublisher {
             )?);
         }
         if self.kimi_weekly.is_none() && config.weekly_enabled(Agent::Kimi) {
-            let settings = crate::quota_kimi::Settings::default();
+            let settings = kimi_worker_settings();
             #[cfg(not(test))]
             let mut client = crate::quota_kimi::Client::from_env(settings);
             #[cfg(test)]
@@ -461,7 +473,7 @@ impl MetadataPublisher {
             let mut previous = None;
             let mut previous_stamp = None;
             let mut last_success = None;
-            self.kimi_weekly = Some(model::WeeklyWorker::start(
+            self.kimi_weekly = Some(model::WeeklyWorker::start_effect(
                 shutdown,
                 settings.interval(),
                 move || {
@@ -504,7 +516,6 @@ impl MetadataPublisher {
                     };
                     previous = sample;
                     let _ = write_weekly_result(&directory, WeeklyProvider::Kimi, result);
-                    sample
                 },
             )?);
         }
@@ -805,7 +816,7 @@ impl MetadataPublisher {
                     .and_then(|worker| worker.sample(now))
             })
             .flatten();
-        let grok_weekly = fresh_grok_weekly(
+        let grok_weekly = fresh_account_weekly(
             grok_weekly,
             self.grok_observed.try_lock().ok().and_then(|value| *value),
             Instant::now(),
@@ -1212,6 +1223,103 @@ fn unix(time: SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FAR_RESET: &str = "2099-01-01T00:00:00Z";
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct FixtureReply {
+        status: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ratio: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reset: Option<String>,
+    }
+
+    impl FixtureReply {
+        fn weekly(ratio: f64, reset: Option<&str>) -> Self {
+            Self {
+                status: 200,
+                ratio: Some(ratio),
+                reset: reset.map(str::to_owned),
+            }
+        }
+
+        fn status(status: u16) -> Self {
+            Self {
+                status,
+                ratio: None,
+                reset: None,
+            }
+        }
+    }
+
+    fn serve_kimi_fixture(
+        listener: std::net::TcpListener,
+        replies: &Path,
+        connections: &Path,
+        stop: &AtomicBool,
+    ) {
+        listener.set_nonblocking(true).unwrap();
+        let mut count = 0usize;
+        while !stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    count += 1;
+                    let temporary = connections.with_extension("tmp");
+                    std::fs::write(&temporary, count.to_string()).unwrap();
+                    std::fs::rename(&temporary, connections).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n")
+                        && request.len() < 8192
+                    {
+                        match std::io::Read::read(&mut stream, &mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(size) => request.extend_from_slice(&buffer[..size]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let token = request.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().strip_prefix("Bearer "))
+                            .flatten()
+                    });
+                    let script = std::fs::read(replies).ok().and_then(|bytes| {
+                        serde_json::from_slice::<BTreeMap<String, FixtureReply>>(&bytes).ok()
+                    });
+                    let reply = token.and_then(|token| script.as_ref()?.get(token).cloned());
+                    let (status, body) = match reply {
+                        Some(reply) if reply.status == 200 => {
+                            let ratio = reply.ratio.unwrap_or(0.0);
+                            let body = match reply.reset {
+                                Some(reset) => format!(
+                                    r#"{{"usages":{{"limit_7d":{{"used_ratio":{ratio},"reset_time":"{reset}"}}}}}}"#
+                                ),
+                                None => format!(
+                                    r#"{{"usages":{{"limit_7d":{{"used_ratio":{ratio}}}}}}}"#
+                                ),
+                            };
+                            (200, body)
+                        }
+                        Some(reply) => (reply.status, "no".into()),
+                        None => (401, "no".into()),
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
     use crate::{daemon::Publisher as _, model::*, socket::Transport};
     use serde_json::{Value, json};
     use std::{
@@ -1971,7 +2079,7 @@ mod tests {
         let refresh = Duration::from_millis(config.refresh_interval_ms);
         let next_query_done = now + settings.interval() + settings.timeout();
         assert!(
-            fresh_grok_weekly(
+            fresh_account_weekly(
                 sample,
                 Some(now),
                 next_query_done + refresh,
@@ -1981,7 +2089,7 @@ mod tests {
             .is_some()
         );
         assert!(
-            fresh_grok_weekly(
+            fresh_account_weekly(
                 sample,
                 Some(now),
                 next_query_done + refresh + Duration::from_millis(1),
@@ -1992,7 +2100,7 @@ mod tests {
         );
         let longer_age = settings.interval() + settings.timeout() + refresh + settings.interval();
         assert!(
-            fresh_grok_weekly(
+            fresh_account_weekly(
                 sample,
                 Some(now),
                 now + longer_age,
@@ -2002,7 +2110,7 @@ mod tests {
             .is_some()
         );
         assert!(
-            fresh_grok_weekly(
+            fresh_account_weekly(
                 sample,
                 None,
                 now,
@@ -2133,6 +2241,274 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset() {
+        let Some(root) = std::env::var_os("LINEUP_FAKE_KIMI_WIRING_CHILD") else {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("kimi-home");
+            std::fs::create_dir_all(home.join("credentials")).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/usages", listener.local_addr().unwrap());
+            let replies = root.path().join("replies.json");
+            let connections = root.path().join("connections");
+            std::fs::write(&replies, b"{}").unwrap();
+            std::fs::write(&connections, b"0").unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server = {
+                let replies = replies.clone();
+                let connections = connections.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    serve_kimi_fixture(listener, &replies, &connections, &stop)
+                })
+            };
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "publish::tests::kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset",
+                ])
+                .env("LINEUP_FAKE_KIMI_WIRING_CHILD", root.path())
+                .env("HOME", root.path())
+                .env("KIMI_CODE_HOME", &home)
+                .env("LINEUP_TEST_KIMI_ENDPOINT", endpoint)
+                .env("LINEUP_TEST_KIMI_INTERVAL_MS", "100")
+                .env_remove("KIMI_CODE_BASE_URL")
+                .env_remove("GROK_HOME")
+                .env_remove("GROK_AUTH_FILE")
+                .env_remove("CODEX_HOME")
+                .env_remove("HERDR_SOCKET_PATH")
+                .env_remove("HERDR_PLUGIN_STATE_DIR")
+                .env_remove("HERDR_PLUGIN_CONFIG_DIR")
+                .env_remove("HERDR_PLUGIN_ROOT")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated Kimi wiring child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            stop.store(true, Ordering::Release);
+            server.join().unwrap();
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+            assert!(
+                status.success(),
+                "isolated Kimi wiring child failed: {stderr}"
+            );
+            return;
+        };
+        let root = PathBuf::from(root);
+        let home = PathBuf::from(std::env::var_os("KIMI_CODE_HOME").unwrap());
+        let auth = home.join("credentials/kimi-code.json");
+        let replies = root.join("replies.json");
+        let connections = root.join("connections");
+        for (index, (network, kimi_enabled, providers)) in [
+            (false, false, vec!["kimi".into()]),
+            (true, false, vec!["kimi".into()]),
+            (false, true, vec!["kimi".into()]),
+            (true, true, vec!["claude".into()]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = root.join(format!("opt-in-{index}"));
+            std::fs::create_dir(&directory).unwrap();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let mut publisher =
+                MetadataPublisher::new(directory, "fake".into(), Homes::from_env()).unwrap();
+            publisher.set_shutdown(shutdown.clone());
+            publisher
+                .start_weekly(&Config {
+                    allow_network: network,
+                    kimi_weekly_enabled: kimi_enabled,
+                    providers,
+                    ..Config::default()
+                })
+                .unwrap();
+            assert!(publisher.kimi_weekly.is_none());
+            shutdown.store(true, Ordering::Release);
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(std::fs::read_to_string(&connections).unwrap().trim(), "0");
+
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let mut script = BTreeMap::new();
+        let long_expiry = 4_102_444_800_u64;
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            providers: vec!["kimi".into()],
+            ..Config::default()
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut publisher =
+            MetadataPublisher::new(state.clone(), "fake".into(), Homes::from_env()).unwrap();
+        publisher.set_shutdown(shutdown.clone());
+        let observe = |publisher: &MetadataPublisher| {
+            current_kimi_weekly(
+                &publisher.kimi_source,
+                publisher.homes.kimi.as_deref(),
+                &enabled,
+                SystemTime::now(),
+                Instant::now(),
+            )
+        };
+        let wait_percent = |publisher: &MetadataPublisher, percent: f64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(sample) = observe(publisher)
+                    && (sample.used_percent - percent).abs() < 0.001
+                {
+                    return sample;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {percent}: {}",
+                    crate::quota_diagnostic::weekly_diagnostics(&state)
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let wait_cleared = |publisher: &MetadataPublisher| {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if observe(publisher).is_none() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for weekly to clear: {}",
+                    crate::quota_diagnostic::weekly_diagnostics(&state)
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let publish = |script: &BTreeMap<String, FixtureReply>| {
+            let bytes = serde_json::to_vec(script).unwrap();
+            let temporary = replies.with_extension("tmp");
+            std::fs::write(&temporary, bytes).unwrap();
+            std::fs::rename(temporary, &replies).unwrap();
+        };
+        let credential = |token: &str, expires_at: u64| {
+            std::fs::write(
+                &auth,
+                format!(r#"{{"access_token":"{token}","expires_at":{expires_at}}}"#),
+            )
+            .unwrap();
+        };
+
+        script.insert(
+            "phase-success".into(),
+            FixtureReply::weekly(0.25, Some(FAR_RESET)),
+        );
+        publish(&script);
+        credential("phase-success", long_expiry);
+        publisher.start_weekly(&enabled).unwrap();
+        let sample = wait_percent(&publisher, 25.0);
+        assert!(sample.resets_at.is_some());
+        assert!(crate::quota_diagnostic::weekly_diagnostics(&state).contains("kimi=ok"));
+        assert!(
+            publisher
+                .kimi_weekly
+                .as_ref()
+                .unwrap()
+                .sample(SystemTime::now())
+                .is_none()
+        );
+
+        script.insert(
+            "phase-rotated".into(),
+            FixtureReply::weekly(0.5, Some(FAR_RESET)),
+        );
+        publish(&script);
+        credential("phase-rotated", long_expiry);
+        assert_eq!(wait_percent(&publisher, 50.0).used_percent, 50.0);
+
+        script.insert("phase-rotated".into(), FixtureReply::status(500));
+        publish(&script);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let retained = observe(&publisher).is_some_and(|sample| sample.used_percent == 50.0);
+            let transient =
+                crate::quota_diagnostic::weekly_diagnostics(&state).contains("kimi=transient");
+            if retained && transient {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "transient failure did not retain reset sample"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        script.insert("phase-resetless".into(), FixtureReply::weekly(0.125, None));
+        publish(&script);
+        credential("phase-resetless", long_expiry);
+        let resetless = wait_percent(&publisher, 12.5);
+        assert!(resetless.resets_at.is_none());
+        script.insert("phase-resetless".into(), FixtureReply::status(500));
+        publish(&script);
+        wait_cleared(&publisher);
+        assert!(crate::quota_diagnostic::weekly_diagnostics(&state).contains("kimi=transient"));
+
+        let reset =
+            chrono::DateTime::<chrono::Utc>::from(SystemTime::now() + Duration::from_secs(4))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        script.insert(
+            "phase-reset".into(),
+            FixtureReply::weekly(0.75, Some(&reset)),
+        );
+        publish(&script);
+        credential("phase-reset", long_expiry);
+        let reset_at = wait_percent(&publisher, 75.0).resets_at.unwrap();
+        wait_cleared(&publisher);
+        assert!(SystemTime::now() >= reset_at);
+
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 4;
+        script.insert(
+            "phase-expiry".into(),
+            FixtureReply::weekly(0.375, Some(FAR_RESET)),
+        );
+        publish(&script);
+        credential("phase-expiry", expires_at);
+        let expiring = wait_percent(&publisher, 37.5);
+        assert!(
+            expiring
+                .resets_at
+                .is_some_and(|reset| reset > SystemTime::now())
+        );
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let cleared = observe(&publisher).is_none();
+            let expired =
+                crate::quota_diagnostic::weekly_diagnostics(&state).contains("kimi=auth_expired");
+            if cleared && expired {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "credential expiry did not clear weekly"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(SystemTime::now() >= UNIX_EPOCH + Duration::from_secs(expires_at));
+        shutdown.store(true, Ordering::Release);
     }
 
     #[test]

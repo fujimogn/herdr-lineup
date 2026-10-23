@@ -17,29 +17,37 @@ const CREDENTIAL_RELATIVE_PATH: &str = "credentials/kimi-code.json";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
-    interval: Duration,
-    timeout: Duration,
+    cadence: crate::model::AccountCadence,
 }
 
 impl Settings {
     pub fn new(interval: Duration, timeout: Duration) -> Self {
         Self {
-            interval: interval.clamp(Duration::from_secs(60), Duration::from_secs(3600)),
-            timeout: timeout.clamp(Duration::from_secs(1), Duration::from_secs(30)),
+            cadence: crate::model::AccountCadence::new(interval, timeout),
+        }
+    }
+
+    /// Bypass the production cadence clamp for an isolated worker fixture.
+    #[cfg(test)]
+    pub(crate) fn exact_for_test(interval: Duration, timeout: Duration) -> Self {
+        Self {
+            cadence: crate::model::AccountCadence::exact(interval, timeout),
         }
     }
 
     pub fn interval(self) -> Duration {
-        self.interval
+        self.cadence.interval()
     }
     pub fn timeout(self) -> Duration {
-        self.timeout
+        self.cadence.timeout()
     }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self::new(Duration::from_secs(300), Duration::from_secs(10))
+        Self {
+            cadence: crate::model::AccountCadence::default_account(),
+        }
     }
 }
 
@@ -163,7 +171,7 @@ impl Client {
 
     fn with_endpoint(auth_file: PathBuf, settings: Settings, endpoint: String) -> Self {
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(settings.timeout))
+            .timeout_global(Some(settings.timeout()))
             .max_redirects(0)
             .https_only(!cfg!(test))
             .build()
@@ -200,7 +208,7 @@ impl Client {
         if self.next_request.is_some_and(|next| now < next) {
             return Outcome::Throttled;
         }
-        self.next_request = Some(now + self.settings.interval);
+        self.next_request = Some(now + self.settings.interval());
         let outcome = self.fetch(wall_now);
         self.last_result = match outcome {
             Outcome::Weekly(_) => crate::quota_diagnostic::WeeklyResult::Ok,
