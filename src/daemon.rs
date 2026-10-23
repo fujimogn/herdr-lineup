@@ -412,6 +412,32 @@ fn stage_parts(aggregate: &RefreshStageAggregate) -> [&StageDurationStats; 5] {
     ]
 }
 
+fn histogram_total(histogram: &[u64; REFRESH_DURATION_BUCKETS]) -> Option<u64> {
+    histogram
+        .iter()
+        .try_fold(0u64, |total, bucket| total.checked_add(*bucket))
+}
+
+/// Occupied buckets must overlap `[min_us, max_us]`, and the buckets that
+/// contain last, min, and max must hold a real observation. A saturated
+/// `u64::MAX` count does not make an impossible bucket legal.
+fn buckets_match_extrema(duration: &RefreshDuration) -> bool {
+    let min_bucket = duration_bucket(duration.min_us);
+    let max_bucket = duration_bucket(duration.max_us);
+    let last_bucket = duration_bucket(duration.last_us);
+    if duration.histogram[min_bucket] == 0
+        || duration.histogram[max_bucket] == 0
+        || duration.histogram[last_bucket] == 0
+    {
+        return false;
+    }
+    duration
+        .histogram
+        .iter()
+        .enumerate()
+        .all(|(index, count)| *count == 0 || (min_bucket..=max_bucket).contains(&index))
+}
+
 fn stage_duration_consistent(stats: &StageDurationStats) -> bool {
     let duration = &stats.duration;
     if stats.count == 0 {
@@ -424,10 +450,11 @@ fn stage_duration_consistent(stats: &StageDurationStats) -> bool {
     if duration.min_us > duration.max_us
         || duration.last_us < duration.min_us
         || duration.last_us > duration.max_us
+        || !buckets_match_extrema(duration)
     {
         return false;
     }
-    if stats.count == 1 && stats.sum_us != duration.last_us && stats.sum_us != u64::MAX {
+    if stats.count == 1 && stats.sum_us != duration.last_us {
         return false;
     }
     if let Some(lower) = duration.min_us.checked_mul(stats.count)
@@ -437,25 +464,17 @@ fn stage_duration_consistent(stats: &StageDurationStats) -> bool {
         return false;
     }
     if let Some(upper) = duration.max_us.checked_mul(stats.count)
-        && stats.sum_us != u64::MAX
         && stats.sum_us > upper
     {
         return false;
     }
-    let histogram_saturated = duration.histogram.contains(&u64::MAX);
-    if stats.count != u64::MAX && !histogram_saturated {
-        let mut histogram_count = 0u64;
-        for bucket in duration.histogram {
-            match histogram_count.checked_add(bucket) {
-                Some(next) => histogram_count = next,
-                None => return false,
-            }
-        }
-        if histogram_count != stats.count {
-            return false;
-        }
+    match histogram_total(&duration.histogram) {
+        Some(total) if total == stats.count => true,
+        // One saturated bucket plus a later sample in another bucket no longer
+        // fits in `u64`, while the attempt count stays saturated.
+        None if stats.count == u64::MAX && duration.histogram.contains(&u64::MAX) => true,
+        _ => false,
     }
-    true
 }
 
 fn stage_aggregate_consistent(aggregate: &RefreshStageAggregate) -> bool {
@@ -3139,6 +3158,155 @@ mod tests {
         let unequal_view = control_view_from_frame(&serde_json::to_vec(&unequal).unwrap()).unwrap();
         assert_eq!(unequal_view.health.endpoint, sample_health().endpoint);
         assert!(unequal_view.observation.unwrap().stages.is_none());
+    }
+
+    fn stage_distribution(
+        count: u64,
+        sum_us: u64,
+        last_us: u64,
+        min_us: u64,
+        max_us: u64,
+        histogram: [u64; REFRESH_DURATION_BUCKETS],
+    ) -> serde_json::Value {
+        let stage = serde_json::json!({
+            "count": count,
+            "sum_us": sum_us,
+            "duration": {
+                "last_us": last_us,
+                "min_us": min_us,
+                "max_us": max_us,
+                "histogram": histogram,
+            }
+        });
+        let mut health = serde_json::to_value(sample_health()).unwrap();
+        health["refresh_observation"] = serde_json::json!({
+            "attempt_count": count,
+            "success_count": count,
+            "error_count": 0,
+            "capacity_skip_count": 0,
+            "duration": {
+                "last_us": 0,
+                "min_us": 0,
+                "max_us": 0,
+                "histogram": [1, 0, 0, 0, 0, 0, 0, 0, 0]
+            },
+            "stages": {
+                "snapshot": stage.clone(),
+                "git": stage.clone(),
+                "reader": stage.clone(),
+                "persist": stage.clone(),
+                "socket": stage,
+                "latest_measured": true,
+                "reports": 0,
+                "checkpoints": 0
+            }
+        });
+        health
+    }
+
+    fn assert_stages_unavailable(frame: &serde_json::Value) {
+        let view = control_view_from_frame(&serde_json::to_vec(frame).unwrap()).unwrap();
+        assert!(view.observation.as_ref().unwrap().stages.is_none());
+        assert_eq!(view.health.nonce, sample_health().nonce);
+        assert_eq!(view.health.endpoint, sample_health().endpoint);
+        assert_eq!(
+            view.observation
+                .as_ref()
+                .unwrap()
+                .duration
+                .as_ref()
+                .unwrap()
+                .last_us,
+            0
+        );
+    }
+
+    #[test]
+    fn stage_histogram_buckets_must_cover_min_max_and_last() {
+        let zeros = [0; REFRESH_DURATION_BUCKETS];
+        let mut outside = zeros;
+        outside[8] = 1;
+        // count 1, sum 0, last = min = max = 0, but the only observation is `>=5000ms`.
+        assert_stages_unavailable(&stage_distribution(1, 0, 0, 0, 0, outside));
+
+        let mut above_max = zeros;
+        above_max[0] = 1;
+        above_max[1] = 1;
+        assert_stages_unavailable(&stage_distribution(2, 1_000, 500, 0, 999, above_max));
+
+        let mut missing_last = zeros;
+        missing_last[0] = 1;
+        missing_last[2] = 1;
+        assert_stages_unavailable(&stage_distribution(
+            2,
+            10_000,
+            1_000,
+            0,
+            10_000,
+            missing_last,
+        ));
+
+        let mut missing_min = zeros;
+        missing_min[1] = 1;
+        missing_min[2] = 1;
+        assert_stages_unavailable(&stage_distribution(
+            2,
+            11_000,
+            10_000,
+            0,
+            10_000,
+            missing_min,
+        ));
+
+        let mut saturated_outside = zeros;
+        saturated_outside[8] = u64::MAX;
+        assert_stages_unavailable(&stage_distribution(
+            u64::MAX,
+            u64::MAX,
+            0,
+            0,
+            0,
+            saturated_outside,
+        ));
+
+        let mut saturated_small_count = zeros;
+        saturated_small_count[0] = u64::MAX;
+        assert_stages_unavailable(&stage_distribution(2, 0, 0, 0, 0, saturated_small_count));
+
+        let mut crossing = zeros;
+        crossing[0] = 1;
+        crossing[1] = 1;
+        let accepted = control_view_from_frame(
+            &serde_json::to_vec(&stage_distribution(2, 1_999, 1_000, 999, 1_000, crossing))
+                .unwrap(),
+        )
+        .unwrap();
+        let stages = accepted.observation.unwrap().stages.unwrap();
+        assert_eq!(stages.snapshot.duration.histogram[0], 1);
+        assert_eq!(stages.snapshot.duration.histogram[1], 1);
+        assert_eq!(stages.snapshot.duration.max_us, 1_000);
+        assert_eq!(
+            accepted.health.last_refresh_ms,
+            sample_health().last_refresh_ms
+        );
+
+        let mut saturated = zeros;
+        saturated[0] = u64::MAX;
+        saturated[1] = 1;
+        let saturated_view = control_view_from_frame(
+            &serde_json::to_vec(&stage_distribution(
+                u64::MAX,
+                u64::MAX,
+                1_000,
+                0,
+                1_000,
+                saturated,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(saturated_view.observation.unwrap().stages.is_some());
+        assert_eq!(saturated_view.health.pid, sample_health().pid);
     }
 
     #[test]
