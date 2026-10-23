@@ -682,6 +682,54 @@ struct HeadingCache {
     repository: ship_time::Repository,
 }
 
+struct RefreshInventory {
+    snapshot: protocol::Snapshot,
+    now_unix: i64,
+    mode: tokens::LogoMode,
+    first_panes: BTreeSet<String>,
+    codex_weekly: Option<model::WeeklySample>,
+    grok_weekly: Option<model::WeeklySample>,
+    kimi_weekly: Option<model::WeeklySample>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceHeading {
+    resolved: bool,
+    desired: tokens::Tokens,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Headings {
+    by_workspace: BTreeMap<String, WorkspaceHeading>,
+}
+
+struct PaneObservation {
+    pane_id: String,
+    workspace_id: String,
+    stored_keys: BTreeSet<String>,
+    occupant: Option<tokens::Occupant>,
+    state: String,
+    usage: Option<tokens::Usage>,
+}
+
+struct PlannedPaneReport {
+    resource: ResourceId,
+    stored_keys: BTreeSet<String>,
+    occupant: Option<tokens::Occupant>,
+    desired: tokens::Tokens,
+}
+
+struct PlannedWorkspaceReport {
+    resource: ResourceId,
+    stored_keys: BTreeSet<String>,
+    desired: tokens::Tokens,
+}
+
+struct DesiredReports {
+    panes: Vec<PlannedPaneReport>,
+    workspaces: Vec<PlannedWorkspaceReport>,
+}
+
 pub struct MetadataPublisher {
     planner: tokens::Publisher,
     checkpoint_loaded: bool,
@@ -1299,13 +1347,11 @@ impl MetadataPublisher {
         result
     }
 
-    fn refresh_with_readers_inner(
+    fn collect_inventory(
         &mut self,
         transport: &mut Transport,
         config: &Config,
-        codex: &dyn UsageReader,
-        grok: &dyn UsageReader,
-    ) -> io::Result<()> {
+    ) -> io::Result<RefreshInventory> {
         self.check_shutdown()?;
         config.validate()?;
         self.refresh_ms = config.refresh_interval_ms;
@@ -1365,15 +1411,31 @@ impl MetadataPublisher {
             "text" => tokens::LogoMode::Text,
             _ => tokens::LogoMode::Auto,
         };
-        let mut skipped_resources = 0u64;
+        let first_panes = first_pane_ids(&snapshot)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        Ok(RefreshInventory {
+            snapshot,
+            now_unix,
+            mode,
+            first_panes,
+            codex_weekly,
+            grok_weekly,
+            kimi_weekly,
+        })
+    }
+
+    fn resolve_headings(&mut self, inventory: &RefreshInventory) -> io::Result<Headings> {
         let local_now = chrono::Local::now();
-        let mut headings = BTreeMap::new();
+        let mut by_workspace = BTreeMap::new();
         let mut repository_readings = BTreeMap::new();
-        for workspace in &snapshot.workspaces {
+        for workspace in &inventory.snapshot.workspaces {
             #[cfg(test)]
             let stage_start = Instant::now();
             self.check_shutdown()?;
-            let panes: Vec<_> = snapshot
+            let panes: Vec<_> = inventory
+                .snapshot
                 .panes
                 .iter()
                 .filter(|pane| pane.workspace_id == workspace.workspace_id)
@@ -1388,7 +1450,8 @@ impl MetadataPublisher {
                     ship_time::read_repository_controlled(cwd, self.shutdown.as_deref())
                 })
             });
-            let occupants = snapshot
+            let occupants = inventory
+                .snapshot
                 .panes
                 .iter()
                 .filter(|pane| pane.workspace_id == workspace.workspace_id)
@@ -1413,19 +1476,31 @@ impl MetadataPublisher {
                     Some(ship_time::format_ship_time(ship, &local_now)),
                 ),
             ]);
-            headings.insert(workspace.workspace_id.as_str(), (resolved, desired));
+            by_workspace.insert(
+                workspace.workspace_id.clone(),
+                WorkspaceHeading { resolved, desired },
+            );
             #[cfg(test)]
             self.stages
                 .lock()
                 .unwrap()
                 .add("git", stage_start.elapsed());
         }
+        Ok(Headings { by_workspace })
+    }
+
+    fn observe_panes(
+        &mut self,
+        inventory: &RefreshInventory,
+        config: &Config,
+        codex: &dyn UsageReader,
+        grok: &dyn UsageReader,
+    ) -> io::Result<Vec<PaneObservation>> {
         // A single budget for the cycle prevents N panes multiplying the reader wait.
         let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
-        let first_panes = first_pane_ids(&snapshot);
-        for pane in &snapshot.panes {
+        let mut observations = Vec::with_capacity(inventory.snapshot.panes.len());
+        for pane in &inventory.snapshot.panes {
             self.check_shutdown()?;
-            let first_pane = first_panes.contains(pane.pane_id.as_str());
             let occupant = pane
                 .occupant
                 .clone()
@@ -1501,9 +1576,6 @@ impl MetadataPublisher {
                 } else {
                     #[cfg(test)]
                     let stage_start = Instant::now();
-                    #[cfg(test)]
-                    let result = reader.read(&request);
-                    #[cfg(not(test))]
                     let result = reader.read(&request);
                     #[cfg(test)]
                     self.stages
@@ -1552,12 +1624,12 @@ impl MetadataPublisher {
                             if reading.binding
                                 == Some(model::UsageBinding::NativeSession(native.clone())) =>
                         {
-                            codex_weekly
+                            inventory.codex_weekly
                         }
                         // Grok has one configured account, shared across all its
                         // panes even when no local context/native id is available.
-                        Agent::Grok => grok_weekly,
-                        Agent::Kimi if config.weekly_enabled(Agent::Kimi) => kimi_weekly,
+                        Agent::Grok => inventory.grok_weekly,
+                        Agent::Kimi if config.weekly_enabled(Agent::Kimi) => inventory.kimi_weekly,
                         _ => None,
                     };
                     if let Some(weekly) = weekly {
@@ -1591,24 +1663,54 @@ impl MetadataPublisher {
                         .and_then(|age| i64::try_from(age.as_secs()).ok()),
                 })
             });
+            observations.push(PaneObservation {
+                pane_id: pane.pane_id.clone(),
+                workspace_id: pane.workspace_id.clone(),
+                stored_keys: pane.stored_keys.clone(),
+                occupant,
+                state: pane.state.clone(),
+                usage,
+            });
+        }
+        Ok(observations)
+    }
+
+    fn plan_desired_reports(
+        &self,
+        inventory: &RefreshInventory,
+        config: &Config,
+        headings: &Headings,
+        observations: Vec<PaneObservation>,
+    ) -> io::Result<DesiredReports> {
+        let mut pane_reports = Vec::with_capacity(observations.len());
+        for obs in observations {
             self.check_shutdown()?;
+            let first_pane = inventory.first_panes.contains(&obs.pane_id);
             let mut desired = tokens::pane_tokens(
                 &tokens::PaneInput {
-                    pane_id: pane.pane_id.clone(),
-                    occupant: occupant.clone(),
-                    state: Some(pane.state.clone()),
-                    usage,
+                    pane_id: obs.pane_id.clone(),
+                    occupant: obs.occupant.clone(),
+                    state: Some(obs.state),
+                    usage: obs.usage,
                 },
-                mode,
+                inventory.mode,
                 false,
-                now_unix,
+                inventory.now_unix,
             );
-            let (resolved, heading) = &headings[pane.workspace_id.as_str()];
-            if first_pane && *resolved {
-                desired.insert("lineup_group".into(), heading["lineup_repo"].clone());
+            if let Some(heading) = headings.by_workspace.get(&obs.workspace_id)
+                && first_pane
+                && heading.resolved
+            {
+                desired.insert(
+                    "lineup_group".into(),
+                    heading.desired.get("lineup_repo").and_then(Clone::clone),
+                );
                 desired.insert(
                     "lineup_group_ship_text".into(),
-                    heading["lineup_ship_text"].clone(),
+                    heading
+                        .desired
+                        .get("lineup_ship_text")
+                        .and_then(Clone::clone),
                 );
             }
             if !first_pane
@@ -1620,13 +1722,48 @@ impl MetadataPublisher {
                     &"\u{2800}".repeat(usize::from(config.non_first_pane_logo_indent)),
                 );
             }
-            let resource = self.resource(ResourceKind::Pane, &pane.pane_id);
+            let resource = self.resource(ResourceKind::Pane, &obs.pane_id);
+            pane_reports.push(PlannedPaneReport {
+                resource,
+                stored_keys: obs.stored_keys,
+                occupant: obs.occupant,
+                desired,
+            });
+        }
+        let mut workspace_reports = Vec::with_capacity(inventory.snapshot.workspaces.len());
+        for workspace in &inventory.snapshot.workspaces {
+            self.check_shutdown()?;
+            let desired = headings
+                .by_workspace
+                .get(&workspace.workspace_id)
+                .map(|heading| heading.desired.clone())
+                .unwrap_or_default();
+            let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
+            workspace_reports.push(PlannedWorkspaceReport {
+                resource,
+                stored_keys: workspace.stored_keys.clone(),
+                desired,
+            });
+        }
+        Ok(DesiredReports {
+            panes: pane_reports,
+            workspaces: workspace_reports,
+        })
+    }
+
+    fn send_reports(
+        &mut self,
+        transport: &mut Transport,
+        reports: DesiredReports,
+    ) -> io::Result<()> {
+        let mut skipped_resources = 0u64;
+        for report in reports.panes {
             if let Err(error) = self.report(
                 transport,
-                &resource,
-                &pane.stored_keys,
-                occupant.as_ref(),
-                &desired,
+                &report.resource,
+                &report.stored_keys,
+                report.occupant.as_ref(),
+                &report.desired,
                 None,
             ) {
                 if capacity_skip_count(&error).is_some() {
@@ -1637,16 +1774,14 @@ impl MetadataPublisher {
                 return Err(error);
             }
         }
-        for workspace in &snapshot.workspaces {
+        for report in reports.workspaces {
             self.check_shutdown()?;
-            let desired = &headings[workspace.workspace_id.as_str()].1;
-            let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
             if let Err(error) = self.report(
                 transport,
-                &resource,
-                &workspace.stored_keys,
+                &report.resource,
+                &report.stored_keys,
                 None,
-                desired,
+                &report.desired,
                 None,
             ) {
                 if capacity_skip_count(&error).is_none() {
@@ -1663,6 +1798,20 @@ impl MetadataPublisher {
         } else {
             Ok(())
         }
+    }
+
+    fn refresh_with_readers_inner(
+        &mut self,
+        transport: &mut Transport,
+        config: &Config,
+        codex: &dyn UsageReader,
+        grok: &dyn UsageReader,
+    ) -> io::Result<()> {
+        let inventory = self.collect_inventory(transport, config)?;
+        let headings = self.resolve_headings(&inventory)?;
+        let observations = self.observe_panes(&inventory, config, codex, grok)?;
+        let reports = self.plan_desired_reports(&inventory, config, &headings, observations)?;
+        self.send_reports(transport, reports)
     }
 }
 
