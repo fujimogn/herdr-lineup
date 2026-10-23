@@ -195,3 +195,16 @@ Doctor's `reader_*` tests cover unavailable versus measured values, fixed labels
 units, retained deadline-skip meaning, nontransactional observation times and
 existing unhealthy/startup errors. Existing identity and refresh-classification
 fixtures remain in the normal suite. No new ignored tests or live verification.
+
+The mutex regression uses the actual `ControlWorker`: cfg(test) channel gates
+pause its live sampler and the control write site while the test acquires the
+worker's own state mutex. This is a controlled write stall, not a claim of
+kernel socket backpressure. Holding the state mutex across `serve_control`
+is a verified failing mutation. The publisher cycle fixture is isolated from
+process-global Codex BUSY users; it checks actual completed discovery and the
+fresh/shared cycle transition, plus a zero-timeout negative with no scan.
+The saturated combined serializer fixture is 6186 bytes including newline;
+escaped long paths exercise both optional omission tiers. This synthetic size
+is not a bound for arbitrary Health identities; exact per-response checking
+remains required. Required local checks passed; independent re-review remains
+pending. Historical lifecycle failure causes remain unconfirmed.

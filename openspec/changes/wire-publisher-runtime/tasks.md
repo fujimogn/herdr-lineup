@@ -22,5 +22,5 @@
       live reader diagnostics, keeping private model types private.
 - [x] Enforce the exact control frame budget with one-sample fallback.
 - [x] Print fixed reader and retained deadline-skip diagnostics before errors.
-- [ ] Verify live release, contention, skew, saturation and frame boundaries
+- [x] Verify live release, contention, skew, saturation and frame boundaries
       in normal isolated tests and run the mandatory checks.
