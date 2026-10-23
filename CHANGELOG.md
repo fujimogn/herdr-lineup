@@ -4,8 +4,11 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
-Development after v0.2.2 updates CI, release tooling, and the locked dependency set. Plugin behavior is unchanged in this section.
+Development after v0.2.2 updates CI, release tooling, the locked dependency set, and three P2 fixes.
 
+- Fix: **Kimi weekly quota** adds end-to-end wiring tests and shares retention, reset, expiry, and credential-change rules with Codex and Grok while removing the unused `WeeklyWorker` sample cache.
+- Fix: **Font apply** refuses concurrent external edits before writing, compares planned original bytes before each write, cleans up incomplete font files on partial failure, and rolls back only files changed by this operation so external edits and journal consistency are preserved.
+- Performance: **Codex and Kimi fingerprint cache** is shared in one implementation, reducing duplicate cache code while preserving duplicate and symlink rejection and the 4,096-entry traversal boundary.
 - Maintenance: **CI** runs light checks on pushes to `develop` and on pull requests: Actionlint, gitleaks, formatting, Clippy, and `cargo test` (unit, integration, and doc tests). Pushes to `main` and `v*` tags keep the full checks, including the release build, binary-license check, CLI help, version and release-note gates, and the dependency audit.
 - Maintenance: **Release tooling** pins develop-tools to 0.6.2, takes English release notes from the dated changelog section, and runs the release version check from the pre-push hook on a tag-only push.
 - Maintenance: **Dependencies** refresh nine locked crates, including ureq 3.5.0 and webpki-roots 1.0.11, for the pinned Rust 1.99.1 toolchain.
