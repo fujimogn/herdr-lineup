@@ -8,9 +8,6 @@ all release versions remain 0.2.2.
 
 ## Open
 
-- [ ] Commander-owned inclusive GPT-6.1 Sol high review from full base
-  `d3ccbc17d3f8344d466015fac580cd0fe3b60269` to the fixed final head. The
-  final candidate must pass the mandatory Rust and documentation checks.
 - [ ] Controlled old/new stage timing comparison, with binaries alternated
   on one host and filesystem (N1). Historical and new-candidate synthetic
   observations are separate records, not a speed-up or SLO.
@@ -47,6 +44,12 @@ Start only when the named condition is met; these are not obligations.
 
 ## Completed in the local candidate (unshipped)
 
+- [x] Commander-owned inclusive GPT-6.1 Sol high GO for fixed range
+  `d3ccbc17d3f8344d466015fac580cd0fe3b60269..91268267f46061f5f0aaf46711ea10158bad0873`;
+  the Dplan NO-GO is resolved. Mandatory source checks passed: fmt, strict
+  locked Clippy, default parallel tests (441 unit, 1 integration, 6 existing
+  ignored), locked release build and help; documentation checks also passed.
+  Local review GO is not automated queue acceptance or shipment.
 - [x] M2 close-on-exec, M3 transient Kimi stat, M4 exact Grok weekly kinds,
   C3 credential-change invalidation, C5 release-gate failure categories.
 - [x] M5 existing-key replacement and FIFO single eviction; M6 typed publisher

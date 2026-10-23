@@ -3,8 +3,10 @@
 **Status:** D control/doctor and all five local reader worker producers are
 implemented and integrated in the local candidate; nothing is shipped.
 **Implementation source:** `0220da64f8545f89b6daca211553f486b271057f`.
-Final inclusive review remains a separate commander-owned gate; no live
-measurement is claimed.
+Commander-owned inclusive Sol 6.1 high review is GO through
+`91268267f46061f5f0aaf46711ea10158bad0873`; see the full range in
+[the coverage record](../reviews/review-followup-coverage.md).
+No automated queue acceptance, shipment or live measurement is claimed.
 **Historical D baseline:** `bfe2a4d3a7a4369711b49057016ec233273f9484`.
 P was reviewed and integrated locally before the commander authorized D.
 This document supplements [the P plan](publisher-runtime-wiring.md); current
@@ -212,5 +214,5 @@ escaped long paths exercise both optional omission tiers. This synthetic size
 is not a bound for arbitrary Health identities; exact per-response checking
 remains required. The original D candidate passed its required local checks;
 its then-pending independent re-review completed before local integration.
-Final inclusive review is separate. Historical lifecycle failure causes
-remain unconfirmed.
+Inclusive review through the fixed head above is GO. Historical lifecycle
+failure causes remain unconfirmed.
