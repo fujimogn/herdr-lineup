@@ -175,6 +175,16 @@ struct DirectoryStamp {
 }
 
 fn directory_stamp(path: &Path) -> Result<Option<DirectoryStamp>, MissingReason> {
+    #[cfg(test)]
+    if let Some(stamp) = tests::EXTERNAL_ANCESTOR_STAMPS.with(|stamps| {
+        stamps
+            .borrow()
+            .iter()
+            .find(|(ancestor, _)| ancestor == path)
+            .map(|(_, stamp)| stamp.clone())
+    }) {
+        return Ok(stamp);
+    }
     match fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some(DirectoryStamp {
             fingerprint: Fingerprint::of(&meta),
@@ -926,6 +936,34 @@ pub(crate) mod tests {
     use super::*;
     thread_local! {
         pub(crate) static CONTENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static EXTERNAL_ANCESTOR_STAMPS: std::cell::RefCell<Vec<(PathBuf, Option<DirectoryStamp>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    // Exact-cap fixtures cannot afford a legitimate fallback caused by another
+    // test creating/removing a sibling under /tmp. Freeze only ancestors outside
+    // the fixture home; every directory in its owned subtree still uses real
+    // metadata. The injection is thread-local and restored even on panic.
+    fn stable_external_ancestors(home: &Path) -> impl Drop {
+        struct Restore(
+            Vec<(PathBuf, Option<DirectoryStamp>)>,
+            std::marker::PhantomData<std::rc::Rc<()>>,
+        );
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                EXTERNAL_ANCESTOR_STAMPS.with(|stamps| {
+                    stamps.replace(std::mem::take(&mut self.0));
+                });
+            }
+        }
+        let snapshots = home
+            .ancestors()
+            .skip(1)
+            .map(|path| (path.to_path_buf(), directory_stamp(path).unwrap()))
+            .collect();
+        Restore(
+            EXTERNAL_ANCESTOR_STAMPS.with(|stamps| stamps.replace(snapshots)),
+            std::marker::PhantomData,
+        )
     }
     #[test]
     fn weekly_worker_cache_never_waits_for_query_and_expires_during_query() {
@@ -1192,6 +1230,7 @@ pub(crate) mod tests {
     #[test]
     fn cycle_discovery_reuses_names_but_detects_nested_changes_and_missing_roots() {
         let dir = tempfile::tempdir().unwrap();
+        let _stable = stable_external_ancestors(dir.path());
         let id = identity(Provider::Codex);
         let request = request(&id, dir.path());
         let cycle = ReadCycle::new();
@@ -1233,6 +1272,7 @@ pub(crate) mod tests {
             fs::write(archive.join(format!("a{index}")), b"").unwrap();
         }
         let cycle = ReadCycle::new();
+        let _stable = stable_external_ancestors(dir.path());
         assert!(
             cycle
                 .files(&mut Budget::new(&request), dir.path(), DiscoveryKind::Codex)
@@ -1265,6 +1305,99 @@ pub(crate) mod tests {
             ),
             Err(MissingReason::Invalid)
         );
+    }
+
+    #[test]
+    fn cycle_discovery_sibling_churn_recharges_full_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let sessions = home.join("sessions");
+        let archive = home.join("archived_sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir(&archive).unwrap();
+        for index in 0..MAX_DIRECTORY_ENTRIES / 2 {
+            fs::write(sessions.join(format!("a{index}")), b"").unwrap();
+            fs::write(archive.join(format!("a{index}")), b"").unwrap();
+        }
+        // Force a distinguishable pre-churn mtime without relying on a sleep
+        // or on the filesystem's timestamp resolution.
+        File::open(dir.path())
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        let parent_before = directory_stamp(dir.path()).unwrap();
+        let home_before = directory_stamp(&home).unwrap();
+        let sessions_before = directory_stamp(&sessions).unwrap();
+        let archive_before = directory_stamp(&archive).unwrap();
+        let id = identity(Provider::Codex);
+        let mut request = request(&id, &home);
+        request.timeout = Duration::from_secs(10);
+        let cycle = ReadCycle::new();
+        let mut budget = Budget::new(&request);
+        let result = cycle.files_with_hooks(
+            &mut budget,
+            &home,
+            DiscoveryKind::Codex,
+            |_| {},
+            || {
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        let sibling = dir.path().join("unrelated-test");
+                        fs::create_dir(&sibling).unwrap();
+                        fs::remove_dir(&sibling).unwrap();
+                    });
+                });
+                assert!(directory_stamp(dir.path()).unwrap() != parent_before);
+                assert!(directory_stamp(&home).unwrap() == home_before);
+                assert!(directory_stamp(&sessions).unwrap() == sessions_before);
+                assert!(directory_stamp(&archive).unwrap() == archive_before);
+            },
+        );
+        // Each traversal alone fits. The ancestor change requires a fallback
+        // against the SAME budget, so the first revisited entry exceeds the cap.
+        assert_eq!(result, Err(MissingReason::EntryLimit));
+        assert_eq!(budget.entries, MAX_DIRECTORY_ENTRIES + 1);
+        assert!(cycle.discoveries.lock().unwrap().is_empty());
+
+        File::open(dir.path())
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        {
+            let _stable = stable_external_ancestors(&home);
+            let mut budget = Budget::new(&request);
+            let result = cycle.files_with_hooks(
+                &mut budget,
+                &home,
+                DiscoveryKind::Codex,
+                |_| {},
+                || {
+                    std::thread::scope(|scope| {
+                        scope.spawn(|| {
+                            let sibling = dir.path().join("unrelated-test");
+                            fs::create_dir(&sibling).unwrap();
+                            fs::remove_dir(&sibling).unwrap();
+                        });
+                    });
+                    assert!(
+                        fs::metadata(dir.path()).unwrap().modified().unwrap()
+                            != UNIX_EPOCH + Duration::from_secs(1)
+                    );
+                },
+            );
+            assert_eq!(result, Ok(Vec::new()));
+            assert_eq!(budget.entries, MAX_DIRECTORY_ENTRIES);
+            assert_eq!(cycle.discoveries.lock().unwrap().len(), 1);
+            let mut cached = Budget::new(&request);
+            assert_eq!(
+                cycle.files(&mut cached, &home, DiscoveryKind::Codex),
+                result
+            );
+            assert_eq!(cached.entries, MAX_DIRECTORY_ENTRIES);
+            assert_eq!(cycle.scans.load(Ordering::Relaxed), 2);
+        }
+        // The production stamp path resumes after the fixture's scoped override.
+        assert!(directory_stamp(dir.path()).unwrap() != parent_before);
     }
 
     #[test]
