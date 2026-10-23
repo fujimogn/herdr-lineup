@@ -249,23 +249,6 @@ fn require_bytes(path: &Path, expected: Option<&[u8]>) -> io::Result<()> {
     Ok(())
 }
 
-fn rollback_owned(
-    path: &Path,
-    expected: Option<&FileStamp>,
-    original: Option<&[u8]>,
-) -> io::Result<()> {
-    if stamp(path)?.as_ref() != expected {
-        return Err(conflict(&format!(
-            "Rollback conflict at {}; recovery requires manual inspection",
-            path.display()
-        )));
-    }
-    match original {
-        Some(bytes) => write_atomic(path, bytes),
-        None => fs::remove_file(path),
-    }
-}
-
 /// Install only after explicit opt-in. Records ownership separately from font presence.
 pub fn install(locations: &Locations) -> io::Result<Vec<String>> {
     apply(locations, false)
@@ -331,6 +314,13 @@ fn apply_with_font_and_remove(
     let _lock = FontLock(lock);
     let journal = locations.state.join("font-ownership.json");
     let mut state = load(&journal)?;
+    if state.get("pending").is_some() {
+        return Err(conflict(&format!(
+            "Font ownership is unresolved at {}; inspect the recorded paths and current files manually before another action",
+            journal.display()
+        )));
+    }
+    let original_state = state.clone();
     check_path(&locations.font)?;
     if state["font_owned"] == true && state["font_path"].as_str() != locations.font.to_str() {
         return Err(conflict(
@@ -426,6 +416,15 @@ fn apply_with_font_and_remove(
             state["entries"].as_array_mut().unwrap().push(json!({"path":path.to_str().ok_or_else(|| conflict("Non-UTF-8 config path"))?,"owned":owned}));
             changes.push((path, format!("{text}{owned}"), original));
         }
+        if original_font.is_none() {
+            state["font_owned"] = json!(true);
+            state["font_path"] = json!(
+                locations
+                    .font
+                    .to_str()
+                    .ok_or_else(|| conflict("Non-UTF-8 font path"))?
+            );
+        }
     }
     let font_existed = original_font.is_some();
     let old_journal = match fs::read(&journal) {
@@ -433,31 +432,51 @@ fn apply_with_font_and_remove(
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    let mut created_font = false;
     let mut changed_paths = Vec::new();
-    let mut rollback_stamps: Vec<(PathBuf, Option<FileStamp>)> = Vec::new();
+    let mut affected_paths: Vec<PathBuf> =
+        changes.iter().map(|(path, _, _)| path.clone()).collect();
+    if (!removing && !font_existed) || (removing && state["font_owned"] == true && font_existed) {
+        affected_paths.push(locations.font.clone());
+    }
+    let mut action_path = journal.clone();
     let result: io::Result<()> = (|| {
+        // The pending record is durable before any font or terminal mutation.
+        // An interrupted or failed action remains blocked for manual inspection.
+        let mut pending_state = if removing {
+            original_state.clone()
+        } else {
+            state.clone()
+        };
+        pending_state["pending"] = json!({
+            "action": if removing { "uninstall" } else { "install" },
+            "paths": affected_paths.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>()
+        });
+        let pending_journal = serde_json::to_vec(&pending_state).map_err(io::Error::other)?;
+        let next_journal = serde_json::to_vec(&state).map_err(io::Error::other)?;
+        let needs_write = !affected_paths.is_empty()
+            || old_journal
+                .as_deref()
+                .is_some_and(|old| old != next_journal.as_slice());
+        if needs_write {
+            require_bytes(&journal, old_journal.as_deref())?;
+            write_atomic(&journal, &pending_journal)?;
+            changed_paths.push(journal.clone());
+        }
         if removing {
             for (path, text, original) in &changes {
+                action_path = path.clone();
                 if &fs::read(path)? != original {
                     return Err(conflict(&format!(
                         "Configuration file was modified concurrently at {}; leaving it unchanged",
                         path.display()
                     )));
                 }
-                let write_result = writer(path, text.as_bytes());
-                let written = stamp(path)?;
-                if written
-                    .as_ref()
-                    .is_some_and(|file| file.bytes == text.as_bytes())
-                {
-                    rollback_stamps.push((path.clone(), written));
-                }
-                write_result?;
+                writer(path, text.as_bytes())?;
                 require_bytes(path, Some(text.as_bytes()))?;
                 changed_paths.push(path.clone());
             }
             if state["font_owned"] == true && font_existed {
+                action_path = locations.font.clone();
                 before_font_remove(&locations.font)?;
                 if stamp(&locations.font)? != original_font {
                     return Err(conflict(
@@ -468,100 +487,51 @@ fn apply_with_font_and_remove(
                 changed_paths.push(locations.font.clone());
             }
             state = json!({"version":1,"font_owned":false,"entries":state["entries"]});
-            let next_journal = serde_json::to_vec(&state).map_err(io::Error::other)?;
-            if old_journal
-                .as_deref()
-                .is_some_and(|old| old != next_journal)
-            {
-                require_bytes(&journal, old_journal.as_deref())?;
-                write_atomic(&journal, &next_journal)?;
-                rollback_stamps.push((journal.clone(), stamp(&journal)?));
-                changed_paths.push(journal.clone());
-            }
         } else {
             if !font_existed {
-                state["font_owned"] = json!(true);
-                state["font_path"] = json!(
-                    locations
-                        .font
-                        .to_str()
-                        .ok_or_else(|| conflict("Non-UTF-8 font path"))?
-                );
-            }
-            // A crash after a terminal write must leave its ownership record.
-            let next_journal = serde_json::to_vec(&state).map_err(io::Error::other)?;
-            if old_journal.as_deref() != Some(next_journal.as_slice()) {
-                require_bytes(&journal, old_journal.as_deref())?;
-                write_atomic(&journal, &next_journal)?;
-                rollback_stamps.push((journal.clone(), stamp(&journal)?));
-                changed_paths.push(journal.clone());
-            }
-            if !font_existed {
+                action_path = locations.font.clone();
                 fs::create_dir_all(locations.font.parent().unwrap())?;
                 let mut file = fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .open(&locations.font)?;
-                created_font = true;
                 changed_paths.push(locations.font.clone());
-                let write_result = font_writer(&mut file, FONT);
-                rollback_stamps.push((locations.font.clone(), stamp(&locations.font)?));
-                write_result?;
+                font_writer(&mut file, FONT)?;
+                require_bytes(&locations.font, Some(FONT))?;
             }
             for (path, text, original) in &changes {
+                action_path = path.clone();
                 if &fs::read(path)? != original {
                     return Err(conflict(&format!(
                         "Configuration file was modified concurrently at {}; leaving it unchanged",
                         path.display()
                     )));
                 }
-                let write_result = writer(path, text.as_bytes());
-                let written = stamp(path)?;
-                if written
-                    .as_ref()
-                    .is_some_and(|file| file.bytes == text.as_bytes())
-                {
-                    rollback_stamps.push((path.clone(), written));
-                }
-                write_result?;
+                writer(path, text.as_bytes())?;
                 require_bytes(path, Some(text.as_bytes()))?;
                 changed_paths.push(path.clone());
             }
         }
+        if needs_write {
+            action_path = journal.clone();
+            require_bytes(&journal, Some(&pending_journal))?;
+            write_atomic(
+                &journal,
+                &serde_json::to_vec(&state).map_err(io::Error::other)?,
+            )?;
+        }
         Ok(())
     })();
     if let Err(error) = result {
-        let mut failures = Vec::new();
-        for (path, _, original) in changes.iter().rev() {
-            if let Some((_, expected)) = rollback_stamps.iter().find(|(written, _)| written == path)
-                && let Err(rollback) = rollback_owned(path, expected.as_ref(), Some(original))
-            {
-                failures.push(rollback.to_string());
-            }
-        }
-        if font_existed && changed_paths.contains(&locations.font) {
-            if let Err(rollback) = rollback_owned(&locations.font, None, Some(FONT)) {
-                failures.push(rollback.to_string());
-            }
-        } else if created_font
-            && let Some((_, expected)) = rollback_stamps
-                .iter()
-                .find(|(written, _)| written == &locations.font)
-            && let Err(rollback) = rollback_owned(&locations.font, expected.as_ref(), None)
-        {
-            failures.push(rollback.to_string());
-        }
-        if let Some((_, expected)) = rollback_stamps
-            .iter()
-            .find(|(written, _)| written == &journal)
-            && failures.is_empty()
-            && let Err(rollback) =
-                rollback_owned(&journal, expected.as_ref(), old_journal.as_deref())
-        {
-            failures.push(rollback.to_string());
-        }
         return Err(conflict(&format!(
-            "Font action failed: {error}; rollback errors: {failures:?}"
+            "Font action failed at {}: {error}; partial state or a conflict is possible; no automatic rollback or deletion was attempted; ownership journal: {}; inspect these paths manually before another action: {}",
+            action_path.display(),
+            journal.display(),
+            affected_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
     let removed_owned_file = changed_paths.iter().any(|path| path != &journal);
@@ -783,9 +753,14 @@ mod tests {
                 let next = install(&locations);
                 child.assert_running();
                 drop(child);
-                next.unwrap();
-                uninstall(&locations).unwrap();
-                assert_eq!(fs::read_to_string(config).unwrap(), "# original\n");
+                if fail_write {
+                    assert!(next.is_err());
+                    assert!(locations.state.join("font-ownership.json").exists());
+                } else {
+                    next.unwrap();
+                    uninstall(&locations).unwrap();
+                    assert_eq!(fs::read_to_string(config).unwrap(), "# original\n");
+                }
             }
         }
     }
@@ -960,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_install_recovers_on_next_action() {
+    fn interrupted_install_requires_manual_recovery() {
         for removing in [false, true] {
             let (_root, locations) = fixture();
             let path = locations.config.join("kitty/kitty.conf");
@@ -977,15 +952,20 @@ mod tests {
             }));
             assert!(interrupted.is_err());
             assert!(fs::read_to_string(&path).unwrap().contains(START));
-            if removing {
-                uninstall(&locations).unwrap();
-                assert_eq!(fs::read_to_string(&path).unwrap(), "# original\n");
-                assert_eq!(fs::read_to_string(&other).unwrap(), "# original\n");
+            let journal = locations.state.join("font-ownership.json");
+            assert!(fs::read_to_string(&journal).unwrap().contains("pending"));
+            let result = if removing {
+                uninstall(&locations)
             } else {
-                install(&locations).unwrap();
-                assert!(fs::read_to_string(&other).unwrap().contains(START));
-                uninstall(&locations).unwrap();
-            }
+                install(&locations)
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&journal.display().to_string())
+            );
+            assert_eq!(fs::read_to_string(&other).unwrap(), "# original\n");
         }
     }
 
@@ -1122,124 +1102,68 @@ mod tests {
     }
 
     #[test]
-    fn write_failure_restores_original_terminal_bytes_and_font_ownership() {
-        let (_root, locations) = fixture();
-        let ghostty = locations.config.join("ghostty/config");
-        let kitty = locations.config.join("kitty/kitty.conf");
-        for path in [&ghostty, &kitty] {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, "# original\n").unwrap();
-        }
-        let mut writes = 0;
-        assert!(
-            apply_with(&locations, false, |path, bytes| {
-                writes += 1;
-                if writes == 2 {
-                    Err(conflict("injected write failure"))
-                } else {
-                    write_atomic(path, bytes)
-                }
-            })
-            .is_err()
-        );
-        assert_eq!(fs::read_to_string(&ghostty).unwrap(), "# original\n");
-        assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
-        assert!(!locations.font.exists());
-        install(&locations).unwrap();
-        let before = fs::read(&ghostty).unwrap();
-        let mut writes = 0;
-        assert!(
-            apply_with(&locations, true, |path, bytes| {
-                writes += 1;
-                if writes == 2 {
-                    Err(conflict("injected write failure"))
-                } else {
-                    write_atomic(path, bytes)
-                }
-            })
-            .is_err()
-        );
-        assert_eq!(fs::read(&ghostty).unwrap(), before);
-        assert!(locations.font.exists());
-        uninstall(&locations).unwrap();
-    }
-
-    #[test]
-    fn concurrent_external_edit_before_write_is_preserved_and_recovers() {
+    fn failed_install_and_uninstall_keep_journal_and_earlier_writes() {
         for removing in [false, true] {
             let (_root, locations) = fixture();
-            let ghostty = locations.config.join("ghostty/config");
             let kitty = locations.config.join("kitty/kitty.conf");
-            for path in [&ghostty, &kitty] {
+            let ghostty = locations.config.join("ghostty/config");
+            for path in [&kitty, &ghostty] {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, "# original\n").unwrap();
             }
             if removing {
                 install(&locations).unwrap();
             }
-            let external_edit = "# concurrent external edit\n";
             let mut writes = 0;
+            let journal = locations.state.join("font-ownership.json");
             let result = apply_with(&locations, removing, |path, bytes| {
+                assert_eq!(
+                    load(&journal).unwrap()["pending"]["action"],
+                    if removing { "uninstall" } else { "install" }
+                );
                 writes += 1;
-                if path == kitty {
-                    // While writing kitty, simulate a concurrent edit to ghostty
-                    // right before its write phase.
-                    let current = fs::read_to_string(&ghostty).unwrap();
-                    fs::write(&ghostty, format!("{current}{external_edit}")).unwrap();
+                if writes == 2 {
+                    Err(conflict("injected terminal write failure"))
+                } else {
+                    write_atomic(path, bytes)
                 }
-                write_atomic(path, bytes)
             });
-            assert!(result.is_err());
-            let err_msg = result.unwrap_err().to_string();
+            let message = result.unwrap_err().to_string();
             assert!(
-                err_msg.contains(&ghostty.display().to_string()),
-                "error message should identify conflicting path: {err_msg}"
+                message.contains(&ghostty.display().to_string()),
+                "{message}"
             );
-
-            // 1. External edit bytes are preserved and not overwritten.
-            let ghostty_content = fs::read_to_string(&ghostty).unwrap();
+            let state = load(&journal).unwrap();
+            assert_eq!(
+                state["pending"]["action"],
+                if removing { "uninstall" } else { "install" }
+            );
             assert!(
-                ghostty_content.contains(external_edit),
-                "external edit must be preserved: {ghostty_content}"
+                state["pending"]["paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path == &json!(ghostty.to_string_lossy()))
             );
-
-            // 2. The first file was rolled back (only modified files rolled back).
-            if removing {
-                // In uninstall, kitty had its block removed, then rolled back to include START block.
-                assert!(fs::read_to_string(&kitty).unwrap().contains(START));
-                // Font was not removed because action failed before font deletion.
-                assert!(locations.font.exists());
-                // Can recover from journal: uninstall succeeds and retains external edit.
-                uninstall(&locations).unwrap();
-                assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
-                assert_eq!(
-                    fs::read_to_string(&ghostty).unwrap(),
-                    format!("# original\n{external_edit}")
-                );
-                assert!(!locations.font.exists());
-            } else {
-                // In install, kitty had block added, then rolled back to original.
-                assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
-                // Font was rolled back.
-                assert!(!locations.font.exists());
-                // Can recover: subsequent install succeeds, preserving external edit.
-                install(&locations).unwrap();
-                assert!(fs::read_to_string(&kitty).unwrap().contains(START));
-                let ghostty_after = fs::read_to_string(&ghostty).unwrap();
-                assert!(ghostty_after.contains(external_edit));
-                assert!(ghostty_after.contains(START));
-                uninstall(&locations).unwrap();
-                assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
-                assert_eq!(
-                    fs::read_to_string(&ghostty).unwrap(),
-                    format!("# original\n{external_edit}")
-                );
-            }
+            assert!(message.contains(&journal.display().to_string()));
+            assert_eq!(
+                fs::read_to_string(&ghostty).unwrap().contains(START),
+                removing
+            );
+            assert_eq!(
+                fs::read_to_string(&kitty).unwrap().contains(START),
+                !removing
+            );
+            assert!(locations.font.exists());
+            let before = fs::read(&kitty).unwrap();
+            assert!(install(&locations).is_err());
+            assert!(uninstall(&locations).is_err());
+            assert_eq!(fs::read(&kitty).unwrap(), before);
         }
     }
 
     #[test]
-    fn external_edit_after_our_write_survives_rollback() {
+    fn partial_terminal_write_and_external_edit_are_retained() {
         for removing in [false, true] {
             let (_root, locations) = fixture();
             let kitty = locations.config.join("kitty/kitty.conf");
@@ -1253,23 +1177,67 @@ mod tests {
             }
             let result = apply_with(&locations, removing, |path, bytes| {
                 if path == ghostty {
-                    let content = fs::read_to_string(&kitty).unwrap();
-                    fs::write(&kitty, format!("{content}# external\n")).unwrap();
-                    return Err(conflict("injected failure"));
+                    fs::write(path, b"partial terminal write")?;
+                    return Err(conflict("injected partial write"));
                 }
                 write_atomic(path, bytes)
             });
-            let message = result.unwrap_err().to_string();
-            assert!(message.contains("Rollback conflict"), "{message}");
-            assert!(fs::read_to_string(&kitty).unwrap().contains("# external\n"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&ghostty.display().to_string())
+            );
+            assert_eq!(fs::read(&ghostty).unwrap(), b"partial terminal write");
             assert!(locations.state.join("font-ownership.json").exists());
-            if removing {
-                assert!(locations.font.exists());
-                assert!(fs::read_to_string(&kitty).unwrap().contains("# external\n"));
-            } else {
-                assert!(!locations.font.exists());
-            }
+            assert!(install(&locations).is_err());
         }
+
+        let (_root, locations) = fixture();
+        let kitty = locations.config.join("kitty/kitty.conf");
+        let ghostty = locations.config.join("ghostty/config");
+        for path in [&kitty, &ghostty] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "# original\n").unwrap();
+        }
+        let result = apply_with(&locations, false, |path, bytes| {
+            write_atomic(path, bytes)?;
+            if path == kitty {
+                fs::write(&ghostty, b"# external edit\n")?;
+            }
+            Ok(())
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains(&ghostty.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(fs::read(&ghostty).unwrap(), b"# external edit\n");
+        assert!(fs::read_to_string(&kitty).unwrap().contains(START));
+        assert!(locations.font.exists());
+        assert!(load(&locations.state.join("font-ownership.json")).unwrap()["pending"].is_object());
+    }
+
+    #[test]
+    fn journal_change_at_completion_preserves_partial_installation() {
+        let (_root, locations) = fixture();
+        let kitty = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(kitty.parent().unwrap()).unwrap();
+        fs::write(&kitty, "# original\n").unwrap();
+        let journal = locations.state.join("font-ownership.json");
+        let result = apply_with(&locations, false, |path, bytes| {
+            write_atomic(path, bytes)?;
+            fs::write(&journal, b"external journal")
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains(&journal.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(fs::read(&journal).unwrap(), b"external journal");
+        assert!(locations.font.exists());
+        assert!(fs::read_to_string(&kitty).unwrap().contains(START));
+        assert!(install(&locations).is_err());
     }
 
     #[test]
@@ -1293,53 +1261,17 @@ mod tests {
         let message = result.unwrap_err().to_string();
         assert!(message.contains("font changed before removal"), "{message}");
         assert_eq!(fs::read(&locations.font).unwrap(), FONT);
-        assert!(fs::read_to_string(&kitty).unwrap().contains(START));
-        assert!(locations.state.join("font-ownership.json").exists());
+        assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
+        assert!(load(&locations.state.join("font-ownership.json")).unwrap()["pending"].is_object());
     }
 
     #[test]
-    fn externally_changed_journal_survives_install_failure() {
-        let (_root, locations) = fixture();
-        let kitty = locations.config.join("kitty/kitty.conf");
-        fs::create_dir_all(kitty.parent().unwrap()).unwrap();
-        fs::write(&kitty, "# original\n").unwrap();
-        let journal = locations.state.join("font-ownership.json");
-        let result = apply_with(&locations, false, |_path, _bytes| {
-            fs::write(&journal, b"external journal")?;
-            Err(conflict("injected failure"))
-        });
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("Rollback conflict"), "{message}");
-        assert_eq!(fs::read(&journal).unwrap(), b"external journal");
-        assert!(!locations.font.exists());
-    }
-
-    #[test]
-    fn replaced_created_font_survives_rollback() {
-        let (_root, locations) = fixture();
-        let kitty = locations.config.join("kitty/kitty.conf");
-        fs::create_dir_all(kitty.parent().unwrap()).unwrap();
-        fs::write(&kitty, "# original\n").unwrap();
-        let result = apply_with(&locations, false, |_path, _bytes| {
-            let replacement = locations.font.with_extension("replacement");
-            fs::write(&replacement, FONT)?;
-            fs::rename(replacement, &locations.font)?;
-            Err(conflict("injected failure"))
-        });
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("Rollback conflict"), "{message}");
-        assert_eq!(fs::read(&locations.font).unwrap(), FONT);
-        assert!(locations.state.join("font-ownership.json").exists());
-    }
-
-    #[test]
-    fn font_creation_partial_write_or_sync_failure_cleans_up_incomplete_font() {
+    fn partial_font_write_or_sync_failure_keeps_font_and_journal() {
         for fail_stage in ["partial_write", "sync"] {
             let (_root, locations) = fixture();
             let kitty = locations.config.join("kitty/kitty.conf");
             fs::create_dir_all(kitty.parent().unwrap()).unwrap();
             fs::write(&kitty, "# original\n").unwrap();
-
             let result = apply_with_font(&locations, false, write_atomic, |file, bytes| {
                 if fail_stage == "partial_write" {
                     file.write_all(b"partial corrupted font")?;
@@ -1349,56 +1281,25 @@ mod tests {
                     Err(conflict("injected font sync failure"))
                 }
             });
-            assert!(result.is_err(), "stage {fail_stage} must fail");
+            let message = result.unwrap_err().to_string();
             assert!(
-                !locations.font.exists(),
-                "incomplete font file must be removed for stage {fail_stage}"
-            );
-            assert!(
-                !locations.state.join("font-ownership.json").exists(),
-                "journal must be cleaned up for stage {fail_stage}"
+                message.contains(&locations.font.display().to_string()),
+                "{message}"
             );
             assert_eq!(
-                fs::read_to_string(&kitty).unwrap(),
-                "# original\n",
-                "terminal file must be untouched for stage {fail_stage}"
+                fs::read(&locations.font).unwrap(),
+                if fail_stage == "partial_write" {
+                    b"partial corrupted font".as_slice()
+                } else {
+                    FONT
+                }
             );
-
-            // Verify clean retry succeeds
-            install(&locations).unwrap();
-            assert!(locations.font.exists());
-            assert!(fs::read_to_string(&kitty).unwrap().contains(START));
-            uninstall(&locations).unwrap();
-            assert!(!locations.font.exists());
+            assert!(
+                load(&locations.state.join("font-ownership.json")).unwrap()["pending"].is_object()
+            );
             assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
+            assert!(install(&locations).is_err());
         }
-    }
-
-    #[test]
-    fn first_write_failure_after_font_creation_cleans_up_font_and_journal() {
-        let (_root, locations) = fixture();
-        let kitty = locations.config.join("kitty/kitty.conf");
-        fs::create_dir_all(kitty.parent().unwrap()).unwrap();
-        fs::write(&kitty, "# original\n").unwrap();
-
-        let result = apply_with(&locations, false, |_path, _bytes| {
-            Err(conflict("injected first write failure"))
-        });
-        assert!(result.is_err());
-        assert!(
-            !locations.font.exists(),
-            "font must be cleaned up on failure"
-        );
-        assert!(
-            !locations.state.join("font-ownership.json").exists(),
-            "journal must be cleaned up on failure"
-        );
-        assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
-
-        install(&locations).unwrap();
-        assert!(locations.font.exists());
-        assert!(fs::read_to_string(&kitty).unwrap().contains(START));
-        uninstall(&locations).unwrap();
     }
 
     #[test]
