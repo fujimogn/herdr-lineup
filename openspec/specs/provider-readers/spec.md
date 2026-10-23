@@ -382,9 +382,37 @@ recording fails. Oversized input SHALL be streamed to the child without being
 parsed or stored. Hook installation and user configuration changes remain
 explicit opt-in work outside capture.
 
-#### Scenario: Session or pane replacement does not reuse context
+#### Scenario: A different session or pane binding key rejects context
 - **WHEN** a reader key differs from the observation's provider or binding key
 - **THEN** both outcomes are unavailable, with no fallback to a latest record
+
+### Existing limitation: Antigravity pane reuse has no capture generation
+The implemented Antigravity statusLine record is version 1 and binds only the
+inherited pane ID. It does not store the capture-time native session, terminal
+identity, or occupant generation. A replacement using the same pane ID can
+therefore read the previous occupant's record; context does not expire by age.
+The identity requirements above do not establish generation safety for that
+case. A different native ID in the current snapshot cannot validate an old
+pane-only record's origin. This is an existing limitation, not a guarantee that
+replacement clears usage.
+
+### Planned: Generation-bound Antigravity observations
+Not implemented. A strict path requires a host-owned launch identity delivered
+to the capture process and exposed with the authoritative occupant. It must
+change for each replacement, including resume of the same conversation, and
+remain distinct across endpoint restarts. Missing or mismatched generation
+would make usage unavailable. Native session, terminal ID, timestamps and
+snapshot revisions are not proven substitutes in the inspected v0.9.3 contract.
+Preventing a replacement between read and publication additionally requires
+host-side atomic conditional acceptance for that occupant; pre/post snapshots
+alone do not prove it.
+
+Migration would preserve existing observation files without promoting them to
+generation-bound records or changing user settings automatically. The strict
+path, record version/namespace, capability gate, host lifecycle guarantees and
+rollback behavior require separate approval and fixture verification. See
+[the generation research record](../../../docs/reviews/agy-occupant-generation.md)
+for primary evidence, unknowns, production seam and Planned adversarial fixtures.
 
 ### Requirement: Reader association is explicit and freshness is independent
 `UsageReading` SHALL carry the association type (`native_session` or `pane`)
