@@ -16,30 +16,30 @@ const MAX_BYTES: u64 = 64 * 1024;
 /// Bounded request cadence, independent of the daemon's refresh cadence.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
-    interval: Duration,
-    timeout: Duration,
+    cadence: crate::model::AccountCadence,
 }
 
 impl Settings {
     /// Clamp cadence to 60..=3600 seconds and request timeout to 1..=30 seconds.
     pub fn new(interval: Duration, timeout: Duration) -> Self {
         Self {
-            interval: interval.clamp(Duration::from_secs(60), Duration::from_secs(3600)),
-            timeout: timeout.clamp(Duration::from_secs(1), Duration::from_secs(30)),
+            cadence: crate::model::AccountCadence::new(interval, timeout),
         }
     }
 
     pub fn interval(self) -> Duration {
-        self.interval
+        self.cadence.interval()
     }
     pub fn timeout(self) -> Duration {
-        self.timeout
+        self.cadence.timeout()
     }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self::new(Duration::from_secs(300), Duration::from_secs(10))
+        Self {
+            cadence: crate::model::AccountCadence::default_account(),
+        }
     }
 }
 
@@ -84,6 +84,16 @@ pub enum Outcome {
     /// A MONTHLY allowance must not be displayed as 7d. Weekly callers show missing.
     NonWeekly,
     Unavailable(Failure),
+}
+
+fn weekly_sample(outcome: Outcome) -> Option<crate::model::WeeklySample> {
+    match outcome {
+        Outcome::Weekly(usage) => Some(crate::model::WeeklySample {
+            used_percent: usage.used_percent,
+            resets_at: usage.resets_at,
+        }),
+        Outcome::NonWeekly | Outcome::Unavailable(_) => None,
+    }
 }
 
 /// Resolve precedence without changing the process environment. No file is read.
@@ -131,7 +141,7 @@ impl Client {
             auth_file,
             settings,
             BILLING_URL.to_owned(),
-            settings.timeout,
+            settings.timeout(),
         )
     }
 
@@ -182,7 +192,7 @@ impl Client {
 
     fn poll_at(&mut self, now: Instant, wall_now: SystemTime) -> Outcome {
         if self.next_request.is_none_or(|next| now >= next) {
-            self.next_request = Some(now + self.settings.interval);
+            self.next_request = Some(now + self.settings.interval());
             let fetched = self.fetch();
             if matches!(fetched, Ok(Outcome::Weekly(_))) {
                 self.last_success = Some(Instant::now());
@@ -194,13 +204,20 @@ impl Client {
             };
             self.cached = match fetched {
                 Ok(outcome) => outcome,
-                Err(Failure::Transient) if matches!(self.cached, Outcome::Weekly(usage) if usage.resets_at.is_some_and(|reset| reset > wall_now)) => {
+                Err(Failure::Transient)
+                    if crate::model::retain_known_reset_after_failure(
+                        weekly_sample(self.cached),
+                        wall_now,
+                    )
+                    .is_some() =>
+                {
                     self.cached
                 }
                 Err(failure) => Outcome::Unavailable(failure),
             };
         }
-        if matches!(self.cached, Outcome::Weekly(usage) if usage.resets_at.is_some_and(|reset| reset <= wall_now))
+        if weekly_sample(self.cached).is_some()
+            && crate::model::clear_expired_reset(weekly_sample(self.cached), wall_now).is_none()
         {
             self.cached = Outcome::Unavailable(Failure::InvalidResponse);
         }

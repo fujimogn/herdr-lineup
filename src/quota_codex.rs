@@ -28,6 +28,20 @@ pub struct Weekly {
     pub resets_at: Option<SystemTime>,
 }
 
+fn as_sample(weekly: Option<Weekly>) -> Option<crate::model::WeeklySample> {
+    weekly.map(|weekly| crate::model::WeeklySample {
+        used_percent: weekly.used_percent,
+        resets_at: weekly.resets_at,
+    })
+}
+
+fn from_sample(sample: Option<crate::model::WeeklySample>) -> Option<Weekly> {
+    sample.map(|sample| Weekly {
+        used_percent: sample.used_percent,
+        resets_at: sample.resets_at,
+    })
+}
+
 fn read_weekly_controlled(
     codex_home: &Path,
     timeout: Duration,
@@ -69,7 +83,7 @@ impl WeeklyClient {
     pub fn new(codex_home: PathBuf, interval: Duration, timeout: Duration) -> Self {
         Self {
             codex_home,
-            interval: interval.clamp(MIN_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL),
+            interval: crate::model::clamp_account_interval(interval),
             timeout: timeout.clamp(Duration::from_millis(1), MAX_TIMEOUT),
             last_attempt: None,
             cached: None,
@@ -103,12 +117,10 @@ impl WeeklyClient {
     }
 
     fn expire(&mut self, now: SystemTime) {
-        if self
-            .cached
-            .is_some_and(|weekly| weekly.resets_at.is_some_and(|reset| now >= reset))
-        {
-            self.cached = None;
-        }
+        self.cached = from_sample(crate::model::clear_expired_reset(
+            as_sample(self.cached),
+            now,
+        ));
     }
 
     fn refresh_with(
@@ -142,9 +154,10 @@ impl WeeklyClient {
             Err(_) => {
                 self.last_result = WeeklyResult::Transient;
                 // An unknown reset cannot justify retaining a failed observation.
-                if self.cached.is_some_and(|weekly| weekly.resets_at.is_none()) {
-                    self.cached = None;
-                }
+                self.cached = from_sample(crate::model::retain_known_reset_after_failure(
+                    as_sample(self.cached),
+                    wall,
+                ));
             }
         }
         self.expire(wall);

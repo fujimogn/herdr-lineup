@@ -117,11 +117,86 @@ pub(crate) struct WeeklySample {
     pub resets_at: Option<SystemTime>,
 }
 
+/// Shared 60..=3600 second account-query cadence. Codex keeps its own timeout floor.
+pub(crate) fn clamp_account_interval(interval: Duration) -> Duration {
+    interval.clamp(Duration::from_secs(60), Duration::from_secs(3600))
+}
+
+pub(crate) fn clamp_account_cadence(interval: Duration, timeout: Duration) -> (Duration, Duration) {
+    (
+        clamp_account_interval(interval),
+        timeout.clamp(Duration::from_secs(1), Duration::from_secs(30)),
+    )
+}
+
+/// Grok and Kimi request cadence. The public provider settings are thin wrappers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AccountCadence {
+    interval: Duration,
+    timeout: Duration,
+}
+
+impl AccountCadence {
+    pub(crate) fn new(interval: Duration, timeout: Duration) -> Self {
+        let (interval, timeout) = clamp_account_cadence(interval, timeout);
+        Self { interval, timeout }
+    }
+
+    /// Test fixture cadence. Production settings keep [`Self::new`]'s clamps.
+    #[cfg(test)]
+    pub(crate) fn exact(interval: Duration, timeout: Duration) -> Self {
+        Self { interval, timeout }
+    }
+
+    pub(crate) fn interval(self) -> Duration {
+        self.interval
+    }
+
+    pub(crate) fn timeout(self) -> Duration {
+        self.timeout
+    }
+
+    pub(crate) fn default_account() -> Self {
+        Self::new(Duration::from_secs(300), Duration::from_secs(10))
+    }
+}
+
+/// Drop a sample whose known reset is no longer in the future.
+/// A reset-less sample stays; callers apply their own age or failure rule.
+pub(crate) fn clear_expired_reset(
+    sample: Option<WeeklySample>,
+    now: SystemTime,
+) -> Option<WeeklySample> {
+    sample.filter(|sample| sample.resets_at.is_none_or(|reset| reset > now))
+}
+
+/// After a failed query, keep only a sample with a still-future reset.
+pub(crate) fn retain_known_reset_after_failure(
+    sample: Option<WeeklySample>,
+    now: SystemTime,
+) -> Option<WeeklySample> {
+    clear_expired_reset(sample, now).filter(|sample| sample.resets_at.is_some())
+}
+
+/// A sample with a reset stays for the reset check. Without one, it stays only
+/// through `max_age` after the observation instant.
+pub(crate) fn fresh_until_reset_or_age(
+    sample: Option<WeeklySample>,
+    observed: Option<Instant>,
+    now: Instant,
+    max_age: Duration,
+) -> Option<WeeklySample> {
+    sample.filter(|sample| {
+        sample.resets_at.is_some()
+            || observed.is_some_and(|observed| now.saturating_duration_since(observed) <= max_age)
+    })
+}
+
 /// One long-lived query loop per provider. The query owns its existing client,
 /// including its transient/authentication cache policy. Publication only tries
 /// the cache lock; it never takes a client lock or waits for a request.
 pub(crate) struct WeeklyWorker {
-    cache: std::sync::Arc<std::sync::Mutex<Option<WeeklySample>>>,
+    cache: Option<std::sync::Arc<std::sync::Mutex<Option<WeeklySample>>>>,
     done: std::sync::Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -129,12 +204,35 @@ impl WeeklyWorker {
     pub(crate) fn start(
         shutdown: std::sync::Arc<AtomicBool>,
         interval: Duration,
-        mut query: impl FnMut() -> Option<WeeklySample> + Send + 'static,
+        query: impl FnMut() -> Option<WeeklySample> + Send + 'static,
     ) -> io::Result<Self> {
         let cache = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let shared = cache.clone();
+        Self::spawn(shutdown, interval, Some(cache), query)
+    }
+
+    /// Query loop whose publication state lives outside this worker.
+    /// Kimi reads its credential snapshot directly, so a second sample cache
+    /// would never be observed.
+    pub(crate) fn start_effect(
+        shutdown: std::sync::Arc<AtomicBool>,
+        interval: Duration,
+        mut query: impl FnMut() + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn(shutdown, interval, None, move || {
+            query();
+            None
+        })
+    }
+
+    fn spawn(
+        shutdown: std::sync::Arc<AtomicBool>,
+        interval: Duration,
+        cache: Option<std::sync::Arc<std::sync::Mutex<Option<WeeklySample>>>>,
+        mut query: impl FnMut() -> Option<WeeklySample> + Send + 'static,
+    ) -> io::Result<Self> {
         let done = std::sync::Arc::new(AtomicBool::new(false));
         let stopped = done.clone();
+        let shared = cache.clone();
         // Clients enforce their 60..=3600 second provider request cadence.
         // The smaller loop floor also permits fast injected queries in tests.
         let interval = interval.clamp(Duration::from_millis(100), Duration::from_secs(3600));
@@ -146,7 +244,9 @@ impl WeeklyWorker {
                     if shutdown.load(Ordering::Acquire) || stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    if let Ok(mut cache) = shared.lock() {
+                    if let Some(shared) = &shared
+                        && let Ok(mut cache) = shared.lock()
+                    {
                         *cache = result;
                     }
                     let next = Instant::now() + interval;
@@ -170,11 +270,10 @@ impl WeeklyWorker {
     }
 
     pub(crate) fn sample(&self, now: SystemTime) -> Option<WeeklySample> {
-        let sample = *self.cache.try_lock().ok()?;
-        sample.filter(|sample| {
-            sample.used_percent.is_finite()
-                && (0.0..=100.0).contains(&sample.used_percent)
-                && sample.resets_at.is_none_or(|reset| reset > now)
+        let cache = self.cache.as_ref()?;
+        let sample = *cache.try_lock().ok()?;
+        clear_expired_reset(sample, now).filter(|sample| {
+            sample.used_percent.is_finite() && (0.0..=100.0).contains(&sample.used_percent)
         })
     }
 }
@@ -661,6 +760,71 @@ pub(crate) mod tests {
         worker.handle.as_ref().unwrap().thread().unpark();
         worker.handle.take().unwrap().join().unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn retention_keeps_future_resets_and_ages_resetless_samples() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let future = Some(WeeklySample {
+            used_percent: 25.0,
+            resets_at: Some(now + Duration::from_secs(30)),
+        });
+        let resetless = Some(WeeklySample {
+            used_percent: 25.0,
+            resets_at: None,
+        });
+        let expired = Some(WeeklySample {
+            used_percent: 25.0,
+            resets_at: Some(now),
+        });
+        for (sample, expired_reset, after_failure) in [
+            (future, future, future),
+            (resetless, resetless, None),
+            (expired, None, None),
+            (None, None, None),
+        ] {
+            assert_eq!(clear_expired_reset(sample, now), expired_reset);
+            assert_eq!(retain_known_reset_after_failure(sample, now), after_failure);
+        }
+        let observed = Instant::now();
+        assert_eq!(
+            fresh_until_reset_or_age(resetless, Some(observed), observed, Duration::from_secs(5)),
+            resetless
+        );
+        assert_eq!(
+            fresh_until_reset_or_age(
+                resetless,
+                Some(observed),
+                observed + Duration::from_secs(6),
+                Duration::from_secs(5)
+            ),
+            None
+        );
+        assert_eq!(
+            fresh_until_reset_or_age(
+                future,
+                None,
+                observed + Duration::from_secs(60),
+                Duration::from_secs(1)
+            ),
+            future
+        );
+    }
+
+    #[test]
+    fn effect_worker_does_not_retain_a_sample_cache() {
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker =
+            WeeklyWorker::start_effect(shutdown.clone(), Duration::from_secs(3600), move || {
+                let _ = tx.send(());
+            })
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(worker.sample(SystemTime::now()).is_none());
+        assert!(worker.cache.is_none());
+        shutdown.store(true, Ordering::Release);
+        worker.handle.as_ref().unwrap().thread().unpark();
     }
     pub fn identity(provider: Provider) -> SessionIdentity {
         SessionIdentity {
