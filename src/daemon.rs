@@ -149,11 +149,43 @@ pub(crate) struct RefreshDuration {
     pub histogram: [u64; REFRESH_DURATION_BUCKETS],
 }
 
+/// One measured stage, in microseconds, using the same buckets as the total.
+///
+/// `count` is the number of completed attempts that supplied this stage.
+/// `sum_us` saturates. Absence of the parent aggregate is unmeasured, not zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StageDurationStats {
+    pub count: u64,
+    pub sum_us: u64,
+    pub duration: RefreshDuration,
+}
+
+/// Histograms for the five measured refresh stages.
+///
+/// `latest_measured` is false when the most recent completed attempt returned
+/// no stage sample. The histograms still describe earlier measured attempts.
+/// `reports` and `checkpoints` are saturating sums of those measured attempts,
+/// not extra stages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RefreshStageAggregate {
+    pub snapshot: StageDurationStats,
+    pub git: StageDurationStats,
+    pub reader: StageDurationStats,
+    pub persist: StageDurationStats,
+    pub socket: StageDurationStats,
+    pub latest_measured: bool,
+    pub reports: u64,
+    pub checkpoints: u64,
+}
+
 /// Memory-only totals for completed refresh attempts.
 ///
 /// Absence of this object on the control wire means the peer did not measure
 /// attempts. Absence of `duration` means no monotonic sample exists yet.
-/// Neither case is a zero measurement.
+/// Absence of `stages` means no stage sample has been measured yet.
+/// None of those cases is a zero measurement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RefreshObservation {
@@ -164,7 +196,7 @@ pub(crate) struct RefreshObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration: Option<RefreshDuration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stages: Option<RefreshStages>,
+    pub stages: Option<RefreshStageAggregate>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +273,61 @@ pub(crate) fn duration_bucket(duration_us: u64) -> usize {
         .unwrap_or(REFRESH_DURATION_BUCKETS - 1)
 }
 
+fn observe_duration(stats: &mut RefreshDuration, duration_us: u64) {
+    stats.last_us = duration_us;
+    stats.min_us = stats.min_us.min(duration_us);
+    stats.max_us = stats.max_us.max(duration_us);
+    let index = duration_bucket(duration_us);
+    stats.histogram[index] = stats.histogram[index].saturating_add(1);
+}
+
+fn new_stage_stats(duration_us: u64) -> StageDurationStats {
+    let mut duration = RefreshDuration {
+        last_us: duration_us,
+        min_us: duration_us,
+        max_us: duration_us,
+        histogram: [0; REFRESH_DURATION_BUCKETS],
+    };
+    observe_duration(&mut duration, duration_us);
+    StageDurationStats {
+        count: 1,
+        sum_us: duration_us,
+        duration,
+    }
+}
+
+fn observe_stage(stats: &mut StageDurationStats, duration_us: u64) {
+    stats.count = stats.count.saturating_add(1);
+    stats.sum_us = stats.sum_us.saturating_add(duration_us);
+    observe_duration(&mut stats.duration, duration_us);
+}
+
+fn stage_aggregate_from_sample(sample: RefreshStages) -> RefreshStageAggregate {
+    RefreshStageAggregate {
+        snapshot: new_stage_stats(sample.durations.snapshot_us),
+        git: new_stage_stats(sample.durations.git_us),
+        reader: new_stage_stats(sample.durations.reader_us),
+        persist: new_stage_stats(sample.durations.persist_us),
+        socket: new_stage_stats(sample.durations.socket_us),
+        latest_measured: true,
+        reports: sample.counts.reports,
+        checkpoints: sample.counts.checkpoints,
+    }
+}
+
+fn observe_stages(aggregate: &mut RefreshStageAggregate, sample: RefreshStages) {
+    observe_stage(&mut aggregate.snapshot, sample.durations.snapshot_us);
+    observe_stage(&mut aggregate.git, sample.durations.git_us);
+    observe_stage(&mut aggregate.reader, sample.durations.reader_us);
+    observe_stage(&mut aggregate.persist, sample.durations.persist_us);
+    observe_stage(&mut aggregate.socket, sample.durations.socket_us);
+    aggregate.latest_measured = true;
+    aggregate.reports = aggregate.reports.saturating_add(sample.counts.reports);
+    aggregate.checkpoints = aggregate
+        .checkpoints
+        .saturating_add(sample.counts.checkpoints);
+}
+
 pub(crate) fn record_refresh(health: &mut Health, result: &io::Result<()>, elapsed_ms: u64) {
     match refresh_outcome(result) {
         RefreshOutcome::Success => {
@@ -298,15 +385,105 @@ fn note_refresh_attempt(
             max_us: duration_us,
             histogram: [0; REFRESH_DURATION_BUCKETS],
         });
-        stats.last_us = duration_us;
-        stats.min_us = stats.min_us.min(duration_us);
-        stats.max_us = stats.max_us.max(duration_us);
-        let index = duration_bucket(duration_us);
-        stats.histogram[index] = stats.histogram[index].saturating_add(1);
+        observe_duration(&mut stats, duration_us);
         current.duration = Some(stats);
     }
-    current.stages = measured.stages;
+    match measured.stages {
+        Some(sample) => match current.stages.as_mut() {
+            Some(aggregate) => observe_stages(aggregate, sample),
+            None => current.stages = Some(stage_aggregate_from_sample(sample)),
+        },
+        None => {
+            if let Some(aggregate) = current.stages.as_mut() {
+                aggregate.latest_measured = false;
+            }
+        }
+    }
     *observation = Some(current);
+}
+
+fn stage_parts(aggregate: &RefreshStageAggregate) -> [&StageDurationStats; 5] {
+    [
+        &aggregate.snapshot,
+        &aggregate.git,
+        &aggregate.reader,
+        &aggregate.persist,
+        &aggregate.socket,
+    ]
+}
+
+fn stage_duration_consistent(stats: &StageDurationStats) -> bool {
+    let duration = &stats.duration;
+    if stats.count == 0 {
+        return stats.sum_us == 0
+            && duration.last_us == 0
+            && duration.min_us == 0
+            && duration.max_us == 0
+            && duration.histogram.iter().all(|count| *count == 0);
+    }
+    if duration.min_us > duration.max_us
+        || duration.last_us < duration.min_us
+        || duration.last_us > duration.max_us
+    {
+        return false;
+    }
+    if stats.count == 1 && stats.sum_us != duration.last_us && stats.sum_us != u64::MAX {
+        return false;
+    }
+    if let Some(lower) = duration.min_us.checked_mul(stats.count)
+        && stats.sum_us != u64::MAX
+        && stats.sum_us < lower
+    {
+        return false;
+    }
+    if let Some(upper) = duration.max_us.checked_mul(stats.count)
+        && stats.sum_us != u64::MAX
+        && stats.sum_us > upper
+    {
+        return false;
+    }
+    let histogram_saturated = duration.histogram.contains(&u64::MAX);
+    if stats.count != u64::MAX && !histogram_saturated {
+        let mut histogram_count = 0u64;
+        for bucket in duration.histogram {
+            match histogram_count.checked_add(bucket) {
+                Some(next) => histogram_count = next,
+                None => return false,
+            }
+        }
+        if histogram_count != stats.count {
+            return false;
+        }
+    }
+    true
+}
+
+fn stage_aggregate_consistent(aggregate: &RefreshStageAggregate) -> bool {
+    let parts = stage_parts(aggregate);
+    if !parts.iter().all(|stage| stage_duration_consistent(stage)) {
+        return false;
+    }
+    let count = parts[0].count;
+    count > 0 && parts.iter().all(|stage| stage.count == count)
+}
+
+fn stage_aggregate_from_value(value: &serde_json::Value) -> Option<RefreshStageAggregate> {
+    let aggregate: RefreshStageAggregate = serde_json::from_value(value.clone()).ok()?;
+    stage_aggregate_consistent(&aggregate).then_some(aggregate)
+}
+
+/// A missing, legacy, unknown, or contradictory `stages` object is unavailable.
+/// It does not erase a valid total, and it is not stored as a zero histogram.
+fn observation_from_raw(raw: &serde_json::Value) -> Option<RefreshObservation> {
+    let mut object = raw.as_object()?.clone();
+    let stages_value = object.remove("stages");
+    let mut observation: RefreshObservation =
+        serde_json::from_value(serde_json::Value::Object(object)).ok()?;
+    observation.stages = match stages_value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => stage_aggregate_from_value(&value),
+    };
+    Some(observation)
 }
 
 fn control_frame(state: &ControlState) -> io::Result<Vec<u8>> {
@@ -324,7 +501,7 @@ pub(crate) fn control_view_from_frame(frame: &[u8]) -> io::Result<ControlView> {
         .map_err(|_| io::Error::other("invalid daemon control identity"))?;
     let observation = match value.get("refresh_observation") {
         None | Some(serde_json::Value::Null) => None,
-        Some(raw) => serde_json::from_value(raw.clone()).ok(),
+        Some(raw) => observation_from_raw(raw),
     };
     Ok(ControlView {
         health,
@@ -2612,15 +2789,24 @@ mod tests {
         assert!(!first_view.health.refresh_failed);
         let first_observation = first_view.observation.unwrap();
         assert_eq!(first_observation.duration.unwrap().last_us, 10_400);
-        assert_eq!(first_observation.stages.unwrap().durations.git_us, 0);
-        assert_eq!(first_observation.stages.unwrap().counts.reports, 2);
+        let first_stages = first_observation.stages.unwrap();
+        assert!(first_stages.latest_measured);
+        assert_eq!(first_stages.git.duration.last_us, 0);
+        assert_eq!(first_stages.git.count, 1);
+        assert_eq!(first_stages.git.duration.histogram[0], 1);
+        assert_eq!(first_stages.reports, 2);
+        assert_eq!(first_stages.checkpoints, 1);
         assert_eq!(first_observation.success_count, 1);
 
         let current = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
         assert!(current.health.refresh_failed);
         assert_eq!(current.health.last_refresh_ms, Some(20));
         let current_observation = current.observation.unwrap();
-        assert!(current_observation.stages.is_none());
+        let kept_stages = current_observation.stages.unwrap();
+        assert!(!kept_stages.latest_measured);
+        assert_eq!(kept_stages.git.count, 1);
+        assert_eq!(kept_stages.git.duration.histogram.iter().sum::<u64>(), 1);
+        assert_eq!(kept_stages.reports, 2);
         assert_eq!(current_observation.error_count, 1);
         assert_eq!(current_observation.duration.unwrap().last_us, 7_000);
         let legacy: Health = serde_json::from_slice(&control_frame(&state).unwrap()).unwrap();
@@ -2664,6 +2850,260 @@ mod tests {
         assert!(observation.unwrap().stages.is_none());
     }
 
+    fn stages_us(
+        snapshot: u64,
+        git: u64,
+        reader: u64,
+        persist: u64,
+        socket: u64,
+        reports: u64,
+        checkpoints: u64,
+    ) -> RefreshStages {
+        RefreshStages {
+            durations: RefreshStageDurations {
+                snapshot_us: snapshot,
+                git_us: git,
+                reader_us: reader,
+                persist_us: persist,
+                socket_us: socket,
+            },
+            counts: RefreshStageCounts {
+                reports,
+                checkpoints,
+            },
+        }
+    }
+
+    #[test]
+    fn stage_histograms_keep_measured_attempts_and_ignore_missing_ones() {
+        let mut health = sample_health();
+        health.last_refresh_ms = None;
+        let mut observation = None;
+        note(
+            &mut health,
+            &mut observation,
+            &Ok(()),
+            40,
+            Some(12_400),
+            Some(stages_us(999, 1_000, 5_000, 50_000, 5_000_000, 2, 1)),
+        );
+        note(
+            &mut health,
+            &mut observation,
+            &Err(io::Error::other("transport")),
+            80,
+            Some(200),
+            Some(stages_us(0, 4_999, 9_999, 99_999, u64::MAX, u64::MAX, 3)),
+        );
+        assert!(health.refresh_failed);
+        assert_eq!(health.last_refresh_ms, Some(40));
+        note(&mut health, &mut observation, &Ok(()), 90, None, None);
+        assert!(!health.refresh_failed);
+        assert_eq!(health.last_refresh_ms, Some(90));
+        note(
+            &mut health,
+            &mut observation,
+            &Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                crate::publish::CapacitySkip {
+                    skipped_resources: 1,
+                },
+            )),
+            100,
+            Some(3_000),
+            Some(stages_us(10, 10, 10, 10, 10, 1, 0)),
+        );
+
+        let observed = observation.unwrap();
+        assert_eq!(observed.success_count, 2);
+        assert_eq!(observed.error_count, 1);
+        assert_eq!(observed.capacity_skip_count, 1);
+        assert_eq!(health.last_refresh_ms, Some(100));
+        assert!(!health.refresh_failed);
+        let total = observed.duration.unwrap();
+        assert_eq!(total.last_us, 3_000);
+        assert_eq!(total.min_us, 200);
+        assert_eq!(total.max_us, 12_400);
+        assert_eq!(total.histogram[0], 1);
+        assert_eq!(total.histogram[1], 1);
+        assert_eq!(total.histogram[3], 1);
+        assert_eq!(total.histogram.iter().sum::<u64>(), 3);
+
+        let stages = observed.stages.unwrap();
+        assert!(stages.latest_measured);
+        assert_eq!(stages.reports, u64::MAX);
+        assert_eq!(stages.checkpoints, 4);
+        assert_eq!(stages.snapshot.count, 3);
+        assert_eq!(stages.snapshot.duration.last_us, 10);
+        assert_eq!(stages.snapshot.duration.min_us, 0);
+        assert_eq!(stages.snapshot.duration.max_us, 999);
+        assert_eq!(stages.snapshot.sum_us, 1_009);
+        assert_eq!(stages.snapshot.duration.histogram[0], 3);
+        assert_eq!(stages.git.duration.histogram[0], 1);
+        assert_eq!(stages.git.duration.histogram[1], 2);
+        assert_eq!(stages.git.sum_us, 6_009);
+        assert_eq!(stages.reader.duration.histogram[0], 1);
+        assert_eq!(stages.reader.duration.histogram[2], 2);
+        assert_eq!(stages.persist.duration.histogram[0], 1);
+        assert_eq!(stages.persist.duration.histogram[4], 2);
+        assert_eq!(stages.socket.duration.histogram[0], 1);
+        assert_eq!(stages.socket.duration.histogram[8], 2);
+        assert_eq!(stages.socket.sum_us, u64::MAX);
+        assert_eq!(duration_bucket(999), 0);
+        assert_eq!(duration_bucket(1_000), 1);
+    }
+
+    #[test]
+    fn stage_histograms_saturate_without_zeroing_history() {
+        let saturated = StageDurationStats {
+            count: u64::MAX,
+            sum_us: u64::MAX,
+            duration: RefreshDuration {
+                last_us: 5,
+                min_us: 5,
+                max_us: 5,
+                histogram: [u64::MAX; REFRESH_DURATION_BUCKETS],
+            },
+        };
+        let mut health = sample_health();
+        let mut observation = Some(RefreshObservation {
+            attempt_count: 4,
+            success_count: 4,
+            error_count: 0,
+            capacity_skip_count: 0,
+            duration: None,
+            stages: Some(RefreshStageAggregate {
+                snapshot: saturated.clone(),
+                git: saturated.clone(),
+                reader: saturated.clone(),
+                persist: saturated.clone(),
+                socket: saturated,
+                latest_measured: true,
+                reports: u64::MAX,
+                checkpoints: u64::MAX,
+            }),
+        });
+        note(
+            &mut health,
+            &mut observation,
+            &Err(io::Error::other("transport")),
+            11,
+            None,
+            Some(stages_us(0, 1, 2, 3, 4, 9, 8)),
+        );
+        let stages = observation.unwrap().stages.unwrap();
+        assert!(stages.latest_measured);
+        assert_eq!(stages.snapshot.count, u64::MAX);
+        assert_eq!(stages.snapshot.sum_us, u64::MAX);
+        assert_eq!(stages.snapshot.duration.histogram[0], u64::MAX);
+        assert_eq!(stages.snapshot.duration.last_us, 0);
+        assert_eq!(stages.snapshot.duration.min_us, 0);
+        assert_eq!(stages.snapshot.duration.max_us, 5);
+        assert_eq!(stages.reports, u64::MAX);
+        assert_eq!(stages.checkpoints, u64::MAX);
+        assert!(health.refresh_failed);
+        assert_eq!(health.last_refresh_ms, sample_health().last_refresh_ms);
+    }
+
+    #[test]
+    fn stage_wire_rejects_legacy_malformed_and_contradictions() {
+        let mut base = serde_json::to_value(sample_health()).unwrap();
+        base["refresh_observation"] = serde_json::json!({
+            "attempt_count": 1,
+            "success_count": 1,
+            "error_count": 0,
+            "capacity_skip_count": 0,
+            "duration": {
+                "last_us": 0,
+                "min_us": 0,
+                "max_us": 0,
+                "histogram": [1, 0, 0, 0, 0, 0, 0, 0, 0]
+            }
+        });
+        let missing = control_view_from_frame(&serde_json::to_vec(&base).unwrap()).unwrap();
+        let missing_observation = missing.observation.unwrap();
+        assert!(missing_observation.stages.is_none());
+        assert_eq!(missing_observation.duration.unwrap().last_us, 0);
+
+        let mut legacy = base.clone();
+        legacy["refresh_observation"]["stages"] = serde_json::json!({
+            "durations": {
+                "snapshot_us": 1,
+                "git_us": 1,
+                "reader_us": 1,
+                "persist_us": 1,
+                "socket_us": 1
+            },
+            "counts": {"reports": 1, "checkpoints": 1}
+        });
+        let legacy_view = control_view_from_frame(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(legacy_view.observation.unwrap().stages.is_none());
+        assert_eq!(legacy_view.health.nonce, sample_health().nonce);
+
+        let mut health = sample_health();
+        let mut observation = None;
+        note(
+            &mut health,
+            &mut observation,
+            &Ok(()),
+            5,
+            Some(0),
+            Some(stages_us(0, 0, 0, 0, 0, 0, 0)),
+        );
+        let state = ControlState {
+            health,
+            observation,
+        };
+        let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
+        let measured = roundtrip.observation.unwrap().stages.unwrap();
+        assert_eq!(measured.snapshot.count, 1);
+        assert_eq!(measured.snapshot.duration.last_us, 0);
+        assert_eq!(measured.snapshot.duration.histogram[0], 1);
+        assert!(measured.latest_measured);
+
+        let mut valid = serde_json::to_value(&state.health).unwrap();
+        valid["refresh_observation"] =
+            serde_json::to_value(state.observation.as_ref().unwrap()).unwrap();
+        let mut short = valid.clone();
+        short["refresh_observation"]["stages"]["snapshot"]["duration"]["histogram"] =
+            serde_json::json!([1]);
+        let short_view = control_view_from_frame(&serde_json::to_vec(&short).unwrap()).unwrap();
+        let short_observation = short_view.observation.unwrap();
+        assert!(short_observation.stages.is_none());
+        assert_eq!(short_observation.duration.unwrap().last_us, 0);
+
+        let mut unknown = valid.clone();
+        unknown["refresh_observation"]["stages"]["extra"] = serde_json::json!(1);
+        assert!(
+            control_view_from_frame(&serde_json::to_vec(&unknown).unwrap())
+                .unwrap()
+                .observation
+                .unwrap()
+                .stages
+                .is_none()
+        );
+
+        let mut contradictory = valid.clone();
+        contradictory["refresh_observation"]["stages"]["git"]["duration"]["min_us"] =
+            serde_json::json!(8);
+        contradictory["refresh_observation"]["stages"]["git"]["duration"]["max_us"] =
+            serde_json::json!(1);
+        assert!(
+            control_view_from_frame(&serde_json::to_vec(&contradictory).unwrap())
+                .unwrap()
+                .observation
+                .unwrap()
+                .stages
+                .is_none()
+        );
+
+        let mut unequal = valid;
+        unequal["refresh_observation"]["stages"]["socket"]["count"] = serde_json::json!(2);
+        let unequal_view = control_view_from_frame(&serde_json::to_vec(&unequal).unwrap()).unwrap();
+        assert_eq!(unequal_view.health.endpoint, sample_health().endpoint);
+        assert!(unequal_view.observation.unwrap().stages.is_none());
+    }
+
     #[test]
     fn serve_control_uses_a_snapshot_without_the_state_mutex() {
         let state = Arc::new(Mutex::new(ControlState::from(sample_health())));
@@ -2677,7 +3117,7 @@ mod tests {
                 &Ok(()),
                 30,
                 Some(5_400),
-                None,
+                Some(stages_us(1, 2, 3, 4, 5, 1, 1)),
             );
             guard.health = health;
             guard.observation = observation;
@@ -2694,6 +3134,16 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .last_us = 999;
+            guard
+                .observation
+                .as_mut()
+                .unwrap()
+                .stages
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .duration
+                .last_us = 999;
         }
         let held = state.lock().unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -2705,7 +3155,9 @@ mod tests {
         let view = control_view_from_frame(&read_frame(&mut client, 8192).unwrap()).unwrap();
         assert!(started.elapsed() < Duration::from_millis(400));
         assert_eq!(view.health.last_refresh_ms, Some(30));
-        assert_eq!(view.observation.unwrap().duration.unwrap().last_us, 5_400);
+        let observed = view.observation.unwrap();
+        assert_eq!(observed.duration.unwrap().last_us, 5_400);
+        assert_eq!(observed.stages.unwrap().snapshot.duration.last_us, 1);
         drop(client);
         drop(held);
         assert!(!worker.join().unwrap().unwrap());
