@@ -577,6 +577,23 @@ mod tests {
 
     #[test]
     fn statusline_scan_separates_eof_errors_and_limit_and_releases_the_directory() {
+        // File-descriptor checks share the process table. Run them in a
+        // one-test child so another test cannot reuse the closed number.
+        if std::env::var_os("LINEUP_TEST_STATUSLINE_SCAN_FD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "doctor::tests::statusline_scan_separates_eof_errors_and_limit_and_releases_the_directory",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("LINEUP_TEST_STATUSLINE_SCAN_FD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
         use std::cell::Cell;
         thread_local! {
             static FILES_RETURNED: Cell<usize> = const { Cell::new(0) };
@@ -744,8 +761,8 @@ mod tests {
             assert_directory_released();
         }
         let after = open_fd_count();
-        assert!(
-            after <= before.saturating_add(8),
+        assert_eq!(
+            before, after,
             "directory fd leaked: before {before} after {after}"
         );
 
