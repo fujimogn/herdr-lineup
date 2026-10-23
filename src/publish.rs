@@ -707,6 +707,38 @@ pub struct MetadataPublisher {
     /// Successful `sequences.json` writes. Tests assert one write per report.
     #[cfg(test)]
     checkpoint_persists: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    stages: std::sync::Mutex<StageTimes>,
+}
+
+#[cfg(test)]
+#[derive(Default, Clone, Debug)]
+struct StageTimes {
+    snapshot: Duration,
+    git: Duration,
+    reader: Duration,
+    persist: Duration,
+    socket: Duration,
+    refresh: Duration,
+    pipeline: Duration,
+    reports: u64,
+    checkpoint_rows: usize,
+}
+
+#[cfg(test)]
+impl StageTimes {
+    fn add(&mut self, stage: &str, elapsed: Duration) {
+        match stage {
+            "snapshot" => self.snapshot += elapsed,
+            "git" => self.git += elapsed,
+            "reader" => self.reader += elapsed,
+            "persist" => self.persist += elapsed,
+            "socket" => self.socket += elapsed,
+            "refresh" => self.refresh += elapsed,
+            "pipeline" => self.pipeline += elapsed,
+            _ => unreachable!(),
+        }
+    }
 }
 impl MetadataPublisher {
     /// Construction performs no state I/O. The daemon acquires its session lock
@@ -741,6 +773,8 @@ impl MetadataPublisher {
             local_readings: BTreeMap::new(),
             #[cfg(test)]
             checkpoint_persists: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            stages: std::sync::Mutex::new(StageTimes::default()),
         })
     }
 
@@ -1018,6 +1052,8 @@ impl MetadataPublisher {
     }
 
     fn persist(&self) -> io::Result<()> {
+        #[cfg(test)]
+        let stage_start = Instant::now();
         let mut rows: Vec<_> = self
             .planner
             .checkpoint()
@@ -1054,6 +1090,9 @@ impl MetadataPublisher {
         #[cfg(test)]
         {
             let _ = self.checkpoint_persists.fetch_add(1, Ordering::Relaxed);
+            let mut stages = self.stages.lock().unwrap();
+            stages.add("persist", stage_start.elapsed());
+            stages.checkpoint_rows = rows.len();
         }
         Ok(())
     }
@@ -1069,6 +1108,8 @@ impl MetadataPublisher {
     }
 
     fn snapshot(&mut self, transport: &mut Transport) -> io::Result<protocol::Snapshot> {
+        #[cfg(test)]
+        let stage_start = Instant::now();
         self.load_checkpoint()?;
         let identity = transport.identity();
         let endpoint = format!("{}:{}:{}", self.socket_key, identity.device, identity.inode);
@@ -1080,9 +1121,22 @@ impl MetadataPublisher {
             return Err(io::Error::other("publisher endpoint changed"));
         }
         self.endpoint = Some(endpoint);
+        #[cfg(test)]
+        let socket_start = Instant::now();
         let (id, response) = self.request(transport, "session.snapshot")?;
-        protocol::parse_snapshot(&id, &response)
-            .map_err(|_| io::Error::other("invalid snapshot response"))
+        #[cfg(test)]
+        self.stages
+            .lock()
+            .unwrap()
+            .add("socket", socket_start.elapsed());
+        let result = protocol::parse_snapshot(&id, &response)
+            .map_err(|_| io::Error::other("invalid snapshot response"));
+        #[cfg(test)]
+        self.stages
+            .lock()
+            .unwrap()
+            .add("snapshot", stage_start.elapsed());
+        result
     }
 
     fn resource(&self, kind: ResourceKind, id: &str) -> ResourceId {
@@ -1153,7 +1207,14 @@ impl MetadataPublisher {
             // in-flight exchange but does not begin a new metadata frame.
             self.check_shutdown()?;
         }
+        #[cfg(test)]
+        let socket_start = Instant::now();
         let response = exchange(transport, &request)?;
+        #[cfg(test)]
+        {
+            let mut stages = self.stages.lock().unwrap();
+            stages.add("socket", socket_start.elapsed());
+        }
         let result = protocol::response_result(&id, &response)
             .map_err(|_| io::Error::other("metadata report rejected"))?;
         if result.get("type").and_then(Value::as_str) != Some("ok") {
@@ -1162,6 +1223,10 @@ impl MetadataPublisher {
         self.planner
             .acknowledge(&report, now_ms)
             .map_err(|_| io::Error::other("invalid metadata reservation"))?;
+        #[cfg(test)]
+        {
+            self.stages.lock().unwrap().reports += 1;
+        }
         // `acknowledge` records acceptance only. `checkpoint()` is the high-water
         // sequence already saved before the send, so another persist would
         // rewrite the same bytes.
@@ -1197,6 +1262,44 @@ impl MetadataPublisher {
     }
 
     fn refresh_with_readers(
+        &mut self,
+        transport: &mut Transport,
+        config: &Config,
+        codex: &dyn UsageReader,
+        grok: &dyn UsageReader,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        let stage_start = Instant::now();
+        let result = self.refresh_with_readers_inner(transport, config, codex, grok);
+        #[cfg(test)]
+        self.stages
+            .lock()
+            .unwrap()
+            .add("pipeline", stage_start.elapsed());
+        result
+    }
+
+    #[cfg(test)]
+    fn refresh_cycle_with_readers(
+        &mut self,
+        transport: &mut Transport,
+        config: &Config,
+        codex: &dyn UsageReader,
+        grok: &dyn UsageReader,
+    ) -> io::Result<()> {
+        let stage_start = Instant::now();
+        let result = config
+            .validate()
+            .and_then(|_| self.start_weekly(config))
+            .and_then(|_| self.refresh_with_readers(transport, config, codex, grok));
+        self.stages
+            .lock()
+            .unwrap()
+            .add("refresh", stage_start.elapsed());
+        result
+    }
+
+    fn refresh_with_readers_inner(
         &mut self,
         transport: &mut Transport,
         config: &Config,
@@ -1267,6 +1370,8 @@ impl MetadataPublisher {
         let mut headings = BTreeMap::new();
         let mut repository_readings = BTreeMap::new();
         for workspace in &snapshot.workspaces {
+            #[cfg(test)]
+            let stage_start = Instant::now();
             self.check_shutdown()?;
             let panes: Vec<_> = snapshot
                 .panes
@@ -1309,6 +1414,11 @@ impl MetadataPublisher {
                 ),
             ]);
             headings.insert(workspace.workspace_id.as_str(), (resolved, desired));
+            #[cfg(test)]
+            self.stages
+                .lock()
+                .unwrap()
+                .add("git", stage_start.elapsed());
         }
         // A single budget for the cycle prevents N panes multiplying the reader wait.
         let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
@@ -1389,7 +1499,18 @@ impl MetadataPublisher {
                         model::MissingReason::NotFound,
                     )
                 } else {
-                    reader.read(&request)
+                    #[cfg(test)]
+                    let stage_start = Instant::now();
+                    #[cfg(test)]
+                    let result = reader.read(&request);
+                    #[cfg(not(test))]
+                    let result = reader.read(&request);
+                    #[cfg(test)]
+                    self.stages
+                        .lock()
+                        .unwrap()
+                        .add("reader", stage_start.elapsed());
+                    result
                 };
                 if reading.identity != identity {
                     self.local_readings.remove(&pane.pane_id);
@@ -1550,9 +1671,14 @@ impl daemon::Publisher for MetadataPublisher {
         self.shutdown = Some(shutdown);
     }
     fn refresh(&mut self, transport: &mut Transport, config: &Config) -> io::Result<()> {
-        config.validate()?;
-        self.start_weekly(config)?;
-        self.refresh_with_readers(transport, config, &CodexReader, &GrokReader)
+        #[cfg(test)]
+        return self.refresh_cycle_with_readers(transport, config, &CodexReader, &GrokReader);
+        #[cfg(not(test))]
+        {
+            config.validate()?;
+            self.start_weekly(config)?;
+            self.refresh_with_readers(transport, config, &CodexReader, &GrokReader)
+        }
     }
     fn shutdown(&mut self) {
         self.codex_control.stop();
@@ -4964,6 +5090,123 @@ mod tests {
                 "agent_session": {"agent":"codex", "kind":"id", "value":"synthetic-session"},
                 "agent_status":"working", "tokens":{"lineup_context_pct":"old"}}]
         }}})
+    }
+
+    // Run explicitly with --ignored --nocapture. This uses the existing fake
+    // socket and snapshot shape, and never connects to a Herdr session.
+    #[test]
+    #[ignore = "synthetic refresh latency measurement"]
+    fn measure_refresh_stages() {
+        let root = std::env::var_os("LINEUP_BENCH_ROOT").expect("set LINEUP_BENCH_ROOT");
+        let root = Path::new(&root);
+        let repeats: usize = std::env::var("LINEUP_BENCH_REPEATS")
+            .unwrap_or_else(|_| "3".into())
+            .parse()
+            .unwrap();
+        assert!(repeats >= 2);
+        println!(
+            "panes,run,total_us,pipeline_us,snapshot_us,git_us,reader_us,persist_us,socket_us,reports,checkpoint_rows,external_us"
+        );
+        for panes in [1, 8, 32, 128, 256] {
+            for run in 0..repeats {
+                let dir = tempfile::Builder::new()
+                    .prefix("herdr-lineup-refresh-")
+                    .tempdir_in(root)
+                    .unwrap();
+                let repo = dir.path().join("repo");
+                std::fs::create_dir(&repo).unwrap();
+                let git = |args: &[&str]| {
+                    let output = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&repo)
+                        .args(args)
+                        .env_remove("GIT_DIR")
+                        .env_remove("GIT_WORK_TREE")
+                        .env_remove("GIT_INDEX_FILE")
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "git fixture failed: {:?}", args);
+                };
+                git(&["init", "-q"]);
+                git(&[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "fixture",
+                ]);
+                git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+                let socket = dir.path().join("fake.sock");
+                let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let mut template = snapshot(&json!("template"), true);
+                template["result"]["snapshot"]["workspaces"][0]["checkout_path"] = json!(repo);
+                template["result"]["snapshot"]["panes"] = Value::Array(
+                    (0..panes)
+                        .map(|index| {
+                            json!({"pane_id":format!("w1:p{index}"), "workspace_id":"w1",
+                                "cwd":repo,"agent":"codex",
+                                "agent_session":{"agent":"codex","kind":"id",
+                                    "value":format!("synthetic-{index}")},
+                                "agent_status":"working","tokens":{}})
+                        })
+                        .collect(),
+                );
+                let server = token_server_with_template(
+                    UnixListener::bind(&socket).unwrap(),
+                    clock,
+                    Arc::new(std::sync::Mutex::new(template)),
+                );
+                let mut transport = Transport::connect(&socket).unwrap();
+                let mut publisher = MetadataPublisher::new(
+                    dir.path().into(),
+                    "fake".into(),
+                    Homes {
+                        codex: Some(dir.path().into()),
+                        ..Homes::default()
+                    },
+                )
+                .unwrap();
+                publisher.set_shutdown(Arc::new(AtomicBool::new(false)));
+                let external_start = Instant::now();
+                publisher
+                    .refresh_cycle_with_readers(
+                        &mut transport,
+                        &Config::default(),
+                        &SampleReader,
+                        &SampleReader,
+                    )
+                    .unwrap();
+                let external = external_start.elapsed();
+                let stages = publisher.stages.lock().unwrap().clone();
+                let us = |duration: Duration| duration.as_micros();
+                println!(
+                    "{panes},{run},{},{},{},{},{},{},{},{},{},{}",
+                    us(stages.refresh),
+                    us(stages.pipeline),
+                    us(stages.snapshot),
+                    us(stages.git),
+                    us(stages.reader),
+                    us(stages.persist),
+                    us(stages.socket),
+                    stages.reports,
+                    stages.checkpoint_rows,
+                    us(external)
+                );
+                publisher.request(&mut transport, "test.finish").unwrap();
+                server.join().unwrap();
+                if root != Path::new("/tmp") {
+                    // Preserve disk fixtures: only /tmp-owned fixture directories
+                    // may be reclaimed automatically by this measurement.
+                    let path = dir.keep();
+                    eprintln!("retained_fixture={}", path.display());
+                }
+            }
+        }
     }
 
     #[test]
