@@ -3,7 +3,8 @@
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::{self, Write},
+    io::{self, Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -209,6 +210,62 @@ fn load(path: &Path) -> io::Result<Value> {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    bytes: Vec<u8>,
+}
+
+fn stamp(path: &Path) -> io::Result<Option<FileStamp>> {
+    check_path(path)?;
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(mut file) => {
+            let meta = file.metadata()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(Some(FileStamp {
+                device: meta.dev(),
+                inode: meta.ino(),
+                bytes,
+            }))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn require_bytes(path: &Path, expected: Option<&[u8]>) -> io::Result<()> {
+    if stamp(path)?.as_ref().map(|file| file.bytes.as_slice()) != expected {
+        return Err(conflict(&format!(
+            "Concurrent change at {}; leaving it unchanged",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn rollback_owned(
+    path: &Path,
+    expected: Option<&FileStamp>,
+    original: Option<&[u8]>,
+) -> io::Result<()> {
+    if stamp(path)?.as_ref() != expected {
+        return Err(conflict(&format!(
+            "Rollback conflict at {}; recovery requires manual inspection",
+            path.display()
+        )));
+    }
+    match original {
+        Some(bytes) => write_atomic(path, bytes),
+        None => fs::remove_file(path),
+    }
+}
+
 /// Install only after explicit opt-in. Records ownership separately from font presence.
 pub fn install(locations: &Locations) -> io::Result<Vec<String>> {
     apply(locations, false)
@@ -247,8 +304,18 @@ fn apply_with(
 fn apply_with_font(
     locations: &Locations,
     removing: bool,
+    writer: impl FnMut(&Path, &[u8]) -> io::Result<()>,
+    font_writer: impl FnMut(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> io::Result<Vec<String>> {
+    apply_with_font_and_remove(locations, removing, writer, font_writer, |_| Ok(()))
+}
+
+fn apply_with_font_and_remove(
+    locations: &Locations,
+    removing: bool,
     mut writer: impl FnMut(&Path, &[u8]) -> io::Result<()>,
     mut font_writer: impl FnMut(&mut fs::File, &[u8]) -> io::Result<()>,
+    mut before_font_remove: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<Vec<String>> {
     let locations = locations.resolved()?;
     check_path(&locations.state)?;
@@ -270,7 +337,11 @@ fn apply_with_font(
             "Font ownership record belongs to a different font directory",
         ));
     }
-    if locations.font.exists() && fs::read(&locations.font)? != FONT {
+    let original_font = stamp(&locations.font)?;
+    if original_font
+        .as_ref()
+        .is_some_and(|file| file.bytes != FONT)
+    {
         return Err(conflict(&format!(
             "Installed font differs at {}; leaving it unchanged",
             locations.font.display()
@@ -356,7 +427,7 @@ fn apply_with_font(
             changes.push((path, format!("{text}{owned}"), original));
         }
     }
-    let font_existed = locations.font.exists();
+    let font_existed = original_font.is_some();
     let old_journal = match fs::read(&journal) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -364,6 +435,7 @@ fn apply_with_font(
     };
     let mut created_font = false;
     let mut changed_paths = Vec::new();
+    let mut rollback_stamps: Vec<(PathBuf, Option<FileStamp>)> = Vec::new();
     let result: io::Result<()> = (|| {
         if removing {
             for (path, text, original) in &changes {
@@ -373,10 +445,25 @@ fn apply_with_font(
                         path.display()
                     )));
                 }
-                writer(path, text.as_bytes())?;
+                let write_result = writer(path, text.as_bytes());
+                let written = stamp(path)?;
+                if written
+                    .as_ref()
+                    .is_some_and(|file| file.bytes == text.as_bytes())
+                {
+                    rollback_stamps.push((path.clone(), written));
+                }
+                write_result?;
+                require_bytes(path, Some(text.as_bytes()))?;
                 changed_paths.push(path.clone());
             }
-            if state["font_owned"] == true && locations.font.exists() {
+            if state["font_owned"] == true && font_existed {
+                before_font_remove(&locations.font)?;
+                if stamp(&locations.font)? != original_font {
+                    return Err(conflict(
+                        "Installed font changed before removal; leaving it unchanged",
+                    ));
+                }
                 fs::remove_file(&locations.font)?;
                 changed_paths.push(locations.font.clone());
             }
@@ -386,7 +473,9 @@ fn apply_with_font(
                 .as_deref()
                 .is_some_and(|old| old != next_journal)
             {
+                require_bytes(&journal, old_journal.as_deref())?;
                 write_atomic(&journal, &next_journal)?;
+                rollback_stamps.push((journal.clone(), stamp(&journal)?));
                 changed_paths.push(journal.clone());
             }
         } else {
@@ -402,7 +491,9 @@ fn apply_with_font(
             // A crash after a terminal write must leave its ownership record.
             let next_journal = serde_json::to_vec(&state).map_err(io::Error::other)?;
             if old_journal.as_deref() != Some(next_journal.as_slice()) {
+                require_bytes(&journal, old_journal.as_deref())?;
                 write_atomic(&journal, &next_journal)?;
+                rollback_stamps.push((journal.clone(), stamp(&journal)?));
                 changed_paths.push(journal.clone());
             }
             if !font_existed {
@@ -413,7 +504,9 @@ fn apply_with_font(
                     .open(&locations.font)?;
                 created_font = true;
                 changed_paths.push(locations.font.clone());
-                font_writer(&mut file, FONT)?;
+                let write_result = font_writer(&mut file, FONT);
+                rollback_stamps.push((locations.font.clone(), stamp(&locations.font)?));
+                write_result?;
             }
             for (path, text, original) in &changes {
                 if &fs::read(path)? != original {
@@ -422,7 +515,16 @@ fn apply_with_font(
                         path.display()
                     )));
                 }
-                writer(path, text.as_bytes())?;
+                let write_result = writer(path, text.as_bytes());
+                let written = stamp(path)?;
+                if written
+                    .as_ref()
+                    .is_some_and(|file| file.bytes == text.as_bytes())
+                {
+                    rollback_stamps.push((path.clone(), written));
+                }
+                write_result?;
+                require_bytes(path, Some(text.as_bytes()))?;
                 changed_paths.push(path.clone());
             }
         }
@@ -431,32 +533,32 @@ fn apply_with_font(
     if let Err(error) = result {
         let mut failures = Vec::new();
         for (path, _, original) in changes.iter().rev() {
-            if changed_paths.contains(path)
-                && let Err(rollback) = write_atomic(path, original)
+            if let Some((_, expected)) = rollback_stamps.iter().find(|(written, _)| written == path)
+                && let Err(rollback) = rollback_owned(path, expected.as_ref(), Some(original))
             {
                 failures.push(rollback.to_string());
             }
         }
-        if font_existed && !locations.font.exists() && changed_paths.contains(&locations.font) {
-            if let Err(rollback) = write_atomic(&locations.font, FONT) {
+        if font_existed && changed_paths.contains(&locations.font) {
+            if let Err(rollback) = rollback_owned(&locations.font, None, Some(FONT)) {
                 failures.push(rollback.to_string());
             }
         } else if created_font
-            && locations.font.exists()
-            && let Err(rollback) = fs::remove_file(&locations.font)
+            && let Some((_, expected)) = rollback_stamps
+                .iter()
+                .find(|(written, _)| written == &locations.font)
+            && let Err(rollback) = rollback_owned(&locations.font, expected.as_ref(), None)
         {
             failures.push(rollback.to_string());
         }
-        if changed_paths.contains(&journal) && failures.is_empty() {
-            if let Some(bytes) = old_journal {
-                if let Err(rollback) = write_atomic(&journal, &bytes) {
-                    failures.push(rollback.to_string());
-                }
-            } else if journal.exists()
-                && let Err(rollback) = fs::remove_file(&journal)
-            {
-                failures.push(rollback.to_string());
-            }
+        if let Some((_, expected)) = rollback_stamps
+            .iter()
+            .find(|(written, _)| written == &journal)
+            && failures.is_empty()
+            && let Err(rollback) =
+                rollback_owned(&journal, expected.as_ref(), old_journal.as_deref())
+        {
+            failures.push(rollback.to_string());
         }
         return Err(conflict(&format!(
             "Font action failed: {error}; rollback errors: {failures:?}"
@@ -1134,6 +1236,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn external_edit_after_our_write_survives_rollback() {
+        for removing in [false, true] {
+            let (_root, locations) = fixture();
+            let kitty = locations.config.join("kitty/kitty.conf");
+            let ghostty = locations.config.join("ghostty/config");
+            for path in [&kitty, &ghostty] {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "# original\n").unwrap();
+            }
+            if removing {
+                install(&locations).unwrap();
+            }
+            let result = apply_with(&locations, removing, |path, bytes| {
+                if path == ghostty {
+                    let content = fs::read_to_string(&kitty).unwrap();
+                    fs::write(&kitty, format!("{content}# external\n")).unwrap();
+                    return Err(conflict("injected failure"));
+                }
+                write_atomic(path, bytes)
+            });
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains("Rollback conflict"), "{message}");
+            assert!(fs::read_to_string(&kitty).unwrap().contains("# external\n"));
+            assert!(locations.state.join("font-ownership.json").exists());
+            if removing {
+                assert!(locations.font.exists());
+                assert!(fs::read_to_string(&kitty).unwrap().contains("# external\n"));
+            } else {
+                assert!(!locations.font.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn same_byte_font_replacement_before_removal_is_preserved() {
+        let (_root, locations) = fixture();
+        let kitty = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(kitty.parent().unwrap()).unwrap();
+        fs::write(&kitty, "# original\n").unwrap();
+        install(&locations).unwrap();
+        let result = apply_with_font_and_remove(
+            &locations,
+            true,
+            write_atomic,
+            |file, bytes| file.write_all(bytes),
+            |path| {
+                let replacement = path.with_extension("replacement");
+                fs::write(&replacement, FONT)?;
+                fs::rename(replacement, path)
+            },
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("font changed before removal"), "{message}");
+        assert_eq!(fs::read(&locations.font).unwrap(), FONT);
+        assert!(fs::read_to_string(&kitty).unwrap().contains(START));
+        assert!(locations.state.join("font-ownership.json").exists());
+    }
+
+    #[test]
+    fn externally_changed_journal_survives_install_failure() {
+        let (_root, locations) = fixture();
+        let kitty = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(kitty.parent().unwrap()).unwrap();
+        fs::write(&kitty, "# original\n").unwrap();
+        let journal = locations.state.join("font-ownership.json");
+        let result = apply_with(&locations, false, |_path, _bytes| {
+            fs::write(&journal, b"external journal")?;
+            Err(conflict("injected failure"))
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("Rollback conflict"), "{message}");
+        assert_eq!(fs::read(&journal).unwrap(), b"external journal");
+        assert!(!locations.font.exists());
+    }
+
+    #[test]
+    fn replaced_created_font_survives_rollback() {
+        let (_root, locations) = fixture();
+        let kitty = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(kitty.parent().unwrap()).unwrap();
+        fs::write(&kitty, "# original\n").unwrap();
+        let result = apply_with(&locations, false, |_path, _bytes| {
+            let replacement = locations.font.with_extension("replacement");
+            fs::write(&replacement, FONT)?;
+            fs::rename(replacement, &locations.font)?;
+            Err(conflict("injected failure"))
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("Rollback conflict"), "{message}");
+        assert_eq!(fs::read(&locations.font).unwrap(), FONT);
+        assert!(locations.state.join("font-ownership.json").exists());
     }
 
     #[test]
