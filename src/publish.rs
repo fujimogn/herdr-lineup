@@ -8160,7 +8160,9 @@ mod tests {
             log.clone(),
         );
         let mut transport = Transport::connect(&socket).unwrap();
-        let mut publisher = budget_publisher(dir.path(), budget_terms(0, 0, 100));
+        // Admission closes 100 ms after headings; an admitted 60 ms report
+        // keeps a 300 ms margin, so load does not cut it in flight.
+        let mut publisher = budget_publisher(dir.path(), budget_terms(0, 0, 300));
         let reader = NativeLog::default();
         let resources = 14;
         let mut acknowledged = BTreeSet::new();
