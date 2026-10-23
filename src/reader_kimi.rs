@@ -4,6 +4,7 @@
 //! alias's window keys.
 
 use crate::model::*;
+use crate::reader_cache::FingerprintCache;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -16,19 +17,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CACHE_ENTRIES: usize = 128;
 type Turn = (f64, SystemTime, String);
+type WireCache = FingerprintCache<(PathBuf, String), Result<Turn, MissingReason>>;
+type WindowCache = FingerprintCache<(PathBuf, String), Result<f64, MissingReason>>;
 
-struct CachedWire {
-    fingerprint: Fingerprint,
-    observation: Result<Turn, MissingReason>,
-}
-static CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), CachedWire>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CACHE: LazyLock<Mutex<WireCache>> =
+    LazyLock::new(|| Mutex::new(FingerprintCache::new(CACHE_ENTRIES)));
 type StateBinding = Result<Option<(String, PathBuf)>, MissingReason>;
-static STATE_CACHE: LazyLock<Mutex<HashMap<PathBuf, (Fingerprint, StateBinding)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-type CachedWindow = (Fingerprint, Result<f64, MissingReason>);
-static WINDOW_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), CachedWindow>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static STATE_CACHE: LazyLock<Mutex<FingerprintCache<PathBuf, StateBinding>>> =
+    LazyLock::new(|| Mutex::new(FingerprintCache::new(MAX_DIRECTORY_ENTRIES)));
+static WINDOW_CACHE: LazyLock<Mutex<WindowCache>> =
+    LazyLock::new(|| Mutex::new(FingerprintCache::new(CACHE_ENTRIES)));
 
 pub struct KimiReader;
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -113,15 +111,14 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, SystemTime), MissingR
 fn state_binding(budget: &Budget, path: &Path) -> Result<Option<(String, PathBuf)>, MissingReason> {
     let mut file = budget.open(path)?;
     let before = Fingerprint::of(&file.metadata().map_err(|error| io_reason(&error))?);
-    if let Some((fingerprint, binding)) = STATE_CACHE
+    if let Some(binding) = STATE_CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .get(path)
-        && *fingerprint == before
+        .get(&path.to_path_buf(), before)
     {
         budget.check()?;
         if stable_file(path, &file, before)? {
-            return binding.clone();
+            return binding;
         }
         return Err(MissingReason::SourceError);
     }
@@ -143,11 +140,10 @@ fn state_binding(budget: &Budget, path: &Path) -> Result<Option<(String, PathBuf
                 )
                 .map(|(id, cwd)| (id.to_owned(), cwd))
         });
-    let mut cache = STATE_CACHE.lock().map_err(|_| MissingReason::SourceError)?;
-    if cache.len() >= MAX_DIRECTORY_ENTRIES {
-        cache.clear();
-    }
-    cache.insert(path.to_path_buf(), (before, binding.clone()));
+    STATE_CACHE
+        .lock()
+        .map_err(|_| MissingReason::SourceError)?
+        .insert(path.to_path_buf(), before, binding.clone());
     binding
 }
 
@@ -226,11 +222,10 @@ fn read_wire(
     if let Some(cached) = CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .get(&key)
-        && cached.fingerprint == fingerprint
+        .get(&key, fingerprint)
     {
         budget.check()?;
-        return cached.observation.clone();
+        return cached;
     }
     let text = read_jsonl_tail(budget, &mut file, fingerprint.size, |_| Ok(()))?;
     budget.check()?;
@@ -250,17 +245,10 @@ fn read_wire(
         result,
         Err(MissingReason::Timeout | MissingReason::SourceError | MissingReason::PermissionDenied)
     ) {
-        let mut cache = CACHE.lock().map_err(|_| MissingReason::SourceError)?;
-        if cache.len() >= CACHE_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(
-            key,
-            CachedWire {
-                fingerprint,
-                observation: result.clone(),
-            },
-        );
+        CACHE
+            .lock()
+            .map_err(|_| MissingReason::SourceError)?
+            .insert(key, fingerprint, result.clone());
     }
     result
 }
@@ -406,15 +394,14 @@ fn model_window(budget: &Budget, home: &Path, alias: &str) -> Result<f64, Missin
     let mut file = budget.open(&path)?;
     let before = Fingerprint::of(&file.metadata().map_err(|error| io_reason(&error))?);
     let key = (path.clone(), alias.to_owned());
-    if let Some((fingerprint, window)) = WINDOW_CACHE
+    if let Some(window) = WINDOW_CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .get(&key)
-        && *fingerprint == before
+        .get(&key, before)
     {
         budget.check()?;
         if stable_file(&path, &file, before)? {
-            return *window;
+            return window;
         }
         return Err(MissingReason::SourceError);
     }
@@ -423,13 +410,10 @@ fn model_window(budget: &Budget, home: &Path, alias: &str) -> Result<f64, Missin
         return Err(MissingReason::SourceError);
     }
     let window = parse_window(&bytes, alias);
-    let mut cache = WINDOW_CACHE
+    WINDOW_CACHE
         .lock()
-        .map_err(|_| MissingReason::SourceError)?;
-    if cache.len() >= CACHE_ENTRIES {
-        cache.clear();
-    }
-    cache.insert(key, (before, window));
+        .map_err(|_| MissingReason::SourceError)?
+        .insert(key, before, window);
     window
 }
 
@@ -1065,6 +1049,50 @@ mod tests {
             .join("sessions/wd_synthetic/session-1/state.json");
         std::fs::write(&state, r#"{"id":"other-session","cwd":"/synthetic/repo"}"#).unwrap();
         assert_eq!(read_session(&base), Err(MissingReason::Unassociated));
+    }
+
+    #[test]
+    fn cached_wire_replacement_and_symlink_are_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = identity(Provider::Kimi);
+        let now = fresh_ms(&request(&bound, dir.path()));
+        install(dir.path(), "session-1", "/synthetic/repo", 75, now, "");
+        let wire = dir
+            .path()
+            .join("sessions/wd_synthetic/session-1/agents/main/wire.jsonl");
+        assert_eq!(
+            read_at(dir.path(), "session-1", "/synthetic/repo"),
+            UsageOutcome::Available(7.5)
+        );
+
+        let metadata = std::fs::metadata(&wire).unwrap();
+        let replacement = wire.with_extension("replacement");
+        std::fs::write(
+            &replacement,
+            std::fs::read_to_string(&wire)
+                .unwrap()
+                .replace("\"tokens\":75", "\"tokens\":85"),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(metadata.modified().unwrap())
+            .unwrap();
+        std::fs::rename(&replacement, &wire).unwrap();
+        assert_eq!(
+            read_at(dir.path(), "session-1", "/synthetic/repo"),
+            UsageOutcome::Available(8.5)
+        );
+
+        let saved = wire.with_extension("saved");
+        std::fs::rename(&wire, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &wire).unwrap();
+        assert!(!matches!(
+            read_at(dir.path(), "session-1", "/synthetic/repo"),
+            UsageOutcome::Available(_)
+        ));
     }
 
     #[test]
