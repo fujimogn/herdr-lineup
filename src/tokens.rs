@@ -309,9 +309,10 @@ struct ResourceState {
     reserved: Option<Report>,
 }
 
-/// Pure planner. The daemon must durably persist `checkpoint()` after every
-/// successful `prepare()` and BEFORE sending its report. If persistence fails,
-/// do not send. Only call `acknowledge()` after the server accepts the report.
+/// Pure planner. Before sending, the daemon must durably reserve and confirm
+/// an endpoint sequence window covering the prepared report. Reports within
+/// that window need no per-prepare persistence. If reservation persistence
+/// fails, do not send. Only call `acknowledge()` after server acceptance.
 /// Restoring a checkpoint intentionally drops cached values and forces a full
 /// authoritative republish, retaining per-endpoint/session/resource sequences.
 #[derive(Clone, Debug, Default)]
