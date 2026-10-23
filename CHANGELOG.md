@@ -6,7 +6,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 Development after v0.2.2 updates CI, release tooling, the locked dependency set, and three P2 fixes.
 
-- Fix: **Kimi weekly quota** adds end-to-end wiring tests and shares retention, reset, expiry, and credential-change rules with Codex and Grok while removing the unused `WeeklyWorker` sample cache.
+- Fix: **Kimi weekly quota** adds end-to-end wiring tests and shares reset and retention helpers across providers while removing the unused `WeeklyWorker` sample cache. Credential-change handling remains provider-specific and is covered by the Kimi wiring tests.
 - Fix: **Font apply** refuses concurrent external edits before writing, compares planned original bytes before each write, cleans up incomplete font files on partial failure, and rolls back only files changed by this operation so external edits and journal consistency are preserved.
 - Performance: **Codex and Kimi fingerprint cache** is shared in one implementation, reducing duplicate cache code while preserving duplicate and symlink rejection and the 4,096-entry traversal boundary.
 - Maintenance: **CI** runs light checks on pushes to `develop` and on pull requests: Actionlint, gitleaks, formatting, Clippy, and `cargo test` (unit, integration, and doc tests). Pushes to `main` and `v*` tags keep the full checks, including the release build, binary-license check, CLI help, version and release-note gates, and the dependency audit.
