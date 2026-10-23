@@ -236,7 +236,19 @@ impl Drop for FontLock {
 fn apply_with(
     locations: &Locations,
     removing: bool,
+    writer: impl FnMut(&Path, &[u8]) -> io::Result<()>,
+) -> io::Result<Vec<String>> {
+    apply_with_font(locations, removing, writer, |file, bytes| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+fn apply_with_font(
+    locations: &Locations,
+    removing: bool,
     mut writer: impl FnMut(&Path, &[u8]) -> io::Result<()>,
+    mut font_writer: impl FnMut(&mut fs::File, &[u8]) -> io::Result<()>,
 ) -> io::Result<Vec<String>> {
     let locations = locations.resolved()?;
     check_path(&locations.state)?;
@@ -401,8 +413,7 @@ fn apply_with(
                     .open(&locations.font)?;
                 created_font = true;
                 changed_paths.push(locations.font.clone());
-                file.write_all(FONT)?;
-                file.sync_all()?;
+                font_writer(&mut file, FONT)?;
             }
             for (path, text, original) in &changes {
                 if &fs::read(path)? != original {
@@ -1122,6 +1133,48 @@ mod tests {
                     format!("# original\n{external_edit}")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn font_creation_partial_write_or_sync_failure_cleans_up_incomplete_font() {
+        for fail_stage in ["partial_write", "sync"] {
+            let (_root, locations) = fixture();
+            let kitty = locations.config.join("kitty/kitty.conf");
+            fs::create_dir_all(kitty.parent().unwrap()).unwrap();
+            fs::write(&kitty, "# original\n").unwrap();
+
+            let result = apply_with_font(&locations, false, write_atomic, |file, bytes| {
+                if fail_stage == "partial_write" {
+                    file.write_all(b"partial corrupted font")?;
+                    Err(conflict("injected font write failure"))
+                } else {
+                    file.write_all(bytes)?;
+                    Err(conflict("injected font sync failure"))
+                }
+            });
+            assert!(result.is_err(), "stage {fail_stage} must fail");
+            assert!(
+                !locations.font.exists(),
+                "incomplete font file must be removed for stage {fail_stage}"
+            );
+            assert!(
+                !locations.state.join("font-ownership.json").exists(),
+                "journal must be cleaned up for stage {fail_stage}"
+            );
+            assert_eq!(
+                fs::read_to_string(&kitty).unwrap(),
+                "# original\n",
+                "terminal file must be untouched for stage {fail_stage}"
+            );
+
+            // Verify clean retry succeeds
+            install(&locations).unwrap();
+            assert!(locations.font.exists());
+            assert!(fs::read_to_string(&kitty).unwrap().contains(START));
+            uninstall(&locations).unwrap();
+            assert!(!locations.font.exists());
+            assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
         }
     }
 
