@@ -200,7 +200,8 @@ fn openat(dir: &File, name: &str, flags: i32) -> Result<File, MissingReason> {
     let name = std::ffi::CString::new(name).map_err(|_| MissingReason::Invalid)?;
     // SAFETY: `dir` is an open directory and `name` is one NUL-terminated path
     // component. `O_NOFOLLOW` makes a symlink return an error instead of a target.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    // `O_CLOEXEC` keeps both the directory and file descriptors from surviving exec.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io_reason(&std::io::Error::last_os_error()));
     }
@@ -493,6 +494,32 @@ mod tests {
     use super::*;
     use crate::model::tests::{identity, request};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn raw_openat_directory_and_file_keep_cloexec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/wire.jsonl"), b"{}\n").unwrap();
+        let root = open_directory(dir.path()).unwrap();
+        let child = openat(
+            &root,
+            "nested",
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )
+        .unwrap();
+        let file = openat(
+            &child,
+            "wire.jsonl",
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+        .unwrap();
+        for descriptor in [&child, &file] {
+            let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
 
     #[test]
     fn typed_wire_ignores_valid_non_objects_and_rejects_completed_corruption() {
