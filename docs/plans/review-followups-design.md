@@ -55,7 +55,11 @@ Each behavior task starts from a failing regression or an existing invariant
 suite, then runs focused tests. The integration candidate later runs
 `cargo fmt --all --check`, locked Clippy for all targets with warnings denied,
 locked tests, a locked release build, and binary help. A fresh worktree build
-can exceed 1 GiB; report that estimate before starting it.
+can exceed 1 GiB; report that estimate before starting it. The commander
+permitted one such run on the coverage worktree. The commander also owns the
+final GPT-6.1 Sol high review from `d3ccbc17d3f8344d466015fac580cd0fe3b60269`
+to the final head fixed when that review starts. A local GO is not queue
+acceptance, and an unconfirmed review is not completion.
 
 Benchmark fixtures use synthetic data and must not delete a non-`/tmp` root.
 Each task is its own commit. Rollback is the previous local commit, without

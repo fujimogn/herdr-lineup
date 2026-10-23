@@ -39,6 +39,17 @@ These assignments already exist on Formation
 - [ ] `lane_inventory` / `asg_review_coverage`: this coverage record, this
   design, and this plan.
 
+## Final inclusive review
+
+Owner: `lane_commander`. This is a completion condition for the integration
+candidate. This lane does not launch the review.
+
+- [ ] Review the full diff from `d3ccbc17d3f8344d466015fac580cd0fe3b60269` to the final head fixed when the review starts. Use GPT-6.1 Sol high.
+- [ ] Include every commit that an accepted review does not already cover.
+- [ ] Resolve every NO-GO in that history with a later GO in the same chain.
+- [ ] Treat the local Sol high reads in `docs/reviews/review-followup-coverage.md` as evidence only. They are not queue acceptance.
+- [ ] Do not reimplement M2, M3, or C3 for this gate, and do not mark those rows shipped before the review is GO.
+
 ## Ordered work after the current wave
 
 1. [ ] Integrate the current wave only after each lane has a clean commit and
