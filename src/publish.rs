@@ -8757,8 +8757,24 @@ mod tests {
     // publisher-owned diagnostics; the next refresh starts with a fresh cycle.
     #[test]
     fn one_reader_cycle_per_refresh_shares_discovery_and_diagnostics() {
+        // Codex's process-global BUSY permit is intentionally shared by readers.
+        // Isolate this discovery assertion from other tests holding that permit.
+        const CHILD: &str = "HERDR_LINEUP_PUBLISH_CYCLE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "publish::tests::one_reader_cycle_per_refresh_shares_discovery_and_diagnostics",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         struct CycleProbe {
-            scans: std::sync::Mutex<Vec<(usize, usize)>>,
+            scans: std::sync::Mutex<Vec<(usize, usize, usize)>>,
             diagnostics: std::sync::Mutex<Vec<Arc<model::ReaderDiagnostics>>>,
         }
         impl UsageReader for CycleProbe {
@@ -8770,12 +8786,18 @@ mod tests {
                 request: &ReadRequest<'_>,
                 cycle: &model::ReadCycle,
             ) -> UsageReading {
+                let before = cycle.discovery_scan_count();
                 let reading = CodexReader.read_in_cycle(request, cycle);
+                assert_eq!(
+                    reading.context,
+                    UsageOutcome::Unavailable(MissingReason::NotFound),
+                    "empty synthetic directory must complete discovery, not BUSY/timeout"
+                );
                 let address = std::ptr::from_ref(cycle) as usize;
                 self.scans
                     .lock()
                     .unwrap()
-                    .push((address, cycle.discovery_scan_count()));
+                    .push((address, before, cycle.discovery_scan_count()));
                 self.diagnostics
                     .lock()
                     .unwrap()
@@ -8812,6 +8834,41 @@ mod tests {
             read: ship_time::RepositoryRead::Complete(None),
             verified_at: None,
         }));
+        let negative_cycle =
+            model::ReadCycle::with_diagnostics(publisher.reader_diagnostics.clone());
+        let identity = model::SessionIdentity {
+            provider: Provider::Codex,
+            native_session_id: "negative".into(),
+            repository_identity: "/synthetic/codex".into(),
+        };
+        let refused = CodexReader.read_in_cycle(
+            &ReadRequest {
+                identity: &identity,
+                home: &dir.path().join("codex-home"),
+                now: SystemTime::now(),
+                max_age: Duration::from_secs(60),
+                timeout: Duration::ZERO,
+                shutdown: None,
+            },
+            &negative_cycle,
+        );
+        assert_eq!(
+            refused.context,
+            UsageOutcome::Unavailable(MissingReason::Timeout)
+        );
+        assert_eq!(
+            negative_cycle.discovery_scan_count(),
+            0,
+            "a timeout need not have scanned"
+        );
+        assert_eq!(
+            publisher
+                .reader_diagnostics
+                .snapshot(Provider::Codex)
+                .unwrap()
+                .deadline_ends,
+            1
+        );
         let probe = CycleProbe {
             scans: std::sync::Mutex::default(),
             diagnostics: std::sync::Mutex::default(),
@@ -8832,11 +8889,10 @@ mod tests {
         assert_eq!(scans.len(), 4);
         for refresh in scans.chunks(2) {
             assert_eq!(refresh[0].0, refresh[1].0, "panes used different cycles");
-            assert_eq!(
-                refresh[0].1, 1,
-                "a refresh did not start with an empty cycle"
-            );
-            assert!((1..=2).contains(&refresh[1].1));
+            assert_eq!(refresh[0].1, 0, "a refresh reused prior discovery");
+            assert_eq!(refresh[0].2, 1, "first completed read did not scan");
+            assert_eq!(refresh[1].1, 1, "second pane did not inherit discovery");
+            assert!((1..=2).contains(&refresh[1].2));
         }
         assert!(
             probe

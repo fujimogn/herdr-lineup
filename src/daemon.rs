@@ -62,6 +62,8 @@ pub struct ReaderDiagnosticsHandle {
     diagnostics: Arc<crate::model::ReaderDiagnostics>,
     #[cfg(test)]
     samples: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    sample_gate: Option<Arc<ControlTestGate>>,
 }
 
 impl std::fmt::Debug for ReaderDiagnosticsHandle {
@@ -76,12 +78,18 @@ impl ReaderDiagnosticsHandle {
             diagnostics,
             #[cfg(test)]
             samples: Arc::default(),
+            #[cfg(test)]
+            sample_gate: None,
         }
     }
 
     fn sample(&self) -> ReaderDiagnosticsData {
         #[cfg(test)]
         self.samples.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(gate) = &self.sample_gate {
+            gate.wait();
+        }
         let providers = self
             .diagnostics
             .snapshots()
@@ -380,12 +388,33 @@ pub(crate) struct DeadlineSkipObservation {
     pub last_capacity_skipped: u64,
 }
 
+// Channel gates exercise the real control worker's lock scope in normal tests.
+#[cfg(test)]
+#[derive(Debug)]
+struct ControlTestGate {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+#[cfg(test)]
+impl ControlTestGate {
+    fn wait(&self) {
+        self.entered.send(()).unwrap();
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ControlState {
     health: Health,
     observation: Option<RefreshObservation>,
     deadline_skips: Option<DeadlineSkipObservation>,
     reader_diagnostics: Option<ReaderDiagnosticsHandle>,
+    #[cfg(test)]
+    write_gate: Option<Arc<ControlTestGate>>,
 }
 
 impl From<Health> for ControlState {
@@ -395,6 +424,8 @@ impl From<Health> for ControlState {
             observation: None,
             deadline_skips: None,
             reader_diagnostics: None,
+            #[cfg(test)]
+            write_gate: None,
         }
     }
 }
@@ -1400,6 +1431,10 @@ fn serve_control(stream: UnixStream, snapshot: &ControlState) -> io::Result<bool
     let Ok(bytes) = control_frame(snapshot) else {
         return Ok(false);
     };
+    #[cfg(test)]
+    if let Some(gate) = &snapshot.write_gate {
+        gate.wait();
+    }
     if write_frame(reader.get_mut(), &bytes).is_err() {
         return Ok(false);
     }
@@ -2081,6 +2116,14 @@ mod tests {
         let mut command = child_command();
         command.env("LINEUP_TEST_RECORD_START", "1");
         let restarted = ensure_command(&options, command);
+        assert!(
+            stopped.is_ok(),
+            "stop failed before restart probe: {stopped:?}"
+        );
+        assert!(
+            restarted.is_ok(),
+            "ensure failed before restart probe: {restarted:?}"
+        );
         let new = probe(&paths, &options.socket).unwrap().unwrap();
         // Reap only the child owned by this fixture, even on a regression.
         let old_exited_at_start = old.try_wait().unwrap().is_some();
@@ -2361,6 +2404,14 @@ mod tests {
         let stopped = stop(&options);
         let cleared = options.state.join("clear-called").exists();
         let restarted = ensure_command(&options, child_command());
+        assert!(
+            stopped.is_ok(),
+            "stop failed before restart probe: {stopped:?}"
+        );
+        assert!(
+            restarted.is_ok(),
+            "ensure failed before restart probe: {restarted:?}"
+        );
         let new = probe(&paths, &options.socket).unwrap().unwrap();
         // Clean up even when the regression assertion fails.
         stop(&options).unwrap();
@@ -3464,6 +3515,8 @@ mod tests {
             observation,
             deadline_skips: None,
             reader_diagnostics: None,
+            #[cfg(test)]
+            write_gate: None,
         };
         let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
         let measured = roundtrip.observation.unwrap().stages.unwrap();
@@ -3724,6 +3777,8 @@ mod tests {
             observation: parsed.observation.clone(),
             deadline_skips: None,
             reader_diagnostics: None,
+            #[cfg(test)]
+            write_gate: None,
         };
         let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
         assert_eq!(roundtrip.health.nonce, parsed.health.nonce);
@@ -4070,7 +4125,20 @@ mod tests {
 
     #[test]
     fn reader_wire_skew_does_not_erase_health_or_valid_siblings() {
-        let (state, _) = reader_test_state();
+        let (mut state, _) = reader_test_state();
+        note(
+            &mut state.health,
+            &mut state.observation,
+            &Ok(()),
+            9,
+            Some(10),
+            None,
+        );
+        state.deadline_skips = Some(DeadlineSkipObservation {
+            attempt_count: 3,
+            last_deadline_skipped: 4,
+            last_capacity_skipped: 2,
+        });
         let base: serde_json::Value =
             serde_json::from_slice(&control_frame(&state).unwrap()).unwrap();
         let decode = |value: &serde_json::Value| {
@@ -4087,6 +4155,8 @@ mod tests {
             value["reader_diagnostics"] = bad;
             let view = decode(&value);
             assert!(view.reader_diagnostics.is_none());
+            assert_eq!(view.observation.unwrap().attempt_count, 1);
+            assert_eq!(view.deadline_skips.unwrap().last_capacity_skipped, 2);
             assert_eq!(view.health.nonce, state.health.nonce);
         }
         let mut bad_samples = Vec::new();
@@ -4095,6 +4165,7 @@ mod tests {
             serde_json::json!(1.5),
             serde_json::json!("4"),
             serde_json::json!(true),
+            serde_json::from_str("18446744073709551616").unwrap(),
         ] {
             let mut value = base.clone();
             value["reader_diagnostics"]["providers"]["codex"]["sample"]["attempts"] = bad;
@@ -4216,6 +4287,10 @@ mod tests {
         let handle = state.reader_diagnostics.as_ref().unwrap().clone();
         let normal = control_frame(&state).unwrap();
         assert!(normal.len() < 8192);
+        eprintln!(
+            "reader maximum combined frame including newline: {} bytes",
+            normal.len() + 1
+        );
         let parsed = control_view_from_frame(&normal).unwrap();
         assert_eq!(
             reader_entry(&parsed, "codex").caller_wait_total_ns,
@@ -4295,35 +4370,65 @@ mod tests {
 
     #[test]
     fn reader_sampling_and_slow_client_do_not_hold_control_mutex() {
-        use crate::model::Provider;
-        let (state, diagnostics) = reader_test_state();
-        let shared = Arc::new(Mutex::new(state));
-        let snapshot = shared.lock().unwrap().clone();
-        diagnostics.test_with_slot(Provider::Claude, || {
-            assert!(shared.try_lock().is_ok());
-            assert!(matches!(
-                reader_view(&snapshot).reader_diagnostics.unwrap().providers["claude"],
-                ReaderEntry::Contended
-            ));
-            assert!(shared.try_lock().is_ok());
-        });
-        let (mut client, server) = UnixStream::pair().unwrap();
-        server.set_nonblocking(true).unwrap();
+        fn gate() -> (
+            Arc<ControlTestGate>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (entered, arrival) = std::sync::mpsc::sync_channel(1);
+            let (release, released) = std::sync::mpsc::channel();
+            (
+                Arc::new(ControlTestGate {
+                    entered,
+                    release: Mutex::new(released),
+                }),
+                arrival,
+                release,
+            )
+        }
+        let (mut state, diagnostics) = reader_test_state();
+        let (sampling, sample_arrived, sample_release) = gate();
+        let (writing, write_arrived, write_release) = gate();
+        state.reader_diagnostics.as_mut().unwrap().sample_gate = Some(sampling);
+        state.write_gate = Some(writing);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let control = ControlWorker::start(listener, state);
+        let mut client = UnixStream::connect(path).unwrap();
         client.write_all(b"health\n").unwrap();
-        let worker = std::thread::spawn(move || serve_control(server, &snapshot));
+        sample_arrived.recv_timeout(Duration::from_secs(2)).unwrap();
+        // This is the actual ControlWorker state, while its sampler is gated.
+        let sample_unlocked = control.state.try_lock().is_ok();
+        sample_release.send(()).unwrap();
+        write_arrived.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Deliberately stall the actual write site; no claim of kernel backpressure.
+        let write_unlocked = control.state.try_lock().is_ok();
+        write_release.send(()).unwrap();
         let mut client = BufReader::new(client);
-        let frame = read_frame(&mut client, 8192).unwrap();
-        assert!(
-            control_view_from_frame(&frame)
+        let view = control_view_from_frame(&read_frame(&mut client, 8192).unwrap()).unwrap();
+        assert_eq!(reader_entry(&view, "claude").attempts, 0);
+        assert_eq!(
+            diagnostics
+                .snapshot(crate::model::Provider::Claude)
                 .unwrap()
-                .reader_diagnostics
-                .is_some()
+                .attempts,
+            0
         );
-        assert!(shared.try_lock().is_ok());
         drop(client);
-        assert!(!worker.join().unwrap().unwrap());
+        drop(control);
+        assert!(
+            sample_unlocked,
+            "ControlWorker held state mutex during live sampling"
+        );
+        assert!(
+            write_unlocked,
+            "ControlWorker held state mutex at a stalled control write"
+        );
         assert!(NoopPublisher.reader_diagnostics().is_none());
     }
+
     #[test]
     fn reader_handle_survives_actual_daemon_completed_state_publication() {
         let (_dir, options, done, server) = fixture();
