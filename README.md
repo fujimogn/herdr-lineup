@@ -371,13 +371,16 @@ preserved. If you removed a whole managed block by hand, a later action can
 drop that stale ownership entry. A partly removed or edited block causes a
 conflict. Keep `$HERDR_PLUGIN_STATE_DIR/font-ownership.json`: each `entries`
 item contains the config `path` and exact `owned` text, including newlines.
-If an action fails after it starts changing files, the journal retains a
-`pending` action and its affected paths. The action leaves earlier writes, a
-partially written font, and current terminal files in place. It refuses
-another font action while `pending` exists. Inspect the journal and every
-reported path, establish which bytes are Lineup-owned and which are external
-edits, and make a manual recovery plan before changing anything. If ownership
-cannot be established, stop and keep the files and journal for manual help.
+Before changing a font or terminal file, an action writes a `pending` action
+and affected paths to the journal. On a later failure it leaves earlier writes,
+a partially written font, and current terminal files in place, and refuses
+another font action while `pending` exists. A preflight or initial journal
+write failure may leave no `pending` record; a concurrent journal edit may
+replace one. In either case, inspect the reported path, the journal, and
+current files before deciding whether any action is safe. Establish which
+bytes are Lineup-owned and which are external edits, then make a manual
+recovery plan. If ownership cannot be established, stop and keep the files
+and journal for manual help.
 Do not delete the journal or simply retry to bypass the refusal. For a
 modified managed block, restore its exact recorded text once while preserving
 unrelated edits only after confirming its ownership. If a terminal config is
