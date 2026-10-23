@@ -2338,7 +2338,7 @@ mod tests {
         clock: Arc<std::sync::atomic::AtomicU64>,
         template: Arc<std::sync::Mutex<Value>>,
     ) -> std::thread::JoinHandle<()> {
-        sequence_server(listener, clock, template, Arc::default())
+        sequence_server(listener, clock, template, Arc::default(), Arc::default())
     }
 
     /// One received metadata report: resource ID, seq, and whether it applied.
@@ -2347,12 +2347,14 @@ mod tests {
     // Like Herdr, a report whose seq is not newer than the last accepted seq
     // for the same resource and source is answered `ok` but not applied. The
     // accepted seq outlives the resource leaving the snapshot, so a reused ID
-    // must also move forward.
+    // must also move forward. A report whose seq equals `lose_response_for`
+    // is applied and logged, then its connection closes without a reply.
     fn sequence_server(
         listener: UnixListener,
         clock: Arc<std::sync::atomic::AtomicU64>,
         template: Arc<std::sync::Mutex<Value>>,
         log: ReportLog,
+        lose_response_for: Arc<std::sync::atomic::AtomicU64>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
@@ -2408,6 +2410,14 @@ mod tests {
                                     tokens.insert(key.clone(), (value.clone(), now + ttl));
                                 }
                             }
+                        }
+                        if seq == lose_response_for.load(Ordering::Acquire) {
+                            stream
+                                .get_mut()
+                                .0
+                                .shutdown(std::net::Shutdown::Both)
+                                .unwrap();
+                            continue;
                         }
                         json!({"id":request["id"],"result":{"type":"ok"}})
                     }
@@ -7093,6 +7103,7 @@ mod tests {
             clock,
             template.clone(),
             log.clone(),
+            Arc::default(),
         );
         let mut transport = Transport::connect(&socket).unwrap();
         let state = dir.path().join("state");
@@ -7176,6 +7187,7 @@ mod tests {
                 clock,
                 template,
                 log.clone(),
+                Arc::default(),
             );
             let mut transport = Transport::connect(&socket).unwrap();
             let state = dir.path().join("state");
@@ -7252,5 +7264,216 @@ mod tests {
             assert!(log[0].2);
             assert_eq!(log[0].1, expected_disk.unwrap_or_default() + 1);
         }
+    }
+
+    struct SequenceFixture {
+        dir: tempfile::TempDir,
+        socket: PathBuf,
+        state: PathBuf,
+        template: Arc<std::sync::Mutex<Value>>,
+        log: ReportLog,
+        lose_response_for: Arc<std::sync::atomic::AtomicU64>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl SequenceFixture {
+        fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("fake.sock");
+            let state = dir.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
+            let log = ReportLog::default();
+            let lose_response_for = Arc::<std::sync::atomic::AtomicU64>::default();
+            let server = sequence_server(
+                UnixListener::bind(&socket).unwrap(),
+                Arc::default(),
+                template.clone(),
+                log.clone(),
+                lose_response_for.clone(),
+            );
+            Self {
+                dir,
+                socket,
+                state,
+                template,
+                log,
+                lose_response_for,
+                server,
+            }
+        }
+
+        fn publisher(&self) -> MetadataPublisher {
+            MetadataPublisher::new(self.state.clone(), "fake".into(), Homes::default()).unwrap()
+        }
+
+        fn seqs(&self) -> Vec<(u64, bool)> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, seq, applied)| (*seq, *applied))
+                .collect()
+        }
+
+        /// Ends the server and returns its final pane tokens.
+        fn finish(self, publisher: &mut MetadataPublisher, transport: &mut Transport) -> Value {
+            let (_, response) = publisher.request(transport, "session.snapshot").unwrap();
+            publisher.request(transport, "test.finish").unwrap();
+            self.server.join().unwrap();
+            drop(self.dir);
+            response["result"]["snapshot"]["panes"][0]["tokens"].clone()
+        }
+    }
+
+    #[test]
+    fn response_lost_after_apply_is_never_replayed() {
+        let fixture = SequenceFixture::start();
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "a").unwrap();
+        // The server applies seq 2 and then drops the reply.
+        fixture.lose_response_for.store(2, Ordering::Release);
+        assert!(report_logo(&mut publisher, &mut transport, "w1:p1", "b").is_err());
+        assert_eq!(fixture.seqs(), [(1, true), (2, true)]);
+
+        // Reconnect: the unacknowledged seq 2 is not reused and the old
+        // patch is not resent; the current desired value goes out above it.
+        publisher.reconnected();
+        transport.reconnect_same_endpoint().unwrap();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "c").unwrap();
+        // Restart: the new instance continues above the durable bound.
+        drop(publisher);
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "d").unwrap();
+
+        // `reconnected` and restart both discard the rest of the window.
+        let window = MIN_RESERVATION_WINDOW;
+        assert_eq!(
+            fixture.seqs(),
+            [
+                (1, true),
+                (2, true),
+                (window + 1, true),
+                (2 * window + 1, true)
+            ]
+        );
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "d");
+    }
+
+    #[test]
+    fn process_exit_after_reservation_discards_unused_window() {
+        if let Some(socket) = std::env::var_os("LINEUP_SEQUENCE_EXIT_CHILD") {
+            let state = PathBuf::from(std::env::var_os("LINEUP_SEQUENCE_EXIT_STATE").unwrap());
+            let mut transport = Transport::connect(Path::new(&socket)).unwrap();
+            let mut publisher =
+                MetadataPublisher::new(state, "fake".into(), Homes::default()).unwrap();
+            report_logo(&mut publisher, &mut transport, "w1:p1", "child").unwrap();
+            // Exit with 31 reserved slots unused and without running Drop.
+            std::process::exit(0);
+        }
+        let fixture = SequenceFixture::start();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "publish::tests::process_exit_after_reservation_discards_unused_window",
+            ])
+            .env("LINEUP_SEQUENCE_EXIT_CHILD", &fixture.socket)
+            .env("LINEUP_SEQUENCE_EXIT_STATE", &fixture.state)
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "sequence child failed");
+        let child_upper_bound = endpoint_upper_bound_on_disk(&fixture.state).unwrap();
+        assert_eq!(child_upper_bound, MIN_RESERVATION_WINDOW);
+        assert_eq!(fixture.seqs(), [(1, true)]);
+
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "parent").unwrap();
+        assert_eq!(fixture.seqs(), [(1, true), (child_upper_bound + 1, true)]);
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "parent");
+    }
+
+    #[test]
+    fn clear_deadline_after_reservation_burns_the_unsent_seq() {
+        let fixture = SequenceFixture::start();
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        let snapshot = publisher.snapshot(&mut transport).unwrap();
+        let resource = publisher.resource(ResourceKind::Pane, "w1:p1");
+        let desired = BTreeMap::from([("lineup_logo".into(), Some("late".into()))]);
+        // A deadline that has passed by the time the reservation is durable:
+        // `report` reserves and allocates, then stops before the send.
+        let expired = Instant::now();
+        assert!(
+            publisher
+                .report(
+                    &mut transport,
+                    &resource,
+                    &snapshot.panes[0].stored_keys,
+                    None,
+                    &desired,
+                    Some(expired),
+                )
+                .is_err()
+        );
+        assert!(fixture.seqs().is_empty());
+        assert_eq!(
+            endpoint_upper_bound_on_disk(&fixture.state),
+            Some(MIN_RESERVATION_WINDOW)
+        );
+
+        report_logo(&mut publisher, &mut transport, "w1:p1", "next").unwrap();
+        drop(publisher);
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "restart").unwrap();
+        // Seq 1 was burned without a send; the restart skips the unused window.
+        assert_eq!(
+            fixture.seqs(),
+            [(2, true), (MIN_RESERVATION_WINDOW + 1, true)]
+        );
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "restart");
+    }
+
+    #[test]
+    fn failed_pruning_persist_poisons_refresh_clear_and_reconnect() {
+        let fixture = SequenceFixture::start();
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "a").unwrap();
+        let removed = std::mem::take(
+            fixture.template.lock().unwrap()["result"]["snapshot"]["panes"]
+                .as_array_mut()
+                .unwrap(),
+        );
+        let snapshot = publisher.snapshot(&mut transport).unwrap();
+        *publisher.persist_fault.lock().unwrap() = Some(PersistStage::DirectorySync);
+        assert!(publisher.reconcile_missing(&snapshot).is_err());
+        *publisher.persist_fault.lock().unwrap() = None;
+        fixture.template.lock().unwrap()["result"]["snapshot"]["panes"] = Value::Array(removed);
+
+        assert!(
+            publisher
+                .refresh(&mut transport, &crate::config::Config::default())
+                .is_err()
+        );
+        publisher.reconnected();
+        assert!(publisher.snapshot(&mut transport).is_err());
+        assert!(publisher.clear(&mut transport).is_err());
+        assert!(report_logo(&mut publisher, &mut transport, "w1:p1", "b").is_err());
+        assert_eq!(fixture.seqs(), [(1, true)]);
+
+        drop(publisher);
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "b").unwrap();
+        assert_eq!(
+            fixture.seqs(),
+            [(1, true), (MIN_RESERVATION_WINDOW + 1, true)]
+        );
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "b");
     }
 }
