@@ -55,8 +55,171 @@ impl Options {
     }
 }
 
+/// Opaque memory-only access to advisory reader observations.
+/// Cloning this handle does not join workers or acquire provider locks.
+#[derive(Clone)]
+pub struct ReaderDiagnosticsHandle {
+    diagnostics: Arc<crate::model::ReaderDiagnostics>,
+    #[cfg(test)]
+    samples: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Debug for ReaderDiagnosticsHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReaderDiagnosticsHandle(opaque)")
+    }
+}
+
+impl ReaderDiagnosticsHandle {
+    pub(crate) fn new(diagnostics: Arc<crate::model::ReaderDiagnostics>) -> Self {
+        Self {
+            diagnostics,
+            #[cfg(test)]
+            samples: Arc::default(),
+        }
+    }
+
+    fn sample(&self) -> ReaderDiagnosticsData {
+        #[cfg(test)]
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        let providers = self
+            .diagnostics
+            .snapshots()
+            .into_iter()
+            .map(|(provider, result)| {
+                use crate::model::{DiagnosticUnavailable, Provider};
+                let label = match provider {
+                    Provider::Claude => "claude",
+                    Provider::Agy => "agy",
+                    Provider::Codex => "codex",
+                    Provider::Grok => "grok",
+                    Provider::Hermes => "hermes",
+                    Provider::Kimi => "kimi",
+                };
+                let entry = match result {
+                    Ok(sample) => ReaderEntry::Available {
+                        sample: ReaderSample::from(sample),
+                    },
+                    Err(DiagnosticUnavailable::Contended) => ReaderEntry::Contended,
+                    Err(DiagnosticUnavailable::Poisoned) => ReaderEntry::Poisoned,
+                    Err(DiagnosticUnavailable::Incomplete) => ReaderEntry::Incomplete,
+                };
+                (label, entry)
+            })
+            .collect();
+        ReaderDiagnosticsData {
+            version: 1,
+            sampling: "live_best_effort",
+            providers,
+        }
+    }
+}
+
+pub(crate) const READER_LABELS: [&str; 6] = ["claude", "agy", "codex", "grok", "hermes", "kimi"];
+
+/// Non-sensitive wire DTO: never serialize a model object or arbitrary labels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReaderSample {
+    pub attempts: u64,
+    pub busy_rejections: u64,
+    pub deadline_ends: u64,
+    pub shutdown_ends: u64,
+    pub spawn_failures: u64,
+    pub worker_failures: u64,
+    pub completed: u64,
+    pub invalid: u64,
+    pub caller_wait_count: u64,
+    pub caller_wait_total_ns: u64,
+    pub caller_wait_max_ns: u64,
+    pub sampling_skips: u64,
+    pub worker_active: bool,
+    pub timed_out_worker_active: bool,
+    pub shutdown_worker_active: bool,
+}
+
+impl From<crate::model::ReaderSnapshot> for ReaderSample {
+    fn from(s: crate::model::ReaderSnapshot) -> Self {
+        Self {
+            attempts: s.attempts,
+            busy_rejections: s.busy_rejections,
+            deadline_ends: s.deadline_ends,
+            shutdown_ends: s.shutdown_ends,
+            spawn_failures: s.spawn_failures,
+            worker_failures: s.worker_failures,
+            completed: s.completed,
+            invalid: s.invalid,
+            caller_wait_count: s.caller_wait_count,
+            caller_wait_total_ns: s.caller_wait_total_ns,
+            caller_wait_max_ns: s.caller_wait_max_ns,
+            sampling_skips: s.sampling_skips,
+            worker_active: s.worker_active,
+            timed_out_worker_active: s.timed_out_worker_active,
+            shutdown_worker_active: s.shutdown_worker_active,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ReaderEntry {
+    Available { sample: ReaderSample },
+    Contended,
+    Poisoned,
+    Incomplete,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReaderDiagnosticsData {
+    version: u64,
+    sampling: &'static str,
+    pub providers: std::collections::BTreeMap<&'static str, ReaderEntry>,
+}
+
+fn reader_diagnostics_from_raw(raw: &serde_json::Value) -> Option<ReaderDiagnosticsData> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Envelope {
+        version: u64,
+        sampling: String,
+        providers: serde_json::Map<String, serde_json::Value>,
+    }
+    let envelope: Envelope = serde_json::from_value(raw.clone()).ok()?;
+    if envelope.version != 1 || envelope.sampling != "live_best_effort" {
+        return None;
+    }
+    let providers = READER_LABELS
+        .into_iter()
+        .map(|label| {
+            let entry = envelope
+                .providers
+                .get(label)
+                .and_then(|value| serde_json::from_value::<ReaderEntry>(value.clone()).ok())
+                .filter(|entry| match entry {
+                    ReaderEntry::Available { sample } => {
+                        sample.worker_active
+                            || !(sample.timed_out_worker_active || sample.shutdown_worker_active)
+                    }
+                    _ => true,
+                })
+                .unwrap_or(ReaderEntry::Unavailable);
+            (label, entry)
+        })
+        .collect();
+    Some(ReaderDiagnosticsData {
+        version: 1,
+        sampling: "live_best_effort",
+        providers,
+    })
+}
+
 /// Implementations must bound I/O and clear only plugin-owned metadata.
 pub trait Publisher {
+    /// Advisory reader state; unavailable for publishers without a registry.
+    fn reader_diagnostics(&self) -> Option<ReaderDiagnosticsHandle> {
+        None
+    }
     /// Observe shutdown between bounded reader calls and complete metadata frames.
     fn set_shutdown(&mut self, _shutdown: Arc<AtomicBool>) {}
     /// Stop owned background queries on every exit, without joining HTTP I/O.
@@ -222,6 +385,7 @@ struct ControlState {
     health: Health,
     observation: Option<RefreshObservation>,
     deadline_skips: Option<DeadlineSkipObservation>,
+    reader_diagnostics: Option<ReaderDiagnosticsHandle>,
 }
 
 impl From<Health> for ControlState {
@@ -230,6 +394,7 @@ impl From<Health> for ControlState {
             health,
             observation: None,
             deadline_skips: None,
+            reader_diagnostics: None,
         }
     }
 }
@@ -242,12 +407,16 @@ struct ControlResponse<'a> {
     refresh_observation: Option<&'a RefreshObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_deadline_skips: Option<&'a DeadlineSkipObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reader_diagnostics: Option<&'a ReaderDiagnosticsData>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ControlView {
     pub health: Health,
     pub observation: Option<RefreshObservation>,
+    pub deadline_skips: Option<DeadlineSkipObservation>,
+    pub reader_diagnostics: Option<ReaderDiagnosticsData>,
 }
 
 struct MeasuredRefresh<'a> {
@@ -560,12 +729,36 @@ fn observation_from_raw(raw: &serde_json::Value) -> Option<RefreshObservation> {
 }
 
 fn control_frame(state: &ControlState) -> io::Result<Vec<u8>> {
-    let response = ControlResponse {
+    // Exactly one live sample per response, reused throughout size fallback.
+    let readers = state
+        .reader_diagnostics
+        .as_ref()
+        .map(ReaderDiagnosticsHandle::sample);
+    let mut response = ControlResponse {
         health: &state.health,
         refresh_observation: state.observation.as_ref(),
         refresh_deadline_skips: state.deadline_skips.as_ref(),
+        reader_diagnostics: readers.as_ref(),
     };
-    serde_json::to_vec(&response).map_err(|_| io::Error::other("invalid daemon control snapshot"))
+    for step in 0..3 {
+        let bytes = serde_json::to_vec(&response)
+            .map_err(|_| io::Error::other("invalid daemon control snapshot"))?;
+        // write_frame appends one newline, and read_frame counts that byte.
+        if bytes.len() < 8192 {
+            return Ok(bytes);
+        }
+        match step {
+            0 => response.reader_diagnostics = None,
+            1 => {
+                response.refresh_observation = None;
+                response.refresh_deadline_skips = None;
+            }
+            _ => break,
+        }
+    }
+    Err(io::Error::other(
+        "daemon control health exceeds frame limit",
+    ))
 }
 
 pub(crate) fn control_view_from_frame(frame: &[u8]) -> io::Result<ControlView> {
@@ -577,15 +770,23 @@ pub(crate) fn control_view_from_frame(frame: &[u8]) -> io::Result<ControlView> {
         None | Some(serde_json::Value::Null) => None,
         Some(raw) => observation_from_raw(raw),
     };
+    let deadline_skips = value
+        .get("refresh_deadline_skips")
+        .and_then(|raw| serde_json::from_value(raw.clone()).ok());
+    let reader_diagnostics = value
+        .get("reader_diagnostics")
+        .and_then(reader_diagnostics_from_raw);
     Ok(ControlView {
         health,
         observation,
+        deadline_skips,
+        reader_diagnostics,
     })
 }
 
 /// Typed seam for doctor: the optional deadline skip field of a control
 /// frame. Absent, null or invalid reads as unavailable, never as zero.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn deadline_skips_from_frame(frame: &[u8]) -> Option<DeadlineSkipObservation> {
     let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
     serde_json::from_value(value.get("refresh_deadline_skips")?.clone()).ok()
@@ -775,6 +976,7 @@ fn run_locked(
         refresh_failed: false,
         capacity_skipped_resources: 0,
     });
+    state.reader_diagnostics = publisher.reader_diagnostics();
     fs::write(&paths.pid, format!("{}\n", state.health.pid))?;
     let control = ControlWorker::start(listener, state.clone());
     publisher.set_shutdown(control.shutdown.clone());
@@ -1485,6 +1687,30 @@ mod tests {
                     &mut publisher,
                 )
                 .unwrap();
+                return;
+            }
+            if std::env::var_os("LINEUP_TEST_READER_DIAGNOSTICS").is_some() {
+                struct ReaderPublisher(Arc<crate::model::ReaderDiagnostics>);
+                impl Publisher for ReaderPublisher {
+                    fn reader_diagnostics(&self) -> Option<ReaderDiagnosticsHandle> {
+                        Some(ReaderDiagnosticsHandle::new(self.0.clone()))
+                    }
+                    fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                        self.0.test_seed(
+                            crate::model::Provider::Codex,
+                            crate::model::ReaderSnapshot {
+                                attempts: 42,
+                                ..Default::default()
+                            },
+                        );
+                        Ok(())
+                    }
+                    fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let diagnostics = Arc::new(crate::model::ReaderDiagnostics::default());
+                run_foreground(&options, true, &mut ReaderPublisher(diagnostics)).unwrap();
                 return;
             }
             if std::env::var_os("LINEUP_TEST_REFRESH_DEADLINE_SKIP").is_some() {
@@ -3237,6 +3463,7 @@ mod tests {
             health,
             observation,
             deadline_skips: None,
+            reader_diagnostics: None,
         };
         let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
         let measured = roundtrip.observation.unwrap().stages.unwrap();
@@ -3496,6 +3723,7 @@ mod tests {
             health: parsed.health.clone(),
             observation: parsed.observation.clone(),
             deadline_skips: None,
+            reader_diagnostics: None,
         };
         let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
         assert_eq!(roundtrip.health.nonce, parsed.health.nonce);
@@ -3725,5 +3953,396 @@ mod tests {
                     .is_some()
             );
         }
+    }
+    #[test]
+    fn reader_frame_rejects_oversized_health_without_truncating_identity() {
+        let mut state = ControlState::from(sample_health());
+        state.health.socket_path = PathBuf::from("/".to_owned() + &"x".repeat(8192));
+        assert!(
+            control_frame(&state).is_err(),
+            "health alone must fit including newline"
+        );
+    }
+    fn reader_test_state() -> (ControlState, Arc<crate::model::ReaderDiagnostics>) {
+        let diagnostics = Arc::new(crate::model::ReaderDiagnostics::default());
+        let mut state = ControlState::from(sample_health());
+        state.reader_diagnostics = Some(ReaderDiagnosticsHandle::new(diagnostics.clone()));
+        (state, diagnostics)
+    }
+
+    fn reader_entry(view: &ControlView, label: &str) -> ReaderSample {
+        match &view.reader_diagnostics.as_ref().unwrap().providers[label] {
+            ReaderEntry::Available { sample } => sample.clone(),
+            other => panic!("expected available, got {other:?}"),
+        }
+    }
+
+    fn reader_view(state: &ControlState) -> ControlView {
+        control_view_from_frame(&control_frame(state).unwrap()).unwrap()
+    }
+
+    // Removing per-slot try_lock or flattening unavailable into zero breaks this.
+    #[test]
+    fn reader_control_reports_real_contention_poison_and_incomplete_independently() {
+        use crate::model::Provider;
+        let (state, diagnostics) = reader_test_state();
+        diagnostics.test_with_slot(Provider::Codex, || {
+            let view = reader_view(&state);
+            assert!(matches!(
+                view.reader_diagnostics.unwrap().providers["codex"],
+                ReaderEntry::Contended
+            ));
+        });
+        let clone = diagnostics.clone();
+        assert!(
+            std::thread::spawn(
+                move || clone.test_with_slot(Provider::Grok, || panic!("synthetic poison"))
+            )
+            .join()
+            .is_err()
+        );
+        diagnostics.test_unknown(Provider::Kimi);
+        let view = reader_view(&state);
+        let readers = view.reader_diagnostics.as_ref().unwrap();
+        assert!(matches!(readers.providers["grok"], ReaderEntry::Poisoned));
+        assert!(matches!(readers.providers["kimi"], ReaderEntry::Incomplete));
+        assert_eq!(reader_entry(&view, "codex").attempts, 0);
+        assert!(!reader_entry(&view, "codex").worker_active);
+        assert_eq!(view.health.nonce, state.health.nonce);
+    }
+
+    // Sampling a frozen refresh snapshot would keep active=true after release.
+    #[test]
+    fn reader_control_live_worker_release_is_visible_without_another_refresh() {
+        use crate::model::{
+            self, Provider, ReadRequest, SessionIdentity, SourceKind, UsageReading,
+        };
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let (state, diagnostics) = reader_test_state();
+        let identity = SessionIdentity {
+            provider: Provider::Codex,
+            native_session_id: "synthetic".into(),
+            repository_identity: "synthetic".into(),
+        };
+        let request = ReadRequest {
+            identity: &identity,
+            home: std::path::Path::new("/unused"),
+            now: std::time::SystemTime::now(),
+            max_age: Duration::from_secs(60),
+            timeout: Duration::from_millis(20),
+            shutdown: None,
+        };
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, running) = std::sync::mpsc::channel();
+        let result = model::bounded_read_observed(
+            &request,
+            SourceKind::CodexRollout,
+            &BUSY,
+            &diagnostics,
+            move |r| {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+                UsageReading::sample(r, SourceKind::CodexRollout, 7.0, r.now)
+            },
+        );
+        running.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            result.context,
+            model::UsageOutcome::Unavailable(model::MissingReason::Timeout)
+        );
+        let before = reader_view(&state);
+        let sample = reader_entry(&before, "codex");
+        assert!(sample.worker_active && sample.timed_out_worker_active);
+        assert_eq!(sample.deadline_ends, 1);
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while BUSY.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert!(!BUSY.load(Ordering::Acquire));
+        let after = reader_view(&state);
+        let sample = reader_entry(&after, "codex");
+        assert!(!sample.worker_active && !sample.timed_out_worker_active);
+        assert_eq!(sample.attempts, 1);
+        assert_eq!(after.health.last_refresh_ms, before.health.last_refresh_ms);
+        assert_eq!(after.health.nonce, before.health.nonce);
+    }
+
+    #[test]
+    fn reader_wire_skew_does_not_erase_health_or_valid_siblings() {
+        let (state, _) = reader_test_state();
+        let base: serde_json::Value =
+            serde_json::from_slice(&control_frame(&state).unwrap()).unwrap();
+        let decode = |value: &serde_json::Value| {
+            control_view_from_frame(&serde_json::to_vec(value).unwrap()).unwrap()
+        };
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"version":2,"sampling":"live_best_effort","providers":{}}),
+            serde_json::json!({"version":1,"sampling":"frozen","providers":{}}),
+            serde_json::json!({"version":1,"sampling":"live_best_effort","providers":{},"path":"do-not-display"}),
+        ] {
+            let mut value = base.clone();
+            value["reader_diagnostics"] = bad;
+            let view = decode(&value);
+            assert!(view.reader_diagnostics.is_none());
+            assert_eq!(view.health.nonce, state.health.nonce);
+        }
+        let mut bad_samples = Vec::new();
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("4"),
+            serde_json::json!(true),
+        ] {
+            let mut value = base.clone();
+            value["reader_diagnostics"]["providers"]["codex"]["sample"]["attempts"] = bad;
+            bad_samples.push(value);
+        }
+        for field in ["attempts", "worker_active"] {
+            let mut value = base.clone();
+            value["reader_diagnostics"]["providers"]["codex"]["sample"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            bad_samples.push(value);
+        }
+        for (field, value) in [
+            ("extra", serde_json::json!("nonce-path-usage-secret")),
+            ("worker_active", serde_json::json!(0)),
+            ("timed_out_worker_active", serde_json::json!(true)),
+        ] {
+            let mut bad = base.clone();
+            bad["reader_diagnostics"]["providers"]["codex"]["sample"][field] = value;
+            bad_samples.push(bad);
+        }
+        let mut missing = base.clone();
+        missing["reader_diagnostics"]["providers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("codex");
+        bad_samples.push(missing);
+        let mut unknown = base.clone();
+        unknown["reader_diagnostics"]["providers"]["codex"] =
+            serde_json::json!({"status":"nonce-path-usage-secret"});
+        bad_samples.push(unknown);
+        for mut value in bad_samples {
+            value["reader_diagnostics"]["providers"]["arbitrary-secret-label"] =
+                serde_json::json!({"status":"available"});
+            let view = decode(&value);
+            let readers = view.reader_diagnostics.as_ref().unwrap();
+            assert_eq!(readers.providers.len(), 6);
+            assert!(matches!(
+                readers.providers["codex"],
+                ReaderEntry::Unavailable
+            ));
+            assert_eq!(reader_entry(&view, "agy").attempts, 0);
+            assert_eq!(view.health.nonce, state.health.nonce);
+        }
+        let mut invalid_health = base;
+        invalid_health["pid"] = serde_json::json!("invalid");
+        assert!(control_view_from_frame(&serde_json::to_vec(&invalid_health).unwrap()).is_err());
+    }
+
+    fn maximum_reader_state() -> ControlState {
+        use crate::model::{Provider, ReaderSnapshot};
+        let (mut state, diagnostics) = reader_test_state();
+        let maximum = ReaderSnapshot {
+            attempts: u64::MAX,
+            busy_rejections: u64::MAX,
+            deadline_ends: u64::MAX,
+            shutdown_ends: u64::MAX,
+            spawn_failures: u64::MAX,
+            worker_failures: u64::MAX,
+            completed: u64::MAX,
+            invalid: u64::MAX,
+            caller_wait_count: u64::MAX,
+            caller_wait_total_ns: u64::MAX,
+            caller_wait_max_ns: u64::MAX,
+            sampling_skips: u64::MAX,
+            ..ReaderSnapshot::default()
+        };
+        for provider in [
+            Provider::Claude,
+            Provider::Agy,
+            Provider::Codex,
+            Provider::Grok,
+            Provider::Hermes,
+            Provider::Kimi,
+        ] {
+            diagnostics.test_seed(provider, maximum);
+        }
+        let duration = RefreshDuration {
+            last_us: u64::MAX,
+            min_us: 0,
+            max_us: u64::MAX,
+            histogram: [u64::MAX; REFRESH_DURATION_BUCKETS],
+        };
+        let stage = StageDurationStats {
+            count: u64::MAX,
+            sum_us: u64::MAX,
+            duration: duration.clone(),
+        };
+        state.observation = Some(RefreshObservation {
+            attempt_count: u64::MAX,
+            success_count: u64::MAX,
+            error_count: u64::MAX,
+            capacity_skip_count: u64::MAX,
+            duration: Some(duration),
+            stages: Some(RefreshStageAggregate {
+                snapshot: stage.clone(),
+                git: stage.clone(),
+                reader: stage.clone(),
+                persist: stage.clone(),
+                socket: stage,
+                latest_measured: true,
+                reports: u64::MAX,
+                checkpoints: u64::MAX,
+            }),
+        });
+        state.deadline_skips = Some(DeadlineSkipObservation {
+            attempt_count: u64::MAX,
+            last_deadline_skipped: u64::MAX,
+            last_capacity_skipped: u64::MAX,
+        });
+        state
+    }
+
+    // Wrong budget, partial provider removal or resampling on fallback fails here.
+    #[test]
+    fn reader_maximum_frame_and_fallback_sample_once_preserving_health() {
+        let mut state = maximum_reader_state();
+        let handle = state.reader_diagnostics.as_ref().unwrap().clone();
+        let normal = control_frame(&state).unwrap();
+        assert!(normal.len() < 8192);
+        let parsed = control_view_from_frame(&normal).unwrap();
+        assert_eq!(
+            reader_entry(&parsed, "codex").caller_wait_total_ns,
+            u64::MAX
+        );
+        assert_eq!(
+            parsed.observation.unwrap().stages.unwrap().reader.count,
+            u64::MAX
+        );
+        assert_eq!(
+            parsed.deadline_skips.unwrap().last_capacity_skipped,
+            u64::MAX
+        );
+        assert_eq!(handle.samples.load(Ordering::Relaxed), 1);
+        state.health.socket_path = PathBuf::from("/".to_owned() + &"\"".repeat(1200));
+        let fallback = control_frame(&state).unwrap();
+        let parsed = control_view_from_frame(&fallback).unwrap();
+        assert!(parsed.reader_diagnostics.is_none());
+        assert!(parsed.observation.is_some());
+        assert!(parsed.deadline_skips.is_some());
+        assert_eq!(parsed.health.socket_path, state.health.socket_path);
+        assert_eq!(handle.samples.load(Ordering::Relaxed), 2);
+        state.health.socket_path = PathBuf::from("/".to_owned() + &"\"".repeat(3200));
+        let fallback = control_frame(&state).unwrap();
+        let parsed = control_view_from_frame(&fallback).unwrap();
+        assert!(
+            parsed.reader_diagnostics.is_none()
+                && parsed.observation.is_none()
+                && parsed.deadline_skips.is_none()
+        );
+        assert_eq!(parsed.health.nonce, state.health.nonce);
+        assert_eq!(parsed.health.endpoint, state.health.endpoint);
+        assert_eq!(parsed.health.socket_path, state.health.socket_path);
+        assert_eq!(handle.samples.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn reader_frame_exact_newline_boundary_and_oversized_health_failure() {
+        let (mut state, _) = reader_test_state();
+        // With Health alone at exactly 8192 bytes, both extension tiers disappear.
+        let original = serde_json::to_vec(&state.health).unwrap().len();
+        let padding = 8191 - original;
+        state.health.socket_key.push_str(&"x".repeat(padding));
+        let frame = control_frame(&state).unwrap();
+        assert_eq!(frame.len() + 1, 8192);
+        assert!(
+            control_view_from_frame(&frame)
+                .unwrap()
+                .reader_diagnostics
+                .is_none()
+        );
+        let mut line = frame.clone();
+        line.push(b'\n');
+        let read_line = |line: Vec<u8>| {
+            let (mut sender, receiver) = UnixStream::pair().unwrap();
+            sender.write_all(&line).unwrap();
+            drop(sender);
+            read_frame(&mut BufReader::new(receiver), 8192)
+        };
+        assert_eq!(read_line(line).unwrap(), frame);
+        let mut over = frame.clone();
+        over.push(b' ');
+        over.push(b'\n');
+        assert!(read_line(over).is_err());
+        state.health.socket_key.push('x');
+        assert!(control_frame(&state).is_err());
+        assert_eq!(
+            state
+                .reader_diagnostics
+                .as_ref()
+                .unwrap()
+                .samples
+                .load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn reader_sampling_and_slow_client_do_not_hold_control_mutex() {
+        use crate::model::Provider;
+        let (state, diagnostics) = reader_test_state();
+        let shared = Arc::new(Mutex::new(state));
+        let snapshot = shared.lock().unwrap().clone();
+        diagnostics.test_with_slot(Provider::Claude, || {
+            assert!(shared.try_lock().is_ok());
+            assert!(matches!(
+                reader_view(&snapshot).reader_diagnostics.unwrap().providers["claude"],
+                ReaderEntry::Contended
+            ));
+            assert!(shared.try_lock().is_ok());
+        });
+        let (mut client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.write_all(b"health\n").unwrap();
+        let worker = std::thread::spawn(move || serve_control(server, &snapshot));
+        let mut client = BufReader::new(client);
+        let frame = read_frame(&mut client, 8192).unwrap();
+        assert!(
+            control_view_from_frame(&frame)
+                .unwrap()
+                .reader_diagnostics
+                .is_some()
+        );
+        assert!(shared.try_lock().is_ok());
+        drop(client);
+        assert!(!worker.join().unwrap().unwrap());
+        assert!(NoopPublisher.reader_diagnostics().is_none());
+    }
+    #[test]
+    fn reader_handle_survives_actual_daemon_completed_state_publication() {
+        let (_dir, options, done, server) = fixture();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_READER_DIAGNOSTICS", "1");
+        ensure_command(&options, command).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let mut observed = None;
+        wait_until(|| {
+            observed = probe_view(&paths, &options.socket).unwrap();
+            observed
+                .as_ref()
+                .is_some_and(|view| view.health.last_refresh_ms.is_some())
+        });
+        let view = observed.unwrap();
+        assert_eq!(reader_entry(&view, "codex").attempts, 42);
+        assert!(view.observation.is_some());
+        stop(&options).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
     }
 }

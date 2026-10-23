@@ -1,9 +1,9 @@
 # Reader diagnostics control and doctor design
 
-**Status:** D design candidate; no source implementation or shipment approval.
-**Source baseline:** `17873866afedfa21f73315e2e4d39af8ce03a0dc`.
-P runtime wiring is a separate task in progress. D implementation starts only
-after P integration, commander approval, clear, and a new assignment.
+**Status:** D implementation candidate; independent review and shipment pending.
+**Implementation baseline:** `bfe2a4d3a7a4369711b49057016ec233273f9484`.
+P was reviewed and integrated locally before the commander authorized D.
+This candidate does not imply integration, shipment or live measurement.
 This document supplements [the P plan](publisher-runtime-wiring.md); current
 assignment decisions supersede its older allocation of Arc ownership to D.
 
@@ -16,7 +16,9 @@ The baseline implements `ReadCycle::with_diagnostics`, `diagnostics`,
 `DiagnosticUnavailable::{Contended,Poisoned,Incomplete}` in `src/model.rs`.
 These model types remain crate-private. The fixed source order is Claude,
 Agy, Codex, Grok, Hermes, Kimi; it is independent of configured providers.
-Reader selection is integrated; publisher/control/doctor consumption is not.
+D connects publisher/control/doctor consumption. Claude/Agy/Grok observed routing
+is a separate concurrent task; Codex/Kimi routing is in the baseline. Hermes
+has no bounded worker: its empty slot is not a successful read measurement.
 P owns one publisher-lifetime `Arc<ReaderDiagnostics>` and passes a clone to
 each fresh `ReadCycle::with_diagnostics`. D reuses that Arc; it must not create
 a second registry or reset counters per refresh/reconnect.
@@ -39,7 +41,7 @@ this request. Doctor prints this distinction even during a running refresh.
 Each provider result is advisory: counters can miss updates and saturate;
 worker bits and counters are not a jointly atomic accounting ledger.
 
-## 3. Ownership and public API seam (proposed new names)
+## 3. Ownership and public API seam
 
 Add a public opaque `daemon::ReaderDiagnosticsHandle` with private fields,
 `Clone`, and a crate-only constructor accepting `Arc<ReaderDiagnostics>`.
@@ -69,7 +71,7 @@ join, permit, file or query. Preserve existing shutdown and teardown order.
 
 Add top-level optional `reader_diagnostics`, sibling to `refresh_observation`
 and P's approved `refresh_deadline_skips`. Keep `Health` unchanged.
-Proposed version 1 schema (all names here are new wire names):
+Version 1 schema (all names here are new wire names):
 `{version:1,sampling:"live_best_effort",providers:{claude:entry,...}}`.
 Provider keys are exactly the six lowercase source labels, never arbitrary IDs.
 An entry is `{status:"available",sample:{...}}` or
@@ -124,7 +126,7 @@ omit the entire reader extension and retry; if still oversized, omit optional
 all Health fields, including capacity count. Missing diagnostics then decode
 as unavailable. If even Health alone exceeds the bound, return the existing
 control failure; never produce an oversized frame or claim healthy identity.
-The implementation fixture must measure six available providers with u64::MAX
+The implementation fixture measures six available providers with u64::MAX
 for every counter, false booleans (longer JSON), maximum stage histograms,
 deadline counters and an escaped long synthetic socket path. Assert fallback
 keeps a valid Health and makes each removed extension unavailable; also cover
@@ -148,10 +150,13 @@ No registry => `Reader diagnostics: unavailable`; no fabricated provider zeros.
 Build reader and refresh/deadline text before `refresh_diagnostic` returns an
 unhealthy/first-refresh error, so available diagnostic text still prints and
 the pre-existing nonzero status is preserved. Optional absence alone succeeds.
-Consume P's `refresh_deadline_skips{attempt_count,last_skipped_resources}` as
-separate deadline-skip attempt count and latest skipped-resource count, not
-reader deadlines and not cumulative skipped resources. Missing/malformed means
-unavailable, including before P's first measured attempt. A measured 0 is 0.
+Consume P's `refresh_deadline_skips{attempt_count,last_deadline_skipped,last_capacity_skipped}` as
+separate cumulative deadline-skip attempt count and deadline/capacity resource
+counts from the latest deadline-skip attempt, not reader deadlines or cumulative
+skipped resources. These resource counts remain across later successful, error
+or capacity-only attempts; they are not counts of the latest refresh.
+Missing/malformed means unavailable, including before the first deadline-skip
+attempt. A measured 0 is 0.
 Deadline skips belong in total attempt/duration/stage accounting; capacity and
 deadline may coexist in one attempt, so category counts are not a partition.
 Use P's integrated classification: real errors, poison and shutdown cannot be
@@ -170,13 +175,23 @@ relabeled as skips. Keep `Health.last_refresh_ms` startup-relative semantics.
 | doctor | Fixed labels/units only; None versus zero; live versus completed header; escaped arbitrary input never printed; metrics visible on first-refresh/error path with unchanged exit status |
 | daemon/doctor | P mixed capacity+deadline, success, real error, poison, shutdown; total attempts/durations remain consistent and deadline counter saturation remains accepted |
 
-Future D touches only `src/publish.rs`, `src/daemon.rs`, `src/doctor.rs` plus an
-approved daemon-lifecycle delta. Propose adding scenarios to **Safe stop and
-read-only doctor** in `openspec/changes/wire-publisher-runtime/specs/daemon-lifecycle/spec.md`
-after P integration: live sampling/release, optional-data version skew, frame
-fallback, fixed redacted output and unhealthy-refresh diagnostics. Scope approval
-and strict OpenSpec validation precede source implementation; no spec edited here.
+D touches only `src/publish.rs`, `src/daemon.rs`, `src/doctor.rs` plus cfg(test) model helpers approved by touching amendment 382, this plan and
+the approved daemon-lifecycle delta in `openspec/changes/wire-publisher-runtime/specs/daemon-lifecycle/spec.md`
+for live sampling/release, optional-data version skew, frame fallback, fixed
+redacted output and unhealthy-refresh diagnostics. Scope approval and strict
+OpenSpec validation preceded source implementation.
 No disk/config format changes. Rollback D's commit independently of P restores
 unavailable reader control output; registry counters reset only on daemon lifetime
 replacement. No restart is performed for verification. D fixtures use synthetic
 sockets, channels and samples; real Herdr/session/config/API contact stays forbidden.
+
+## 8. Candidate verification mapping
+
+Normal daemon tests named `reader_control_*`, `reader_wire_*`, `reader_frame_*`,
+`reader_maximum_frame_*`, `reader_sampling_*` and `reader_handle_survives_*`
+exercise live release, source lock/error states, decoding, saturated counters,
+exact serializer fallback and the daemon completed-state publication seam.
+Doctor's `reader_*` tests cover unavailable versus measured values, fixed labels,
+units, retained deadline-skip meaning, nontransactional observation times and
+existing unhealthy/startup errors. Existing identity and refresh-classification
+fixtures remain in the normal suite. No new ignored tests or live verification.

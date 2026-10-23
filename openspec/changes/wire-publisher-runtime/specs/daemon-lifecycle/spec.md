@@ -34,3 +34,43 @@ not the attempt duration.
 - **WHEN** a refresh fails after some reports were acknowledged
 - **THEN** the stage sample for that attempt is still reported, with counts
   for that attempt only
+
+### Requirement: Live reader diagnostics are optional and advisory
+Control health SHALL optionally include typed diagnostics for the six fixed
+providers from the publisher-owned registry, sampled once per valid health
+request after releasing the control-state mutex. Sampling SHALL be nonblocking, advisory, live best-effort and nontransactional
+across providers. Health and refresh metrics SHALL retain completed-attempt
+observation times.
+
+#### Scenario: Worker release without another refresh
+- **WHEN** a timed-out worker releases before the next refresh
+- **THEN** a subsequent control request reports it inactive using the same registry
+
+#### Scenario: Optional version skew or provider contention
+- **WHEN** reader diagnostics are absent, unsupported, malformed or contended
+- **THEN** valid health remains readable and valid sibling provider metrics survive
+- **AND** unknown input labels and sensitive data are never printed
+- **AND** unavailable, unmeasured wait, measured zero and inactive stay distinct
+- **AND** diagnostics do not affect refresh, reconnect, shutdown or permits
+
+### Requirement: Control frames preserve health within the existing limit
+A response SHALL fit 8192 bytes including its newline. It SHALL sample readers
+only once, omit the whole reader extension first if oversized, then omit refresh
+observation and deadline extensions together. Health SHALL never be truncated;
+oversized health alone SHALL fail the control exchange.
+
+#### Scenario: Maximum counters and near-limit health
+- **WHEN** all six providers and stage histograms contain maximum counters
+- **THEN** exact serialization and fallback preserve valid health within the limit
+- **AND** a frame of 8192 bytes including newline is accepted and 8193 is rejected
+
+### Requirement: Doctor distinguishes diagnostic observation times and categories
+Doctor SHALL use fixed count/ns labels, marking readers live best-effort and
+nontransactional. It SHALL distinguish reader deadlines from retained totals
+and resource counts of the latest deadline-skip attempt. Diagnostics SHALL
+precede existing health errors without changing exit status or identity checks.
+
+#### Scenario: Failed refresh still prints available diagnostics
+- **WHEN** health reports a failed or incomplete first refresh
+- **THEN** optional diagnostic text prints and the existing error remains an error
+- **AND** retained deadline-skip counts are not labeled as latest-refresh counts

@@ -17,3 +17,10 @@
 - [x] Report production refresh stage timings after every attempt.
 - [x] Keep clear on its own three-second deadline.
 - [x] Cover the plan's boundary fixtures in the default test suite.
+
+- [x] Expose the publisher registry via an opaque handle and typed optional
+      live reader diagnostics, keeping private model types private.
+- [x] Enforce the exact control frame budget with one-sample fallback.
+- [x] Print fixed reader and retained deadline-skip diagnostics before errors.
+- [ ] Verify live release, contention, skew, saturation and frame boundaries
+      in normal isolated tests and run the mandatory checks.

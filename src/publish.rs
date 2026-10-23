@@ -2346,6 +2346,11 @@ impl MetadataPublisher {
 }
 
 impl daemon::Publisher for MetadataPublisher {
+    fn reader_diagnostics(&self) -> Option<daemon::ReaderDiagnosticsHandle> {
+        Some(daemon::ReaderDiagnosticsHandle::new(
+            self.reader_diagnostics.clone(),
+        ))
+    }
     fn set_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
         self.shutdown = Some(shutdown);
     }

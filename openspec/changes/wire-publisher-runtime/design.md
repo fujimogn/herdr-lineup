@@ -50,3 +50,16 @@ records the decisions that the spec deltas depend on.
 
 Revert the implementation commits. No on-disk format changes; a checkpoint
 written by the new code is valid for the old code.
+
+## Reader diagnostics control and doctor
+
+D follows `docs/plans/reader-diagnostics-control.md`: a public opaque handle
+clones the P-owned registry without exposing private model types. Control clones
+base state and handle under its mutex, then samples once outside it. Provider
+samples are live best-effort and nontransactional; refresh metrics describe
+completed attempts. The serializer reuses this sample through the 8192-byte
+including-newline fallback ladder: reader extension, then other extensions,
+then error if Health alone is too large. Identity fields are never truncated.
+The P deadline extension retains `attempt_count`, `last_deadline_skipped` and
+`last_capacity_skipped` for the latest deadline-skip attempt, including after
+later successes, errors or capacity-only skips. Absence is unavailable.
