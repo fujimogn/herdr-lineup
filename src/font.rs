@@ -447,12 +447,17 @@ fn apply_with_font_and_remove(
         } else {
             state.clone()
         };
+        let final_state = if removing {
+            json!({"version":1,"font_owned":false,"entries":state["entries"]})
+        } else {
+            state.clone()
+        };
         pending_state["pending"] = json!({
             "action": if removing { "uninstall" } else { "install" },
             "paths": affected_paths.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>()
         });
         let pending_journal = serde_json::to_vec(&pending_state).map_err(io::Error::other)?;
-        let next_journal = serde_json::to_vec(&state).map_err(io::Error::other)?;
+        let next_journal = serde_json::to_vec(&final_state).map_err(io::Error::other)?;
         let needs_write = !affected_paths.is_empty()
             || old_journal
                 .as_deref()
@@ -486,7 +491,6 @@ fn apply_with_font_and_remove(
                 fs::remove_file(&locations.font)?;
                 changed_paths.push(locations.font.clone());
             }
-            state = json!({"version":1,"font_owned":false,"entries":state["entries"]});
         } else {
             if !font_existed {
                 action_path = locations.font.clone();
@@ -515,10 +519,7 @@ fn apply_with_font_and_remove(
         if needs_write {
             action_path = journal.clone();
             require_bytes(&journal, Some(&pending_journal))?;
-            write_atomic(
-                &journal,
-                &serde_json::to_vec(&state).map_err(io::Error::other)?,
-            )?;
+            write_atomic(&journal, &next_journal)?;
         }
         Ok(())
     })();
@@ -829,6 +830,22 @@ mod tests {
         uninstall(&locations).unwrap();
         assert_eq!(fs::read(&locations.font).unwrap(), FONT);
         assert!(!locations.config.join("ghostty/config").exists());
+    }
+
+    #[test]
+    fn uninstall_clears_journal_when_owned_font_is_already_missing() {
+        let (_root, locations) = fixture();
+        install(&locations).unwrap();
+        let journal = locations.state.join("font-ownership.json");
+        assert_eq!(load(&journal).unwrap()["font_owned"], true);
+        fs::remove_file(&locations.font).unwrap();
+
+        let output = uninstall(&locations).unwrap().join("\n");
+        assert!(output.contains(&journal.display().to_string()));
+        let state = load(&journal).unwrap();
+        assert_eq!(state["font_owned"], false);
+        assert!(state.get("pending").is_none());
+        assert!(!locations.font.exists());
     }
 
     #[test]
@@ -1238,6 +1255,21 @@ mod tests {
         assert!(locations.font.exists());
         assert!(fs::read_to_string(&kitty).unwrap().contains(START));
         assert!(install(&locations).is_err());
+    }
+
+    #[test]
+    fn invalid_journal_preflight_does_not_start_installation() {
+        let (_root, locations) = fixture();
+        let kitty = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(kitty.parent().unwrap()).unwrap();
+        fs::write(&kitty, "# original\n").unwrap();
+        fs::create_dir_all(&locations.state).unwrap();
+        let journal = locations.state.join("font-ownership.json");
+        fs::write(&journal, b"invalid journal").unwrap();
+        assert!(install(&locations).is_err());
+        assert_eq!(fs::read(&journal).unwrap(), b"invalid journal");
+        assert!(!locations.font.exists());
+        assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
     }
 
     #[test]
