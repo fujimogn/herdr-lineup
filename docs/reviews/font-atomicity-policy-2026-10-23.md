@@ -1,12 +1,40 @@
 # Font action atomicity policy (2026-10-23)
 
-## Decision in brief
+## Current status (integration snapshot `d95e5b5`)
+
+The owner chose the conservative policy: when ownership is uncertain, stop and
+leave recovery to the user. It is implemented on the local integration line,
+which is not shipped:
+
+- `f319f52` and `ead231d` remove automatic rollback. A failure after the
+  `pending` journal is written leaves earlier writes, any partially written
+  font, and the journal in place, and the error states that no automatic
+  rollback or deletion was attempted and names the paths to inspect
+  (`src/font.rs:608`, `:650`).
+- Planned original bytes are compared before each terminal write, and the
+  installed font is stamped again immediately before removal (`75865cd`,
+  `src/font.rs:632-638`).
+- `885194b` types the ownership journal at load and separates planning from
+  application; a `pending` journal still refuses every further action.
+
+What remains open (H1 and M1 stay `partial` in
+`docs/reviews/review-followup-coverage.md`): each check is still separate from
+the following pathname `rename` or `unlink`. An external edit or replacement
+between a check and that operation can still be replaced or deleted. Recovery
+is manual; nothing rolls back automatically. Do not describe this as atomic or
+as fully closed.
+
+The sections below are the historical assessment of `7919649`, written before
+the owner's decision. Their statements that the policy was not implemented
+describe that candidate, not the integration line.
+
+## Decision in brief (historical, before the owner's decision)
 
 The unreviewed `79196492940e4266a0182aca4dd27e188cacbf51` candidate improves the `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0` baseline: it compares file identity and bytes before rollback, checks the font again before removal, and adds injected conflict tests. These are useful best-effort protections, **not a guarantee against an uncooperative editor**. Each check remains separate from the following pathname-based `rename` or `unlink`. Neither the portable API used by this crate nor the OS-specific APIs cited below offer a conditional "replace or unlink this name only if it still denotes this inode and these bytes" operation. Do not describe H1/M1 as fully closed or ship this policy as implemented.
 
 The smallest policy with a defensible preservation claim is to **stop automatic destructive recovery when ownership is uncertain**, retain the ownership record and any displaced file for inspection, and report a conflict with exact paths. That changes current rollback and uninstall behavior and requires owner approval. Until that decision, the candidate's checks can reduce common races, but an absolute external-edit preservation claim is unavailable. No implementation change is made here.
 
-## Fixed code comparison
+## Fixed code comparison (historical)
 
 This assessment compares exactly `b5fc311..7919649` (`src/font.rs` only, 219 insertions and 23 deletions). `7919649` is a local candidate, not reviewed, integrated, or shipped. The baseline's `apply_with_font` spans `src/font.rs:247-484`. The candidate introduces `apply_with_font_and_remove` at `src/font.rs:313-586`. `FontLock` serializes participating Lineup actions, not arbitrary terminal editors or font managers.
 
@@ -42,10 +70,12 @@ The candidate tests use temporary homes and injected callbacks. They show specif
 
 Primary sources: [Linux `renameat2(2)`](https://man7.org/linux/man-pages/man2/renameat2.2.html) documents destination atomic replacement, `RENAME_NOREPLACE`, `RENAME_EXCHANGE`, filesystem support, and NFS caveats; [Linux `unlinkat(2)`](https://man7.org/linux/man-pages/man2/unlink.2.html) documents pathname deletion and flags; [Linux `openat(2)`](https://man7.org/linux/man-pages/man2/open.2.html) explains directory descriptors protecting path prefixes, not the final name from replacement. Apple's [XNU `sys/stdio.h`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stdio.h) declares `RENAME_EXCL`, `RENAME_SWAP`, and `renameatx_np`; [Apple's volume capability](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumesupportsexclusiverenaming) says exclusive rename depends on the volume; [Apple's `rename(2)` manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/rename.2.html) describes replacement of an existing destination. The conclusion about absent compare-and-delete/replace semantics is an inference from these documented interfaces, not proof that no private or future OS API could provide it.
 
-## Recommendation and decision boundary
+## Recommendation and decision boundary (historical)
+
+The owner later chose option (b). See "Current status" above.
 
 1. **Now, with no behavior change:** Keep `7919649` identified as an unreviewed best-effort candidate. Review its full fixed range before any integration. Wording must say it detects the tested pre-operation conflicts and leaves a residual check-to-mutation race. Keep `b5fc311` as the baseline for this record.
 2. **Recommended minimal next implementation, subject to owner choice:** Fail closed on uncertain ownership, stop automatic destructive rollback/deletion, preserve the journal, and report a manual recovery path. If an action must replace a terminal config, consider an atomic exchange into retained quarantine so the displaced bytes remain recoverable. This still does not guarantee that an external edit remains at its original path. Bound retention and test APFS/Linux behavior before enabling it.
 3. **Owner decision required:** Choose between (a) best-effort automatic recovery with explicitly limited guarantees, (b) conservative partial-state/manual recovery, and (c) a stronger external-edit preservation requirement that blocks font actions until a proven platform-specific or cooperative protocol exists. Also decide whether retaining displaced user files in quarantine is acceptable, how long to retain them, and whether automatic font uninstall should be disabled when ownership is uncertain. These alter user-visible behavior and recovery responsibility.
 
-No proposed policy is implemented or verified by this document. No real font, terminal configuration, Herdr session, or user plugin state was touched. The Rust checks for this record-only worktree are reported separately with the candidate commit.
+This document itself implements nothing; option (b) was implemented later, as described under "Current status". No real font, terminal configuration, Herdr session, or user plugin state was touched. The Rust checks for this record-only worktree are reported separately with the candidate commit.

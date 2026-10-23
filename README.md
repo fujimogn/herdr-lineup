@@ -579,8 +579,11 @@ existing agent settings before changing them; startup does not edit them.
    regular records were found (also check the state directory's permissions);
    otherwise `StatusLine records: <count> (latest: <N>s ago)` reports the count
    and newest record age. The scan examines at most 1,024 directory entries
-   without following symlinks. This is a storage diagnostic, not proof that a
-   record belongs to the current pane. Check that the relevant pane gains usage data.
+   without following symlinks; when it reaches that limit, the line says
+   `in scanned entries` and `scan limit reached`, and a directory or entry
+   read error prints `StatusLine records: scan incomplete` instead of a partial count.
+   This is a storage diagnostic, not proof that a record belongs to the
+   current pane. Check that the relevant pane gains usage data.
 
 Usage is shown in the sidebar only. `herdr-lineup statusline` does not render
 a status line and does not print a pace label. `herdr-lineup statusline --help`
@@ -602,6 +605,12 @@ pane. Antigravity ignores any conversation id in the JSON. Herdr panes provide
 observation. Antigravity's weekly remaining is the active model's weekly quota
 pool. When the model does not select a pool, the only pool present is used; two
 pools leave weekly unavailable.
+
+Known limitation: an Antigravity record is bound only to the pane ID, without
+an occupant generation. If another Antigravity session later runs in the same
+pane, it can show the previous occupant's last values until a new
+observation arrives. Fixing this needs an occupant generation from the Herdr
+host and is tracked separately; it is not resolved in this version.
 
 Context stays `—` until an observation matches the pane, then retains the last
 valid value while that exact session or pane binding matches. Idle Claude,
@@ -868,7 +877,11 @@ preserved and counted before publication.
 `doctor` distinguishes metadata capacity skips from refresh failures. It shows
 the number of resources skipped during the latest refresh; skips alone do not
 make it fail. A real refresh failure still exits nonzero. It also checks the
-control socket path length before trying to connect.
+control socket path length before trying to connect. Before that result it
+prints the latest, minimum, and maximum refresh duration in microseconds, a
+fixed duration histogram, and attempt, success, error, and capacity-skip
+counts. `last refresh <N> ms after startup` is the time since the daemon
+started, not the duration of a refresh.
 
 ### Per-session publisher
 

@@ -2,64 +2,56 @@
 
 ## Scope
 
-Keep the local candidate `96829df7e6fc51af327b448f5b8b3596f0a96d3f` as the base
-for follow-ups from the 2026-10-23 whole-repository review and latency
-investigation. The mapping of every finding is
+Follow-ups from the 2026-10-23 whole-repository review and latency
+investigation build on the local integration line. The mapping of every
+finding, and the integration snapshot it was read from, is
 `docs/reviews/review-followup-coverage.md`. This design does not reopen
-`rejected-wrong-basis` rows R1 and R2, and it does not treat `spec-waiting`
-rows as done.
+`rejected-wrong-basis` rows R1 and R2, and it does not treat `spec-waiting`,
+`conditional`, or `separate-task` rows as done.
 
-Several reviewed defects are already `fixed-in-candidate` or `partial`. Later
-tasks must not reimplement them. `develop` does not contain this candidate.
-Shipment stays on hold until the owner asks for one batch.
+`develop` does not contain the integration line. Shipment stays on hold until
+the owner asks for one batch.
 
 ## Approach
 
 Land one behavior at a time on a dedicated worktree, with a regression test
 before broadening the change. Review each fixed range with the owner-selected
-GPT-6.1 Sol high reviewer, read-only, with no native subagent fork. A single
-unreviewed rewrite would hide safety regressions. Changing the 5 second
-default without removing repeated work would increase load.
-
-Rows that are only measured or only designed stay in `docs/reviews/` until
-their judgment condition is met. A measurement document is not an
-implementation approval.
+GPT-6.1 Sol high reviewer, read-only, with no native subagent fork. An API
+that is not yet called by publication is recorded as unwired, not as a
+runtime improvement. A measurement document is not an implementation approval.
 
 ## Boundaries that still hold
 
-- Font ownership may become typed at the load boundary. Version 1, unknown
-  fields, pending-state refusal, original bytes, and manual recovery stay.
-  The candidate no longer rolls back automatically. Do not restore automatic
-  rollback. The check-then-rename and check-then-unlink race remains open and
-  is not called closed.
-- Publisher stages may separate inventory, headings, observations, desired
+- Font ownership is typed at load. Version 1, unknown fields, pending-state
+  refusal, original bytes, and manual recovery stay. A failure after the
+  `pending` journal leaves partial state for manual recovery; automatic
+  rollback is not restored. The check-then-rename and check-then-unlink races
+  remain and are not called closed.
+- Publisher stages separate inventory, headings, observations, desired
   reports, and send. Capacity skips stay per resource. An ambiguous socket
-  result stops the cycle. Sequence reservation behavior does not change in
-  the stage split.
-- An endpoint reservation window is design-only. The candidate still persists
-  each sequence before send. Restart must not reuse a number that might have
-  reached Herdr. Resource pruning must not lower the durable floor. Wire and
-  checkpoint formats stay compatible until a reviewed migration says otherwise.
-- Git and reader caches must name their invalidation rules. A cache hit must
-  not skip association or ownership checks. HEAD-only mtime and
+  result stops the cycle.
+- The endpoint sequence window persists the durable upper bound before any
+  number in the window is sent. An uncertain checkpoint write poisons the
+  publisher until a new instance. Restart never reuses a number that might
+  have reached Herdr, and pruning never lowers the durable floor. Rows of the
+  failure table without test evidence stay design intent.
+- Git and reader caches name their invalidation rules. A cache hit does not
+  skip association, ownership, or `safe.directory` checks. HEAD-only mtime and
   previous-path-only discovery are rejected.
 - Stage timings and bounded waits are measured before any new budget. The
   5 second default and endpoint path identity stay. No task replaces a live
   Herdr server, reads real credentials, or writes user configuration.
-- Unknown occupant generation fails closed. OS-blocked filesystem I/O is not
-  given a false strict wall-clock deadline.
+- Unknown occupant generation fails closed; the host side is a separate task.
+  OS-blocked filesystem I/O is not given a false strict wall-clock deadline.
 
 ## Validation and rollback
 
 Each behavior task starts from a failing regression or an existing invariant
-suite, then runs focused tests. The integration candidate later runs
+suite, then runs focused tests. The integration candidate runs
 `cargo fmt --all --check`, locked Clippy for all targets with warnings denied,
 locked tests, a locked release build, and binary help. A fresh worktree build
-can exceed 1 GiB; report that estimate before starting it. The commander
-permitted one such run on the coverage worktree. The commander also owns the
-final GPT-6.1 Sol high review from `d3ccbc17d3f8344d466015fac580cd0fe3b60269`
-to the final head fixed when that review starts. A local GO is not queue
-acceptance, and an unconfirmed review is not completion.
+can exceed 1 GiB; report that estimate before starting it. A documentation-only
+change runs encoding, whitespace, and link checks instead of a Rust build.
 
 Benchmark fixtures use synthetic data and must not delete a non-`/tmp` root.
 Each task is its own commit. Rollback is the previous local commit, without

@@ -1,6 +1,6 @@
 # Bounded reader worker observations
 
-Status: local implementation candidate; independent review and integration pending.
+Status: integrated on the local line as `98a57de` (not shipped); production wiring is a separate, pending task.
 Base: `4f7044ad3f9066798bf55aff00bd6f17094022e2`.
 The candidate commit is the commit containing this document (or its reviewed successor).
 This addresses the observation portion of latency finding L5, not worker cancellation.

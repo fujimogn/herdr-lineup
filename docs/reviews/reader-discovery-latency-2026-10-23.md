@@ -9,6 +9,8 @@
 | Environment | Linux 7.2.10-1-cachyos / x86_64, AMD Ryzen 9 9955HX (16 Cores), synthetic isolated `tmpfs` fixtures (`/tmp`) |
 | Primary touching path | `docs/reviews/reader-discovery-latency-2026-10-23.md` |
 
+Later status: the local integration line (`d95e5b5`) adds a per-cycle `ReadCycle` discovery API (`f7abe35`), but publication does not pass one cycle across panes yet. The measurements below describe `b5fc311` and remain tmpfs-only.
+
 ---
 
 ## 1. Executive Summary
