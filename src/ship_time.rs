@@ -586,6 +586,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn packed_refs_are_read_and_refreshed_correctly() {
+        let fixture = Fixture::new();
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        assert_eq!(
+            read_repository(&fixture.repo).unwrap().ship_unix,
+            Some(1_704_067_200)
+        );
+        // Pack loose refs into .git/packed-refs
+        fixture.git(&["pack-refs", "--all"], None);
+        assert!(!fixture.repo.join(".git/refs/remotes/origin/main").exists());
+        assert!(fixture.repo.join(".git/packed-refs").exists());
+        assert_eq!(
+            read_repository(&fixture.repo).unwrap().ship_unix,
+            Some(1_704_067_200)
+        );
+        // Update ref after packing (creates a loose ref that shadows packed-refs)
+        fixture.commit("2024-01-02T00:00:00Z");
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        assert!(fixture.repo.join(".git/refs/remotes/origin/main").exists());
+        assert_eq!(
+            read_repository(&fixture.repo).unwrap().ship_unix,
+            Some(1_704_153_600)
+        );
+        // Pack again
+        fixture.git(&["pack-refs", "--all"], None);
+        assert!(!fixture.repo.join(".git/refs/remotes/origin/main").exists());
+        assert_eq!(
+            read_repository(&fixture.repo).unwrap().ship_unix,
+            Some(1_704_153_600)
+        );
+    }
+
+    #[test]
+    fn replace_refs_alter_committer_time_and_require_invalidation() {
+        let fixture = Fixture::new();
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        let initial_time = read_repository(&fixture.repo).unwrap().ship_unix;
+        assert_eq!(initial_time, Some(1_704_067_200));
+
+        // Create a second commit with different timestamp
+        fixture.commit("2024-01-02T00:00:00Z");
+        let head_commit = fixture.git(&["rev-parse", "HEAD"], None);
+        let origin_main_commit = fixture.git(&["rev-parse", "refs/remotes/origin/main"], None);
+
+        // Replace origin/main target commit with head_commit
+        fixture.git(&["replace", &origin_main_commit, &head_commit], None);
+
+        // Git for-each-ref respects git replace by default, yielding the replaced commit time
+        let replaced_time = read_repository(&fixture.repo).unwrap().ship_unix;
+        assert_eq!(replaced_time, Some(1_704_153_600));
+
+        // Pack replacement refs into packed-refs. Prune unlinks loose ref files,
+        // leaving the directory empty. Verify and remove the empty directory.
+        fixture.git(&["pack-refs", "--all", "--prune"], None);
+        let loose_replace = fixture.repo.join(".git/refs/replace");
+        if loose_replace.exists() {
+            std::fs::remove_dir(&loose_replace)
+                .expect("pack-refs --prune must leave refs/replace empty");
+        }
+        assert!(!loose_replace.exists());
+        // Packed-only replacement ref is still effective and yields replaced commit time
+        let packed_replaced_time = read_repository(&fixture.repo).unwrap().ship_unix;
+        assert_eq!(packed_replaced_time, Some(1_704_153_600));
+
+        // Delete replace ref
+        fixture.git(&["replace", "-d", &origin_main_commit], None);
+        let restored_time = read_repository(&fixture.repo).unwrap().ship_unix;
+        assert_eq!(restored_time, Some(1_704_067_200));
+    }
+
     impl Fixture {
         fn signed_origin_main(&self) {
             // A synthetic signature triggers Git's verifier without any keys.
@@ -781,6 +852,40 @@ mod tests {
         );
         assert_eq!(read_repository(&fixture.root), None);
         assert_eq!(read_repository(&fixture.repo.join(".git")), None);
+    }
+
+    #[test]
+    fn linked_worktree_lifecycle_add_and_remove() {
+        let fixture = Fixture::new();
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        let linked = fixture.root.join("ephemeral-worktree");
+        fixture.git(
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+            None,
+        );
+        assert_eq!(
+            read_repository(&linked),
+            Some(Repository {
+                name: "canonical-repo".to_owned(),
+                ship_unix: Some(1_704_067_200),
+            })
+        );
+        fixture.git(&["worktree", "remove", linked.to_str().unwrap()], None);
+        assert_eq!(read_repository(&linked), None);
+        // Main repository is unaffected
+        assert_eq!(
+            read_repository(&fixture.repo),
+            Some(Repository {
+                name: "canonical-repo".to_owned(),
+                ship_unix: Some(1_704_067_200),
+            })
+        );
     }
 
     #[test]
