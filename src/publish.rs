@@ -185,6 +185,66 @@ fn fresh_kimi_weekly(
     fresh_account_weekly(sample, observed, now, max_age_ms, refresh_interval_ms)
 }
 
+#[derive(Default)]
+struct GrokSnapshot {
+    source: Option<crate::quota_grok::SourceStamp>,
+    generation: u64,
+    sample: Option<model::WeeklySample>,
+    observed: Option<Instant>,
+}
+
+impl GrokSnapshot {
+    fn observe(&mut self, source: Option<crate::quota_grok::SourceStamp>) {
+        if self.source != source {
+            self.generation = self.generation.wrapping_add(1);
+            self.source = source;
+            self.sample = None;
+            self.observed = None;
+        }
+    }
+
+    fn publish(
+        &mut self,
+        generation: u64,
+        source: &crate::quota_grok::SourceStamp,
+        sample: Option<model::WeeklySample>,
+        observed: Option<Instant>,
+    ) {
+        if self.generation == generation && self.source.as_ref() == Some(source) {
+            self.sample = sample;
+            self.observed = observed;
+        }
+    }
+}
+
+fn current_grok_weekly(
+    state: &std::sync::Mutex<GrokSnapshot>,
+    auth_file: Option<&Path>,
+    config: &Config,
+    now: SystemTime,
+    instant: Instant,
+) -> Option<model::WeeklySample> {
+    if !config.weekly_enabled(Agent::Grok) {
+        if let Ok(mut state) = state.lock() {
+            state.observe(None);
+        }
+        return None;
+    }
+    let source = auth_file.and_then(crate::quota_grok::source_stamp);
+    let Ok(mut state) = state.lock() else {
+        return None;
+    };
+    state.observe(source);
+    let sample = model::clear_expired_reset(state.sample, now);
+    fresh_account_weekly(
+        sample,
+        state.observed,
+        instant,
+        config.usage_max_age_ms,
+        config.refresh_interval_ms,
+    )
+}
+
 #[derive(Clone, Copy)]
 struct KimiSnapshot {
     sample: model::WeeklySample,
@@ -638,6 +698,8 @@ pub struct MetadataPublisher {
     kimi_weekly: Option<model::WeeklyWorker>,
     weekly_diagnostics_initialized: bool,
     grok_observed: Arc<std::sync::Mutex<Option<Instant>>>,
+    grok_source: Arc<std::sync::Mutex<GrokSnapshot>>,
+    grok_auth_file: Option<PathBuf>,
     kimi_source: Arc<std::sync::Mutex<KimiShared>>,
     kimi_epoch: Arc<std::sync::atomic::AtomicU64>,
     codex_control: Arc<crate::quota_codex::QueryControl>,
@@ -672,6 +734,8 @@ impl MetadataPublisher {
             kimi_weekly: None,
             weekly_diagnostics_initialized: false,
             grok_observed: Arc::new(std::sync::Mutex::new(None)),
+            grok_source: Arc::new(std::sync::Mutex::new(GrokSnapshot::default())),
+            grok_auth_file: None,
             kimi_source: Arc::new(std::sync::Mutex::new(KimiShared::default())),
             kimi_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
@@ -790,24 +854,43 @@ impl MetadataPublisher {
             let settings = crate::quota_grok::Settings::default();
             // Preserve resolution failures as fixed categories, not silent None.
             let mut client = crate::quota_grok::Client::from_env(settings);
+            self.grok_auth_file = client
+                .as_ref()
+                .ok()
+                .map(|client| client.auth_file().to_path_buf());
             let directory = self.directory.clone();
-            let observed = self.grok_observed.clone();
-            self.grok_weekly = Some(model::WeeklyWorker::start(
+            let source = self.grok_source.clone();
+            self.grok_weekly = Some(model::WeeklyWorker::start_effect(
                 shutdown.clone(),
                 settings.interval(),
                 move || {
-                    let (sample, result) = match client.as_mut() {
+                    let result = match client.as_mut() {
                         Ok(client) => {
+                            let before = client.source_stamp();
+                            let generation = source.lock().ok().map(|mut state| {
+                                state.observe(before.clone());
+                                state.generation
+                            });
                             let outcome = client.poll();
-                            if let Ok(mut observed) = observed.lock() {
-                                *observed = client.last_success();
+                            let after = client.source_stamp();
+                            if let Ok(mut state) = source.lock() {
+                                state.observe(after.clone());
+                                if let (Some(generation), Some(before)) = (generation, before)
+                                    && after.as_ref() == Some(&before)
+                                {
+                                    state.publish(
+                                        generation,
+                                        &before,
+                                        grok_sample(outcome),
+                                        client.last_success(),
+                                    );
+                                }
                             }
-                            (grok_sample(outcome), client.last_result())
+                            client.last_result()
                         }
-                        Err(failure) => (None, failure.diagnostic()),
+                        Err(failure) => failure.diagnostic(),
                     };
                     let _ = write_weekly_result(&directory, WeeklyProvider::Grok, result);
-                    sample
                 },
             )?);
         }
@@ -1161,20 +1244,12 @@ impl MetadataPublisher {
                     .and_then(|worker| worker.sample(now))
             })
             .flatten();
-        let grok_weekly = config
-            .allow_network
-            .then(|| {
-                self.grok_weekly
-                    .as_ref()
-                    .and_then(|worker| worker.sample(now))
-            })
-            .flatten();
-        let grok_weekly = fresh_account_weekly(
-            grok_weekly,
-            self.grok_observed.try_lock().ok().and_then(|value| *value),
+        let grok_weekly = current_grok_weekly(
+            &self.grok_source,
+            self.grok_auth_file.as_deref(),
+            config,
+            now,
             Instant::now(),
-            config.usage_max_age_ms,
-            config.refresh_interval_ms,
         );
         let kimi_weekly = current_kimi_weekly(
             &self.kimi_source,
@@ -1579,6 +1654,147 @@ mod tests {
     use super::*;
 
     const FAR_RESET: &str = "2099-01-01T00:00:00Z";
+
+    #[test]
+    fn grok_reader_switch_invalidates_worker_result_even_when_auth_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        let a = r#"{"key":"fake-a","user_id":"same"}"#;
+        let b = r#"{"key":"fake-b","user_id":"same"}"#;
+        std::fs::write(&auth, a).unwrap();
+        let source_a = crate::quota_grok::source_stamp(&auth).unwrap();
+        let state = std::sync::Mutex::new(GrokSnapshot::default());
+        let config = Config {
+            allow_network: true,
+            providers: vec!["grok".into()],
+            ..Config::default()
+        };
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let sample = model::WeeklySample {
+            used_percent: 25.0,
+            resets_at: Some(now + Duration::from_secs(600)),
+        };
+        {
+            let mut state = state.lock().unwrap();
+            state.observe(Some(source_a.clone()));
+            let generation = state.generation;
+            state.publish(generation, &source_a, Some(sample), Some(instant));
+        }
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            Some(sample)
+        );
+        let worker_generation = state.lock().unwrap().generation;
+        std::fs::write(&auth, b).unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        std::fs::write(&auth, a).unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        state
+            .lock()
+            .unwrap()
+            .publish(worker_generation, &source_a, Some(sample), Some(instant));
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+    }
+
+    #[test]
+    fn grok_unknown_source_and_expired_reset_are_never_displayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(&auth, r#"{"key":"fake-a","user_id":"user-a"}"#).unwrap();
+        let source = crate::quota_grok::source_stamp(&auth).unwrap();
+        let state = std::sync::Mutex::new(GrokSnapshot::default());
+        let config = Config {
+            allow_network: true,
+            providers: vec!["grok".into()],
+            ..Config::default()
+        };
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        {
+            let mut state = state.lock().unwrap();
+            state.observe(Some(source.clone()));
+            let generation = state.generation;
+            state.publish(
+                generation,
+                &source,
+                Some(model::WeeklySample {
+                    used_percent: 25.0,
+                    resets_at: Some(now - Duration::from_secs(1)),
+                }),
+                Some(instant),
+            );
+        }
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        std::fs::write(&auth, "invalid").unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        assert!(state.lock().unwrap().source.is_none());
+    }
+
+    #[test]
+    fn grok_worker_cannot_publish_after_concurrent_reader_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(&auth, r#"{"key":"fake-a","user_id":"user"}"#).unwrap();
+        let source_a = crate::quota_grok::source_stamp(&auth).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(GrokSnapshot::default()));
+        let config = Config {
+            allow_network: true,
+            providers: vec!["grok".into()],
+            ..Config::default()
+        };
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let sample = model::WeeklySample {
+            used_percent: 25.0,
+            resets_at: Some(now + Duration::from_secs(600)),
+        };
+        let (started, ready) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            let generation = {
+                let mut state = worker_state.lock().unwrap();
+                state.observe(Some(source_a.clone()));
+                state.generation
+            };
+            started.send(()).unwrap();
+            release.recv().unwrap();
+            worker_state.lock().unwrap().publish(
+                generation,
+                &source_a,
+                Some(sample),
+                Some(instant),
+            );
+        });
+        ready.recv().unwrap();
+        std::fs::write(&auth, r#"{"key":"fake-b","user_id":"user"}"#).unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+    }
 
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct FixtureReply {
@@ -3878,6 +4094,24 @@ mod tests {
         publisher.codex_weekly = Some(workers.remove(0));
         publisher.grok_weekly = Some(workers.remove(0));
         publisher.kimi_weekly = Some(workers.remove(0));
+        let grok_auth = dir.path().join("grok-auth.json");
+        std::fs::write(&grok_auth, r#"{"key":"fake-key","user_id":"fake-user"}"#).unwrap();
+        let grok_stamp = crate::quota_grok::source_stamp(&grok_auth).unwrap();
+        publisher.grok_auth_file = Some(grok_auth);
+        {
+            let mut source = publisher.grok_source.lock().unwrap();
+            source.observe(Some(grok_stamp.clone()));
+            let generation = source.generation;
+            source.publish(
+                generation,
+                &grok_stamp,
+                Some(model::WeeklySample {
+                    used_percent: 42.0,
+                    resets_at: Some(SystemTime::now() + Duration::from_secs(86400)),
+                }),
+                Some(Instant::now()),
+            );
+        }
         *publisher.kimi_source.lock().unwrap() = KimiShared::new(Some(KimiSnapshot {
             sample: model::WeeklySample {
                 used_percent: 10.0,
