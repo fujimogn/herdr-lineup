@@ -292,7 +292,8 @@ fn apply_with(
             retained.push(entry.clone());
             continue;
         }
-        let text = fs::read_to_string(&path)?;
+        let original = fs::read(&path)?;
+        let text = std::str::from_utf8(&original).map_err(io::Error::other)?;
         if !text.contains(START) && !text.contains(END) {
             continue;
         }
@@ -309,7 +310,7 @@ fn apply_with(
             retained.push(entry.clone());
         }
         if removing {
-            changes.push((path, text.replacen(owned, "", 1)));
+            changes.push((path, text.replacen(owned, "", 1), original));
         }
     }
     state["entries"] = json!(retained);
@@ -325,7 +326,8 @@ fn apply_with(
             {
                 continue;
             }
-            let text = fs::read_to_string(&path)?;
+            let original = fs::read(&path)?;
+            let text = std::str::from_utf8(&original).map_err(io::Error::other)?;
             if text.contains(START) || text.contains(END) {
                 return Err(conflict(&format!(
                     "Unrecorded font block exists at {}; leaving it unchanged",
@@ -339,14 +341,9 @@ fn apply_with(
             };
             let owned = format!("{separator}{START}\n{mapping}\n{END}\n");
             state["entries"].as_array_mut().unwrap().push(json!({"path":path.to_str().ok_or_else(|| conflict("Non-UTF-8 config path"))?,"owned":owned}));
-            changes.push((path, format!("{text}{owned}")));
+            changes.push((path, format!("{text}{owned}"), original));
         }
     }
-    // Preflight all ownership checks before changing any font or terminal bytes.
-    let originals: Vec<_> = changes
-        .iter()
-        .map(|(path, _)| Ok((path.clone(), fs::read(path)?)))
-        .collect::<io::Result<_>>()?;
     let font_existed = locations.font.exists();
     let old_journal = match fs::read(&journal) {
         Ok(bytes) => Some(bytes),
@@ -357,7 +354,7 @@ fn apply_with(
     let mut changed_paths = Vec::new();
     let result: io::Result<()> = (|| {
         if removing {
-            for ((path, text), (_, original)) in changes.iter().zip(&originals) {
+            for (path, text, original) in &changes {
                 if &fs::read(path)? != original {
                     return Err(conflict(&format!(
                         "Configuration file was modified concurrently at {}; leaving it unchanged",
@@ -403,11 +400,11 @@ fn apply_with(
                     .write(true)
                     .open(&locations.font)?;
                 created_font = true;
+                changed_paths.push(locations.font.clone());
                 file.write_all(FONT)?;
                 file.sync_all()?;
-                changed_paths.push(locations.font.clone());
             }
-            for ((path, text), (_, original)) in changes.iter().zip(&originals) {
+            for (path, text, original) in &changes {
                 if &fs::read(path)? != original {
                     return Err(conflict(&format!(
                         "Configuration file was modified concurrently at {}; leaving it unchanged",
@@ -422,9 +419,9 @@ fn apply_with(
     })();
     if let Err(error) = result {
         let mut failures = Vec::new();
-        for (path, bytes) in originals.iter().rev() {
+        for (path, _, original) in changes.iter().rev() {
             if changed_paths.contains(path)
-                && let Err(rollback) = write_atomic(path, bytes)
+                && let Err(rollback) = write_atomic(path, original)
             {
                 failures.push(rollback.to_string());
             }
@@ -435,7 +432,6 @@ fn apply_with(
             }
         } else if created_font
             && locations.font.exists()
-            && changed_paths.contains(&locations.font)
             && let Err(rollback) = fs::remove_file(&locations.font)
         {
             failures.push(rollback.to_string());
@@ -1127,6 +1123,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn first_write_failure_after_font_creation_cleans_up_font_and_journal() {
+        let (_root, locations) = fixture();
+        let kitty = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(kitty.parent().unwrap()).unwrap();
+        fs::write(&kitty, "# original\n").unwrap();
+
+        let result = apply_with(&locations, false, |_path, _bytes| {
+            Err(conflict("injected first write failure"))
+        });
+        assert!(result.is_err());
+        assert!(
+            !locations.font.exists(),
+            "font must be cleaned up on failure"
+        );
+        assert!(
+            !locations.state.join("font-ownership.json").exists(),
+            "journal must be cleaned up on failure"
+        );
+        assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
+
+        install(&locations).unwrap();
+        assert!(locations.font.exists());
+        assert!(fs::read_to_string(&kitty).unwrap().contains(START));
+        uninstall(&locations).unwrap();
     }
 
     #[test]
