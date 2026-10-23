@@ -571,7 +571,7 @@ pub(crate) struct ReaderDiagnostics {
     unknown_worker: [AtomicBool; 6],
 }
 
-// Every local reader worker records here; the snapshot seam is not wired into control yet.
+// All five local reader workers record here; control and doctor expose snapshots.
 #[allow(dead_code)]
 impl ReaderDiagnostics {
     fn index(provider: Provider) -> usize {
