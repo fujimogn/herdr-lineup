@@ -2,7 +2,8 @@
 
 **Status:** design candidate only. No production code implements any part of
 it. The commander's decisions in `note-publisher-design-decisions-01` are
-incorporated. Implementation starts only after a design GO and a new task.
+incorporated. Design GO on `86ea771` (`note-publisher-design-go-handoff-01`).
+Implementation starts only with a new task.
 
 **Base:** local integration `64ace031ab5b17615a2cebef46f916bf4defd79c`.
 
@@ -379,6 +380,7 @@ expiry skips only reader I/O and yields a `Timeout` observation while the pass
 continues under `E` admission; attempts are reader API calls with a positive
 budget or started metadata exchanges; the `D + I + b` gap holds only when the
 next cycle sends the resource, and multi-cycle deferral is unbounded degraded
-behavior. Interpretation to confirm: a pane that sends after a reader-expired
-`Timeout` observation has completed its processing and is not counted in
-`deadline_skipped`.
+behavior. Confirmed by the commander (`note-publisher-design-go-handoff-01`):
+a pane that completes its send after a reader-expired `Timeout` observation is
+not counted in `deadline_skipped`, and a workspace whose Git read was not
+started is not counted when its metadata processing completes.
