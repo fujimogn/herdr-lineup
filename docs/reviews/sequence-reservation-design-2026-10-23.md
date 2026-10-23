@@ -64,7 +64,11 @@ socket result, and an in-memory acceptance update only after `ok`.
 
 ## Candidate: one endpoint-wide reservation window
 
-**Inference, not implemented:** use the already supported `kind: "endpoint"`
+> **Historical (2026-10-23):** this section and "Verification and decision
+> gate" record the proposal as written before implementation. The current
+> implementation and its evidence are in "Implementation status (2026-10-24)".
+
+**Inference, not implemented at the time:** use the already supported `kind: "endpoint"`
 checkpoint row as a durable upper bound `U` for all resources on one pinned
 endpoint. Choose a small fixed block size `B` for an experiment; do not add a
 user setting. On loading a checkpoint, calculate `base = max(endpoint floor,
@@ -125,6 +129,9 @@ the current single-daemon guarantee and needs an explicit conflict test or
 separate ownership rule before enabling the optimization.
 
 ## Verification and decision gate
+
+> **Historical (2026-10-23):** the gate below, including "keep the current
+> per-report persist", described the code before the window was implemented.
 
 The implementation owner would be the publisher/planner module owner. The
 integration-test owner would be the same change lane, using the existing
@@ -199,6 +206,10 @@ process; a real power loss or kernel crash was not simulated.
 | Durable reservation, then restart with unused slots | `stale_sequence_server_applies_reports_across_window_restart_and_reuse`: the first seq after restart is above the old `U`, and the server applies it. |
 | Window boundary in one run | Same test: 40 reports cross the 32-slot boundary with exactly two checkpoint writes; every report applies with a strictly increasing seq. |
 | Resource disappears and the ID reappears in the same run | Same test: after pruning, the reused ID gets a seq above the cursor and applies; the final snapshot holds the latest patch. |
+| Server applies, then the response is lost | `response_lost_after_apply_is_never_replayed`: the unacknowledged seq is not resent; after `reconnected` and after a restart, the current desired value goes out above the old window and wins. |
+| Process exits with unused slots | `process_exit_after_reservation_discards_unused_window`: a self-spawned test child reserves a 32-slot window, sends seq 1, and calls `process::exit` without `Drop`; the parent's new instance sends seq 33. |
+| Shutdown-clear deadline after reservation | `clear_deadline_after_reservation_burns_the_unsent_seq`: `report` with an expired deadline reserves and allocates seq 1, then sends nothing; the next report uses seq 2 and a restart uses seq 33. |
+| Pruning write fails | `failed_pruning_persist_poisons_refresh_clear_and_reconnect`: the poison survives refresh, `reconnected`, and clear; only a new instance sends again, above the old bound. |
 | Lost checkpoint (negative control) | Same test: a publisher without the checkpoint sends `seq = 1`, which is answered `ok` but not applied. |
 | Error response | `rejected_report_burns_sequence_and_clear_preserves_other_keys`: the next report uses a fresh number. |
 | Endpoint replaced | `checkpoint_pruning_persists_floor_and_drops_replaced_endpoint`. |
@@ -206,10 +217,13 @@ process; a real power loss or kernel crash was not simulated.
 | Legacy checkpoint without endpoint rows | `legacy_checkpoint_without_endpoint_rows_migrates_safely`, `legacy_checkpoint_migration_in_metadata_publisher`. |
 | Empty patch and capacity skip | `empty_patch_and_capacity_skip_preserve_reservation_cursor`. |
 
-Not verified: crashes between sends at the process level, response loss after
-a written frame, concurrent ensure or a second allocator, a same-source
-competing writer, config change during refresh, the shutdown-clear deadline
-after a reservation, rollback to an older binary, and macOS disks.
+The process-exit row uses a normal `exit`, not `SIGKILL` or power loss. The
+deadline row passes an already expired deadline instead of racing a timer.
+
+Not verified: kernel crash or power loss, concurrent ensure or a second
+allocator, a same-source competing writer, config change during refresh, and
+rollback to an older binary. macOS disks were not available and are
+unmeasured; the Linux results are not extrapolated to them.
 
 ### Measurement
 
