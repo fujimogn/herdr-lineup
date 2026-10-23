@@ -1,9 +1,12 @@
 # Reader diagnostics control and doctor design
 
-**Status:** D implementation candidate; independent review and shipment pending.
-**Implementation baseline:** `bfe2a4d3a7a4369711b49057016ec233273f9484`.
+**Status:** D control/doctor and all five local reader worker producers are
+implemented and integrated in the local candidate; nothing is shipped.
+**Implementation source:** `0220da64f8545f89b6daca211553f486b271057f`.
+Final inclusive review remains a separate commander-owned gate; no live
+measurement is claimed.
+**Historical D baseline:** `bfe2a4d3a7a4369711b49057016ec233273f9484`.
 P was reviewed and integrated locally before the commander authorized D.
-This candidate does not imply integration, shipment or live measurement.
 This document supplements [the P plan](publisher-runtime-wiring.md); current
 assignment decisions supersede its older allocation of Arc ownership to D.
 
@@ -16,8 +19,9 @@ The baseline implements `ReadCycle::with_diagnostics`, `diagnostics`,
 `DiagnosticUnavailable::{Contended,Poisoned,Incomplete}` in `src/model.rs`.
 These model types remain crate-private. The fixed source order is Claude,
 Agy, Codex, Grok, Hermes, Kimi; it is independent of configured providers.
-D connects publisher/control/doctor consumption. Claude/Agy/Grok observed routing
-is a separate concurrent task; Codex/Kimi routing is in the baseline. Hermes
+D connects publisher/control/doctor consumption. Claude, Agy, Codex, Grok and
+Kimi observed routing is now implemented and integrated locally. Historically,
+Claude/Agy/Grok routing was a concurrent task. Hermes
 has no bounded worker: its empty slot is not a successful read measurement.
 P owns one publisher-lifetime `Arc<ReaderDiagnostics>` and passes a clone to
 each fresh `ReadCycle::with_diagnostics`. D reuses that Arc; it must not create
@@ -175,8 +179,8 @@ relabeled as skips. Keep `Health.last_refresh_ms` startup-relative semantics.
 | doctor | Fixed labels/units only; None versus zero; live versus completed header; escaped arbitrary input never printed; metrics visible on first-refresh/error path with unchanged exit status |
 | daemon/doctor | P mixed capacity+deadline, success, real error, poison, shutdown; total attempts/durations remain consistent and deadline counter saturation remains accepted |
 
-D touches only `src/publish.rs`, `src/daemon.rs`, `src/doctor.rs` plus cfg(test) model helpers approved by touching amendment 382, this plan and
-the approved daemon-lifecycle delta in `openspec/changes/wire-publisher-runtime/specs/daemon-lifecycle/spec.md`
+Historically, D touched only `src/publish.rs`, `src/daemon.rs`, `src/doctor.rs` plus cfg(test) model helpers approved by touching amendment 382, this plan and
+the approved daemon-lifecycle delta in `openspec/changes/archive/2026-10-24-wire-publisher-runtime/specs/daemon-lifecycle/spec.md`
 for live sampling/release, optional-data version skew, frame fallback, fixed
 redacted output and unhealthy-refresh diagnostics. Scope approval and strict
 OpenSpec validation preceded source implementation.
@@ -206,5 +210,7 @@ fresh/shared cycle transition, plus a zero-timeout negative with no scan.
 The saturated combined serializer fixture is 6186 bytes including newline;
 escaped long paths exercise both optional omission tiers. This synthetic size
 is not a bound for arbitrary Health identities; exact per-response checking
-remains required. Required local checks passed; independent re-review remains
-pending. Historical lifecycle failure causes remain unconfirmed.
+remains required. The original D candidate passed its required local checks;
+its then-pending independent re-review completed before local integration.
+Final inclusive review is separate. Historical lifecycle failure causes
+remain unconfirmed.
