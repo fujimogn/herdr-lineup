@@ -373,7 +373,19 @@ mod tests {
         let mut transport = Transport::connect(&path).unwrap();
         let (peer, _) = listener.accept().unwrap();
         drop(peer);
-        assert!(transport.check_connection().is_err());
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut disconnected = false;
+        while Instant::now() < deadline {
+            if transport.check_connection().is_err() {
+                disconnected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            disconnected,
+            "socket did not observe peer EOF before deadline"
+        );
         transport.reconnect_same_endpoint().unwrap();
         let _new_peer = listener.accept().unwrap();
         assert!(transport.check_connection().is_ok());
