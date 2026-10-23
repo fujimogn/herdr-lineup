@@ -95,6 +95,11 @@ identity atomically with replacement. The inspected metadata contract provides
 per-source sequence/TTL, not that precondition. Host-owned conditional consume
 or equivalent atomic association is therefore a separate requirement. A single
 snapshot cannot ensure values are current when a later report is applied.
+Conditional acceptance alone also does not retire usage applied before a
+replacement. The host must invalidate that usage on replacement or exclude it
+from rendering unless its stored generation matches the current occupant.
+Provider/state display remains independent; sequence ordering and TTL alone
+cannot provide immediate generation retirement.
 Same-user processes can forge local records or inherited values; this proposal
 addresses lifecycle races, not isolation from a hostile process with the same
 filesystem and socket authority. Stronger authentication is an upstream concern.
@@ -146,6 +151,7 @@ the host owner must supply generation lifecycle and conditional-apply fixtures.
 | A → other → A entirely between snapshots; terminal ID unchanged | Generation differs; reject even if all legacy identity fields match |
 | A's hook finishes after B's hook | A cannot overwrite or satisfy B's generation record |
 | Replacement between snapshot/read/send/server apply | Conditional host consume rejects old-generation report; no false acknowledgement of applied usage |
+| A's usage is applied immediately before B replaces A | Host invalidates the stored usage or excludes it from rendering for B; TTL is not the generation boundary |
 | Endpoint restart or pane/terminal ID reuse; daemon restart with v1 records | No ABA reuse or auto-promotion; legacy bytes preserved |
 | Missing/malformed/unknown generation or unsupported host | Unavailable strict usage; provider/state remain independent |
 | Event loss/reorder/reconnect during replacement | Reconcile authoritative state; never treat event history as generation proof |
