@@ -34,15 +34,20 @@ static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 static TEST_GATE: Mutex<()> = Mutex::new(());
 impl UsageReader for KimiReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+        self.read_in_cycle(request, &ReadCycle::new())
+    }
+
+    fn read_in_cycle(&self, request: &ReadRequest<'_>, cycle: &ReadCycle) -> UsageReading {
         #[cfg(test)]
         let _gate = TEST_GATE.lock().unwrap_or_else(|error| error.into_inner());
         let source = SourceKind::KimiSession;
         if !associated(request, Provider::Kimi) {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
+        let cycle = cycle.clone();
         bounded_read(request, source, &BUSY, move |request| {
             let started = std::time::Instant::now();
-            match read_session(request) {
+            match read_session_in_cycle(request, &cycle) {
                 Ok((percent, time)) => {
                     let evaluated = ReadRequest {
                         now: request.now_after(started),
@@ -56,13 +61,19 @@ impl UsageReader for KimiReader {
     }
 }
 
+#[cfg(test)]
 fn read_session(request: &ReadRequest<'_>) -> Result<(f64, SystemTime), MissingReason> {
+    read_session_in_cycle(request, &ReadCycle::new())
+}
+
+fn read_session_in_cycle(
+    request: &ReadRequest<'_>,
+    cycle: &ReadCycle,
+) -> Result<(f64, SystemTime), MissingReason> {
     let mut budget = Budget::new(request);
     let wanted = lexical_absolute(&request.identity.repository_identity)
         .ok_or(MissingReason::Unassociated)?;
-    let states = budget.files(&request.home.join("sessions"), 2, |path| {
-        path.file_name().is_some_and(|name| name == "state.json")
-    })?;
+    let states = cycle.files(&mut budget, request.home, DiscoveryKind::Kimi)?;
     let mut matched = Vec::new();
     let mut saw_state = false;
     let mut unproven_duplicate = false;
@@ -624,6 +635,51 @@ mod tests {
         identity.native_session_id = session.into();
         identity.repository_identity = cwd.into();
         KimiReader.read(&request(&identity, home)).context
+    }
+
+    #[test]
+    fn cycle_adapter_rechecks_state_content_and_new_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut id = identity(Provider::Kimi);
+        id.repository_identity = "/synthetic/repo".into();
+        let r = request(&id, dir.path());
+        install(
+            dir.path(),
+            "session-1",
+            "/synthetic/repo",
+            75,
+            fresh_ms(&r),
+            "",
+        );
+        let cycle = ReadCycle::new();
+        let first = read_session_in_cycle(&r, &cycle).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        let state = dir
+            .path()
+            .join("sessions/wd_synthetic/session-1/state.json");
+        // A file rewrite does not change its parent directory stamp. The
+        // adapter must still revalidate the state binding on a listing hit.
+        fs::write(&state, r#"{"id":"session-1","cwd":"/synthetic/else"}"#).unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Unassociated)
+        );
+        fs::write(&state, r#"{"id":"session-1","cwd":"/synthetic/repo"}"#).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        let duplicate = dir.path().join("sessions/other/session-1");
+        fs::create_dir_all(&duplicate).unwrap();
+        fs::copy(&state, duplicate.join("state.json")).unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Unassociated)
+        );
+        fs::rename(duplicate.join("state.json"), duplicate.join("ignored")).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        fs::write(&state, b"broken").unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Unassociated)
+        );
     }
 
     #[test]

@@ -108,6 +108,208 @@ impl ReadRequest<'_> {
 
 pub trait UsageReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading;
+
+    /// Share candidate discovery only within the caller's current refresh.
+    /// Existing readers remain compatible and may ignore the cycle.
+    fn read_in_cycle(&self, request: &ReadRequest<'_>, _cycle: &ReadCycle) -> UsageReading {
+        self.read(request)
+    }
+}
+
+/// Create one per refresh and pass it to `UsageReader::read_in_cycle`.
+/// Only names are shared; observations and Kimi state bindings still undergo
+/// their normal per-read validation. Never retain this across refreshes.
+#[derive(Clone, Default)]
+pub struct ReadCycle {
+    discoveries: std::sync::Arc<std::sync::Mutex<Vec<Discovery>>>,
+    #[cfg(test)]
+    scans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscoveryKind {
+    Codex,
+    Kimi,
+}
+
+impl DiscoveryKind {
+    fn roots(self) -> &'static [(&'static str, usize)] {
+        match self {
+            Self::Codex => &[("sessions", 3), ("archived_sessions", 3)],
+            Self::Kimi => &[("sessions", 2)],
+        }
+    }
+
+    fn accepts(self, path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| match self {
+                Self::Codex => {
+                    name.starts_with("rollout-")
+                        && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+                }
+                Self::Kimi => name == "state.json",
+            })
+    }
+}
+
+#[derive(Clone)]
+struct Discovery {
+    home: PathBuf,
+    kind: DiscoveryKind,
+    paths: Vec<PathBuf>,
+    entries: usize,
+    directories: Vec<(PathBuf, bool, Option<DirectoryStamp>)>,
+}
+
+// ctime also detects permission/ownership changes and timestamp restoration.
+// Each traversed directory is checked, including empty directories and missing
+// roots; checking only the home or previous matching path misses duplicates.
+#[derive(Clone, PartialEq, Eq)]
+struct DirectoryStamp {
+    fingerprint: Fingerprint,
+    ctime: (i64, i64),
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+fn directory_stamp(path: &Path, contents: bool) -> Result<Option<DirectoryStamp>, MissingReason> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let mut fingerprint = Fingerprint::of(&meta);
+            let mut ctime = (meta.ctime(), meta.ctime_nsec());
+            if !contents && meta.is_dir() {
+                // Sibling changes above the search root cannot change its
+                // contents. Still detect ancestor replacement and permissions.
+                fingerprint.size = 0;
+                fingerprint.mtime = (0, 0);
+                ctime = (0, 0);
+            }
+            Ok(Some(DirectoryStamp {
+                fingerprint,
+                ctime,
+                mode: meta.mode(),
+                uid: meta.uid(),
+                gid: meta.gid(),
+            }))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_reason(&error)),
+    }
+}
+
+impl Discovery {
+    fn unchanged(&self, budget: &Budget) -> Result<bool, MissingReason> {
+        for (path, contents, stamp) in &self.directories {
+            budget.check()?;
+            if directory_stamp(path, *contents)?.as_ref() != stamp.as_ref() {
+                return Ok(false);
+            }
+        }
+        budget.check()?;
+        Ok(true)
+    }
+}
+
+impl ReadCycle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn files(
+        &self,
+        budget: &mut Budget,
+        home: &Path,
+        kind: DiscoveryKind,
+    ) -> Result<Vec<PathBuf>, MissingReason> {
+        self.files_with_hook(budget, home, kind, || {})
+    }
+
+    fn files_with_hook(
+        &self,
+        budget: &mut Budget,
+        home: &Path,
+        kind: DiscoveryKind,
+        after_scan: impl FnOnce(),
+    ) -> Result<Vec<PathBuf>, MissingReason> {
+        budget.check()?;
+        // Never hold a mutex across filesystem I/O: a stalled worker retains
+        // its provider BUSY permit, but must not block another provider.
+        let cached = {
+            let mut discoveries = self
+                .discoveries
+                .lock()
+                .map_err(|_| MissingReason::SourceError)?;
+            discoveries
+                .iter()
+                .position(|entry| entry.home == home && entry.kind == kind)
+                .map(|index| discoveries.remove(index))
+        };
+        if let Some(cached) = cached
+            && cached.unchanged(budget)?
+        {
+            budget.entries = budget
+                .entries
+                .checked_add(cached.entries)
+                .ok_or(MissingReason::EntryLimit)?;
+            if budget.entries > MAX_DIRECTORY_ENTRIES {
+                return Err(MissingReason::EntryLimit);
+            }
+            let paths = cached.paths.clone();
+            self.remember(cached)?;
+            return Ok(paths);
+        }
+        #[cfg(test)]
+        self.scans.fetch_add(1, Ordering::Relaxed);
+        let mut discovery = Discovery {
+            home: home.to_path_buf(),
+            kind,
+            paths: Vec::new(),
+            entries: 0,
+            directories: Vec::new(),
+        };
+        // Ancestor replacement (including a symlinked home) invalidates names.
+        for ancestor in home.ancestors() {
+            budget.check()?;
+            discovery.directories.push((
+                ancestor.to_path_buf(),
+                false,
+                directory_stamp(ancestor, false)?,
+            ));
+        }
+        let before = budget.entries;
+        for (root, depth) in kind.roots() {
+            discovery.paths.extend(budget.files_tracked(
+                &home.join(root),
+                *depth,
+                |path| kind.accepts(path),
+                &mut discovery.directories,
+            )?);
+        }
+        discovery.entries = budget.entries - before;
+        after_scan();
+        // Mutation during the scan makes uniqueness unproven. Do not publish
+        // or retain a partial mixed listing; a later read starts a full scan.
+        if !discovery.unchanged(budget)? {
+            return Err(MissingReason::SourceError);
+        }
+        let paths = discovery.paths.clone();
+        self.remember(discovery)?;
+        Ok(paths)
+    }
+
+    fn remember(&self, discovery: Discovery) -> Result<(), MissingReason> {
+        let mut discoveries = self
+            .discoveries
+            .lock()
+            .map_err(|_| MissingReason::SourceError)?;
+        // Bound retention even if a caller supplies many different homes.
+        if discoveries.len() < 128 {
+            discoveries.push(discovery);
+        }
+        Ok(())
+    }
 }
 
 /// Account quota only; no credentials, raw responses or conversation data.
@@ -498,13 +700,25 @@ impl Budget {
             Ok(())
         }
     }
+    #[cfg(test)]
     pub(crate) fn files(
         &mut self,
         root: &Path,
         depth: usize,
         accept: impl Fn(&Path) -> bool + Copy,
     ) -> Result<Vec<PathBuf>, MissingReason> {
+        self.files_tracked(root, depth, accept, &mut Vec::new())
+    }
+
+    fn files_tracked(
+        &mut self,
+        root: &Path,
+        depth: usize,
+        accept: impl Fn(&Path) -> bool + Copy,
+        directories: &mut Vec<(PathBuf, bool, Option<DirectoryStamp>)>,
+    ) -> Result<Vec<PathBuf>, MissingReason> {
         self.check()?;
+        directories.push((root.to_path_buf(), true, directory_stamp(root, true)?));
         let meta = match fs::symlink_metadata(root) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -525,7 +739,7 @@ impl Budget {
             let entry = entry.map_err(|e| io_reason(&e))?;
             let kind = entry.file_type().map_err(|e| io_reason(&e))?;
             if kind.is_dir() && depth > 0 {
-                result.extend(self.files(&entry.path(), depth - 1, accept)?);
+                result.extend(self.files_tracked(&entry.path(), depth - 1, accept, directories)?);
             } else if kind.is_file() && accept(&entry.path()) {
                 result.push(entry.path());
             }
@@ -970,6 +1184,121 @@ pub(crate) mod tests {
         assert_eq!(
             budget.files(root, 0, |_| true),
             Err(MissingReason::EntryLimit)
+        );
+    }
+
+    #[test]
+    fn cycle_discovery_reuses_names_but_detects_nested_changes_and_missing_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let request = request(&id, dir.path());
+        let cycle = ReadCycle::new();
+        let discover = || cycle.files(&mut Budget::new(&request), dir.path(), DiscoveryKind::Codex);
+        assert!(discover().unwrap().is_empty());
+        let nested = dir.path().join("sessions/2026/10/24");
+        fs::create_dir_all(&nested).unwrap();
+        let first = nested.join("rollout-a-session-1.jsonl");
+        fs::write(&first, b"").unwrap();
+        assert_eq!(discover().unwrap(), vec![first.clone()]);
+        let scans = cycle.scans.load(Ordering::Relaxed);
+        assert_eq!(discover().unwrap(), vec![first.clone()]);
+        assert_eq!(cycle.scans.load(Ordering::Relaxed), scans);
+        let duplicate = nested.join("rollout-b-session-1.jsonl");
+        fs::write(&duplicate, b"").unwrap();
+        assert_eq!(discover().unwrap().len(), 2);
+        fs::rename(&first, nested.join("other.jsonl")).unwrap();
+        assert_eq!(discover().unwrap(), vec![duplicate]);
+        assert!(
+            ReadCycle::new()
+                .files(&mut Budget::new(&request), dir.path(), DiscoveryKind::Kimi)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cycle_discovery_counts_both_roots_and_rejects_symlinks_and_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let mut request = request(&id, dir.path());
+        request.timeout = Duration::from_secs(10);
+        let sessions = dir.path().join("sessions");
+        let archive = dir.path().join("archived_sessions");
+        fs::create_dir(&sessions).unwrap();
+        fs::create_dir(&archive).unwrap();
+        for index in 0..MAX_DIRECTORY_ENTRIES / 2 {
+            fs::write(sessions.join(format!("a{index}")), b"").unwrap();
+            fs::write(archive.join(format!("a{index}")), b"").unwrap();
+        }
+        let cycle = ReadCycle::new();
+        assert!(
+            cycle
+                .files(&mut Budget::new(&request), dir.path(), DiscoveryKind::Codex)
+                .unwrap()
+                .is_empty()
+        );
+        let mut charged = Budget::new(&request);
+        cycle
+            .files(&mut charged, dir.path(), DiscoveryKind::Codex)
+            .unwrap();
+        assert_eq!(charged.entries, MAX_DIRECTORY_ENTRIES);
+        fs::write(archive.join("extra"), b"").unwrap();
+        assert_eq!(
+            cycle.files(&mut Budget::new(&request), dir.path(), DiscoveryKind::Codex),
+            Err(MissingReason::EntryLimit)
+        );
+        request.timeout = Duration::ZERO;
+        assert_eq!(
+            cycle.files(&mut Budget::new(&request), dir.path(), DiscoveryKind::Codex),
+            Err(MissingReason::Timeout)
+        );
+        let other = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&sessions, other.path().join("sessions")).unwrap();
+        request.timeout = Duration::from_secs(10);
+        assert_eq!(
+            cycle.files(
+                &mut Budget::new(&request),
+                other.path(),
+                DiscoveryKind::Codex
+            ),
+            Err(MissingReason::Invalid)
+        );
+    }
+
+    #[test]
+    fn cycle_discovery_rejects_mutation_during_scan_without_retaining_partial_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let request = request(&id, dir.path());
+        let root = dir.path().join("sessions");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("rollout-a-session-1.jsonl"), b"").unwrap();
+        let cycle = ReadCycle::new();
+        let result = cycle.files_with_hook(
+            &mut Budget::new(&request),
+            dir.path(),
+            DiscoveryKind::Codex,
+            || {
+                fs::write(root.join("rollout-b-session-1.jsonl"), b"").unwrap();
+            },
+        );
+        assert_eq!(result, Err(MissingReason::SourceError));
+        assert!(cycle.discoveries.lock().unwrap().is_empty());
+        assert_eq!(
+            cycle
+                .files(&mut Budget::new(&request), dir.path(), DiscoveryKind::Codex)
+                .unwrap()
+                .len(),
+            2
+        );
+        // Replacement of a formerly valid root by a symlink must not reuse
+        // the previously cached listing, even if its target has those files.
+        let moved = dir.path().join("moved");
+        fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &root).unwrap();
+        assert_eq!(
+            cycle.files(&mut Budget::new(&request), dir.path(), DiscoveryKind::Codex),
+            Err(MissingReason::Invalid)
         );
     }
 }
