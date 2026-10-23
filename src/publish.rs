@@ -725,12 +725,21 @@ struct PlannedWorkspaceReport {
     desired: tokens::Tokens,
 }
 
+pub(crate) const MIN_RESERVATION_WINDOW: u64 = 32;
+pub(crate) const MAX_RESERVATION_WINDOW: u64 = 4096;
+
+pub(crate) fn compute_reservation_window(pane_count: usize, workspace_count: usize) -> u64 {
+    let candidate = (pane_count.saturating_add(workspace_count) as u64).max(MIN_RESERVATION_WINDOW);
+    candidate.min(MAX_RESERVATION_WINDOW)
+}
+
 pub struct MetadataPublisher {
     planner: tokens::Publisher,
     checkpoint_loaded: bool,
     directory: PathBuf,
     socket_key: String,
     endpoint: Option<String>,
+    reservation_window: u64,
     homes: Homes,
     started: Instant,
     request_seq: u64,
@@ -798,6 +807,7 @@ impl MetadataPublisher {
             directory,
             socket_key,
             endpoint: None,
+            reservation_window: MIN_RESERVATION_WINDOW,
             homes,
             started: Instant::now(),
             request_seq: 0,
@@ -1140,6 +1150,65 @@ impl MetadataPublisher {
         Ok(())
     }
 
+    fn persist_checkpoint_with_upper_bound(
+        &self,
+        endpoint: &str,
+        upper_bound: u64,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        let stage_start = Instant::now();
+        let mut rows: Vec<_> = self
+            .planner
+            .checkpoint()
+            .into_iter()
+            .map(|(resource, seq)| CheckpointRow {
+                endpoint: resource.endpoint_session,
+                kind: match resource.kind {
+                    ResourceKind::Pane => "pane",
+                    ResourceKind::Workspace => "workspace",
+                }
+                .into(),
+                id: resource.id,
+                seq,
+            })
+            .collect();
+        let mut floors = self.planner.checkpoint_floors();
+        floors.insert(endpoint.into(), upper_bound);
+        rows.extend(floors.into_iter().map(|(endpoint, seq)| CheckpointRow {
+            endpoint,
+            kind: "endpoint".into(),
+            id: String::new(),
+            seq,
+        }));
+        let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
+        serde_json::to_writer(file.as_file_mut(), &rows)?;
+        file.flush()?;
+        file.as_file().sync_all()?;
+        file.persist(self.directory.join("sequences.json"))
+            .map_err(|_| io::Error::other("cannot persist sequence checkpoint"))?;
+        File::open(&self.directory)?.sync_all()?;
+        #[cfg(test)]
+        {
+            let _ = self.checkpoint_persists.fetch_add(1, Ordering::Relaxed);
+            let mut stages = self.stages.lock().unwrap();
+            stages.add("persist", stage_start.elapsed());
+            stages.checkpoint_rows = rows.len();
+        }
+        Ok(())
+    }
+
+    fn reserve_window_for_endpoint(&mut self, endpoint: &str, window_size: u64) -> io::Result<()> {
+        let new_upper_bound = self
+            .planner
+            .plan_reservation(endpoint, window_size)
+            .map_err(|_| io::Error::other("sequence reservation exhausted"))?;
+        self.persist_checkpoint_with_upper_bound(endpoint, new_upper_bound)?;
+        self.planner
+            .confirm_reservation(endpoint, new_upper_bound)
+            .map_err(|_| io::Error::other("cannot confirm sequence reservation"))?;
+        Ok(())
+    }
+
     fn request(&mut self, transport: &mut Transport, method: &str) -> io::Result<(String, Value)> {
         self.request_seq = self
             .request_seq
@@ -1173,13 +1242,15 @@ impl MetadataPublisher {
             .unwrap()
             .add("socket", socket_start.elapsed());
         let result = protocol::parse_snapshot(&id, &response)
-            .map_err(|_| io::Error::other("invalid snapshot response"));
+            .map_err(|_| io::Error::other("invalid snapshot response"))?;
         #[cfg(test)]
         self.stages
             .lock()
             .unwrap()
             .add("snapshot", stage_start.elapsed());
-        result
+        self.reservation_window =
+            compute_reservation_window(result.panes.len(), result.workspaces.len());
+        Ok(result)
     }
 
     fn resource(&self, kind: ResourceKind, id: &str) -> ResourceId {
@@ -1207,6 +1278,34 @@ impl MetadataPublisher {
             exists: true,
             stored_keys: keys.clone(),
         };
+        match self.planner.needs_report(
+            resource,
+            &snapshot,
+            occupant,
+            desired,
+            now_ms,
+            self.refresh_ms,
+        ) {
+            Ok(false) => return Ok(()),
+            Err(tokens::PatchError::ResourceCapacity | tokens::PatchError::ReportCapacity) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    CapacitySkip {
+                        skipped_resources: 1,
+                    },
+                ));
+            }
+            Err(_) => return Err(io::Error::other("metadata planning failed")),
+            Ok(true) => {}
+        }
+
+        if !self
+            .planner
+            .has_available_reservation(&resource.endpoint_session)
+        {
+            self.reserve_window_for_endpoint(&resource.endpoint_session, self.reservation_window)?;
+        }
+
         let Some(report) = self
             .planner
             .prepare(
@@ -1231,9 +1330,6 @@ impl MetadataPublisher {
         else {
             return Ok(());
         };
-        // Reserve durably BEFORE the first byte can reach Herdr. Even an ambiguous
-        // response burns this seq; retry/restart must use a strictly newer one.
-        self.persist()?;
         self.request_seq = self
             .request_seq
             .checked_add(1)
@@ -5710,6 +5806,7 @@ mod tests {
         let mut restarted =
             MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
         restarted.load_checkpoint().unwrap();
+        restarted.reserve_window_for_endpoint(endpoint, 32).unwrap();
         let resource = ResourceId {
             endpoint_session: endpoint.into(),
             kind: ResourceKind::Pane,
@@ -5773,13 +5870,23 @@ mod tests {
         let reserved = std::fs::read(dir.path().join("sequences.json")).unwrap();
         let rows: Vec<CheckpointRow> = serde_json::from_slice(&reserved).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].seq, 1);
-        // Acceptance does not move the high-water mark, so rewriting the
-        // checkpoint after acknowledge stores the same bytes.
+        assert_eq!(rows[0].kind, "endpoint");
+        assert_eq!(rows[0].seq, MIN_RESERVATION_WINDOW);
+        // Acceptance does not move the high-water mark. Rewriting the checkpoint
+        // after acknowledge writes the confirmed resource rows alongside the reserved endpoint window.
         publisher.persist().unwrap();
-        assert_eq!(
-            std::fs::read(dir.path().join("sequences.json")).unwrap(),
-            reserved
+        let post_ack_rows: Vec<CheckpointRow> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
+                .unwrap();
+        assert!(
+            post_ack_rows
+                .iter()
+                .any(|r| r.kind == "endpoint" && r.seq == MIN_RESERVATION_WINDOW)
+        );
+        assert!(
+            post_ack_rows
+                .iter()
+                .any(|r| r.kind == "pane" && r.id == "w1:p1" && r.seq == 1)
         );
 
         let mut restarted =
@@ -5800,7 +5907,10 @@ mod tests {
         let rows: Vec<CheckpointRow> =
             serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
                 .unwrap();
-        assert_eq!(rows[0].seq, 2);
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == "endpoint" && r.seq == MIN_RESERVATION_WINDOW * 2)
+        );
         server.join().unwrap();
     }
 
@@ -5837,7 +5947,7 @@ mod tests {
         let rows: Vec<CheckpointRow> =
             serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
                 .unwrap();
-        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[0].seq, MIN_RESERVATION_WINDOW);
         let mut line = String::new();
         assert!(stream.read_line(&mut line).is_err());
         assert!(line.is_empty());
@@ -5884,7 +5994,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
                 .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[0].seq, MIN_RESERVATION_WINDOW);
     }
 
     #[test]
@@ -6143,7 +6253,7 @@ mod tests {
         let reports = server.join().unwrap();
         assert_eq!(reports[0]["params"]["seq"], 1);
         assert_eq!(reports[1]["params"]["seq"], 2);
-        assert_eq!(reports[3]["params"]["seq"], 3);
+        assert_eq!(reports[3]["params"]["seq"], 4);
         for request in &reports[3..] {
             let tokens = request["params"]["tokens"].as_object().unwrap();
             assert!(tokens.values().all(Value::is_null));
@@ -6446,13 +6556,18 @@ mod tests {
                     let rows: Vec<CheckpointRow> =
                         serde_json::from_slice(&std::fs::read(&server_checkpoint).unwrap())
                             .unwrap();
-                    assert!(rows.iter().any(|row| row.id
-                        == request["params"][if request["method"] == "pane.report_metadata" {
-                            "pane_id"
-                        } else {
-                            "workspace_id"
-                        }]
-                        && row.seq == request["params"]["seq"]));
+                    assert!(rows.iter().any(|row| {
+                        (row.kind == "endpoint"
+                            && row.seq >= request["params"]["seq"].as_u64().unwrap())
+                            || (row.id
+                                == request["params"][if request["method"] == "pane.report_metadata"
+                                {
+                                    "pane_id"
+                                } else {
+                                    "workspace_id"
+                                }]
+                                && row.seq >= request["params"]["seq"].as_u64().unwrap())
+                    }));
                     let response = json!({"id":request["id"], "result":{"type":"ok"}});
                     writeln!(stream.get_mut(), "{response}").unwrap();
                     remember_tokens(&mut stored, &request);
@@ -6502,8 +6617,8 @@ mod tests {
                 .values()
                 .all(Value::is_null)
         );
-        assert_eq!(reports[3]["params"]["seq"], 3);
-        assert_eq!(reports[4]["params"]["seq"], 2);
+        assert_eq!(reports[3]["params"]["seq"], MIN_RESERVATION_WINDOW + 1);
+        assert_eq!(reports[4]["params"]["seq"], MIN_RESERVATION_WINDOW + 2);
     }
 
     #[test]
@@ -6783,6 +6898,117 @@ mod tests {
         assert_eq!(pane(&expired, 1)["lineup_context_text"], "08%");
         assert_eq!(pane(&expired, 1)["lineup_context_pct"], "7.5");
         publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn reservation_checked_overflow_fails_closed_before_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_millis(100));
+            let request = receive(&mut stream);
+            writeln!(stream.get_mut(), "{}", snapshot(&request["id"], true)).unwrap();
+            let mut line = String::new();
+            assert!(stream.read_line(&mut line).is_err());
+            assert!(line.is_empty());
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let identity = transport.identity();
+        let endpoint = format!("fake:{}:{}", identity.device, identity.inode);
+        publisher.load_checkpoint().unwrap();
+        publisher
+            .planner
+            .confirm_reservation(&endpoint, u64::MAX)
+            .unwrap();
+        publisher.planner.set_cursor_for_test(&endpoint, u64::MAX);
+
+        let result = publisher.refresh(&mut transport, &crate::config::Config::default());
+        assert!(result.is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_checkpoint_migration_in_metadata_publisher() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_rows = vec![
+            CheckpointRow {
+                endpoint: "ep1".into(),
+                kind: "pane".into(),
+                id: "w1:p1".into(),
+                seq: 15,
+            },
+            CheckpointRow {
+                endpoint: "ep1".into(),
+                kind: "pane".into(),
+                id: "w1:p2".into(),
+                seq: 28,
+            },
+        ];
+        std::fs::write(
+            dir.path().join("sequences.json"),
+            serde_json::to_vec(&legacy_rows).unwrap(),
+        )
+        .unwrap();
+
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        publisher.load_checkpoint().unwrap();
+        let (cursor, upper_bound) = publisher.planner.endpoint_window("ep1");
+        assert_eq!(cursor, 28);
+        assert_eq!(upper_bound, 28);
+        assert!(!publisher.planner.has_available_reservation("ep1"));
+
+        publisher.reserve_window_for_endpoint("ep1", 32).unwrap();
+        let (cursor, upper_bound) = publisher.planner.endpoint_window("ep1");
+        assert_eq!(cursor, 28);
+        assert_eq!(upper_bound, 28 + 32);
+        assert!(publisher.planner.has_available_reservation("ep1"));
+    }
+
+    #[test]
+    fn window_amortizes_persists_across_multiple_reports_within_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(2));
+            for _ in 0..5 {
+                let request = receive(&mut stream);
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id": request["id"], "result": {"type": "ok"}})
+                )
+                .unwrap();
+            }
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let endpoint = "ep-batch";
+        for i in 1..=5 {
+            let resource = ResourceId {
+                endpoint_session: endpoint.into(),
+                kind: ResourceKind::Pane,
+                id: format!("w1:p{i}"),
+            };
+            let desired = BTreeMap::from([("lineup_agent".into(), Some("codex".into()))]);
+            publisher
+                .report(
+                    &mut transport,
+                    &resource,
+                    &BTreeSet::new(),
+                    None,
+                    &desired,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 1);
         server.join().unwrap();
     }
 }
