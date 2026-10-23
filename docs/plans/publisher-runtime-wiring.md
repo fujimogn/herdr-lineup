@@ -30,7 +30,7 @@ Every behavior change below that a spec states differently needs an
 | Socket `*_before` | `Transport::{connect_before, reconnect_same_endpoint_before, send_line_before, receive_line_before}` exist, each capped locally (connect 1 s, write 0.5 s, read 0.5 s). | Not called by `publish.rs`. |
 | Git | `read_repository_controlled` gives each heading its own 1 s deadline; workspaces run in snapshot order; `Interrupted` keeps the previous heading with no age limit. | No cycle Git budget, no fairness, unbounded fallback age. |
 | `ReadCycle` | `UsageReader::read_in_cycle` exists; Codex and Kimi readers implement it. | `observe_pane` calls `reader.read()`, so each read builds a fresh cycle. |
-| Reader diagnostics | `ReaderDiagnostics` and `ReadCycle::with_diagnostics` exist only on the unintegrated branch `worktree-reader-worker-observability` (`b2239ff`). | No owner, no consumer. |
+| Reader diagnostics | The `ReaderDiagnostics` source API is implemented on another lane and under independent review; it is not in this base. | No owner, no consumer. |
 | Stage timing | `StageTimes` is `cfg(test)`. `Publisher::refresh_stages` returns `None`. Doctor already prints `RefreshStages` when present. | Production reports "unavailable". |
 
 ## 3. Invariants that must survive
@@ -145,13 +145,21 @@ to `publish.rs`) serves both.
   the second workspace.
 - Workspaces left in the queue this cycle get `HeadingState::NotAttempted`.
 
-Git cache contract (`note-git-cache-nogo-01`, owned by `lane_git_implementation`):
-native `rev-parse` and `for-each-ref` run on every read; only the worktree root
-and name are cached, 64 entries, 30 s TTL. A hit returns only after the post
-fingerprint and root check, and inherits the root's original `verified_at`
-(the minimum over root and ref). Any ref Git failure discards the entry and
-returns no `verified_at`; only a clean empty output means absence. `Interrupted`
-returns no `verified_at`. This plan consumes that API and does not change it.
+Git cache contract (`note-git-cache-nogo-01` and
+`note-publisher-design-contract-update-01`, owned by `lane_git_implementation`,
+still under implementation and review): native `rev-parse` and `for-each-ref`
+run on every read; only the worktree root and name are cached, 64 entries,
+30 s TTL. A hit also verifies the native identity and `safe.directory` of the
+common-directory cwd every time, separately from the workspace cwd check. Hit
+and miss both run three Git children; the cache only elides `worktree list`.
+This plan does not claim fewer children per heading or less total subprocess
+work, so the 1 s per-query and 1 s per-cycle Git deadlines and the fair queue
+stay as specified. A hit returns only after the post fingerprint and root
+check, and inherits the root's original `verified_at` (the minimum over root
+and ref) without extending its TTL. Any ref Git failure discards the entry and
+returns no `verified_at`; only a clean empty output means absence.
+`Interrupted` returns no `verified_at`. This plan consumes that API and does
+not change it.
 
 ### 5.2 Send queue (key: `ResourceId`, panes and workspaces together)
 
@@ -235,11 +243,20 @@ files.
 - Create one `ReadCycle` per refresh in `refresh_with_readers_inner`, pass it to
   `observe_pane`, call `read_in_cycle`, and drop it when the refresh returns.
   It is never stored on the publisher.
-- After `b2239ff` (or its successor) is integrated, `MetadataPublisher` owns one
-  `Arc<ReaderDiagnostics>` for its lifetime and builds each cycle with
-  `ReadCycle::with_diagnostics`. A new `Publisher` method with a `None` default,
-  like `refresh_stages`, exposes `ReaderDiagnostics::snapshot()` to the daemon
-  control state and doctor. A skipped sample must stay distinct from zero.
+- The approved diagnostics API (`note-publisher-design-contract-update-01`;
+  source under independent review, callers not wired) is: a compatible
+  `ReadCycle` constructor and accessor that carry an optional
+  `Arc<ReaderDiagnostics>` (default and `new` stay without diagnostics),
+  `bounded_read_observed(..., &ReaderDiagnostics, job)`, and snapshots for the
+  fixed provider set where a failed `try_lock` reads as unavailable. Names are
+  taken from the integrated commit, not from `b2239ff`.
+- After that API is integrated, `MetadataPublisher` owns one
+  `Arc<ReaderDiagnostics>` for its lifetime and builds each refresh's cycle with
+  the diagnostics constructor. Selecting `bounded_read_observed` inside readers
+  belongs to the reader wiring task, not to W2. A new `Publisher` method with a
+  `None` default, like `refresh_stages`, exposes the provider snapshots to the
+  daemon control state and doctor. An unavailable or skipped sample must stay
+  distinct from zero.
 
 ## 10. Tasks, ownership and order
 
