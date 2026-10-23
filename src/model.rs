@@ -110,7 +110,8 @@ pub trait UsageReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading;
 
     /// Share candidate discovery only within the caller's current refresh.
-    /// Existing readers remain compatible and may ignore the cycle.
+    /// Local readers also take the cycle's diagnostics; Hermes has no worker
+    /// and ignores the cycle.
     fn read_in_cycle(&self, request: &ReadRequest<'_>, _cycle: &ReadCycle) -> UsageReading {
         self.read(request)
     }
@@ -570,7 +571,7 @@ pub(crate) struct ReaderDiagnostics {
     unknown_worker: [AtomicBool; 6],
 }
 
-// The observed API and snapshot seam are intentionally not wired into readers/control yet.
+// Every local reader worker records here; the snapshot seam is not wired into control yet.
 #[allow(dead_code)]
 impl ReaderDiagnostics {
     fn index(provider: Provider) -> usize {
