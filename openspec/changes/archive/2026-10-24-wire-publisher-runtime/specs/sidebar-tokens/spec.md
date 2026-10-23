@@ -109,6 +109,104 @@ repository name and show `—` for its pane ship-time text.
 - **THEN** the next refresh recomputes the heading from local refs and the current
   date, even without a workspace focus event
 
+### Requirement: Limits, patches, expiry, and refresh
+All token names SHALL start with `lineup_`, match `[A-Za-z0-9_-]{1,32}`, and values
+SHALL be normalized single-line strings of at most 80 Unicode characters,
+truncated at character boundaries. Empty normalized values and JSON null SHALL
+clear keys; omitted keys SHALL remain unchanged.
+
+#### Scenario: Publish and renew a resource patch
+- **WHEN** a resource has new values or live keys approaching their deadline
+- **THEN** its patch obeys the following expiry, sequencing, refresh, and capacity
+  rules
+
+Publication SHALL use the daemon lifecycle connection rules: one new
+connection per `session.snapshot` or `report_metadata` request, because Herdr
+v0.9.3 closes after each JSON response, and no connect when the socket device
+or inode differs from the startup identity. Frame deadlines follow that same
+contract (non-blocking I/O and `poll`, not `setsockopt`, because macOS returns
+`EINVAL` after the peer closes the socket).
+
+Every live-key report SHALL
+carry `ttl_ms = 3 * refresh_interval_ms`, source `herdr-lineup`, and a strictly
+increasing per-resource `seq` covered by a durable per-endpoint upper bound
+persisted before sending. Clearing reports SHALL also use that source and
+increasing sequence. Restart SHALL discard unused reservation windows and continue
+strictly above the durable per-endpoint upper bound for the same socket/session
+and resource.
+
+After an authoritative snapshot, checkpoint rows for resources absent from that
+snapshot SHALL be removed only after their maximum reserved sequence is retained
+as a durable floor for the same endpoint. The publisher SHALL maintain a durable
+upper bound per endpoint covering all allocated sequences. When an allocation
+exceeds the durable upper bound, a new reservation window (sized to the authoritative
+pane and workspace counts, bounded within 32..=4096) SHALL be fsynced with its
+parent directory before any report using that sequence is sent. If any
+checkpoint write fails, including a directory sync after a successful rename, the
+publisher SHALL send no further report and write no further checkpoint, across
+refresh, clear, and reconnect, until a new publisher instance reloads the
+checkpoint. A resource ID that reappears on that endpoint SHALL use a sequence
+greater than the endpoint cursor within the same process, and greater than the
+loaded durable upper bound after a restart. Rows and floors for a different
+socket endpoint SHALL be removed once the current endpoint identity is verified;
+its metadata cannot be updated through the replaced endpoint. Empty patches and resources skipped due to
+capacity limits SHALL not allocate or consume sequences.
+
+The default refresh interval SHALL be 5,000 ms and TTL 15,000 ms. Startup and
+workspace focus SHALL invoke `ensure`; the publisher SHALL NOT subscribe to
+pane or workspace change events. Each periodic refresh SHALL obtain an
+authoritative session snapshot, invalidate cached usage when pane identity or
+cwd changes, check local refs and reader freshness, and reconcile changes in
+pane agent/status/session, workspace membership, and cwd. Send changed keys
+only except TTL renewal and snapshot repair. Unchanged live keys SHALL be
+re-published once at least one refresh interval has elapsed since their last
+successful publication when the refresh admission rules permit a frame. A desired
+live key absent from the authoritative snapshot SHALL be scheduled for repair
+on that refresh even before the interval elapses, subject to the same admission
+rules. A long or deferred cycle MAY leave a live key expired until its next
+accepted report, as specified by degraded expiry under long cycles. Missing or closed resources SHALL
+not be recreated.
+
+The contract uses **14** pane keys (longest name `lineup_group_ship_text`, 22
+characters) and **3** workspace keys (longest `lineup_ship_unix`/`lineup_ship_text`,
+16 characters), each full patch fitting Herdr's **16 keys per report** and each
+resource fitting **32 stored keys**. The daemon SHALL count existing unrelated
+keys before adding new keys. Pane publication SHALL first drop optional populated
+keys in reverse priority order: `lineup_weekly_pct`, `lineup_context_pct`,
+`lineup_state`, then `lineup_agent`. Dropped keys SHALL be cleared with JSON null
+so previously published values do not survive capacity pressure. Populated
+`lineup_logo`, the active state dot, `lineup_context_text`, `lineup_weekly_text`,
+and the first-pane `lineup_group`/`lineup_group_ship_text` SHALL be retained.
+Insufficient capacity for these required keys SHALL produce a diagnostic and
+skip that resource without evicting other sources. Workspace capacity exhaustion
+SHALL still skip the resource. Optional keys SHALL return when capacity permits.
+No state change needs
+more than fourteen keys, including clears. It SHALL publish no undocumented v1 keys.
+
+#### Scenario: Daemon disappears
+- **WHEN** the default daemon stops publishing without clearing tokens
+- **THEN** each live token expires no later than 15 seconds after its last accepted
+  update, and a restart republishes current values with newer sequences
+
+#### Scenario: No changes while alive
+- **WHEN** usage and state remain unchanged for one refresh interval after publication
+  and the next refresh admits their reports
+- **THEN** that refresh renews those live keys instead of waiting for a second interval
+- **AND** a report deferred by the deadline follows the degraded expiry contract
+
+#### Scenario: Reuse a disappeared pane ID after a publisher restart
+- **WHEN** a pane disappears, its checkpoint row is compacted, and the same pane
+  ID later reappears on the same socket endpoint after a publisher restart
+- **THEN** the new report sequence exceeds the compacted pane's last reserved
+  sequence, including a sequence whose send outcome was ambiguous
+
+#### Scenario: Other plugin consumes capacity
+- **WHEN** adding lineup keys would exceed 32 keys on a resource
+- **THEN** the daemon clears lower-priority optional pane keys until the patch
+  fits, preserving all populated required fields and all unrelated tokens
+- **AND** if required fields still do not fit, it reports capacity exhaustion
+  and skips that resource without clearing or replacing unrelated tokens
+
 ## ADDED Requirements
 
 ### Requirement: Cooperative refresh envelope
@@ -121,7 +219,8 @@ reaping and scheduling delay MAY overrun it.
 
 #### Scenario: Slow snapshot and reports share one end
 - **WHEN** the snapshot and several reports are slow but live
-- **THEN** every exchange of that refresh stops waiting at `E` at the latest
+- **THEN** every exchange uses `E` as its I/O waiting deadline, subject to
+  synchronous OS work and scheduling overruns under the cooperative envelope
 
 ### Requirement: Metadata admission threshold
 A metadata request SHALL start only while at least 2 s remain before `E`,
@@ -154,12 +253,17 @@ Panes and workspaces SHALL share one send queue keyed by resource. Each
 refresh SHALL keep survivors in order, append new resources in snapshot order,
 and walk the queue once without revisiting a resource. A resource SHALL move
 to the tail when its reader call or metadata exchange starts, even if that
-attempt fails or is refused, and SHALL otherwise keep its place. Each pane
+attempt fails, and SHALL otherwise keep its place. Each pane
 SHALL complete observe, plan and send before the next pane is observed.
 
 #### Scenario: Deferred resources go first next time
 - **WHEN** a refresh sends only the first resources of its queue
 - **THEN** the next refresh starts with the resources that did not get an attempt
+
+#### Scenario: Refused admission preserves attempt-based order
+- **WHEN** a resource is refused metadata admission
+- **THEN** refusal alone does not rotate it, while an earlier reader attempt
+  stays rotated
 
 ### Requirement: Degraded expiry under long cycles
 When a cycle runs long or defers a resource, the gap between two sends of a
