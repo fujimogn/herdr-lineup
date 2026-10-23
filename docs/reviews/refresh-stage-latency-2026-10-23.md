@@ -147,23 +147,28 @@ Times are milliseconds. Stage columns are medians across the 3 runs.
 | ext4 | 128 | 598.307, 789.938, 776.692 | 776.692 | 22.797 | 39.118 | 1.023 | 111.617 | 502.986 | 129 | 1 | 1 |
 | ext4 | 256 | 1690.969, 1637.535, 1620.296 | 1637.535 | 47.237 | 41.850 | 2.342 | 20.982 | 1388.374 | 257 | 1 | 1 |
 
-### Before vs After Comparison
+### Comparison with the historical results
 
-1. **Persistence writes**:
-   - **Before**: 1 fsync + dir sync per report (`panes + 1` writes total, e.g. 257 writes for 256 panes).
-   - **After**: 1 fsync + dir sync per window reservation (`1` write total for the refresh cycle).
-2. **Persistence latency (ext4, 256 panes)**:
-   - **Before**: 2,414.420 ms
-   - **After**: 20.982 ms (reduction by **>99.1%**, ~115x faster)
-3. **Persistence latency (tmpfs, 256 panes)**:
-   - **Before**: 230.642 ms
-   - **After**: 0.113 ms (reduction by **>99.9%**, ~2040x faster)
-4. **Overall cycle median (ext4, 256 panes)**:
-   - **Before**: 2,877.134 ms (dominated by disk syncs)
-   - **After**: 1,637.535 ms (disk syncs virtually eliminated; time dominated by Unix socket loopback roundtrips)
+Only the write count is a controlled comparison. It follows from the code, not
+from timing: the earlier publisher persisted the checkpoint once per report
+(`panes + 1` writes in a cold cycle), and the window publisher writes once per
+reservation. A cold cycle of up to 4,096 resources fits one window, so every
+case above recorded one write.
 
-### Measurement Limitations
+The elapsed times are not a controlled comparison. The historical run used an
+earlier base on another day, and host load and cache state were not controlled
+in either run. The socket stage, which the window does not change, moved from
+360.949 to 1,388.374 ms on ext4 and from 317.930 to 1,318.535 ms on tmpfs at
+256 panes, so the conditions differed by more than the effect being measured.
+The persist column fell (2,414.420 to 20.982 ms on ext4), but this record
+claims no percentage or speed-up for persistence or for the cycle. Measuring
+one requires both binaries run alternately on the same host, filesystem, and
+fixture.
 
-- **Host & Environment**: Synthetic Linux test only. macOS and live Herdr server interactions remain unmeasured.
-- **Socket Overhead**: The remaining latency at 256 panes is loopback Unix socket roundtrips in the synthetic fixture, not disk I/O.
-- **Shipment Hold**: This measurement demonstrates the latency benefit of the reservation window in isolated fixtures; automated shipping, main integration, and push remain strictly prohibited.
+### Measurement limitations
+
+- Synthetic Linux test only. macOS and a live Herdr server were not measured.
+- At 256 panes the remaining cycle time is mostly the fixture's loopback
+  socket exchanges.
+- Shipment remains on hold; this record is not approval for integration or
+  push.

@@ -1,11 +1,12 @@
 # Sequence reservation design record (2026-10-23)
 
-**Decision for this record:** implemented and verified an endpoint-wide reservation
-window separating durable upper bound `U` from the in-memory cursor `C`. The window
-amortizes fsync and directory sync costs across reports within the window while
-guaranteeing fail-closed safety, strict per-resource monotonicity, checkpoint
-backwards compatibility, and restart safety above `U`. No live Herdr session,
-user configuration, or production checkpoint was used for this record.
+**Decision for this record:** an endpoint-wide reservation window is implemented
+on an unshipped candidate. It separates the durable upper bound `U` from the
+in-memory cursor `C` and amortizes the file and directory syncs across the
+reports in one window. Only the failure-table rows listed under "Verified
+failure rows" below have test evidence; the others remain design intent. No
+live Herdr session, user configuration, or production checkpoint was used for
+this record.
 
 ## Fixed sources and current behavior
 
@@ -155,30 +156,73 @@ guarantee. Reverting an experimental code change should retain the checkpoint
 file and use the current compatible binary; deleting the file or lowering its
 high-water mark is not a safe rollback.
 
-## Implementation and Verification Status (2026-10-24)
+## Implementation status (2026-10-24)
 
-The endpoint-wide sequence reservation window was implemented and verified
-in `src/tokens.rs` and `src/publish.rs`:
+The endpoint-wide reservation window is implemented in `src/tokens.rs` and
+`src/publish.rs`. It is not shipped.
 
-1. **State separation**:
-   - `endpoint_floors` holds the durable upper bound `U` per endpoint.
-   - `endpoint_cursors` holds the in-memory cursor `C` per endpoint.
-   - On restart, `Publisher::restore_with_floors` recovers `base = max(floor, max(resource_seqs))`, sets `cursor = floor = bound`, and discards any unused window. Next allocations proceed strictly above `U`.
-2. **Window sizing**:
-   - Dynamically sized by `compute_reservation_window(panes, workspaces)` based on snapshot counts, clamped to `32..=4096`. No new user settings introduced.
-3. **Fail-closed durability**:
-   - `persist_checkpoint_with_upper_bound` runs before any send when `cursor >= upper_bound`.
-   - File flush, file `sync_all`, rename, and directory `sync_all` are preserved.
-   - If persist fails, reservation is not confirmed, no report is sent, and the publisher fails closed.
-4. **Empty patches and capacity skips**:
-   - `Publisher::needs_report` pre-filters patches; empty diffs and resources skipped due to capacity limits consume no sequence and trigger no persistence.
-5. **Isolated fixture coverage**:
-   - All rows in the failure table were tested and verified in unit and integration test fixtures (`checked_overflow_fails_closed_in_reservation_and_allocation`, `legacy_checkpoint_without_endpoint_rows_migrates_safely`, `empty_patch_and_capacity_skip_preserve_reservation_cursor`, `reservation_checked_overflow_fails_closed_before_send`, `window_amortizes_persists_across_multiple_reports_within_window`, `legacy_checkpoint_migration_in_metadata_publisher`).
-   - 334/334 tests passed.
-   - `cargo fmt`, `cargo clippy -D warnings`, `cargo build --release` verified.
-6. **Synthetic benchmark results**:
-   - Measured with `measure_refresh_stages` across tmpfs and ext4 for 1, 8, 32, 128, and 256 panes.
-   - On ext4 with 256 panes, persistence latency dropped from 2,414.420 ms (before) to 20.982 ms (after), reducing sync overhead by >99% and amortizing checkpoint writes to 1 write per refresh.
-   - macOS and live Herdr session remained unmeasured as noted in `refresh-stage-latency-2026-10-23.md`.
-7. **Boundary and out-of-scope items (C2)**:
-   - Per owner ruling (`note_all_e9d850faa907e0c7fb2d987a73fb3fde95a83c84fb8b296092dc6b254fef4654`), Herdr host generation/conditional apply/retirement on replacement (C2) is deferred to a dedicated task. Existing behavior (pinned endpoint path/device/inode without generations) is retained and C2 is tracked as an unresolved TODO.
+1. **State separation**: `endpoint_floors` holds the durable upper bound `U`
+   per endpoint and `endpoint_cursors` holds the in-memory cursor `C`. Loading
+   a checkpoint sets `C = U = max(endpoint row, resource rows)`, which discards
+   any unused window.
+2. **Window sizing**: `compute_reservation_window(panes, workspaces)` sizes the
+   window from the authoritative snapshot counts, clamped to `32..=4096`. No
+   user setting is added.
+3. **Barrier**: the reservation is written lazily, before the first send that
+   needs a sequence above `U`. The file is flushed and synced, renamed, and the
+   directory is synced; only then is `U` raised in memory.
+4. **Uncertain persistence is fatal**: any failed checkpoint write (file sync,
+   rename, or directory sync, for reservation or pruning) poisons the
+   publisher. After a rename has succeeded, the directory sync can still fail,
+   leaving a higher `U` on disk than in memory. A poisoned publisher therefore
+   refuses every later reservation, checkpoint write, snapshot, report,
+   refresh, and clear, and `reconnected` keeps the poison. Publication resumes
+   only in a new instance that reloads the checkpoint (daemon restart). There
+   is no in-process reload path.
+5. **Empty patches and capacity skips**: `Publisher::needs_report` filters them
+   before reservation, so they allocate no sequence and write no checkpoint.
+6. **Ambiguous sends**: a number is consumed by `prepare` before the send and is
+   never returned, including after an error response.
+
+### Verified failure rows
+
+The synthetic socket fixture `sequence_server` models Herdr's per-resource,
+per-source rule: a report whose `seq` is not newer than the last accepted one
+is answered `ok` but not applied, and the accepted `seq` outlives the resource
+leaving the snapshot. Failures are injected as returned errors inside the
+process; a real power loss or kernel crash was not simulated.
+
+| Failure-table row | Evidence |
+| --- | --- |
+| Failure before the window's rename (file sync, rename) | `uncertain_checkpoint_write_poisons_publication_until_new_instance`: disk keeps the old bound, nothing is sent, the poison survives retry, `reconnected`, refresh, and clear; a new instance resumes and the report applies. |
+| Rename done, directory sync fails | Same test: disk keeps the attempted `U = 4096`; a retry with a 32-slot window is refused instead of writing a lower bound; a new instance sends `4097`. |
+| Durable reservation, then restart with unused slots | `stale_sequence_server_applies_reports_across_window_restart_and_reuse`: the first seq after restart is above the old `U`, and the server applies it. |
+| Window boundary in one run | Same test: 40 reports cross the 32-slot boundary with exactly two checkpoint writes; every report applies with a strictly increasing seq. |
+| Resource disappears and the ID reappears in the same run | Same test: after pruning, the reused ID gets a seq above the cursor and applies; the final snapshot holds the latest patch. |
+| Lost checkpoint (negative control) | Same test: a publisher without the checkpoint sends `seq = 1`, which is answered `ok` but not applied. |
+| Error response | `rejected_report_burns_sequence_and_clear_preserves_other_keys`: the next report uses a fresh number. |
+| Endpoint replaced | `checkpoint_pruning_persists_floor_and_drops_replaced_endpoint`. |
+| Overflow | `checked_overflow_fails_closed_in_reservation_and_allocation`, `reservation_checked_overflow_fails_closed_before_send`. |
+| Legacy checkpoint without endpoint rows | `legacy_checkpoint_without_endpoint_rows_migrates_safely`, `legacy_checkpoint_migration_in_metadata_publisher`. |
+| Empty patch and capacity skip | `empty_patch_and_capacity_skip_preserve_reservation_cursor`. |
+
+Not verified: crashes between sends at the process level, response loss after
+a written frame, concurrent ensure or a second allocator, a same-source
+competing writer, config change during refresh, the shutdown-clear deadline
+after a reservation, rollback to an older binary, and macOS disks.
+
+### Measurement
+
+`refresh-stage-latency-2026-10-23.md` records the window run. The deterministic
+result is the checkpoint write count of a cold cycle: `panes + 1` before, one
+after. The elapsed times were not taken under the same conditions as the
+historical baseline and do not establish a speed-up.
+
+### Out of scope (C2)
+
+Per the owner ruling
+(`note_all_e9d850faa907e0c7fb2d987a73fb3fde95a83c84fb8b296092dc6b254fef4654`),
+Herdr host generation, conditional apply, and retirement on replacement (C2)
+belong to a separate Herdr task. The existing behavior (endpoint pinned by
+path, device, and inode, without generations) is kept, and C2 remains an
+unresolved TODO.
