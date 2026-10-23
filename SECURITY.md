@@ -73,7 +73,21 @@ credentials), invalid responses, and failures without an earlier success return
 missing data. All failure paths are throttled; expired reset times clear cached
 usage. The synchronous client runs only on its worker. Its one configured auth
 source supplies weekly quota to all Grok panes independently of local context.
-Restart the Lineup daemon after account changes to discard cached quota.
+The client and foreground publisher compare the exact selected key and optional
+user ID in memory. A change, unreadable source, or unknown source clears the
+old sample. The worker checks the source before and after HTTP and publishes
+only if the foreground has not observed another source in the meantime. A
+failed request retains an old sample only for the same source and only with a
+still-future known reset. A daemon restart is not needed to discard an old
+Grok weekly value after an account switch. Source identities, response bodies,
+and credentials are never written to diagnostics or plugin state.
+
+The foreground rereads the selected auth file once per refresh, with the
+existing 64 KiB file bound and nonblocking open. A synthetic 48-byte auth file
+measured 1,000 source reads in 3.58 ms on the development host (debug test
+build, 2026-10-23); this is a local cost measurement, not a service latency
+claim. At the default five-second refresh interval, it adds one bounded local
+read and parse per cycle.
 
 The daemon saves only fixed query-result categories in private per-session
 `weekly-codex.json`, `weekly-grok.json`, and `weekly-kimi.json` files under
