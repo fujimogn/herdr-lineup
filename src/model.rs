@@ -159,7 +159,7 @@ struct Discovery {
     kind: DiscoveryKind,
     paths: Vec<PathBuf>,
     entries: usize,
-    directories: Vec<(PathBuf, bool, Option<DirectoryStamp>)>,
+    directories: Vec<(PathBuf, Option<DirectoryStamp>)>,
 }
 
 // ctime also detects permission/ownership changes and timestamp restoration.
@@ -174,26 +174,15 @@ struct DirectoryStamp {
     gid: u32,
 }
 
-fn directory_stamp(path: &Path, contents: bool) -> Result<Option<DirectoryStamp>, MissingReason> {
+fn directory_stamp(path: &Path) -> Result<Option<DirectoryStamp>, MissingReason> {
     match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            let mut fingerprint = Fingerprint::of(&meta);
-            let mut ctime = (meta.ctime(), meta.ctime_nsec());
-            if !contents && meta.is_dir() {
-                // Sibling changes above the search root cannot change its
-                // contents. Still detect ancestor replacement and permissions.
-                fingerprint.size = 0;
-                fingerprint.mtime = (0, 0);
-                ctime = (0, 0);
-            }
-            Ok(Some(DirectoryStamp {
-                fingerprint,
-                ctime,
-                mode: meta.mode(),
-                uid: meta.uid(),
-                gid: meta.gid(),
-            }))
-        }
+        Ok(meta) => Ok(Some(DirectoryStamp {
+            fingerprint: Fingerprint::of(&meta),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+            mode: meta.mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+        })),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io_reason(&error)),
     }
@@ -201,9 +190,9 @@ fn directory_stamp(path: &Path, contents: bool) -> Result<Option<DirectoryStamp>
 
 impl Discovery {
     fn unchanged(&self, budget: &Budget) -> Result<bool, MissingReason> {
-        for (path, contents, stamp) in &self.directories {
+        for (path, stamp) in &self.directories {
             budget.check()?;
-            if directory_stamp(path, *contents)?.as_ref() != stamp.as_ref() {
+            if directory_stamp(path)?.as_ref() != stamp.as_ref() {
                 return Ok(false);
             }
         }
@@ -223,14 +212,15 @@ impl ReadCycle {
         home: &Path,
         kind: DiscoveryKind,
     ) -> Result<Vec<PathBuf>, MissingReason> {
-        self.files_with_hook(budget, home, kind, || {})
+        self.files_with_hooks(budget, home, kind, |_| {}, || {})
     }
 
-    fn files_with_hook(
+    fn files_with_hooks(
         &self,
         budget: &mut Budget,
         home: &Path,
         kind: DiscoveryKind,
+        mut before_directory: impl FnMut(&Path),
         after_scan: impl FnOnce(),
     ) -> Result<Vec<PathBuf>, MissingReason> {
         budget.check()?;
@@ -272,11 +262,9 @@ impl ReadCycle {
         // Ancestor replacement (including a symlinked home) invalidates names.
         for ancestor in home.ancestors() {
             budget.check()?;
-            discovery.directories.push((
-                ancestor.to_path_buf(),
-                false,
-                directory_stamp(ancestor, false)?,
-            ));
+            discovery
+                .directories
+                .push((ancestor.to_path_buf(), directory_stamp(ancestor)?));
         }
         let before = budget.entries;
         for (root, depth) in kind.roots() {
@@ -285,14 +273,22 @@ impl ReadCycle {
                 *depth,
                 |path| kind.accepts(path),
                 &mut discovery.directories,
+                &mut before_directory,
             )?);
         }
         discovery.entries = budget.entries - before;
         after_scan();
-        // Mutation during the scan makes uniqueness unproven. Do not publish
-        // or retain a partial mixed listing; a later read starts a full scan.
+        // Discard a mixed listing, including ancestor rename/restore (ABA).
+        // An unrelated sibling update can also change an ancestor stamp. In
+        // either case reprove association with the original full traversal,
+        // under the remaining deadline, and never cache that fallback result.
         if !discovery.unchanged(budget)? {
-            return Err(MissingReason::SourceError);
+            budget.entries = before;
+            let mut paths = Vec::new();
+            for (root, depth) in kind.roots() {
+                paths.extend(budget.files(&home.join(root), *depth, |path| kind.accepts(path))?);
+            }
+            return Ok(paths);
         }
         let paths = discovery.paths.clone();
         self.remember(discovery)?;
@@ -700,14 +696,13 @@ impl Budget {
             Ok(())
         }
     }
-    #[cfg(test)]
     pub(crate) fn files(
         &mut self,
         root: &Path,
         depth: usize,
         accept: impl Fn(&Path) -> bool + Copy,
     ) -> Result<Vec<PathBuf>, MissingReason> {
-        self.files_tracked(root, depth, accept, &mut Vec::new())
+        self.files_tracked(root, depth, accept, &mut Vec::new(), &mut |_| {})
     }
 
     fn files_tracked(
@@ -715,10 +710,11 @@ impl Budget {
         root: &Path,
         depth: usize,
         accept: impl Fn(&Path) -> bool + Copy,
-        directories: &mut Vec<(PathBuf, bool, Option<DirectoryStamp>)>,
+        directories: &mut Vec<(PathBuf, Option<DirectoryStamp>)>,
+        before_directory: &mut impl FnMut(&Path),
     ) -> Result<Vec<PathBuf>, MissingReason> {
         self.check()?;
-        directories.push((root.to_path_buf(), true, directory_stamp(root, true)?));
+        directories.push((root.to_path_buf(), directory_stamp(root)?));
         let meta = match fs::symlink_metadata(root) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -727,6 +723,7 @@ impl Budget {
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(MissingReason::Invalid);
         }
+        before_directory(root);
         let mut result = Vec::new();
         for entry in fs::read_dir(root).map_err(|e| io_reason(&e))? {
             self.check()?;
@@ -739,7 +736,13 @@ impl Budget {
             let entry = entry.map_err(|e| io_reason(&e))?;
             let kind = entry.file_type().map_err(|e| io_reason(&e))?;
             if kind.is_dir() && depth > 0 {
-                result.extend(self.files_tracked(&entry.path(), depth - 1, accept, directories)?);
+                result.extend(self.files_tracked(
+                    &entry.path(),
+                    depth - 1,
+                    accept,
+                    directories,
+                    before_directory,
+                )?);
             } else if kind.is_file() && accept(&entry.path()) {
                 result.push(entry.path());
             }
@@ -1266,7 +1269,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cycle_discovery_rejects_mutation_during_scan_without_retaining_partial_names() {
+    fn cycle_discovery_reproves_after_mutation_without_retaining_partial_names() {
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
         let request = request(&id, dir.path());
@@ -1274,15 +1277,16 @@ pub(crate) mod tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("rollout-a-session-1.jsonl"), b"").unwrap();
         let cycle = ReadCycle::new();
-        let result = cycle.files_with_hook(
+        let result = cycle.files_with_hooks(
             &mut Budget::new(&request),
             dir.path(),
             DiscoveryKind::Codex,
+            |_| {},
             || {
                 fs::write(root.join("rollout-b-session-1.jsonl"), b"").unwrap();
             },
         );
-        assert_eq!(result, Err(MissingReason::SourceError));
+        assert_eq!(result.unwrap().len(), 2);
         assert!(cycle.discoveries.lock().unwrap().is_empty());
         assert_eq!(
             cycle
@@ -1300,5 +1304,41 @@ pub(crate) mod tests {
             cycle.files(&mut Budget::new(&request), dir.path(), DiscoveryKind::Codex),
             Err(MissingReason::Invalid)
         );
+    }
+
+    #[test]
+    fn cycle_discovery_reproves_uniqueness_after_temporary_ancestor_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let alternate = dir.path().join("alternate");
+        let saved = dir.path().join("saved");
+        for root in [&home, &alternate] {
+            fs::create_dir_all(root.join("sessions")).unwrap();
+            fs::write(root.join("sessions/rollout-a-session-1.jsonl"), b"").unwrap();
+        }
+        fs::write(home.join("sessions/rollout-b-session-1.jsonl"), b"").unwrap();
+        let id = identity(Provider::Codex);
+        let request = request(&id, &home);
+        let cycle = ReadCycle::new();
+        let paths = cycle
+            .files_with_hooks(
+                &mut Budget::new(&request),
+                &home,
+                DiscoveryKind::Codex,
+                |path| {
+                    if path == home.join("sessions") {
+                        fs::rename(&home, &saved).unwrap();
+                        fs::rename(&alternate, &home).unwrap();
+                    }
+                },
+                || {
+                    fs::rename(&home, &alternate).unwrap();
+                    fs::rename(&saved, &home).unwrap();
+                },
+            )
+            .unwrap();
+        // Returning only A would hide B from the exact-session adapter.
+        assert_eq!(paths.len(), 2);
+        assert!(cycle.discoveries.lock().unwrap().is_empty());
     }
 }
