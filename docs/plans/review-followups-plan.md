@@ -1,7 +1,7 @@
 # Review follow-ups implementation plan
 
 **Goal:** Finish the accepted 2026-10-23 review findings without marking
-partial, unwired, measured, conditional, or separate-task rows as complete.
+partial, measured, conditional, or separate-task rows as complete.
 
 **Architecture:** See `docs/plans/review-followups-design.md`.
 
@@ -26,15 +26,13 @@ by hand and do not recursively delete. Report a build that is likely to exceed
 
 ## Done in the integration snapshot
 
-The first wave and its follow-ups are integrated locally (not pushed, not
-shipped): typed font journal (M7), publisher stages (M6), sequence window with
-poison and failure fixtures (L1), FIFO single eviction (M5), doctor scan
-errors (C4), Git cache API (L2), shared socket deadline API (L3 part),
-`ReadCycle` discovery sharing API (L4), reader worker diagnostics API and
-reader-side routing (L5), and refresh duration and stage histogram
-aggregation (L3 part). The coverage table has the
-evidence and remaining limits. API-only rows have no runtime effect until
-wired.
+The implementation source is
+`0220da64f8545f89b6daca211553f486b271057f`. P runtime wiring, D control/doctor
+wiring and all five worker producers are implemented locally alongside the
+first-wave fixes. The coverage table maps every original finding to source,
+fixtures and remaining limits; `TODO.md` keeps the open and completed items.
+The runtime plan and archived spec are linked there. No timing improvement,
+strict wall-clock guarantee, host C2 fix, or shipment follows from this status.
 
 ## Final inclusive review
 
@@ -52,18 +50,17 @@ candidate. A member lane does not launch it.
 
 `TODO.md` lists the open items. Take them in this order of dependency:
 
-1. Land publisher runtime wiring (`docs/plans/publisher-runtime-wiring.md`),
-   then reader diagnostics in control and `doctor`, each with its own
-   fixtures. Until then those rows stay `api-unwired` or `partial`.
-2. Measure on the wired head (N1, N3, N4, L5 frequency) before any budget,
-   cap, or isolation decision. Linux numbers are not extrapolated to macOS.
-3. Decide C1 before any discovery cap change.
-4. Conditional proposals (L6 period change and N5 event-to-visible, L7 child
-   timeouts and direct exec, L8 socket reuse, L5 process isolation) start only
-   when their written condition is met. They are not obligations.
-5. C2 belongs to the separate Herdr host task. Keep current behavior here.
-6. H1 and M1 residual races stay `partial` unless the owner approves a design.
-   R1 and R2 stay rejected.
+1. The commander's final synthetic observations are recorded separately from
+   historical results. Controlled timing comparison, Git/reader real-disk
+   matrices and stuck-worker frequency remain the measurement work in
+   `TODO.md`.
+2. Conditional proposals (L6 period/event changes and N5 event-to-visible,
+   L7 child timeouts/direct exec, L8 reuse, L5 isolation) start only when their
+   written condition is met. They are not obligations. The L3 cooperative
+   envelope and C1 combined-cap contract are already implemented.
+3. C2 belongs to the separate Herdr host task and stays unresolved here.
+4. H1/M1 residual races stay partial unless the owner approves a design.
+   R1/R2 stay rejected.
 
 ## Documentation, TODO, and changelog order
 

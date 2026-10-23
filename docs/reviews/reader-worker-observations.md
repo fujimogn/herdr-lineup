@@ -1,32 +1,44 @@
 # Bounded reader worker observations
 
-Status: integrated on the local line as `98a57de` (not shipped); production wiring is a separate, pending task.
-Base: `4f7044ad3f9066798bf55aff00bd6f17094022e2`.
-The candidate commit is the commit containing this document (or its reviewed successor).
-This addresses the observation portion of latency finding L5, not worker cancellation.
+Status: implemented in the local unshipped candidate. Implementation source:
+`0220da64f8545f89b6daca211553f486b271057f`. The original observation API was
+based on `4f7044ad3f9066798bf55aff00bd6f17094022e2` and integrated as
+`98a57de`; production wiring followed in P/D and the worker-producer tasks.
+This addresses L5 observation, not cancellation or process isolation.
 
-## API and ownership
+## API, production wiring and ownership
 
-`bounded_read` preserves its existing signature and returns the same `UsageReading`.
-It uses the common implementation with diagnostics disabled. Existing readers still
-call that wrapper: **production reader, publisher, control and doctor wiring is
-not implemented in this candidate**. No setting, interval or persistent state is added.
+`bounded_read` keeps its signature and observation-free behavior. All five
+local readers (Claude, Agy, Codex, Grok, Kimi) now choose
+`bounded_read_observed` when the refresh's `ReadCycle` carries diagnostics;
+the nonobserved path remains compatible. The publisher owns one Arc across
+refreshes and passes it through `ReadCycle::with_diagnostics`. Each provider
+keeps its single existing static BUSY permit. Diagnostics never replace it.
+No global singleton, setting, interval or persistent state is added.
 
-`bounded_read_observed(request, source, busy, &Arc<ReaderDiagnostics>, job)` adds
-optional observation without changing the caller's result contract. The caller must
-use the existing single static BUSY flag for its provider, consistently through the
-observed API when diagnostics are enabled. Diagnostics do not replace that permit.
-A later publisher task should own one diagnostics Arc across refreshes and pass it
-through `ReadCycle::with_diagnostics`; `diagnostics()` borrows that Arc. Default,
-`new`, and existing readers remain compatible and observation-free. Clones share
-only the explicitly supplied owner. No global diagnostics singleton is introduced.
+Control samples the shared handle on request, independently of the completed
+refresh metrics; doctor shows the provider, availability, counts, nanosecond
+waits and worker gauges before a health error. See
+`../plans/reader-diagnostics-control.md` for optional/legacy wire validation,
+frame-size fallback and unavailable semantics. Snapshots are best-effort,
+nontransactional and may describe a newer worker state than the last refresh.
+An accepted result increments `completed` even when its usage is missing;
+it does not prove a successful usage read.
 
-`snapshots()` returns six typed `(Provider, Result<ReaderSnapshot,
-DiagnosticUnavailable>)` entries in Claude, Agy, Codex, Grok, Hermes, Kimi order.
-Hermes is a fixed empty slot unless a future caller explicitly observes it.
-A later Serde control adapter must preserve the provider, availability and units;
-it must not serialize an unavailable result as a zero-valued successful snapshot.
-No identity, path, usage, wall-clock timestamp, error text or credentials are retained.
+`snapshots()` returns six fixed provider slots. Hermes has no local worker:
+its empty slot and zero counters are not a read-success or latency measurement.
+Unavailable results stay unavailable, rather than becoming successful zero
+snapshots. No identity, path, usage, wall-clock timestamp, error text or
+credentials are retained.
+
+Current fixtures include each reader's `diagnostic_routing_isolated`,
+`one_reader_cycle_per_refresh_shares_discovery_and_diagnostics`,
+`reader_control_live_worker_release_is_visible_without_another_refresh`,
+`reader_handle_survives_actual_daemon_completed_state_publication`, and
+`reader_doctor_uses_fixed_labels_units_and_retained_deadline_meaning`.
+Actual Codex/Kimi multi-pane fixtures assert shared discovery scans as well
+as attempt/completed counters. They are bounded local regressions, not live
+worker-frequency or OS-stall measurements.
 
 ## Counter and state contract
 
@@ -72,7 +84,7 @@ form a transaction; consumers must display skip/unavailable status explicitly.
 The registry retains at most one worker Arc per provider. Caller/worker clones live
 only as long as their calls; no history, labels or dynamically keyed map is retained.
 
-## Isolated measurements
+## Historical isolated measurements (API candidate)
 
 Environment: Linux `7.2.10-1-cachyos`, x86_64 GNU/Linux, Rust `1.99.1`
 (`58cf8f9c3`, 2026-10-13), debug test build. No real provider files, account API,
@@ -101,9 +113,9 @@ These are individual unoptimized fixture observations under uncontrolled host lo
 not percentiles, frequency estimates, performance improvements, or production bounds.
 The shutdown loop still uses its original 100 ms slice. Scheduling can extend elapsed
 wall time. OS-stalled reads, process isolation, cancellation, macOS and real-world
-worker occupancy frequencies were not measured. No production wiring is claimed.
+worker occupancy frequencies were not measured. Production wiring was added later; these measurements were not repeated for it.
 
-## Candidate verification
+## Historical API candidate verification
 
 Formatting, strict all-target Clippy, the full locked test suite (368 unit passes,
 6 pre-existing ignored tests, 1 integration pass), locked release build, release

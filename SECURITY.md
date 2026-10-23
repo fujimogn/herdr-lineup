@@ -38,6 +38,15 @@ to one `daemon.log.1` generation. The detached daemon's stdout and stderr are
 discarded. Git and Codex children discard stderr; their bounded stdout is
 parsed for local commit metadata and quota results, respectively.
 
+Refresh and reader diagnostics contain only fixed providers, categories,
+saturating counters and monotonic durations. They contain no session identity,
+paths, usage values, credentials or error text. Control samples reader state
+best-effort independently of completed refresh metrics; unavailable/legacy
+samples are not successful zero reads. Hermes has no local worker. These
+observations neither cancel an OS-stalled worker nor establish a strict
+filesystem deadline. C2 occupant-generation binding remains unresolved in a
+separate Herdr host task; see the README's Antigravity limitation.
+
 ## Local data read by the Grok billing client
 
 `quota_grok::Client` is polled by the dedicated daemon worker only with network

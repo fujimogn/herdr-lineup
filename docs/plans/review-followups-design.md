@@ -6,7 +6,7 @@ Follow-ups from the 2026-10-23 whole-repository review and latency
 investigation build on the local integration line. The mapping of every
 finding, and the integration snapshot it was read from, is
 `docs/reviews/review-followup-coverage.md`. This design does not reopen
-`rejected-wrong-basis` rows R1 and R2, and it does not treat `spec-waiting`,
+`rejected-wrong-basis` rows R1 and R2, and it does not treat `partial`,
 `conditional`, or `separate-task` rows as done.
 
 `develop` does not contain the integration line. Shipment stays on hold until
@@ -16,9 +16,10 @@ the owner asks for one batch.
 
 Land one behavior at a time on a dedicated worktree, with a regression test
 before broadening the change. Review each fixed range with the owner-selected
-GPT-6.1 Sol high reviewer, read-only, with no native subagent fork. An API
-that is not yet called by publication is recorded as unwired, not as a
-runtime improvement. A measurement document is not an implementation approval.
+GPT-6.1 Sol high reviewer, read-only, with no native subagent fork. The final
+candidate connects the P/D APIs and all five worker producers; implementation
+does not imply a measured runtime improvement. A measurement document is not
+an implementation approval.
 
 ## Boundaries that still hold
 
@@ -38,11 +39,15 @@ runtime improvement. A measurement document is not an implementation approval.
 - Git and reader caches name their invalidation rules. A cache hit does not
   skip association, ownership, or `safe.directory` checks. HEAD-only mtime and
   previous-path-only discovery are rejected.
-- Stage timings and bounded waits are measured before any new budget. The
-  5 second default and endpoint path identity stay. No task replaces a live
-  Herdr server, reads real credentials, or writes user configuration.
-- Unknown occupant generation fails closed; the host side is a separate task.
-  OS-blocked filesystem I/O is not given a false strict wall-clock deadline.
+- Production stage samples and total/stage histograms are connected. The
+  default 7 s envelope is derived from existing local caps, not an empirical
+  SLO; see `publisher-runtime-wiring.md` for admission and expiry semantics.
+  The 5 second refresh default and endpoint path identity stay. No task
+  replaces a live Herdr server, reads real credentials, or writes user configuration.
+- C2 generation binding remains unresolved in a separate Herdr host task; its
+  planned contract requires unknown generation to fail closed. Current
+  pane-bound Agy behavior is kept. OS-blocked filesystem I/O is not given a
+  false strict wall-clock deadline.
 
 ## Validation and rollback
 

@@ -3,11 +3,11 @@
 | Field | Details |
 |---|---|
 | Date | 2026-10-24 |
-| Target commit | `96829df` (`96829df7e6fc51af327b448f5b8b3596f0a96d3f`) |
+| Historical design target | `96829df` (`96829df7e6fc51af327b448f5b8b3596f0a96d3f`) |
 | Touched components | `src/ship_time.rs`, `src/publish.rs`, `docs/reviews/git-cache-design.md` |
 | Author | agy (`lane_git_reader`) |
 | Review History | Sol-6.1 high v1–v5 NO-GO -> v6 NO-GO -> v7 (Final Simple Guard: Unconditional Non-Cache on Replacement Directory Presence) |
-| Status | Contract v7, narrowed and implemented as an API in `src/ship_time.rs` on the local integration line (`223de0a`, `8e8639e`, `d95e5b5`); publication is not wired and nothing is shipped. §9 supersedes earlier sections where they differ. |
+| Status | Contract v7, narrowed and implemented as an API in `src/ship_time.rs` on the local integration line (`223de0a`, `8e8639e`, `d95e5b5`); production publication is wired in the current local candidate and nothing is shipped. §9 supersedes earlier sections where they differ. |
 
 ---
 
@@ -207,9 +207,9 @@ The following 20 isolated fixture scenarios specify verification requirements in
 
 ---
 
-## 8. Current Code Baseline vs. Pending Implementation
+## 8. Historical baseline vs. implemented contract
 
-| Capability | Baseline Code (`96829df`) | Contract (cache API implemented, publication wiring pending; see §9) |
+| Capability | Baseline Code (`96829df`) | Implemented contract (see §9) |
 |---|---|---|
 | `cwd` Identity & Security | Native Git in all 3 processes | Native Git preserved in mandatory `rev-parse` |
 | Subprocess Execution | 3 processes unconditionally per `cwd` | 3 processes per `cwd` on a downstream hit: `worktree list` is replaced by a common-directory `rev-parse`; no process-count reduction is claimed (§9) |
@@ -224,7 +224,19 @@ The following 20 isolated fixture scenarios specify verification requirements in
 
 ## 9. Production Implementation Status
 
-The downstream cache in `src/ship_time.rs` implements this contract, narrowed by the commander after the code review (`reviews/git-cache-code-sol61-high.md`, NO-GO on object loss hidden by a warm entry, `for-each-ref` failure read as absence, and a hit skipping the post fingerprint check). **Publication is not wired yet**: `src/publish.rs` still calls `read_repository_controlled`, which observes through a fresh `RepositoryCache` on every call and therefore always performs the full Git read. The `WorkspaceFairQueue`, cycle budget, and `HeadingCache.confirmed` fallback (§5, F-14 to F-18) belong to the follow-up wiring task, which also removes the `dead_code` allowance on `RepositoryObservation::verified_at`.
+The current implementation source is
+`0220da64f8545f89b6daca211553f486b271057f`. The downstream cache implements
+the narrowed contract below, following `reviews/git-cache-code-sol61-high.md`.
+Production `MetadataPublisher::read_heading` now uses its owned cache;
+`resolve_headings_in_budget` shares same-cwd observations within the refresh,
+rotates workspace attempts under the 1 s cycle Git budget, and
+`heading_repository` bounds confirmed fallback to 30 s without renewal on hits.
+Unknown headings clear all three workspace keys; confirmed missing
+`origin/main` keeps the repository name and shows `—` for ship time.
+The runtime contract and fixtures are in `../plans/publisher-runtime-wiring.md`
+and `review-followup-coverage.md` L2. Git cache hits still run three children;
+no wired-head speed improvement has been measured. Earlier design sections
+are historical wherever the narrowed implementation below differs.
 
 ### 9.1 Narrowed Cache Scope (Supersedes §1, §3, §4 Where They Differ)
 
@@ -253,4 +265,4 @@ The downstream cache in `src/ship_time.rs` implements this contract, narrowed by
 
 ### 9.4 Fixture Coverage
 
-`src/ship_time.rs` tests cover common-directory refusal hidden behind a permitted workspace (isolated global configuration and a test-only Git environment seam using `GIT_TEST_ASSUME_DIFFERENT_OWNER`, which production sanitizing drops; no user configuration or ownership is changed), and the API side of F-01 to F-12 and F-19 with full-query (`worktree list`) counts and verification instants. For F-13 they cover only the API part (uncached successes report fresh `verified_at`); the 40 s / 45 s publication fallback is not wired and remains for the wiring task. Further fixtures cover configuration change and include, refusal clearing all entries, unsupported repository format, re-initialization at the same path (ABA), loose, packed, unreadable, and alternate-target object loss after a warm entry, a ref to a missing object, inaccessible dependencies, a dependency change after the fingerprint during both a hit and a full read, interruption by the caller deadline and after a completed full query, main root rename, and LRU eviction. Each guard was mutated once to confirm that at least one test fails; the `files` format check and the `reftable/` stat fail only when both are removed, and the main root stat cannot be isolated by a fixture.
+`src/ship_time.rs` tests cover common-directory refusal hidden behind a permitted workspace (isolated global configuration and a test-only Git environment seam using `GIT_TEST_ASSUME_DIFFERENT_OWNER`, which production sanitizing drops; no user configuration or ownership is changed), and the API side of F-01 to F-12 and F-19 with full-query (`worktree list`) counts and verification instants. For F-13 the API tests cover fresh `verified_at` on uncached successes. Publication now has `heading_fallback_expires_thirty_seconds_after_the_original_verification`; this uses synthetic instants, not a measured 40 s / 45 s production run. P adds `git_queue_rotates_a_stalled_repository_and_unread_headings_are_null` and `shared_stalled_cwd_is_read_once_and_rotates_only_its_starter` for queue/deadline behavior. The historical F-13 to F-18 table is a design checklist, not evidence that every exact scenario was run. Further fixtures cover configuration change and include, refusal clearing all entries, unsupported repository format, re-initialization at the same path (ABA), loose, packed, unreadable, and alternate-target object loss after a warm entry, a ref to a missing object, inaccessible dependencies, a dependency change after the fingerprint during both a hit and a full read, interruption by the caller deadline and after a completed full query, main root rename, and LRU eviction. Each guard was mutated once to confirm that at least one test fails; the `files` format check and the `reftable/` stat fail only when both are removed, and the main root stat cannot be isolated by a fixture.
