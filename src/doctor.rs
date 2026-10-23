@@ -2,7 +2,10 @@
 
 use crate::{
     config::Config,
-    daemon::{Health, Options, probe},
+    daemon::{
+        ControlView, Health, Options, REFRESH_DURATION_BUCKET_LABELS, RefreshObservation,
+        probe_view,
+    },
     lock::{RuntimePaths, SessionLock},
     socket::Transport,
 };
@@ -329,6 +332,73 @@ pub(crate) fn capacity_diagnostic(health: &Health) -> Option<String> {
     })
 }
 
+pub(crate) fn refresh_metrics_report(observation: Option<&RefreshObservation>) -> String {
+    let Some(observation) = observation else {
+        return "\
+Refresh duration: unavailable
+Refresh attempts: unavailable
+Refresh histogram: unavailable
+Refresh stages: unavailable"
+            .to_owned();
+    };
+    let duration = match &observation.duration {
+        Some(stats) => format!(
+            "Refresh duration: last {} us; min {} us; max {} us",
+            stats.last_us, stats.min_us, stats.max_us
+        ),
+        None => "Refresh duration: unavailable".to_owned(),
+    };
+    let attempts = format!(
+        "Refresh attempts: {}; ok {}; error {}; capacity skip {}",
+        observation.attempt_count,
+        observation.success_count,
+        observation.error_count,
+        observation.capacity_skip_count
+    );
+    let histogram = match &observation.duration {
+        Some(stats) => {
+            let buckets = REFRESH_DURATION_BUCKET_LABELS
+                .iter()
+                .zip(stats.histogram)
+                .map(|(label, count)| format!("{label}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("Refresh histogram: {buckets}")
+        }
+        None => "Refresh histogram: unavailable".to_owned(),
+    };
+    let stages = match observation.stages {
+        Some(stages) => format!(
+            "Refresh stage duration: snapshot {} us; git {} us; reader {} us; persist {} us; socket {} us\nRefresh stage counts: reports {}; checkpoints {}",
+            stages.durations.snapshot_us,
+            stages.durations.git_us,
+            stages.durations.reader_us,
+            stages.durations.persist_us,
+            stages.durations.socket_us,
+            stages.counts.reports,
+            stages.counts.checkpoints
+        ),
+        None => "Refresh stages: unavailable".to_owned(),
+    };
+    format!("{duration}\n{attempts}\n{histogram}\n{stages}")
+}
+
+fn daemon_diagnostic_text(view: &ControlView) -> Result<String, (String, io::Error)> {
+    let metrics = refresh_metrics_report(view.observation.as_ref());
+    let last_refresh_ms = match refresh_diagnostic(&view.health) {
+        Ok(last_refresh_ms) => last_refresh_ms,
+        Err(error) => return Err((metrics, error)),
+    };
+    let mut text = format!(
+        "{metrics}\nHerdr JSON API compatible; config valid; daemon/control/lock healthy; last refresh {last_refresh_ms} ms after startup"
+    );
+    if let Some(diagnostic) = capacity_diagnostic(&view.health) {
+        text.push('\n');
+        text.push_str(&diagnostic);
+    }
+    Ok(text)
+}
+
 pub fn run(options: &Options) -> io::Result<()> {
     let config = Config::load(&options.config)?;
     let paths = RuntimePaths::new(&options.state, &options.socket)?;
@@ -340,15 +410,14 @@ pub fn run(options: &Options) -> io::Result<()> {
     println!("{}", local_diagnostics(&options.state, SystemTime::now()));
     let mut transport = Transport::connect(&options.socket)?;
     check_transport(&mut transport)?;
-    let health = probe(&paths, &options.socket)?;
+    let health = probe_view(&paths, &options.socket)?;
     if let Some(health) = health {
-        let last_refresh_ms = refresh_diagnostic(&health)?;
-        println!(
-            "Herdr JSON API compatible; config valid; daemon/control/lock healthy; last refresh {} ms after startup",
-            last_refresh_ms
-        );
-        if let Some(diagnostic) = capacity_diagnostic(&health) {
-            println!("{diagnostic}");
+        match daemon_diagnostic_text(&health) {
+            Ok(text) => println!("{text}"),
+            Err((text, error)) => {
+                println!("{text}");
+                return Err(error);
+            }
         }
     } else {
         if SessionLock::is_held(&paths)? {
@@ -802,5 +871,179 @@ mod tests {
         ] {
             assert!(validate_pong(reply).is_err());
         }
+    }
+
+    #[test]
+    fn refresh_metrics_use_fixed_labels_and_hide_secrets() {
+        use crate::daemon::{
+            REFRESH_DURATION_BUCKETS, RefreshDuration, RefreshStageCounts, RefreshStageDurations,
+            RefreshStages, control_view_from_frame,
+        };
+        let nonce = "a".repeat(64);
+        let path = "/tmp/lineup-secret-not-for-doctor.sock";
+        let mut legacy = serde_json::json!({
+            "plugin": "herdr-lineup",
+            "socket_path": path,
+            "socket_key": "test",
+            "endpoint": {"device": 1, "inode": 2},
+            "nonce": nonce,
+            "pid": 7,
+            "last_refresh_ms": 9,
+            "refresh_failed": false
+        });
+        let missing = control_view_from_frame(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(missing.observation.is_none());
+        let unavailable = refresh_metrics_report(None);
+        assert_eq!(
+            unavailable,
+            "\
+Refresh duration: unavailable
+Refresh attempts: unavailable
+Refresh histogram: unavailable
+Refresh stages: unavailable"
+        );
+        assert!(!unavailable.contains('0'));
+        legacy["refresh_observation"] = serde_json::json!({"attempt_count": 1, "histogram": [0]});
+        let malformed = control_view_from_frame(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(malformed.health.last_refresh_ms, Some(9));
+        assert!(malformed.observation.is_none());
+        legacy["refresh_observation"] = serde_json::Value::Null;
+        assert!(
+            control_view_from_frame(&serde_json::to_vec(&legacy).unwrap())
+                .unwrap()
+                .observation
+                .is_none()
+        );
+        let mut histogram = [0; REFRESH_DURATION_BUCKETS];
+        histogram[0] = 1;
+        histogram[3] = 1;
+        histogram[4] = 1;
+        let observation = RefreshObservation {
+            attempt_count: 3,
+            success_count: 2,
+            error_count: 1,
+            capacity_skip_count: 0,
+            duration: Some(RefreshDuration {
+                last_us: 12_400,
+                min_us: 400,
+                max_us: 80_000,
+                histogram,
+            }),
+            stages: Some(RefreshStages {
+                durations: RefreshStageDurations {
+                    snapshot_us: 10,
+                    git_us: 0,
+                    reader_us: 20,
+                    persist_us: 30,
+                    socket_us: 40,
+                },
+                counts: RefreshStageCounts {
+                    reports: 2,
+                    checkpoints: 1,
+                },
+            }),
+        };
+        let report = refresh_metrics_report(Some(&observation));
+        assert_eq!(
+            report,
+            "\
+Refresh duration: last 12400 us; min 400 us; max 80000 us
+Refresh attempts: 3; ok 2; error 1; capacity skip 0
+Refresh histogram: <1ms=1 <5ms=0 <10ms=0 <50ms=1 <100ms=1 <500ms=0 <1000ms=0 <5000ms=0 >=5000ms=0
+Refresh stage duration: snapshot 10 us; git 0 us; reader 20 us; persist 30 us; socket 40 us
+Refresh stage counts: reports 2; checkpoints 1"
+        );
+        let mut zero_histogram = [0; REFRESH_DURATION_BUCKETS];
+        zero_histogram[0] = 1;
+        let zero = refresh_metrics_report(Some(&RefreshObservation {
+            attempt_count: 1,
+            success_count: 1,
+            error_count: 0,
+            capacity_skip_count: 0,
+            duration: Some(RefreshDuration {
+                last_us: 0,
+                min_us: 0,
+                max_us: 0,
+                histogram: zero_histogram,
+            }),
+            stages: None,
+        }));
+        assert!(zero.starts_with("Refresh duration: last 0 us; min 0 us; max 0 us\n"));
+        assert!(zero.contains("Refresh histogram: <1ms=1 "));
+        assert!(zero.ends_with("Refresh stages: unavailable"));
+        assert!(!zero.contains("Refresh duration: unavailable"));
+        assert!(!report.contains(&nonce));
+        assert!(!report.contains(path));
+        assert!(!report.contains("credential"));
+        assert!(!report.contains("identity"));
+        assert!(!report.contains("usage"));
+    }
+
+    #[test]
+    fn failed_refresh_prints_metrics_before_the_existing_error() {
+        use crate::daemon::{REFRESH_DURATION_BUCKETS, RefreshDuration};
+        let mut histogram = [0; REFRESH_DURATION_BUCKETS];
+        histogram[0] = 1;
+        let observation = RefreshObservation {
+            attempt_count: 1,
+            success_count: 0,
+            error_count: 1,
+            capacity_skip_count: 0,
+            duration: Some(RefreshDuration {
+                last_us: 200,
+                min_us: 200,
+                max_us: 200,
+                histogram,
+            }),
+            stages: None,
+        };
+        let mut health = Health {
+            plugin: "herdr-lineup".into(),
+            socket_path: "/tmp/lineup-secret-not-for-doctor.sock".into(),
+            socket_key: "test".into(),
+            endpoint: EndpointIdentity {
+                device: 1,
+                inode: 2,
+            },
+            nonce: "ab".repeat(32),
+            pid: 7,
+            last_refresh_ms: Some(9),
+            refresh_failed: true,
+            capacity_skipped_resources: 1,
+        };
+        let failed = daemon_diagnostic_text(&ControlView {
+            health: health.clone(),
+            observation: Some(observation.clone()),
+        })
+        .unwrap_err();
+        assert_eq!(failed.1.to_string(), "daemon refresh is unhealthy");
+        assert!(failed.0.starts_with("Refresh duration: last 200 us"));
+        assert!(!failed.0.contains("last refresh"));
+        assert!(!failed.0.contains(&health.nonce));
+        health.refresh_failed = false;
+        health.last_refresh_ms = None;
+        let starting = daemon_diagnostic_text(&ControlView {
+            health: health.clone(),
+            observation: None,
+        })
+        .unwrap_err();
+        assert!(
+            starting
+                .1
+                .to_string()
+                .contains("first refresh has not completed yet")
+        );
+        assert!(starting.0.contains("Refresh duration: unavailable"));
+        assert!(!starting.0.contains("Herdr JSON API compatible"));
+        health.last_refresh_ms = Some(9);
+        let ready = daemon_diagnostic_text(&ControlView {
+            health,
+            observation: Some(observation),
+        })
+        .unwrap();
+        let metrics_at = ready.find("Refresh duration").unwrap();
+        let uptime_at = ready.find("last refresh 9 ms after startup").unwrap();
+        assert!(metrics_at < uptime_at);
+        assert!(ready.contains("Metadata capacity exhausted: 1 resource skipped"));
     }
 }
