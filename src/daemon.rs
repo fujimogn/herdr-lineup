@@ -2900,6 +2900,15 @@ mod tests {
         note(&mut health, &mut observation, &Ok(()), 90, None, None);
         assert!(!health.refresh_failed);
         assert_eq!(health.last_refresh_ms, Some(90));
+        let unmeasured = observation.clone().unwrap();
+        let unmeasured_stages = unmeasured.stages.unwrap();
+        assert!(!unmeasured_stages.latest_measured);
+        assert_eq!(unmeasured_stages.snapshot.count, 2);
+        assert_eq!(unmeasured_stages.reports, u64::MAX);
+        assert_eq!(
+            unmeasured.duration.unwrap().histogram.iter().sum::<u64>(),
+            2
+        );
         note(
             &mut health,
             &mut observation,
@@ -3090,6 +3099,34 @@ mod tests {
             serde_json::json!(1);
         assert!(
             control_view_from_frame(&serde_json::to_vec(&contradictory).unwrap())
+                .unwrap()
+                .observation
+                .unwrap()
+                .stages
+                .is_none()
+        );
+
+        let mut histogram_mismatch = valid.clone();
+        histogram_mismatch["refresh_observation"]["stages"]["reader"]["duration"]["histogram"] =
+            serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            control_view_from_frame(&serde_json::to_vec(&histogram_mismatch).unwrap())
+                .unwrap()
+                .observation
+                .unwrap()
+                .stages
+                .is_none()
+        );
+        let mut sum_below_max = valid.clone();
+        sum_below_max["refresh_observation"]["stages"]["persist"]["sum_us"] = serde_json::json!(0);
+        sum_below_max["refresh_observation"]["stages"]["persist"]["duration"] = serde_json::json!({
+            "last_us": 30,
+            "min_us": 30,
+            "max_us": 30,
+            "histogram": [1, 0, 0, 0, 0, 0, 0, 0, 0]
+        });
+        assert!(
+            control_view_from_frame(&serde_json::to_vec(&sum_below_max).unwrap())
                 .unwrap()
                 .observation
                 .unwrap()
