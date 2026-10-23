@@ -690,6 +690,7 @@ struct RefreshInventory {
     codex_weekly: Option<model::WeeklySample>,
     grok_weekly: Option<model::WeeklySample>,
     kimi_weekly: Option<model::WeeklySample>,
+    deadline: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -723,11 +724,6 @@ struct PlannedWorkspaceReport {
     resource: ResourceId,
     stored_keys: BTreeSet<String>,
     desired: tokens::Tokens,
-}
-
-struct DesiredReports {
-    panes: Vec<PlannedPaneReport>,
-    workspaces: Vec<PlannedWorkspaceReport>,
 }
 
 pub struct MetadataPublisher {
@@ -1415,6 +1411,8 @@ impl MetadataPublisher {
             .into_iter()
             .map(String::from)
             .collect();
+        // A single budget for the cycle prevents N panes multiplying the reader wait.
+        let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
         Ok(RefreshInventory {
             snapshot,
             now_unix,
@@ -1423,6 +1421,7 @@ impl MetadataPublisher {
             codex_weekly,
             grok_weekly,
             kimi_weekly,
+            deadline,
         })
     }
 
@@ -1489,315 +1488,294 @@ impl MetadataPublisher {
         Ok(Headings { by_workspace })
     }
 
-    fn observe_panes(
+    fn observe_pane(
         &mut self,
         inventory: &RefreshInventory,
         config: &Config,
+        pane: &protocol::Pane,
         codex: &dyn UsageReader,
         grok: &dyn UsageReader,
-    ) -> io::Result<Vec<PaneObservation>> {
-        // A single budget for the cycle prevents N panes multiplying the reader wait.
-        let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
-        let mut observations = Vec::with_capacity(inventory.snapshot.panes.len());
-        for pane in &inventory.snapshot.panes {
-            self.check_shutdown()?;
-            let occupant = pane
-                .occupant
-                .clone()
-                .filter(|who| config.has_provider(who.agent));
-            let usage = occupant.as_ref().and_then(|who| {
-                let agy = AgyReader {
-                    pane_id: pane.pane_id.clone(),
-                };
-                let native = match who.agent {
-                    Agent::Agy | Agent::Grok | Agent::Kimi => {
-                        who.native_session.clone().unwrap_or_default()
-                    }
-                    _ => who.native_session.clone()?,
-                };
-                let (provider, home, reader): (_, _, &dyn UsageReader) = match who.agent {
-                    Agent::Claude => (
-                        model::Provider::Claude,
-                        self.homes.statusline_state.as_ref()?,
-                        &ClaudeReader,
-                    ),
-                    Agent::Agy => (
-                        model::Provider::Agy,
-                        self.homes.statusline_state.as_ref()?,
-                        &agy,
-                    ),
-                    Agent::Codex => (model::Provider::Codex, self.homes.codex.as_ref()?, codex),
-                    Agent::Grok => (
-                        model::Provider::Grok,
-                        self.homes.grok.as_ref().unwrap_or(&self.directory),
-                        grok,
-                    ),
-                    Agent::Kimi => (
-                        model::Provider::Kimi,
-                        self.homes.kimi.as_ref().unwrap_or(&self.directory),
-                        &KimiReader,
-                    ),
-                    _ => return None,
-                };
-                // Snapshot has no pane-specific home/profile. Only the injected daemon
-                // home is searched, with an exact native id; never infer by cwd or use
-                // another session when a different pane profile is inaccessible.
-                let identity = model::SessionIdentity {
-                    provider,
-                    native_session_id: native.clone(),
-                    repository_identity: pane.cwd.clone().unwrap_or_default(),
-                };
-                // Repository discovery and earlier panes may take seconds. A
-                // newly written observation must be compared to this read's clock.
-                let now = SystemTime::now();
-                let request = model::ReadRequest {
-                    identity: &identity,
-                    home,
-                    now,
-                    max_age: Duration::from_millis(config.usage_max_age_ms),
-                    timeout: deadline.saturating_duration_since(Instant::now()),
-                    shutdown: self.shutdown.as_deref(),
-                };
-                let missing_home = (who.agent == Agent::Grok && self.homes.grok.is_none())
-                    || (who.agent == Agent::Kimi && self.homes.kimi.is_none());
-                let mut reading = if missing_home || (who.agent == Agent::Kimi && native.is_empty())
-                {
-                    // Billing account attribution does not require a local session
-                    // home. Do not search plugin state as a substitute for context.
-                    model::UsageReading::missing(
-                        &request,
-                        if who.agent == Agent::Kimi {
-                            model::SourceKind::KimiSession
-                        } else {
-                            model::SourceKind::GrokSignals
-                        },
-                        model::MissingReason::NotFound,
-                    )
-                } else {
-                    #[cfg(test)]
-                    let stage_start = Instant::now();
-                    let result = reader.read(&request);
-                    #[cfg(test)]
-                    self.stages
-                        .lock()
-                        .unwrap()
-                        .add("reader", stage_start.elapsed());
-                    result
-                };
-                if reading.identity != identity {
-                    self.local_readings.remove(&pane.pane_id);
-                    return None;
-                }
-                // A shared cycle budget can expire before this pane gets a turn.
-                // Do not turn a transient read timeout into loss of proven identity.
-                // EntryLimit is not transient: the directory stays over the cap, so
-                // the previous context must be dropped instead of kept without expiry.
-                // Cache local observations only; account workers retain their own
-                // reset/auth policy and are overlaid afresh below.
-                if reading.context
-                    == model::UsageOutcome::Unavailable(model::MissingReason::Timeout)
-                    && matches!(
-                        reading.weekly_remaining,
-                        model::UsageOutcome::Unavailable(_)
-                    )
-                    && let Some(previous) = self.local_readings.get(&pane.pane_id)
-                    && previous.identity == identity
-                    && previous.source_kind == reading.source_kind
-                {
-                    reading = restore_local_after_timeout(previous, now, request.max_age);
-                }
-                if reading.binding.is_some() {
-                    self.local_readings
-                        .insert(pane.pane_id.clone(), reading.clone());
-                } else {
-                    self.local_readings.remove(&pane.pane_id);
-                }
-                if config.allow_network {
-                    let weekly = match who.agent {
-                        // Herdr snapshots do not expose pane-specific CODEX_HOME or
-                        // profiles. Attribute the daemon home's quota only after its
-                        // rollout reader proves this exact native session belongs
-                        // there. Different homes remain unavailable; profiles sharing
-                        // a home cannot be distinguished, and auth changes require
-                        // restarting the daemon to discard the account cache.
-                        Agent::Codex
-                            if reading.binding
-                                == Some(model::UsageBinding::NativeSession(native.clone())) =>
-                        {
-                            inventory.codex_weekly
-                        }
-                        // Grok has one configured account, shared across all its
-                        // panes even when no local context/native id is available.
-                        Agent::Grok => inventory.grok_weekly,
-                        Agent::Kimi if config.weekly_enabled(Agent::Kimi) => inventory.kimi_weekly,
-                        _ => None,
-                    };
-                    if let Some(weekly) = weekly {
-                        reading.weekly_remaining =
-                            model::UsageOutcome::Available(100.0 - weekly.used_percent);
-                        reading.weekly_window = Some(model::WeeklyWindow::RollingSevenDays);
-                        reading.weekly_resets_at = weekly.resets_at;
-                        if matches!(who.agent, Agent::Grok | Agent::Kimi) {
-                            reading.binding = Some(model::UsageBinding::Pane(pane.pane_id.clone()));
-                        }
-                    }
-                }
-                Some(tokens::Usage {
-                    binding: reading.binding,
-                    occupant: who.clone(),
-                    context_pct: match reading.context {
-                        model::UsageOutcome::Available(value) => Some(value),
-                        _ => None,
-                    },
-                    weekly_remaining_pct: match reading.weekly_remaining {
-                        model::UsageOutcome::Available(value)
-                            if reading.weekly_window.is_some() =>
-                        {
-                            Some(value)
-                        }
-                        _ => None,
-                    },
-                    weekly_reset_unix: reading
-                        .weekly_resets_at
-                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                        .and_then(|age| i64::try_from(age.as_secs()).ok()),
-                })
-            });
-            observations.push(PaneObservation {
+    ) -> io::Result<PaneObservation> {
+        let occupant = pane
+            .occupant
+            .clone()
+            .filter(|who| config.has_provider(who.agent));
+        let usage = occupant.as_ref().and_then(|who| {
+            let agy = AgyReader {
                 pane_id: pane.pane_id.clone(),
-                workspace_id: pane.workspace_id.clone(),
-                stored_keys: pane.stored_keys.clone(),
-                occupant,
-                state: pane.state.clone(),
-                usage,
-            });
-        }
-        Ok(observations)
+            };
+            let native = match who.agent {
+                Agent::Agy | Agent::Grok | Agent::Kimi => {
+                    who.native_session.clone().unwrap_or_default()
+                }
+                _ => who.native_session.clone()?,
+            };
+            let (provider, home, reader): (_, _, &dyn UsageReader) = match who.agent {
+                Agent::Claude => (
+                    model::Provider::Claude,
+                    self.homes.statusline_state.as_ref()?,
+                    &ClaudeReader,
+                ),
+                Agent::Agy => (
+                    model::Provider::Agy,
+                    self.homes.statusline_state.as_ref()?,
+                    &agy,
+                ),
+                Agent::Codex => (model::Provider::Codex, self.homes.codex.as_ref()?, codex),
+                Agent::Grok => (
+                    model::Provider::Grok,
+                    self.homes.grok.as_ref().unwrap_or(&self.directory),
+                    grok,
+                ),
+                Agent::Kimi => (
+                    model::Provider::Kimi,
+                    self.homes.kimi.as_ref().unwrap_or(&self.directory),
+                    &KimiReader,
+                ),
+                _ => return None,
+            };
+            // Snapshot has no pane-specific home/profile. Only the injected daemon
+            // home is searched, with an exact native id; never infer by cwd or use
+            // another session when a different pane profile is inaccessible.
+            let identity = model::SessionIdentity {
+                provider,
+                native_session_id: native.clone(),
+                repository_identity: pane.cwd.clone().unwrap_or_default(),
+            };
+            // Repository discovery and earlier panes may take seconds. A
+            // newly written observation must be compared to this read's clock.
+            let now = SystemTime::now();
+            let request = model::ReadRequest {
+                identity: &identity,
+                home,
+                now,
+                max_age: Duration::from_millis(config.usage_max_age_ms),
+                timeout: inventory.deadline.saturating_duration_since(Instant::now()),
+                shutdown: self.shutdown.as_deref(),
+            };
+            let missing_home = (who.agent == Agent::Grok && self.homes.grok.is_none())
+                || (who.agent == Agent::Kimi && self.homes.kimi.is_none());
+            let mut reading = if missing_home || (who.agent == Agent::Kimi && native.is_empty()) {
+                // Billing account attribution does not require a local session
+                // home. Do not search plugin state as a substitute for context.
+                model::UsageReading::missing(
+                    &request,
+                    if who.agent == Agent::Kimi {
+                        model::SourceKind::KimiSession
+                    } else {
+                        model::SourceKind::GrokSignals
+                    },
+                    model::MissingReason::NotFound,
+                )
+            } else {
+                #[cfg(test)]
+                let stage_start = Instant::now();
+                let result = reader.read(&request);
+                #[cfg(test)]
+                self.stages
+                    .lock()
+                    .unwrap()
+                    .add("reader", stage_start.elapsed());
+                result
+            };
+            if reading.identity != identity {
+                self.local_readings.remove(&pane.pane_id);
+                return None;
+            }
+            // A shared cycle budget can expire before this pane gets a turn.
+            // Do not turn a transient read timeout into loss of proven identity.
+            // EntryLimit is not transient: the directory stays over the cap, so
+            // the previous context must be dropped instead of kept without expiry.
+            // Cache local observations only; account workers retain their own
+            // reset/auth policy and are overlaid afresh below.
+            if reading.context == model::UsageOutcome::Unavailable(model::MissingReason::Timeout)
+                && matches!(
+                    reading.weekly_remaining,
+                    model::UsageOutcome::Unavailable(_)
+                )
+                && let Some(previous) = self.local_readings.get(&pane.pane_id)
+                && previous.identity == identity
+                && previous.source_kind == reading.source_kind
+            {
+                reading = restore_local_after_timeout(previous, now, request.max_age);
+            }
+            if reading.binding.is_some() {
+                self.local_readings
+                    .insert(pane.pane_id.clone(), reading.clone());
+            } else {
+                self.local_readings.remove(&pane.pane_id);
+            }
+            if config.allow_network {
+                let weekly = match who.agent {
+                    // Herdr snapshots do not expose pane-specific CODEX_HOME or
+                    // profiles. Attribute the daemon home's quota only after its
+                    // rollout reader proves this exact native session belongs
+                    // there. Different homes remain unavailable; profiles sharing
+                    // a home cannot be distinguished, and auth changes require
+                    // restarting the daemon to discard the account cache.
+                    Agent::Codex
+                        if reading.binding
+                            == Some(model::UsageBinding::NativeSession(native.clone())) =>
+                    {
+                        inventory.codex_weekly
+                    }
+                    // Grok has one configured account, shared across all its
+                    // panes even when no local context/native id is available.
+                    Agent::Grok => inventory.grok_weekly,
+                    Agent::Kimi if config.weekly_enabled(Agent::Kimi) => inventory.kimi_weekly,
+                    _ => None,
+                };
+                if let Some(weekly) = weekly {
+                    reading.weekly_remaining =
+                        model::UsageOutcome::Available(100.0 - weekly.used_percent);
+                    reading.weekly_window = Some(model::WeeklyWindow::RollingSevenDays);
+                    reading.weekly_resets_at = weekly.resets_at;
+                    if matches!(who.agent, Agent::Grok | Agent::Kimi) {
+                        reading.binding = Some(model::UsageBinding::Pane(pane.pane_id.clone()));
+                    }
+                }
+            }
+            Some(tokens::Usage {
+                binding: reading.binding,
+                occupant: who.clone(),
+                context_pct: match reading.context {
+                    model::UsageOutcome::Available(value) => Some(value),
+                    _ => None,
+                },
+                weekly_remaining_pct: match reading.weekly_remaining {
+                    model::UsageOutcome::Available(value) if reading.weekly_window.is_some() => {
+                        Some(value)
+                    }
+                    _ => None,
+                },
+                weekly_reset_unix: reading
+                    .weekly_resets_at
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .and_then(|age| i64::try_from(age.as_secs()).ok()),
+            })
+        });
+        Ok(PaneObservation {
+            pane_id: pane.pane_id.clone(),
+            workspace_id: pane.workspace_id.clone(),
+            stored_keys: pane.stored_keys.clone(),
+            occupant,
+            state: pane.state.clone(),
+            usage,
+        })
     }
 
-    fn plan_desired_reports(
+    fn plan_pane_report(
         &self,
         inventory: &RefreshInventory,
         config: &Config,
         headings: &Headings,
-        observations: Vec<PaneObservation>,
-    ) -> io::Result<DesiredReports> {
-        let mut pane_reports = Vec::with_capacity(observations.len());
-        for obs in observations {
-            self.check_shutdown()?;
-            let first_pane = inventory.first_panes.contains(&obs.pane_id);
-            let mut desired = tokens::pane_tokens(
-                &tokens::PaneInput {
-                    pane_id: obs.pane_id.clone(),
-                    occupant: obs.occupant.clone(),
-                    state: Some(obs.state),
-                    usage: obs.usage,
-                },
-                inventory.mode,
-                false,
-                inventory.now_unix,
+        obs: PaneObservation,
+    ) -> io::Result<PlannedPaneReport> {
+        let first_pane = inventory.first_panes.contains(&obs.pane_id);
+        let mut desired = tokens::pane_tokens(
+            &tokens::PaneInput {
+                pane_id: obs.pane_id.clone(),
+                occupant: obs.occupant.clone(),
+                state: Some(obs.state),
+                usage: obs.usage,
+            },
+            inventory.mode,
+            false,
+            inventory.now_unix,
+        );
+        if let Some(heading) = headings.by_workspace.get(&obs.workspace_id)
+            && first_pane
+            && heading.resolved
+        {
+            desired.insert(
+                "lineup_group".into(),
+                heading.desired.get("lineup_repo").and_then(Clone::clone),
             );
-            if let Some(heading) = headings.by_workspace.get(&obs.workspace_id)
-                && first_pane
-                && heading.resolved
-            {
-                desired.insert(
-                    "lineup_group".into(),
-                    heading.desired.get("lineup_repo").and_then(Clone::clone),
-                );
-                desired.insert(
-                    "lineup_group_ship_text".into(),
-                    heading
-                        .desired
-                        .get("lineup_ship_text")
-                        .and_then(Clone::clone),
-                );
-            }
-            if !first_pane
-                && config.non_first_pane_logo_indent != 0
-                && let Some(Some(logo)) = desired.get_mut("lineup_logo")
-            {
-                logo.insert_str(
-                    0,
-                    &"\u{2800}".repeat(usize::from(config.non_first_pane_logo_indent)),
-                );
-            }
-            let resource = self.resource(ResourceKind::Pane, &obs.pane_id);
-            pane_reports.push(PlannedPaneReport {
-                resource,
-                stored_keys: obs.stored_keys,
-                occupant: obs.occupant,
-                desired,
-            });
+            desired.insert(
+                "lineup_group_ship_text".into(),
+                heading
+                    .desired
+                    .get("lineup_ship_text")
+                    .and_then(Clone::clone),
+            );
         }
-        let mut workspace_reports = Vec::with_capacity(inventory.snapshot.workspaces.len());
-        for workspace in &inventory.snapshot.workspaces {
-            self.check_shutdown()?;
-            let desired = headings
-                .by_workspace
-                .get(&workspace.workspace_id)
-                .map(|heading| heading.desired.clone())
-                .unwrap_or_default();
-            let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
-            workspace_reports.push(PlannedWorkspaceReport {
-                resource,
-                stored_keys: workspace.stored_keys.clone(),
-                desired,
-            });
+        if !first_pane
+            && config.non_first_pane_logo_indent != 0
+            && let Some(Some(logo)) = desired.get_mut("lineup_logo")
+        {
+            logo.insert_str(
+                0,
+                &"\u{2800}".repeat(usize::from(config.non_first_pane_logo_indent)),
+            );
         }
-        Ok(DesiredReports {
-            panes: pane_reports,
-            workspaces: workspace_reports,
+        let resource = self.resource(ResourceKind::Pane, &obs.pane_id);
+        Ok(PlannedPaneReport {
+            resource,
+            stored_keys: obs.stored_keys,
+            occupant: obs.occupant,
+            desired,
         })
     }
 
-    fn send_reports(
+    fn send_pane_report(
         &mut self,
         transport: &mut Transport,
-        reports: DesiredReports,
-    ) -> io::Result<()> {
-        let mut skipped_resources = 0u64;
-        for report in reports.panes {
-            if let Err(error) = self.report(
-                transport,
-                &report.resource,
-                &report.stored_keys,
-                report.occupant.as_ref(),
-                &report.desired,
-                None,
-            ) {
-                if capacity_skip_count(&error).is_some() {
-                    skipped_resources = skipped_resources.saturating_add(1);
-                    continue;
-                }
-                // Do not continue I/O after an ambiguous response: reconnect/reconcile.
+        report: &PlannedPaneReport,
+    ) -> io::Result<Option<u64>> {
+        if let Err(error) = self.report(
+            transport,
+            &report.resource,
+            &report.stored_keys,
+            report.occupant.as_ref(),
+            &report.desired,
+            None,
+        ) {
+            if capacity_skip_count(&error).is_some() {
+                return Ok(Some(1));
+            }
+            // Do not continue I/O after an ambiguous response: reconnect/reconcile.
+            return Err(error);
+        }
+        Ok(None)
+    }
+
+    fn plan_workspace_report(
+        &self,
+        headings: &Headings,
+        workspace: &protocol::Workspace,
+    ) -> PlannedWorkspaceReport {
+        let desired = headings
+            .by_workspace
+            .get(&workspace.workspace_id)
+            .map(|heading| heading.desired.clone())
+            .unwrap_or_default();
+        let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
+        PlannedWorkspaceReport {
+            resource,
+            stored_keys: workspace.stored_keys.clone(),
+            desired,
+        }
+    }
+
+    fn send_workspace_report(
+        &mut self,
+        transport: &mut Transport,
+        report: &PlannedWorkspaceReport,
+    ) -> io::Result<Option<u64>> {
+        if let Err(error) = self.report(
+            transport,
+            &report.resource,
+            &report.stored_keys,
+            None,
+            &report.desired,
+            None,
+        ) {
+            if capacity_skip_count(&error).is_none() {
                 return Err(error);
             }
+            return Ok(Some(1));
         }
-        for report in reports.workspaces {
-            self.check_shutdown()?;
-            if let Err(error) = self.report(
-                transport,
-                &report.resource,
-                &report.stored_keys,
-                None,
-                &report.desired,
-                None,
-            ) {
-                if capacity_skip_count(&error).is_none() {
-                    return Err(error);
-                }
-                skipped_resources = skipped_resources.saturating_add(1);
-            }
-        }
-        if skipped_resources > 0 {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                CapacitySkip { skipped_resources },
-            ))
-        } else {
-            Ok(())
-        }
+        Ok(None)
     }
 
     fn refresh_with_readers_inner(
@@ -1809,9 +1787,34 @@ impl MetadataPublisher {
     ) -> io::Result<()> {
         let inventory = self.collect_inventory(transport, config)?;
         let headings = self.resolve_headings(&inventory)?;
-        let observations = self.observe_panes(&inventory, config, codex, grok)?;
-        let reports = self.plan_desired_reports(&inventory, config, &headings, observations)?;
-        self.send_reports(transport, reports)
+        let mut skipped_resources = 0u64;
+
+        for pane in &inventory.snapshot.panes {
+            self.check_shutdown()?;
+            let observation = self.observe_pane(&inventory, config, pane, codex, grok)?;
+            self.check_shutdown()?;
+            let report = self.plan_pane_report(&inventory, config, &headings, observation)?;
+            if let Some(skip) = self.send_pane_report(transport, &report)? {
+                skipped_resources = skipped_resources.saturating_add(skip);
+            }
+        }
+
+        for workspace in &inventory.snapshot.workspaces {
+            self.check_shutdown()?;
+            let report = self.plan_workspace_report(&headings, workspace);
+            if let Some(skip) = self.send_workspace_report(transport, &report)? {
+                skipped_resources = skipped_resources.saturating_add(skip);
+            }
+        }
+
+        if skipped_resources > 0 {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                CapacitySkip { skipped_resources },
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -4971,6 +4974,167 @@ mod tests {
         assert!(flag.load(Ordering::Acquire), "fixture did not reach reader");
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         assert_eq!(reports, 0, "shutdown must not publish a partial refresh");
+    }
+
+    #[test]
+    fn fast_pane_publishes_before_subsequent_slow_reader() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        struct StepReader {
+            rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl UsageReader for StepReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                if request.identity.native_session_id == "slow-native" {
+                    // Pane 2 waits until Pane 1 has already reached the server.
+                    let _ = self.rx.lock().unwrap().recv_timeout(Duration::from_secs(2));
+                }
+                TimeoutReader.read(request)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let socket = dir.path().join("order.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_millis(500));
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(stream.get_mut(), "{}", json!({"id":request["id"],"result":{
+                "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                "workspaces":[{"workspace_id":"w1"}],"panes":[
+                    {"pane_id":"w1:p1","workspace_id":"w1","agent":"codex",
+                     "agent_session":{"agent":"codex","kind":"id","value":"fast-native"},"agent_status":"idle"},
+                    {"pane_id":"w1:p2","workspace_id":"w1","agent":"codex",
+                     "agent_session":{"agent":"codex","kind":"id","value":"slow-native"},"agent_status":"idle"}
+                ]}
+            }})).unwrap();
+            let mut pane_order = Vec::new();
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap_or_default();
+                if method == "pane.report_metadata" {
+                    let target = request["params"]["pane_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    pane_order.push(target);
+                    // Signal to slow reader that first pane arrived at server.
+                    let _ = tx.send(());
+                }
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+            }
+            pane_order
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().join("state"),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("synthetic-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        let reader = StepReader {
+            rx: std::sync::Mutex::new(rx),
+        };
+        let result = publisher.refresh_with_readers(
+            &mut transport,
+            &Config::default(),
+            &reader,
+            &TimeoutReader,
+        );
+        drop(transport);
+        let pane_order = server.join().unwrap();
+        assert!(result.is_ok(), "refresh failed: {:?}", result);
+        assert_eq!(pane_order, vec!["w1:p1", "w1:p2"]);
+    }
+
+    #[test]
+    fn shutdown_during_subsequent_reader_preserves_earlier_pane_publication() {
+        struct StoppingOnSecondReader(Arc<AtomicBool>);
+        impl UsageReader for StoppingOnSecondReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                if request.identity.native_session_id == "stopping-native" {
+                    self.0.store(true, Ordering::Release);
+                }
+                TimeoutReader.read(request)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let socket = dir.path().join("subsequent-cancel.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_millis(500));
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(stream.get_mut(), "{}", json!({"id":request["id"],"result":{
+                "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                "workspaces":[{"workspace_id":"w1"}],"panes":[
+                    {"pane_id":"w1:p1","workspace_id":"w1","agent":"codex",
+                     "agent_session":{"agent":"codex","kind":"id","value":"fast-native"},"agent_status":"idle"},
+                    {"pane_id":"w1:p2","workspace_id":"w1","agent":"codex",
+                     "agent_session":{"agent":"codex","kind":"id","value":"stopping-native"},"agent_status":"idle"}
+                ]}
+            }})).unwrap();
+            let mut received_panes = Vec::new();
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                if request["method"].as_str() == Some("pane.report_metadata") {
+                    received_panes.push(request["params"]["pane_id"].as_str().unwrap().to_string());
+                }
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+            }
+            received_panes
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().join("state"),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("synthetic-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        publisher.set_shutdown(flag.clone());
+        let result = publisher.refresh_with_readers(
+            &mut transport,
+            &Config::default(),
+            &StoppingOnSecondReader(flag.clone()),
+            &TimeoutReader,
+        );
+        drop(transport);
+        let received_panes = server.join().unwrap();
+        assert!(
+            flag.load(Ordering::Acquire),
+            "fixture did not reach second reader"
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        // Earlier fast pane was already published and acknowledged before second reader shutdown.
+        assert_eq!(received_panes, vec!["w1:p1"]);
     }
 
     #[test]
