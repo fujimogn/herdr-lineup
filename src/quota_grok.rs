@@ -271,10 +271,16 @@ struct Period {
     end: Option<String>,
 }
 
+fn confirmed_weekly(kind: &str) -> bool {
+    // Bare WEEKLY and the proto enum only. NON_WEEKLY, BIWEEKLY, and WEEK
+    // contain related letters but are not confirmed weekly periods.
+    matches!(kind, "WEEKLY" | "BILLING_PERIOD_TYPE_WEEKLY")
+}
+
 fn parse_billing(bytes: &[u8]) -> Result<Outcome, Failure> {
     let billing: Billing = serde_json::from_slice(bytes).map_err(|_| Failure::InvalidResponse)?;
     let kind = billing.config.current_period.r#type.to_ascii_uppercase();
-    if kind.contains("WEEKLY") {
+    if confirmed_weekly(&kind) {
         // Grok's proto3 schema omits the scalar for a new unused period.
         let used_percent = billing.config.credit_usage_percent.unwrap_or(0.0);
         if !used_percent.is_finite() || !(0.0..=100.0).contains(&used_percent) {
@@ -456,6 +462,27 @@ mod tests {
             parse_billing(br#"{"config":{"currentPeriod":{"type":"billing_period_monthly"}}}"#),
             Ok(Outcome::NonWeekly)
         );
+    }
+
+    #[test]
+    fn unconfirmed_week_labels_are_not_weekly() {
+        for kind in [
+            "NON_WEEKLY",
+            "BIWEEKLY",
+            "WEEK",
+            "non_weekly",
+            "biweekly",
+            "Week",
+        ] {
+            let body = format!(
+                r#"{{"config":{{"creditUsagePercent":35,"currentPeriod":{{"type":"{kind}","end":"2099-01-01T00:00:00Z"}}}}}}"#
+            );
+            assert_eq!(
+                parse_billing(body.as_bytes()),
+                Err(Failure::InvalidResponse),
+                "{kind}"
+            );
+        }
     }
 
     #[test]
