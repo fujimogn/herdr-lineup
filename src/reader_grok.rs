@@ -6,9 +6,19 @@ use std::path::Path;
 pub struct GrokReader;
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 impl GrokReader {
+    #[cfg(test)]
     fn read_with_hook(
         &self,
         request: &ReadRequest<'_>,
+        after_discovery: impl FnOnce(&Path) + Send + 'static,
+    ) -> UsageReading {
+        self.read_in_cycle_with_hook(request, &ReadCycle::new(), after_discovery)
+    }
+
+    fn read_in_cycle_with_hook(
+        &self,
+        request: &ReadRequest<'_>,
+        cycle: &ReadCycle,
         after_discovery: impl FnOnce(&Path) + Send + 'static,
     ) -> UsageReading {
         let source = SourceKind::GrokSignals;
@@ -17,7 +27,7 @@ impl GrokReader {
         {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
-        bounded_read(request, source, &BUSY, move |request| {
+        let job = move |request: &ReadRequest<'_>| {
             let started = std::time::Instant::now();
             match read_session_with_hook(request, after_discovery) {
                 Ok((percent, observed)) => {
@@ -29,13 +39,21 @@ impl GrokReader {
                 }
                 Err(reason) => UsageReading::missing(request, source, reason),
             }
-        })
+        };
+        match cycle.diagnostics() {
+            Some(diagnostics) => bounded_read_observed(request, source, &BUSY, diagnostics, job),
+            None => bounded_read(request, source, &BUSY, job),
+        }
     }
 }
 
 impl UsageReader for GrokReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
-        self.read_with_hook(request, |_| {})
+        self.read_in_cycle(request, &ReadCycle::new())
+    }
+
+    fn read_in_cycle(&self, request: &ReadRequest<'_>, cycle: &ReadCycle) -> UsageReading {
+        self.read_in_cycle_with_hook(request, cycle, |_| {})
     }
 }
 fn signals_paths(
@@ -369,5 +387,88 @@ mod tests {
             GrokReader.read(&request).context,
             UsageOutcome::Unavailable(MissingReason::EntryLimit)
         );
+    }
+    #[test]
+    fn diagnostic_routing_isolated() {
+        const CHILD: &str = "HERDR_LINEUP_GROK_ROUTING_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("grok") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reader_grok::tests::diagnostic_routing_isolated",
+                    "--nocapture",
+                ])
+                .env(CHILD, "grok")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Grok);
+        let base = request(&id, dir.path());
+        fixture(dir.path(), r#"{"contextWindowUsage":7}"#, base.now);
+        let diagnostics = std::sync::Arc::new(ReaderDiagnostics::default());
+        let cycle = ReadCycle::with_diagnostics(diagnostics.clone());
+
+        let observed = GrokReader.read_in_cycle(&base, &cycle);
+        wait_for_worker();
+        assert_percent(observed.context.clone());
+        let plain = GrokReader.read_in_cycle(&base, &ReadCycle::new());
+        wait_for_worker();
+        assert_eq!(observed, plain);
+        assert_eq!(observed, GrokReader.read(&base));
+        wait_for_worker();
+        let snapshot = diagnostics.snapshot(Provider::Grok).unwrap();
+        assert_eq!((snapshot.attempts, snapshot.completed), (1, 1));
+        assert!(!snapshot.worker_active);
+
+        // Rejection before bounded_read starts has no diagnostic attempt.
+        let mut unassociated = id.clone();
+        unassociated.provider = Provider::Hermes;
+        assert_eq!(
+            GrokReader
+                .read_in_cycle(&request(&unassociated, dir.path()), &cycle)
+                .context,
+            UsageOutcome::Unavailable(MissingReason::Unassociated)
+        );
+        assert_eq!(diagnostics.snapshot(Provider::Grok).unwrap().attempts, 1);
+        // Invalid timeout is detected inside bounded_read, so it is counted.
+        let invalid = ReadRequest {
+            timeout: Duration::MAX,
+            ..base
+        };
+        assert_eq!(
+            GrokReader.read_in_cycle(&invalid, &cycle).context,
+            UsageOutcome::Unavailable(MissingReason::Invalid)
+        );
+        let snapshot = diagnostics.snapshot(Provider::Grok).unwrap();
+        assert_eq!(
+            (snapshot.attempts, snapshot.completed, snapshot.invalid),
+            (2, 1, 1)
+        );
+
+        // Observed and plain reads share one static permit.
+        BUSY.store(true, Ordering::Release);
+        let busy = UsageOutcome::Unavailable(MissingReason::Timeout);
+        assert_eq!(GrokReader.read_in_cycle(&base, &cycle).context, busy);
+        assert_eq!(GrokReader.read(&base).context, busy);
+        let snapshot = diagnostics.snapshot(Provider::Grok).unwrap();
+        assert_eq!((snapshot.attempts, snapshot.busy_rejections), (3, 1));
+        BUSY.store(false, Ordering::Release);
+        assert_eq!(observed, GrokReader.read_in_cycle(&base, &cycle));
+        wait_for_worker();
+        let snapshot = diagnostics.snapshot(Provider::Grok).unwrap();
+        assert_eq!((snapshot.attempts, snapshot.completed), (4, 2));
+        assert_eq!(snapshot.sampling_skips, 0);
+    }
+
+    fn wait_for_worker() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while BUSY.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
     }
 }
