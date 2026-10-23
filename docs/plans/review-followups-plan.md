@@ -30,8 +30,9 @@ The first wave and its follow-ups are integrated locally (not pushed, not
 shipped): typed font journal (M7), publisher stages (M6), sequence window with
 poison and failure fixtures (L1), FIFO single eviction (M5), doctor scan
 errors (C4), Git cache API (L2), shared socket deadline API (L3 part),
-`ReadCycle` discovery sharing API (L4), reader worker diagnostics API (L5),
-and refresh duration observation (L3 part). The coverage table has the
+`ReadCycle` discovery sharing API (L4), reader worker diagnostics API and
+reader-side routing (L5), and refresh duration and stage histogram
+aggregation (L3 part). The coverage table has the
 evidence and remaining limits. API-only rows have no runtime effect until
 wired.
 
@@ -51,9 +52,9 @@ candidate. A member lane does not launch it.
 
 `TODO.md` lists the open items. Take them in this order of dependency:
 
-1. Land the in-progress wiring (Git cache, shared deadlines, `ReadCycle`, and
-   reader diagnostics into publication) and the stage-histogram fix, each with
-   its own fixtures. Until then those rows stay `api-unwired`.
+1. Land publisher runtime wiring (`docs/plans/publisher-runtime-wiring.md`),
+   then reader diagnostics in control and `doctor`, each with its own
+   fixtures. Until then those rows stay `api-unwired` or `partial`.
 2. Measure on the wired head (N1, N3, N4, L5 frequency) before any budget,
    cap, or isolation decision. Linux numbers are not extrapolated to macOS.
 3. Decide C1 before any discovery cap change.

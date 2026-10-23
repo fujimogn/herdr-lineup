@@ -8,12 +8,11 @@ local and unshipped, and the version stays 0.2.2.
 
 ## In progress on other lanes (not integrated)
 
-- Stage histogram fix for the doctor refresh-stage lines.
-- Publication wiring of the Git heading cache, the fair queue, the cycle
-  budget, the 30 s confirmed fallback, and the shared socket deadlines (L2,
-  L3).
-- Publication wiring of one `ReadCycle` per refresh and of reader worker
-  diagnostics (L4, L5).
+- Publisher runtime wiring (P): cycle and stage samples from
+  `MetadataPublisher`, the Git heading cache, fair queue, cycle budget, 30 s
+  confirmed fallback, shared socket deadlines, and one `ReadCycle` per
+  refresh (L2, L3, L4). Plan: `docs/plans/publisher-runtime-wiring.md`.
+- Reader worker diagnostics in control and `doctor` (D, after P; L5).
 
 ## Open
 
@@ -59,7 +58,7 @@ Start only when the stated condition is met.
 
 ## Completed in the local integration line (unshipped)
 
-Integrated up to `d95e5b5`; see the coverage table for evidence.
+Integrated up to `1787386`; see the coverage table for evidence.
 
 - M2 Kimi `O_CLOEXEC`, M3 Kimi transient stat, M4 exact Grok weekly kinds,
   C3 Grok credential change, C5 release-gate failure classes.
@@ -69,8 +68,11 @@ Integrated up to `d95e5b5`; see the coverage table for evidence.
 - C4 doctor capped scan and `readdir` error versus end.
 - L1 endpoint sequence window, poison after an uncertain write, and failure
   fixtures.
-- L3 refresh duration, histogram, and outcome counts in doctor; socket
+- L3 refresh duration, histogram, and outcome counts in doctor; per-stage
+  histogram aggregation (production stage samples wait for P); socket
   absolute-deadline API and refusal of ambiguous reuse.
+- L5 reader-side routing: Codex and Kimi readers use the observed path when a
+  cycle carries diagnostics (no production caller yet).
 - API only, unwired: L2 Git heading cache, L4 `ReadCycle`, L5 reader
   diagnostics.
 - H1 and M1 partial: automatic rollback removed and a recheck before font
