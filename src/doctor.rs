@@ -42,7 +42,16 @@ pub(crate) fn statusline_records_line(state: &Path, now: SystemTime) -> String {
 
 fn statusline_records_line_limited(state: &Path, now: SystemTime, limit: usize) -> String {
     match scan_statusline_records(&state.join("statusline"), now, limit) {
-        Some((count, latest_age)) if count > 0 => {
+        Some((count, latest_age, true)) if count > 0 => {
+            format!(
+                "StatusLine records: {count} in scanned entries (latest in scanned entries: {latest_age}s ago; scan limit reached)"
+            )
+        }
+        Some((0, _, true)) => {
+            "StatusLine records: 0 in scanned entries (latest unavailable; scan limit reached)"
+                .to_string()
+        }
+        Some((count, latest_age, false)) if count > 0 => {
             format!("StatusLine records: {count} (latest: {latest_age}s ago)")
         }
         _ => "StatusLine records: 0".to_string(),
@@ -53,9 +62,9 @@ fn scan_statusline_records(
     directory: &Path,
     now: SystemTime,
     limit: usize,
-) -> Option<(usize, u64)> {
+) -> Option<(usize, u64, bool)> {
     if limit == 0 {
-        return Some((0, 0));
+        return Some((0, 0, true));
     }
     let metadata = fs::symlink_metadata(directory).ok()?;
     // `symlink_metadata` reports the link itself. A symlinked directory is not
@@ -123,7 +132,7 @@ fn scan_statusline_records(
                 .unwrap_or(0)
         })
         .unwrap_or(0);
-    Some((count, latest_age))
+    Some((count, latest_age, examined >= limit))
 }
 
 pub(crate) fn local_diagnostics(state: &Path, now: SystemTime) -> String {
@@ -413,9 +422,32 @@ mod tests {
                 .unwrap();
         }
         let bounded = statusline_records_line_limited(bounded_state.path(), now, 2);
-        assert_eq!(bounded, "StatusLine records: 2 (latest: 5s ago)");
+        assert_eq!(
+            bounded,
+            "StatusLine records: 2 in scanned entries (latest in scanned entries: 5s ago; scan limit reached)"
+        );
         assert!(!bounded.contains(secret));
         assert!(!bounded.contains("extra-"));
+
+        let mixed_state = tempfile::tempdir().unwrap();
+        let mixed_status = mixed_state.path().join("statusline");
+        std::fs::create_dir(&mixed_status).unwrap();
+        let regular = mixed_status.join("regular.json");
+        std::fs::write(&regular, secret).unwrap();
+        std::fs::File::open(&regular)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(25))
+            .unwrap();
+        std::fs::create_dir(mixed_status.join("nonregular")).unwrap();
+        let mixed = statusline_records_line_limited(mixed_state.path(), now, 2);
+        assert_eq!(
+            mixed,
+            "StatusLine records: 1 in scanned entries (latest in scanned entries: 25s ago; scan limit reached)"
+        );
+        assert!(!mixed.contains(secret));
+
+        let uncapped = statusline_records_line_limited(mixed_state.path(), now, 3);
+        assert_eq!(uncapped, "StatusLine records: 1 (latest: 25s ago)");
     }
 
     #[test]
