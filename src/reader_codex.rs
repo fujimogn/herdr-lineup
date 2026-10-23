@@ -14,7 +14,7 @@ const CACHE_ENTRIES: usize = 128;
 type Observation = Result<(f64, SystemTime), MissingReason>;
 
 // Only paths, exact session IDs and derived observations are retained in memory.
-// Discovery still runs on cache hits to reject duplicate and symlinked sources.
+// Discovery is freshly scanned or cycle-validated before observation cache hits.
 static CACHE: LazyLock<Mutex<FingerprintCache<(PathBuf, String), Observation>>> =
     LazyLock::new(|| Mutex::new(FingerprintCache::new(CACHE_ENTRIES)));
 
@@ -22,15 +22,20 @@ pub struct CodexReader;
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 impl UsageReader for CodexReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+        self.read_in_cycle(request, &ReadCycle::new())
+    }
+
+    fn read_in_cycle(&self, request: &ReadRequest<'_>, cycle: &ReadCycle) -> UsageReading {
         let source = SourceKind::CodexRollout;
         if !associated(request, Provider::Codex)
             || !safe_component(&request.identity.native_session_id)
         {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
+        let cycle = cycle.clone();
         bounded_read(request, source, &BUSY, move |request| {
             let started = std::time::Instant::now();
-            match read_session(request) {
+            match read_session_in_cycle(request, &cycle) {
                 Ok((percent, time)) => {
                     let evaluated = ReadRequest {
                         now: request.now_after(started),
@@ -48,10 +53,12 @@ fn rollout(path: &Path) -> bool {
         s.starts_with("rollout-") && (s.ends_with(".jsonl") || s.ends_with(".jsonl.zst"))
     })
 }
+#[cfg(test)]
 fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime), MissingReason> {
     read_session_with_hook(request, |_| {})
 }
 
+#[cfg(test)]
 fn read_session_with_hook(
     request: &ReadRequest<'_>,
     after_read: impl FnOnce(&Path),
@@ -59,11 +66,25 @@ fn read_session_with_hook(
     read_session_with_hooks(request, after_read, |_| {})
 }
 
+#[cfg(test)]
 fn read_session_with_hooks(
     request: &ReadRequest<'_>,
     after_read: impl FnOnce(&Path),
     after_path_stat: impl FnOnce(&Path),
 ) -> Result<(f64, std::time::SystemTime), MissingReason> {
+    read_session_with_cycle_hooks(request, &ReadCycle::new(), after_read, after_path_stat)
+}
+
+fn read_session_in_cycle(request: &ReadRequest<'_>, cycle: &ReadCycle) -> Observation {
+    read_session_with_cycle_hooks(request, cycle, |_| {}, |_| {})
+}
+
+fn read_session_with_cycle_hooks(
+    request: &ReadRequest<'_>,
+    cycle: &ReadCycle,
+    after_read: impl FnOnce(&Path),
+    after_path_stat: impl FnOnce(&Path),
+) -> Observation {
     let mut budget = Budget::new(request);
     // Discovery reads names only. Other sessions and credential files are never opened.
     let id = &request.identity.native_session_id;
@@ -76,8 +97,11 @@ fn read_session_with_hooks(
                 .and_then(|s| s.to_str())
                 .is_some_and(|name| name.ends_with(&jsonl_suffix) || name.ends_with(&zst_suffix))
     };
-    let mut paths = budget.files(&request.home.join("sessions"), 3, matching_rollout)?;
-    paths.extend(budget.files(&request.home.join("archived_sessions"), 3, matching_rollout)?);
+    let paths: Vec<_> = cycle
+        .files(&mut budget, request.home, DiscoveryKind::Codex)?
+        .into_iter()
+        .filter(|path| matching_rollout(path))
+        .collect();
     if paths.len() > 1 {
         return Err(MissingReason::Unassociated);
     }
@@ -770,6 +794,37 @@ mod tests {
             text,
         )
         .unwrap();
+    }
+    #[test]
+    fn cycle_adapter_detects_archival_duplicate_and_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        let cycle = ReadCycle::new();
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let original = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let first = read_session_in_cycle(&r, &cycle).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        fs::create_dir(dir.path().join("archived_sessions")).unwrap();
+        let archived = dir
+            .path()
+            .join("archived_sessions/rollout-test-session-1.jsonl");
+        fs::rename(&original, &archived).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        fs::copy(&archived, &original).unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Unassociated)
+        );
+        // Moving a candidate away invalidates the old listing and observation.
+        fs::rename(&original, original.with_extension("ignored")).unwrap();
+        fs::write(&archived, b"broken\n").unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Invalid)
+        );
     }
     #[test]
     fn active_append_split_utf8_does_not_hide_completed_observation() {
