@@ -470,9 +470,11 @@ fn stage_duration_consistent(stats: &StageDurationStats) -> bool {
     }
     match histogram_total(&duration.histogram) {
         Some(total) if total == stats.count => true,
-        // One saturated bucket plus a later sample in another bucket no longer
-        // fits in `u64`, while the attempt count stays saturated.
-        None if stats.count == u64::MAX && duration.histogram.contains(&u64::MAX) => true,
+        // `u64::MAX - 1` samples in one bucket and two in the next overflow the
+        // stored total without any single bucket reaching `u64::MAX`. The
+        // attempt count is saturated. Extrema checks above still reject an
+        // occupied bucket outside min/max.
+        None if stats.count == u64::MAX => true,
         _ => false,
     }
 }
@@ -3307,6 +3309,76 @@ mod tests {
         .unwrap();
         assert!(saturated_view.observation.unwrap().stages.is_some());
         assert_eq!(saturated_view.health.pid, sample_health().pid);
+
+        // `u64::MAX - 1` zeros and two 1000 us samples saturate the count
+        // without saturating either bucket. The histogram sum does not fit.
+        let mut spread = zeros;
+        spread[0] = u64::MAX - 1;
+        spread[1] = 2;
+        let parsed = control_view_from_frame(
+            &serde_json::to_vec(&stage_distribution(
+                u64::MAX,
+                2_000,
+                1_000,
+                0,
+                1_000,
+                spread,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .observation
+                .as_ref()
+                .unwrap()
+                .duration
+                .as_ref()
+                .unwrap()
+                .last_us,
+            0
+        );
+        let state = ControlState {
+            health: parsed.health.clone(),
+            observation: parsed.observation.clone(),
+        };
+        let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
+        assert_eq!(roundtrip.health.nonce, parsed.health.nonce);
+        assert_eq!(roundtrip.health.endpoint, parsed.health.endpoint);
+        let stages = roundtrip.observation.unwrap().stages.unwrap();
+        assert_eq!(stages.snapshot.count, u64::MAX);
+        assert_eq!(stages.snapshot.sum_us, 2_000);
+        assert_eq!(stages.snapshot.duration.last_us, 1_000);
+        assert_eq!(stages.snapshot.duration.min_us, 0);
+        assert_eq!(stages.snapshot.duration.max_us, 1_000);
+        assert_eq!(stages.snapshot.duration.histogram[0], u64::MAX - 1);
+        assert_eq!(stages.snapshot.duration.histogram[1], 2);
+        assert!(
+            stages.snapshot.duration.histogram[2..]
+                .iter()
+                .all(|count| *count == 0)
+        );
+        assert!(!stages.snapshot.duration.histogram.contains(&u64::MAX));
+        assert_eq!(stages.socket.duration.histogram[1], 2);
+
+        assert_stages_unavailable(&stage_distribution(
+            u64::MAX - 1,
+            2_000,
+            1_000,
+            0,
+            1_000,
+            spread,
+        ));
+        let mut spread_outside = spread;
+        spread_outside[8] = 1;
+        assert_stages_unavailable(&stage_distribution(
+            u64::MAX,
+            2_000,
+            1_000,
+            0,
+            1_000,
+            spread_outside,
+        ));
     }
 
     #[test]
