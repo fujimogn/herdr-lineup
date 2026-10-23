@@ -1,8 +1,8 @@
 {
-  "version": "0.6.1",
+  "version": "0.6.2",
   "sha256": {
-    "x86_64-unknown-linux-gnu": "9189cf1efe9ad86744a0326bee0f7ff11e6583f58232d8f54556f14f459a5a8b",
-    "aarch64-apple-darwin": "cbb8a9dc6fef3283b3dab28bcf9c9345fea21efe96c6ffb40b437c1a7e2f8dc1"
+    "x86_64-unknown-linux-gnu": "213479e2a9ed08bd31000367418d40e3e507778b0cb43ca16d88ef5e983705fb",
+    "aarch64-apple-darwin": "312c502e7612e93992c7e0546c548b3880c45d9feb674b732afaaf26c84ca7f9"
   },
   "platforms": ["linux", "macos"],
   "platformCheck": {
@@ -14,6 +14,7 @@
       { "path": "Cargo.toml", "kind": "cargo-package" },
       { "path": "herdr-plugin.toml", "kind": "toml-root" },
       { "path": "Cargo.lock", "kind": "cargo-lock" }
-    ]
+    ],
+    "notes": { "mode": "changelog-section", "language": "en" }
   }
 }
