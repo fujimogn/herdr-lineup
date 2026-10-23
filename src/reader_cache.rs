@@ -24,7 +24,7 @@ impl<K: Eq + Hash, V: Clone> FingerprintCache<K, V> {
     }
 
     pub(crate) fn insert(&mut self, key: K, fingerprint: Fingerprint, value: V) {
-        if self.entries.len() >= self.limit {
+        if !self.entries.contains_key(&key) && self.entries.len() >= self.limit {
             self.entries.clear();
         }
         self.entries.insert(key, (fingerprint, value));
@@ -69,5 +69,26 @@ mod tests {
         cache.insert(4096, fingerprint(4096), 4096);
         assert_eq!(cache.get(&0, fingerprint(0)), None);
         assert_eq!(cache.get(&4096, fingerprint(4096)), Some(4096));
+    }
+
+    #[test]
+    fn full_cache_updates_existing_key_without_clearing_other_entries() {
+        let mut cache = FingerprintCache::new(2);
+        cache.insert("first", fingerprint(1), 10);
+        cache.insert("second", fingerprint(2), 20);
+        assert_eq!(cache.get(&"first", fingerprint(1)), Some(10));
+        assert_eq!(cache.get(&"second", fingerprint(2)), Some(20));
+
+        // Update an existing key when the cache is exactly at capacity (2 / 2).
+        cache.insert("first", fingerprint(3), 30);
+        assert_eq!(cache.get(&"first", fingerprint(3)), Some(30));
+        // The unrelated entry is preserved.
+        assert_eq!(cache.get(&"second", fingerprint(2)), Some(20));
+
+        // Inserting a new key at capacity clears the cache.
+        cache.insert("third", fingerprint(4), 40);
+        assert_eq!(cache.get(&"first", fingerprint(3)), None);
+        assert_eq!(cache.get(&"second", fingerprint(2)), None);
+        assert_eq!(cache.get(&"third", fingerprint(4)), Some(40));
     }
 }
