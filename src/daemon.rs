@@ -70,8 +70,7 @@ pub trait Publisher {
     ///
     /// `None` means this publisher does not measure stages. Callers must treat
     /// that as unavailable, not as a zero sample. Durations are microseconds.
-    /// Counts are report and checkpoint totals. `MetadataPublisher` keeps this
-    /// default until a later task wires it.
+    /// Counts are report and checkpoint totals of that refresh only.
     fn refresh_stages(&self) -> Option<RefreshStages> {
         None
     }
@@ -199,10 +198,30 @@ pub(crate) struct RefreshObservation {
     pub stages: Option<RefreshStageAggregate>,
 }
 
+/// Memory-only totals for refresh attempts classified as deadline skips.
+///
+/// Sent as the optional `refresh_deadline_skips` control field beside
+/// `refresh_observation`, so `Health` and `RefreshObservation` keep their
+/// shape and an older peer still parses the frame. Absence means no deadline
+/// skip has happened or the peer does not report them, never a measured zero.
+/// These attempts are included in `refresh_observation.attempt_count` and its
+/// duration and stage histograms, but not in its success, error or capacity
+/// skip counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeadlineSkipObservation {
+    pub attempt_count: u64,
+    /// Resources the latest deadline-skip attempt skipped by its deadline.
+    pub last_deadline_skipped: u64,
+    /// Resources the same attempt skipped for capacity. Zero is measured.
+    pub last_capacity_skipped: u64,
+}
+
 #[derive(Debug, Clone)]
 struct ControlState {
     health: Health,
     observation: Option<RefreshObservation>,
+    deadline_skips: Option<DeadlineSkipObservation>,
 }
 
 impl From<Health> for ControlState {
@@ -210,6 +229,7 @@ impl From<Health> for ControlState {
         Self {
             health,
             observation: None,
+            deadline_skips: None,
         }
     }
 }
@@ -220,6 +240,8 @@ struct ControlResponse<'a> {
     health: &'a Health,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_observation: Option<&'a RefreshObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_deadline_skips: Option<&'a DeadlineSkipObservation>,
 }
 
 #[derive(Debug)]
@@ -240,6 +262,9 @@ enum RefreshOutcome {
     Success,
     Error,
     CapacitySkip,
+    /// At least one resource was skipped by the cycle deadline. Capacity skips
+    /// in the same attempt keep their own count.
+    DeadlineSkip(crate::publish::RefreshSkip),
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -259,10 +284,13 @@ fn attempt_duration_us(started: Duration, finished: Duration) -> Option<u64> {
 fn refresh_outcome(result: &io::Result<()>) -> RefreshOutcome {
     match result {
         Ok(()) => RefreshOutcome::Success,
-        Err(error) if crate::publish::capacity_skip_count(error).is_some() => {
-            RefreshOutcome::CapacitySkip
-        }
-        Err(_) => RefreshOutcome::Error,
+        // Shutdown, poison and ambiguous exchanges return their own errors and
+        // never carry a skip payload.
+        Err(error) => match crate::publish::refresh_skip(error) {
+            Some(skip) if skip.deadline_skipped > 0 => RefreshOutcome::DeadlineSkip(skip),
+            Some(_) => RefreshOutcome::CapacitySkip,
+            None => RefreshOutcome::Error,
+        },
     }
 }
 
@@ -339,11 +367,16 @@ pub(crate) fn record_refresh(health: &mut Health, result: &io::Result<()>, elaps
             let count = result
                 .as_ref()
                 .err()
-                .and_then(crate::publish::capacity_skip_count)
-                .unwrap_or(0);
+                .and_then(crate::publish::refresh_skip)
+                .map_or(0, |skip| skip.capacity_skipped);
             health.last_refresh_ms = Some(elapsed_ms);
             health.refresh_failed = false;
             health.capacity_skipped_resources = count;
+        }
+        RefreshOutcome::DeadlineSkip(skip) => {
+            health.last_refresh_ms = Some(elapsed_ms);
+            health.refresh_failed = false;
+            health.capacity_skipped_resources = skip.capacity_skipped;
         }
         RefreshOutcome::Error => {
             health.refresh_failed = true;
@@ -377,6 +410,8 @@ fn note_refresh_attempt(
         RefreshOutcome::CapacitySkip => {
             current.capacity_skip_count = current.capacity_skip_count.saturating_add(1);
         }
+        // Counted only in the attempt total here; see `note_deadline_skip`.
+        RefreshOutcome::DeadlineSkip(_) => {}
     }
     if let Some(duration_us) = measured.duration_us {
         let mut stats = current.duration.take().unwrap_or(RefreshDuration {
@@ -400,6 +435,23 @@ fn note_refresh_attempt(
         }
     }
     *observation = Some(current);
+}
+
+fn note_deadline_skip(
+    deadline_skips: &mut Option<DeadlineSkipObservation>,
+    result: &io::Result<()>,
+) {
+    if let RefreshOutcome::DeadlineSkip(skip) = refresh_outcome(result) {
+        let attempt_count = deadline_skips
+            .as_ref()
+            .map_or(0, |previous| previous.attempt_count)
+            .saturating_add(1);
+        *deadline_skips = Some(DeadlineSkipObservation {
+            attempt_count,
+            last_deadline_skipped: skip.deadline_skipped,
+            last_capacity_skipped: skip.capacity_skipped,
+        });
+    }
 }
 
 fn stage_parts(aggregate: &RefreshStageAggregate) -> [&StageDurationStats; 5] {
@@ -511,6 +563,7 @@ fn control_frame(state: &ControlState) -> io::Result<Vec<u8>> {
     let response = ControlResponse {
         health: &state.health,
         refresh_observation: state.observation.as_ref(),
+        refresh_deadline_skips: state.deadline_skips.as_ref(),
     };
     serde_json::to_vec(&response).map_err(|_| io::Error::other("invalid daemon control snapshot"))
 }
@@ -528,6 +581,14 @@ pub(crate) fn control_view_from_frame(frame: &[u8]) -> io::Result<ControlView> {
         health,
         observation,
     })
+}
+
+/// Typed seam for doctor: the optional deadline skip field of a control
+/// frame. Absent, null or invalid reads as unavailable, never as zero.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn deadline_skips_from_frame(frame: &[u8]) -> Option<DeadlineSkipObservation> {
+    let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
+    serde_json::from_value(value.get("refresh_deadline_skips")?.clone()).ok()
 }
 
 pub fn ensure(options: &Options) -> io::Result<()> {
@@ -790,9 +851,16 @@ fn run_locked(
                         stages: publisher.refresh_stages(),
                     },
                 );
+                note_deadline_skip(&mut state.deadline_skips, &result);
                 if let Err(error) = result {
-                    if state.health.capacity_skipped_resources > 0 {
-                        let _ = log_event(&paths, "refresh_skipped", "metadata_capacity");
+                    if let Some(skip) = crate::publish::refresh_skip(&error) {
+                        // Neither skip reconnects; the frame was never written.
+                        if skip.deadline_skipped > 0 {
+                            let _ = log_event(&paths, "refresh_skipped", "cycle_deadline");
+                        }
+                        if skip.capacity_skipped > 0 {
+                            let _ = log_event(&paths, "refresh_skipped", "metadata_capacity");
+                        }
                     } else if error.kind() == io::ErrorKind::Interrupted
                         && control.shutdown.load(Ordering::Acquire)
                     {
@@ -2490,8 +2558,9 @@ mod tests {
             &mut health,
             &Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                crate::publish::CapacitySkip {
-                    skipped_resources: 2,
+                crate::publish::RefreshSkip {
+                    capacity_skipped: 2,
+                    deadline_skipped: 0,
                 },
             )),
             12,
@@ -2652,8 +2721,9 @@ mod tests {
             &mut observation,
             &Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                crate::publish::CapacitySkip {
-                    skipped_resources: 2,
+                crate::publish::RefreshSkip {
+                    capacity_skipped: 2,
+                    deadline_skipped: 0,
                 },
             )),
             140,
@@ -2935,8 +3005,9 @@ mod tests {
             &mut observation,
             &Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                crate::publish::CapacitySkip {
-                    skipped_resources: 1,
+                crate::publish::RefreshSkip {
+                    capacity_skipped: 1,
+                    deadline_skipped: 0,
                 },
             )),
             100,
@@ -3083,6 +3154,7 @@ mod tests {
         let state = ControlState {
             health,
             observation,
+            deadline_skips: None,
         };
         let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
         let measured = roundtrip.observation.unwrap().stages.unwrap();
@@ -3341,6 +3413,7 @@ mod tests {
         let state = ControlState {
             health: parsed.health.clone(),
             observation: parsed.observation.clone(),
+            deadline_skips: None,
         };
         let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
         assert_eq!(roundtrip.health.nonce, parsed.health.nonce);

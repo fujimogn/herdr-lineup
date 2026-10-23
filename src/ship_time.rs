@@ -41,9 +41,6 @@ pub(crate) enum RepositoryRead {
 #[derive(Debug)]
 pub(crate) struct RepositoryObservation {
     pub(crate) read: RepositoryRead,
-    // Publication does not consume the verification age yet; the wiring task
-    // that keeps the heading confirmation instant removes this allowance.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) verified_at: Option<Instant>,
 }
 
@@ -56,6 +53,8 @@ const VERIFIED_TTL: Duration = Duration::from_secs(30);
 /// Bound all Git commands for one heading and cancel them on daemon shutdown.
 /// Distinguish interruption from confirmed absence so publication can retain a
 /// previous heading only when its workspace identity is still authoritative.
+// Kept as the compatible uncached seam; the publisher now uses its own cache.
+#[allow(dead_code)]
 pub(crate) fn read_repository_controlled(
     cwd: &Path,
     shutdown: Option<&AtomicBool>,
