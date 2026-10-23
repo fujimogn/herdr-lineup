@@ -1,6 +1,9 @@
 //! Explicit per-user icon font installation; never invoked at startup.
 
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::{Map, Value};
 use std::{
     env, fs,
     io::{self, Read, Write},
@@ -190,21 +193,80 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-fn load(path: &Path) -> io::Result<Value> {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TerminalEntry {
+    path: String,
+    owned: String,
+    #[serde(flatten)]
+    extensions: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OwnershipJournal {
+    entries: Vec<TerminalEntry>,
+    font_owned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    font_path: Option<String>,
+    version: u32,
+    #[serde(flatten)]
+    extensions: Map<String, Value>,
+}
+
+impl OwnershipJournal {
+    fn empty(entries: Vec<TerminalEntry>) -> Self {
+        Self {
+            entries,
+            font_owned: false,
+            font_path: None,
+            version: 1,
+            extensions: Map::new(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PendingJournal<'a> {
+    #[serde(flatten)]
+    state: &'a OwnershipJournal,
+    pending: PendingAction<'a>,
+}
+
+#[derive(Serialize)]
+struct PendingAction<'a> {
+    action: &'a str,
+    paths: Vec<String>,
+}
+
+#[cfg(test)]
+fn load_journal(path: &Path) -> io::Result<OwnershipJournal> {
+    load_journal_snapshot(path).map(|(state, _)| state)
+}
+
+fn load_journal_snapshot(path: &Path) -> io::Result<(OwnershipJournal, Option<Vec<u8>>)> {
     check_path(path)?;
     match fs::read(path) {
         Ok(bytes) => {
+            // Presence, including null or an unknown pending shape, always blocks
+            // another mutation. Never deserialize an unresolved journal as ready.
             let value: Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-            if value["version"] != 1
-                || !value["entries"].is_array()
-                || !value["font_owned"].is_boolean()
-            {
+            if !value.is_object() {
                 return Err(conflict("Invalid font ownership record"));
             }
-            Ok(value)
+            if value.get("pending").is_some() {
+                return Err(conflict(&format!(
+                    "Font ownership is unresolved at {}; inspect the recorded paths and current files manually before another action",
+                    path.display()
+                )));
+            }
+            let journal: OwnershipJournal = serde_json::from_value(value)
+                .map_err(|_| conflict("Invalid font ownership record"))?;
+            if journal.version != 1 {
+                return Err(conflict("Invalid font ownership record"));
+            }
+            Ok((journal, Some(bytes)))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Ok(json!({"version":1,"font_owned":false,"entries":[]}))
+            Ok((OwnershipJournal::empty(Vec::new()), None))
         }
         Err(error) => Err(error),
     }
@@ -312,187 +374,244 @@ fn apply_with_font_and_remove(
         .open(lock_path)?;
     lock.try_lock().map_err(io::Error::other)?;
     let _lock = FontLock(lock);
-    let journal = locations.state.join("font-ownership.json");
-    let mut state = load(&journal)?;
-    if state.get("pending").is_some() {
-        return Err(conflict(&format!(
-            "Font ownership is unresolved at {}; inspect the recorded paths and current files manually before another action",
-            journal.display()
-        )));
-    }
-    let original_state = state.clone();
-    check_path(&locations.font)?;
-    if state["font_owned"] == true && state["font_path"].as_str() != locations.font.to_str() {
-        return Err(conflict(
-            "Font ownership record belongs to a different font directory",
-        ));
-    }
-    let original_font = stamp(&locations.font)?;
-    if original_font
-        .as_ref()
-        .is_some_and(|file| file.bytes != FONT)
-    {
-        return Err(conflict(&format!(
-            "Installed font differs at {}; leaving it unchanged",
-            locations.font.display()
-        )));
-    }
-    let terminals = locations.terminals();
-    for (path, _) in &terminals {
-        check_path(path)?;
-    }
-    let mut changes = Vec::new();
-    let mut retained = Vec::new();
-    for entry in state["entries"].as_array().unwrap() {
-        let path = PathBuf::from(
-            entry["path"]
-                .as_str()
-                .ok_or_else(|| conflict("Invalid terminal path record"))?,
-        );
-        let owned = entry["owned"]
-            .as_str()
-            .ok_or_else(|| conflict("Invalid terminal block record"))?;
-        if !terminals.iter().any(|(candidate, _)| candidate == &path)
-            || !owned.contains(START)
-            || !owned.contains(END)
-        {
-            return Err(conflict(
-                "Font ownership record does not match this home/config directory",
-            ));
-        }
-        check_path(&path)?;
-        if !path.exists() {
-            retained.push(entry.clone());
-            continue;
-        }
-        let original = fs::read(&path)?;
-        let text = std::str::from_utf8(&original).map_err(io::Error::other)?;
-        if !text.contains(START) && !text.contains(END) {
-            continue;
-        }
-        if text.matches(START).count() != 1
-            || text.matches(END).count() != 1
-            || text.matches(owned).count() != 1
-        {
+    let plan = FontPlan::build(&locations, removing)?;
+    plan.apply(
+        &locations,
+        &mut writer,
+        &mut font_writer,
+        &mut before_font_remove,
+    )
+}
+
+/// A planned replacement retains the exact bytes checked before it is applied.
+/// The check and pathname replacement remain separate, best-effort operations.
+struct TerminalChange {
+    path: PathBuf,
+    original: Vec<u8>,
+    replacement: String,
+}
+
+impl TerminalChange {
+    fn apply(&self, writer: &mut impl FnMut(&Path, &[u8]) -> io::Result<()>) -> io::Result<()> {
+        if fs::read(&self.path)? != self.original {
             return Err(conflict(&format!(
-                "Managed font block was modified at {}; resolve it manually",
-                path.display()
+                "Configuration file was modified concurrently at {}; leaving it unchanged",
+                self.path.display()
             )));
         }
-        if !removing {
-            retained.push(entry.clone());
-        }
-        if removing {
-            changes.push((path, text.replacen(owned, "", 1), original));
-        }
+        writer(&self.path, self.replacement.as_bytes())?;
+        require_bytes(&self.path, Some(self.replacement.as_bytes()))
     }
-    state["entries"] = json!(retained);
-    if !removing {
-        for (path, mapping) in terminals {
-            check_path(&path)?;
-            if !path.exists()
-                || state["entries"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|entry| entry["path"].as_str() == path.to_str())
+}
+
+enum FontChange {
+    Preserve,
+    Create,
+    Remove(FileStamp),
+}
+
+/// Serialized before mutation; application only publishes these prepared states.
+struct JournalPlan {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+    pending: Vec<u8>,
+    completed: Vec<u8>,
+    needs_write: bool,
+}
+
+struct FontPlan {
+    removing: bool,
+    terminals: Vec<TerminalChange>,
+    font: FontChange,
+    journal: JournalPlan,
+    affected_paths: Vec<PathBuf>,
+}
+
+impl FontPlan {
+    /// Reads and validates ownership and files without changing them. The caller
+    /// holds the action lock across both this snapshot and its application.
+    fn build(locations: &Locations, removing: bool) -> io::Result<Self> {
+        let journal = locations.state.join("font-ownership.json");
+        let (mut state, old_journal) = load_journal_snapshot(&journal)?;
+        let original_state = state.clone();
+        check_path(&locations.font)?;
+        if state.font_owned && state.font_path.as_deref() != locations.font.to_str() {
+            return Err(conflict(
+                "Font ownership record belongs to a different font directory",
+            ));
+        }
+        let original_font = stamp(&locations.font)?;
+        if original_font
+            .as_ref()
+            .is_some_and(|file| file.bytes != FONT)
+        {
+            return Err(conflict(&format!(
+                "Installed font differs at {}; leaving it unchanged",
+                locations.font.display()
+            )));
+        }
+        let terminals = locations.terminals();
+        for (path, _) in &terminals {
+            check_path(path)?;
+        }
+        let mut changes = Vec::new();
+        let mut retained = Vec::new();
+        for entry in &state.entries {
+            let path = PathBuf::from(&entry.path);
+            let owned = entry.owned.as_str();
+            if !terminals.iter().any(|(candidate, _)| candidate == &path)
+                || !owned.contains(START)
+                || !owned.contains(END)
             {
+                return Err(conflict(
+                    "Font ownership record does not match this home/config directory",
+                ));
+            }
+            check_path(&path)?;
+            if !path.exists() {
+                retained.push(entry.clone());
                 continue;
             }
             let original = fs::read(&path)?;
             let text = std::str::from_utf8(&original).map_err(io::Error::other)?;
-            if text.contains(START) || text.contains(END) {
+            if !text.contains(START) && !text.contains(END) {
+                continue;
+            }
+            if text.matches(START).count() != 1
+                || text.matches(END).count() != 1
+                || text.matches(owned).count() != 1
+            {
                 return Err(conflict(&format!(
-                    "Unrecorded font block exists at {}; leaving it unchanged",
+                    "Managed font block was modified at {}; resolve it manually",
                     path.display()
                 )));
             }
-            let separator = if text.is_empty() || text.ends_with('\n') {
-                ""
-            } else {
-                "\n"
-            };
-            let owned = format!("{separator}{START}\n{mapping}\n{END}\n");
-            state["entries"].as_array_mut().unwrap().push(json!({"path":path.to_str().ok_or_else(|| conflict("Non-UTF-8 config path"))?,"owned":owned}));
-            changes.push((path, format!("{text}{owned}"), original));
+            if !removing {
+                retained.push(entry.clone());
+            }
+            if removing {
+                changes.push(TerminalChange {
+                    path,
+                    replacement: text.replacen(owned, "", 1),
+                    original,
+                });
+            }
         }
-        if original_font.is_none() {
-            state["font_owned"] = json!(true);
-            state["font_path"] = json!(
-                locations
-                    .font
-                    .to_str()
-                    .ok_or_else(|| conflict("Non-UTF-8 font path"))?
-            );
-        }
-    }
-    let font_existed = original_font.is_some();
-    let old_journal = match fs::read(&journal) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-    let mut changed_paths = Vec::new();
-    let mut affected_paths: Vec<PathBuf> =
-        changes.iter().map(|(path, _, _)| path.clone()).collect();
-    if (!removing && !font_existed) || (removing && state["font_owned"] == true && font_existed) {
-        affected_paths.push(locations.font.clone());
-    }
-    let mut action_path = journal.clone();
-    let result: io::Result<()> = (|| {
-        // The pending record is durable before any font or terminal mutation.
-        // An interrupted or failed action remains blocked for manual inspection.
-        let mut pending_state = if removing {
-            original_state.clone()
-        } else {
-            state.clone()
-        };
-        let final_state = if removing {
-            json!({"version":1,"font_owned":false,"entries":state["entries"]})
-        } else {
-            state.clone()
-        };
-        pending_state["pending"] = json!({
-            "action": if removing { "uninstall" } else { "install" },
-            "paths": affected_paths.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>()
-        });
-        let pending_journal = serde_json::to_vec(&pending_state).map_err(io::Error::other)?;
-        let next_journal = serde_json::to_vec(&final_state).map_err(io::Error::other)?;
-        let needs_write = !affected_paths.is_empty()
-            || old_journal
-                .as_deref()
-                .is_some_and(|old| old != next_journal.as_slice());
-        if needs_write {
-            require_bytes(&journal, old_journal.as_deref())?;
-            write_atomic(&journal, &pending_journal)?;
-            changed_paths.push(journal.clone());
-        }
-        if removing {
-            for (path, text, original) in &changes {
-                action_path = path.clone();
-                if &fs::read(path)? != original {
+        state.entries = retained;
+        if !removing {
+            for (path, mapping) in terminals {
+                check_path(&path)?;
+                if !path.exists()
+                    || state
+                        .entries
+                        .iter()
+                        .any(|entry| Some(entry.path.as_str()) == path.to_str())
+                {
+                    continue;
+                }
+                let original = fs::read(&path)?;
+                let text = std::str::from_utf8(&original).map_err(io::Error::other)?;
+                if text.contains(START) || text.contains(END) {
                     return Err(conflict(&format!(
-                        "Configuration file was modified concurrently at {}; leaving it unchanged",
+                        "Unrecorded font block exists at {}; leaving it unchanged",
                         path.display()
                     )));
                 }
-                writer(path, text.as_bytes())?;
-                require_bytes(path, Some(text.as_bytes()))?;
-                changed_paths.push(path.clone());
+                let separator = if text.is_empty() || text.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+                let owned = format!("{separator}{START}\n{mapping}\n{END}\n");
+                state.entries.push(TerminalEntry {
+                    path: path
+                        .to_str()
+                        .ok_or_else(|| conflict("Non-UTF-8 config path"))?
+                        .into(),
+                    owned: owned.clone(),
+                    extensions: Map::new(),
+                });
+                changes.push(TerminalChange {
+                    path,
+                    replacement: format!("{text}{owned}"),
+                    original,
+                });
             }
-            if state["font_owned"] == true && font_existed {
-                action_path = locations.font.clone();
-                before_font_remove(&locations.font)?;
-                if stamp(&locations.font)? != original_font {
-                    return Err(conflict(
-                        "Installed font changed before removal; leaving it unchanged",
-                    ));
-                }
-                fs::remove_file(&locations.font)?;
-                changed_paths.push(locations.font.clone());
+            if original_font.is_none() {
+                state.font_owned = true;
+                state.font_path = Some(
+                    locations
+                        .font
+                        .to_str()
+                        .ok_or_else(|| conflict("Non-UTF-8 font path"))?
+                        .into(),
+                );
             }
-        } else {
-            if !font_existed {
+        }
+        let font = match (removing, state.font_owned, original_font) {
+            (false, _, None) => FontChange::Create,
+            (true, true, Some(original)) => FontChange::Remove(original),
+            _ => FontChange::Preserve,
+        };
+        let mut affected_paths: Vec<PathBuf> =
+            changes.iter().map(|change| change.path.clone()).collect();
+        if !matches!(font, FontChange::Preserve) {
+            affected_paths.push(locations.font.clone());
+        }
+        let pending_state = if removing { &original_state } else { &state };
+        let pending = PendingJournal {
+            state: pending_state,
+            pending: PendingAction {
+                action: if removing { "uninstall" } else { "install" },
+                paths: affected_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+            },
+        };
+        let pending = serde_json::to_vec(&pending).map_err(io::Error::other)?;
+        if removing {
+            state.font_owned = false;
+            state.font_path = None;
+        }
+        let completed = serde_json::to_vec(&state).map_err(io::Error::other)?;
+        let needs_write = !affected_paths.is_empty()
+            || old_journal
+                .as_deref()
+                .is_some_and(|old| old != completed.as_slice());
+        Ok(Self {
+            removing,
+            terminals: changes,
+            font,
+            journal: JournalPlan {
+                path: journal,
+                original: old_journal,
+                pending,
+                completed,
+                needs_write,
+            },
+            affected_paths,
+        })
+    }
+
+    fn apply(
+        self,
+        locations: &Locations,
+        writer: &mut impl FnMut(&Path, &[u8]) -> io::Result<()>,
+        font_writer: &mut impl FnMut(&mut fs::File, &[u8]) -> io::Result<()>,
+        before_font_remove: &mut impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<Vec<String>> {
+        let mut changed_paths = Vec::new();
+        let mut action_path = self.journal.path.clone();
+        let result: io::Result<()> = (|| {
+            // Keep the pending record durable before any font or terminal mutation.
+            // Failures preserve partial files for manual recovery, without rollback.
+            if self.journal.needs_write {
+                require_bytes(&self.journal.path, self.journal.original.as_deref())?;
+                write_atomic(&self.journal.path, &self.journal.pending)?;
+                changed_paths.push(self.journal.path.clone());
+            }
+            if matches!(self.font, FontChange::Create) {
                 action_path = locations.font.clone();
                 fs::create_dir_all(locations.font.parent().unwrap())?;
                 let mut file = fs::OpenOptions::new()
@@ -503,57 +622,61 @@ fn apply_with_font_and_remove(
                 font_writer(&mut file, FONT)?;
                 require_bytes(&locations.font, Some(FONT))?;
             }
-            for (path, text, original) in &changes {
-                action_path = path.clone();
-                if &fs::read(path)? != original {
-                    return Err(conflict(&format!(
-                        "Configuration file was modified concurrently at {}; leaving it unchanged",
-                        path.display()
-                    )));
-                }
-                writer(path, text.as_bytes())?;
-                require_bytes(path, Some(text.as_bytes()))?;
-                changed_paths.push(path.clone());
+            for change in &self.terminals {
+                action_path = change.path.clone();
+                change.apply(writer)?;
+                changed_paths.push(change.path.clone());
             }
+            if let FontChange::Remove(original) = &self.font {
+                action_path = locations.font.clone();
+                before_font_remove(&locations.font)?;
+                if stamp(&locations.font)?.as_ref() != Some(original) {
+                    return Err(conflict(
+                        "Installed font changed before removal; leaving it unchanged",
+                    ));
+                }
+                fs::remove_file(&locations.font)?;
+                changed_paths.push(locations.font.clone());
+            }
+            if self.journal.needs_write {
+                action_path = self.journal.path.clone();
+                require_bytes(&self.journal.path, Some(&self.journal.pending))?;
+                write_atomic(&self.journal.path, &self.journal.completed)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(conflict(&format!(
+                "Font action failed at {}: {error}; partial state or a conflict is possible; no automatic rollback or deletion was attempted; ownership journal: {}; inspect these paths manually before another action: {}",
+                action_path.display(),
+                self.journal.path.display(),
+                self.affected_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
-        if needs_write {
-            action_path = journal.clone();
-            require_bytes(&journal, Some(&pending_journal))?;
-            write_atomic(&journal, &next_journal)?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        return Err(conflict(&format!(
-            "Font action failed at {}: {error}; partial state or a conflict is possible; no automatic rollback or deletion was attempted; ownership journal: {}; inspect these paths manually before another action: {}",
-            action_path.display(),
-            journal.display(),
-            affected_paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+        let removed_owned_file = changed_paths.iter().any(|path| path != &self.journal.path);
+        let mut output = vec![format!(
+            "font: {} {}",
+            if self.removing && removed_owned_file {
+                "removed owned installation from"
+            } else if self.removing {
+                "nothing managed was removed from"
+            } else {
+                "available at"
+            },
+            locations.font.display()
+        )];
+        output.extend(
+            changed_paths
+                .into_iter()
+                .map(|path| format!("changed: {}", path.display())),
+        );
+        output.push("terminal: map U+E1A0-U+E1BA to Herdr Agent Icons Max. Existing Ghostty/kitty configs use managed blocks; for other terminals configure the mapping manually. Reload the terminal configuration or reopen the terminal. On Linux run fc-cache if needed.".into());
+        Ok(output)
     }
-    let removed_owned_file = changed_paths.iter().any(|path| path != &journal);
-    let mut output = vec![format!(
-        "font: {} {}",
-        if removing && removed_owned_file {
-            "removed owned installation from"
-        } else if removing {
-            "nothing managed was removed from"
-        } else {
-            "available at"
-        },
-        locations.font.display()
-    )];
-    output.extend(
-        changed_paths
-            .into_iter()
-            .map(|path| format!("changed: {}", path.display())),
-    );
-    output.push("terminal: map U+E1A0-U+E1BA to Herdr Agent Icons Max. Existing Ghostty/kitty configs use managed blocks; for other terminals configure the mapping manually. Reload the terminal configuration or reopen the terminal. On Linux run fc-cache if needed.".into());
-    Ok(output)
 }
 
 /// Resolve runtime paths only for an explicit install-font/uninstall-font command.
@@ -583,10 +706,156 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn load(path: &Path) -> io::Result<Value> {
+        serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)
+    }
+
     fn fixture() -> (tempfile::TempDir, Locations) {
         let root = tempfile::tempdir().unwrap();
         let locations = Locations::new(root.path(), None, None, &root.path().join("state"), false);
         (root, locations)
+    }
+
+    #[test]
+    fn journal_boundary_rejects_malformed_entries_and_preserves_extensions() {
+        let (_root, locations) = fixture();
+        fs::create_dir_all(&locations.state).unwrap();
+        let path = locations.state.join("font-ownership.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"font_owned":false,"entries":[{"path":42,"owned":"x"}]}"#,
+        )
+        .unwrap();
+        assert!(load_journal(&path).is_err());
+        fs::write(
+            &path,
+            br#"{"version":1,"font_owned":false,"entries":[],"extension":"keep"}"#,
+        )
+        .unwrap();
+        let state = load_journal(&path).unwrap();
+        assert_eq!(serde_json::to_value(state).unwrap()["extension"], "keep");
+        fs::write(
+            &path,
+            br#"{"version":1,"font_owned":false,"entries":[],"pending":null}"#,
+        )
+        .unwrap();
+        assert!(
+            load_journal(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("unresolved")
+        );
+    }
+
+    #[test]
+    fn invalid_journal_shapes_refuse_before_mutation() {
+        let invalid = [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"version": 2, "font_owned": false, "entries": []}),
+            json!({"version": 1, "font_owned": null, "entries": []}),
+            json!({"version": 1, "font_owned": false, "entries": null}),
+            json!({"version": 1, "font_owned": false, "entries": [null]}),
+            json!({"version": 1, "font_owned": false, "entries": [{"path": "x"}]}),
+            json!({"version": 1, "font_owned": false, "entries": [{"path": "x", "owned": null}]}),
+            json!({"version": 1, "font_owned": false, "entries": [], "font_path": 42}),
+        ];
+        for state in invalid {
+            for removing in [false, true] {
+                let (_root, locations) = fixture();
+                fs::create_dir_all(&locations.state).unwrap();
+                let journal = locations.state.join("font-ownership.json");
+                let bytes = serde_json::to_vec(&state).unwrap();
+                fs::write(&journal, &bytes).unwrap();
+                assert!(apply(&locations, removing).is_err(), "{state}");
+                assert_eq!(fs::read(&journal).unwrap(), bytes);
+                assert!(!locations.font.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn pending_presence_always_requires_manual_recovery() {
+        for pending in [
+            json!(null),
+            json!(false),
+            json!("unknown"),
+            json!({}),
+            json!({"action":"install", "paths":[]}),
+        ] {
+            for removing in [false, true] {
+                let (_root, locations) = fixture();
+                fs::create_dir_all(&locations.state).unwrap();
+                let journal = locations.state.join("font-ownership.json");
+                let bytes = serde_json::to_vec(
+                    &json!({"version":1,"font_owned":false,"entries":[],"pending":pending}),
+                )
+                .unwrap();
+                fs::write(&journal, &bytes).unwrap();
+                let error = apply(&locations, removing).unwrap_err().to_string();
+                assert!(error.contains("unresolved"), "{error}");
+                assert!(error.contains(&journal.display().to_string()));
+                assert_eq!(fs::read(&journal).unwrap(), bytes);
+                assert!(!locations.font.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn planning_keeps_files_unchanged_and_application_checks_the_journal_snapshot() {
+        let (_root, locations) = fixture();
+        let config = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "# original\n").unwrap();
+        let plan = FontPlan::build(&locations, false).unwrap();
+        assert!(!locations.font.exists());
+        assert!(!locations.state.exists());
+        assert_eq!(fs::read_to_string(&config).unwrap(), "# original\n");
+        fs::create_dir_all(&locations.state).unwrap();
+        let journal = locations.state.join("font-ownership.json");
+        fs::write(&journal, b"external journal").unwrap();
+        let result = plan.apply(
+            &locations,
+            &mut write_atomic,
+            &mut |file, bytes| file.write_all(bytes),
+            &mut |_| Ok(()),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Concurrent change")
+        );
+        assert_eq!(fs::read(&journal).unwrap(), b"external journal");
+        assert!(!locations.font.exists());
+        assert_eq!(fs::read_to_string(&config).unwrap(), "# original\n");
+    }
+
+    #[test]
+    fn journal_extensions_survive_install_and_uninstall() {
+        let (_root, locations) = fixture();
+        let config = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "# original\n").unwrap();
+        install(&locations).unwrap();
+        let journal = locations.state.join("font-ownership.json");
+        let mut state = load(&journal).unwrap();
+        state["extension"] = json!({"future": [null, 42]});
+        state["entries"][0]["extension"] = json!({"keep": true});
+        fs::write(&journal, serde_json::to_vec(&state).unwrap()).unwrap();
+        install(&locations).unwrap();
+        assert_eq!(load(&journal).unwrap(), state);
+        // A temporarily absent config retains its ownership entry on uninstall.
+        let parked = config.with_extension("parked");
+        fs::rename(&config, &parked).unwrap();
+        uninstall(&locations).unwrap();
+        let after = load(&journal).unwrap();
+        assert_eq!(after["extension"], state["extension"]);
+        assert_eq!(after["entries"], state["entries"]);
+        assert_eq!(after["version"], 1);
+        assert_eq!(after["font_owned"], false);
+        assert!(after.get("font_path").is_none());
     }
 
     #[test]
