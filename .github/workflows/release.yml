@@ -93,12 +93,25 @@ jobs:
           pattern: artifact-*
           path: dist/
           merge-multiple: true
+      # 注釈付き tag に本文があれば注釈を、無ければ（軽量 tag・空の注釈）scripts/extract-release-notes.sh の抽出を本文にする。
+      # 軽量 tag の %(contents) は commit の message になるので、注釈の有無は object の型で見る。
+      # checkout が取った tag の ref が注釈を保つとは限らないので、読む前に origin から取り直す。
       - name: Assemble checksums and release notes
         run: |
+          set -euo pipefail
           cat dist/SHA256SUMS-*.txt > dist/SHA256SUMS.txt
           rm dist/SHA256SUMS-*.txt
-          version="${GITHUB_REF_NAME#v}"
-          scripts/extract-release-notes.sh "$version" > RELEASE_NOTES.md
+          git fetch --force --no-tags origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          annotation=""
+          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = tag ]; then
+            annotation=$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}")
+          fi
+          if [ -n "${annotation//[[:space:]]/}" ]; then
+            printf '%s\n' "$annotation" > RELEASE_NOTES.md
+          else
+            version="${GITHUB_REF_NAME#v}"
+            scripts/extract-release-notes.sh "$version" > RELEASE_NOTES.md
+          fi
       - name: Publish GitHub Release if absent
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
