@@ -414,7 +414,7 @@ mod tests {
 
         let observed = GrokReader.read_in_cycle(&base, &cycle);
         wait_for_worker();
-        assert_percent(observed.context.clone());
+        assert_percent(observed.context);
         let plain = GrokReader.read_in_cycle(&base, &ReadCycle::new());
         wait_for_worker();
         assert_eq!(observed, plain);
