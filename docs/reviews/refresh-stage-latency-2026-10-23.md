@@ -119,3 +119,51 @@ and checkpoint rows. This was an integration smoke check, concurrent with a
 release build, not a replacement for the historical latency results above.
 The ext4 experiment was not repeated. Independent review of the carry-forward
 diff and shipment remain outstanding.
+
+## Sequence reservation window benchmark (2026-10-24)
+
+After implementing the endpoint-wide sequence reservation window, the synthetic
+measurements were re-run using the exact same commands and parameters:
+
+```sh
+LINEUP_BENCH_ROOT=/tmp LINEUP_BENCH_REPEATS=3 cargo test --locked measure_refresh_stages -- --ignored --nocapture
+LINEUP_BENCH_ROOT=/var/tmp LINEUP_BENCH_REPEATS=3 cargo test --locked measure_refresh_stages -- --ignored --nocapture
+```
+
+### After results (sequence reservation window)
+
+Times are milliseconds. Stage columns are medians across the 3 runs.
+
+| Filesystem | Panes | Cycle runs | Cycle median | Snapshot | Heading/Git | Reader | Persist | Socket | Reports | Persist writes | Checkpoint rows |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tmpfs | 1 | 43.371, 52.531, 56.634 | 52.531 | 1.988 | 38.384 | 0.014 | 0.124 | 7.096 | 2 | 1 | 1 |
+| tmpfs | 8 | 106.661, 89.697, 112.574 | 106.661 | 7.777 | 50.766 | 0.087 | 0.151 | 43.263 | 9 | 1 | 1 |
+| tmpfs | 32 | 194.168, 210.091, 149.937 | 194.168 | 6.728 | 44.648 | 0.275 | 0.106 | 137.309 | 33 | 1 | 1 |
+| tmpfs | 128 | 717.401, 537.821, 704.107 | 704.107 | 71.846 | 60.306 | 0.939 | 0.107 | 564.014 | 129 | 1 | 1 |
+| tmpfs | 256 | 1335.776, 1597.702, 1523.464 | 1523.464 | 147.441 | 45.417 | 2.279 | 0.113 | 1318.535 | 257 | 1 | 1 |
+| ext4 | 1 | 224.354, 61.068, 57.985 | 61.068 | 3.657 | 36.714 | 0.011 | 12.338 | 13.191 | 2 | 1 | 1 |
+| ext4 | 8 | 76.184, 92.864, 97.157 | 92.864 | 2.120 | 42.498 | 0.061 | 12.604 | 26.427 | 9 | 1 | 1 |
+| ext4 | 32 | 364.501, 242.429, 398.873 | 364.501 | 20.107 | 47.459 | 0.267 | 165.345 | 138.220 | 33 | 1 | 1 |
+| ext4 | 128 | 598.307, 789.938, 776.692 | 776.692 | 22.797 | 39.118 | 1.023 | 111.617 | 502.986 | 129 | 1 | 1 |
+| ext4 | 256 | 1690.969, 1637.535, 1620.296 | 1637.535 | 47.237 | 41.850 | 2.342 | 20.982 | 1388.374 | 257 | 1 | 1 |
+
+### Before vs After Comparison
+
+1. **Persistence writes**:
+   - **Before**: 1 fsync + dir sync per report (`panes + 1` writes total, e.g. 257 writes for 256 panes).
+   - **After**: 1 fsync + dir sync per window reservation (`1` write total for the refresh cycle).
+2. **Persistence latency (ext4, 256 panes)**:
+   - **Before**: 2,414.420 ms
+   - **After**: 20.982 ms (reduction by **>99.1%**, ~115x faster)
+3. **Persistence latency (tmpfs, 256 panes)**:
+   - **Before**: 230.642 ms
+   - **After**: 0.113 ms (reduction by **>99.9%**, ~2040x faster)
+4. **Overall cycle median (ext4, 256 panes)**:
+   - **Before**: 2,877.134 ms (dominated by disk syncs)
+   - **After**: 1,637.535 ms (disk syncs virtually eliminated; time dominated by Unix socket loopback roundtrips)
+
+### Measurement Limitations
+
+- **Host & Environment**: Synthetic Linux test only. macOS and live Herdr server interactions remain unmeasured.
+- **Socket Overhead**: The remaining latency at 256 panes is loopback Unix socket roundtrips in the synthetic fixture, not disk I/O.
+- **Shipment Hold**: This measurement demonstrates the latency benefit of the reservation window in isolated fixtures; automated shipping, main integration, and push remain strictly prohibited.

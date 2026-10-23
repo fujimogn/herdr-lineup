@@ -318,6 +318,7 @@ struct ResourceState {
 pub struct Publisher {
     resources: BTreeMap<ResourceId, ResourceState>,
     endpoint_floors: BTreeMap<String, u64>,
+    endpoint_cursors: BTreeMap<String, u64>,
 }
 impl Publisher {
     pub fn restore(checkpoint: BTreeMap<ResourceId, u64>) -> Self {
@@ -328,6 +329,22 @@ impl Publisher {
         checkpoint: BTreeMap<ResourceId, u64>,
         endpoint_floors: BTreeMap<String, u64>,
     ) -> Self {
+        let mut endpoint_cursors = BTreeMap::new();
+        for (resource, high_water) in &checkpoint {
+            let entry = endpoint_cursors
+                .entry(resource.endpoint_session.clone())
+                .or_insert(0);
+            *entry = (*entry).max(*high_water);
+        }
+        for (endpoint, floor) in &endpoint_floors {
+            let entry = endpoint_cursors.entry(endpoint.clone()).or_insert(0);
+            *entry = (*entry).max(*floor);
+        }
+        let mut floors = endpoint_floors;
+        for (endpoint, &base) in &endpoint_cursors {
+            let f = floors.entry(endpoint.clone()).or_insert(0);
+            *f = (*f).max(base);
+        }
         Self {
             resources: checkpoint
                 .into_iter()
@@ -341,7 +358,8 @@ impl Publisher {
                     )
                 })
                 .collect(),
-            endpoint_floors,
+            endpoint_floors: floors,
+            endpoint_cursors,
         }
     }
 
@@ -356,6 +374,46 @@ impl Publisher {
         self.endpoint_floors.clone()
     }
 
+    pub fn endpoint_window(&self, endpoint: &str) -> (u64, u64) {
+        let cursor = self.endpoint_cursors.get(endpoint).copied().unwrap_or(0);
+        let upper_bound = self.endpoint_floors.get(endpoint).copied().unwrap_or(0);
+        (cursor, upper_bound)
+    }
+
+    pub fn has_available_reservation(&self, endpoint: &str) -> bool {
+        let (cursor, upper_bound) = self.endpoint_window(endpoint);
+        upper_bound > 0 && cursor < upper_bound
+    }
+
+    pub fn plan_reservation(&self, endpoint: &str, window_size: u64) -> Result<u64, PatchError> {
+        let (cursor, upper_bound) = self.endpoint_window(endpoint);
+        let base = cursor.max(upper_bound);
+        base.checked_add(window_size)
+            .ok_or(PatchError::SequenceExhausted)
+    }
+
+    pub fn confirm_reservation(
+        &mut self,
+        endpoint: &str,
+        new_upper_bound: u64,
+    ) -> Result<(), PatchError> {
+        let (cursor, upper_bound) = self.endpoint_window(endpoint);
+        if new_upper_bound < upper_bound || new_upper_bound < cursor {
+            return Err(PatchError::SequenceExhausted);
+        }
+        self.endpoint_floors
+            .insert(endpoint.into(), new_upper_bound);
+        self.endpoint_cursors
+            .entry(endpoint.into())
+            .or_insert(cursor);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn set_cursor_for_test(&mut self, endpoint: &str, cursor: u64) {
+        self.endpoint_cursors.insert(endpoint.into(), cursor);
+    }
+
     /// The authoritative snapshot permits removal of absent resource rows.
     /// Their maximum reserved sequence remains as a durable endpoint floor,
     /// so a resource ID reused by this same server cannot restart at seq 1.
@@ -367,6 +425,12 @@ impl Publisher {
             .get(endpoint)
             .copied()
             .unwrap_or_default();
+        let cursor = self
+            .endpoint_cursors
+            .get(endpoint)
+            .copied()
+            .unwrap_or_default();
+        floor = floor.max(cursor);
         self.resources.retain(|resource, state| {
             if resource.endpoint_session != endpoint {
                 changed = true;
@@ -384,35 +448,40 @@ impl Publisher {
             changed |= !keep;
             keep
         });
+        self.endpoint_cursors.retain(|key, _| key == endpoint);
         if floor > 0 {
             changed |= self.endpoint_floors.insert(endpoint.into(), floor) != Some(floor);
         }
         changed
     }
 
-    /// `now_ms` is an injected monotonic clock; Unix time is only for displays.
-    /// Missing resources never receive reports. Snapshot keys include all
-    /// sources, so capacity failures never evict another plugin's metadata.
-    /// Renew after one interval to leave room for cycle duration and jitter.
-    /// Authoritatively missing live keys are repaired even before renewal.
-    /// Omitted desired keys remain unchanged. Supply all fourteen pane keys from
-    /// `pane_tokens` on reconciliation to clear departed occupants completely.
-    pub fn prepare(
-        &mut self,
+    pub fn needs_report(
+        &self,
         resource: &ResourceId,
         snapshot: &ResourceSnapshot,
         occupant: Option<&Occupant>,
         desired: &Tokens,
         now_ms: u64,
         refresh_ms: u64,
-    ) -> Result<Option<Report>, PatchError> {
+    ) -> Result<bool, PatchError> {
+        let Some((tokens, _)) =
+            self.plan_tokens(resource, snapshot, occupant, desired, now_ms, refresh_ms)?
+        else {
+            return Ok(false);
+        };
+        Ok(!tokens.is_empty())
+    }
+
+    fn plan_tokens(
+        &self,
+        resource: &ResourceId,
+        snapshot: &ResourceSnapshot,
+        occupant: Option<&Occupant>,
+        desired: &Tokens,
+        now_ms: u64,
+        refresh_ms: u64,
+    ) -> Result<Option<(Tokens, u64)>, PatchError> {
         if !snapshot.exists {
-            if let Some(state) = self.resources.get_mut(resource) {
-                *state = ResourceState {
-                    high_water: state.high_water,
-                    ..ResourceState::default()
-                };
-            }
             return Ok(None);
         }
         let ttl_ms = refresh_ms
@@ -455,8 +524,6 @@ impl Publisher {
                     break;
                 }
                 if !required && normalized.get(*key).is_some_and(Option::is_some) {
-                    // Keep the clear in the patch so earlier optional values do
-                    // not survive under pressure or after daemon restoration.
                     normalized.insert((*key).into(), None);
                     stored_keys.remove(*key);
                 }
@@ -481,18 +548,58 @@ impl Publisher {
             })
             .collect();
         if tokens.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((tokens, ttl_ms)))
+        }
+    }
+
+    /// `now_ms` is an injected monotonic clock; Unix time is only for displays.
+    /// Missing resources never receive reports. Snapshot keys include all
+    /// sources, so capacity failures never evict another plugin's metadata.
+    /// Renew after one interval to leave room for cycle duration and jitter.
+    /// Authoritatively missing live keys are repaired even before renewal.
+    /// Omitted desired keys remain unchanged. Supply all fourteen pane keys from
+    /// `pane_tokens` on reconciliation to clear departed occupants completely.
+    pub fn prepare(
+        &mut self,
+        resource: &ResourceId,
+        snapshot: &ResourceSnapshot,
+        occupant: Option<&Occupant>,
+        desired: &Tokens,
+        now_ms: u64,
+        refresh_ms: u64,
+    ) -> Result<Option<Report>, PatchError> {
+        if !snapshot.exists {
+            if let Some(state) = self.resources.get_mut(resource) {
+                *state = ResourceState {
+                    high_water: state.high_water,
+                    ..ResourceState::default()
+                };
+            }
             return Ok(None);
         }
-        let seq = state
-            .high_water
-            .max(
-                self.endpoint_floors
-                    .get(&resource.endpoint_session)
-                    .copied()
-                    .unwrap_or_default(),
-            )
-            .checked_add(1)
-            .ok_or(PatchError::SequenceExhausted)?;
+        let Some((tokens, ttl_ms)) =
+            self.plan_tokens(resource, snapshot, occupant, desired, now_ms, refresh_ms)?
+        else {
+            return Ok(None);
+        };
+        let (cursor, upper_bound) = self.endpoint_window(&resource.endpoint_session);
+        let seq = if upper_bound > 0 {
+            if cursor >= upper_bound {
+                return Err(PatchError::SequenceExhausted);
+            }
+            cursor.checked_add(1).ok_or(PatchError::SequenceExhausted)?
+        } else {
+            let current = self
+                .resources
+                .get(resource)
+                .map(|s| s.high_water)
+                .unwrap_or(0);
+            current
+                .checked_add(1)
+                .ok_or(PatchError::SequenceExhausted)?
+        };
         let report = Report {
             resource: resource.clone(),
             source: SOURCE,
@@ -504,6 +611,10 @@ impl Publisher {
         let state = self.resources.entry(resource.clone()).or_default();
         state.high_water = seq;
         state.reserved = Some(report.clone());
+        if upper_bound > 0 {
+            self.endpoint_cursors
+                .insert(resource.endpoint_session.clone(), seq);
+        }
         Ok(Some(report))
     }
 
@@ -1200,6 +1311,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut restarted = Publisher::restore(publisher.checkpoint());
+        restarted
+            .confirm_reservation(&resource("p1").endpoint_session, 32)
+            .unwrap();
         assert_eq!(
             restarted
                 .prepare(
@@ -1228,7 +1342,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .seq,
-            1
+            first.seq + 2
         );
         let mut other = resource("p1");
         other.endpoint_session = "new/socket/session".into();
@@ -1276,6 +1390,9 @@ mod tests {
 
         let mut restarted =
             Publisher::restore_with_floors(publisher.checkpoint(), publisher.checkpoint_floors());
+        restarted
+            .confirm_reservation(&pane.endpoint_session, 32)
+            .unwrap();
         let report = restarted
             .prepare(
                 &pane,
@@ -1348,5 +1465,105 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn checked_overflow_fails_closed_in_reservation_and_allocation() {
+        let mut publisher = Publisher::default();
+        let endpoint = "test/endpoint";
+        assert_eq!(
+            publisher.plan_reservation(endpoint, u64::MAX).unwrap(),
+            u64::MAX
+        );
+        publisher.confirm_reservation(endpoint, u64::MAX).unwrap();
+        assert_eq!(
+            publisher.plan_reservation(endpoint, 1).unwrap_err(),
+            PatchError::SequenceExhausted
+        );
+
+        let mut max_publisher = Publisher::default();
+        max_publisher
+            .confirm_reservation(endpoint, u64::MAX)
+            .unwrap();
+        max_publisher.set_cursor_for_test(endpoint, u64::MAX);
+        let id = ResourceId {
+            endpoint_session: endpoint.into(),
+            kind: ResourceKind::Pane,
+            id: "p1".into(),
+        };
+        let desired = BTreeMap::from([("lineup_agent".into(), Some("codex".into()))]);
+        assert_eq!(
+            max_publisher
+                .prepare(&id, &snapshot(0), None, &desired, 0, 5000)
+                .unwrap_err(),
+            PatchError::SequenceExhausted
+        );
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_endpoint_rows_migrates_safely() {
+        let id1 = resource("p1");
+        let id2 = resource("p2");
+        let legacy = BTreeMap::from([(id1.clone(), 10), (id2.clone(), 25)]);
+        let mut publisher = Publisher::restore(legacy);
+        assert_eq!(publisher.endpoint_window(&id1.endpoint_session), (25, 25));
+        assert!(!publisher.has_available_reservation(&id1.endpoint_session));
+        let next_bound = publisher
+            .plan_reservation(&id1.endpoint_session, 32)
+            .unwrap();
+        assert_eq!(next_bound, 25 + 32);
+        publisher
+            .confirm_reservation(&id1.endpoint_session, next_bound)
+            .unwrap();
+        assert!(publisher.has_available_reservation(&id1.endpoint_session));
+
+        let desired = BTreeMap::from([("lineup_agent".into(), Some("codex".into()))]);
+        let rep1 = publisher
+            .prepare(&id1, &snapshot(0), None, &desired, 0, 5000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rep1.seq, 26);
+        let rep2 = publisher
+            .prepare(&id2, &snapshot(0), None, &desired, 0, 5000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rep2.seq, 27);
+    }
+
+    #[test]
+    fn empty_patch_and_capacity_skip_preserve_reservation_cursor() {
+        let mut publisher = Publisher::default();
+        let endpoint = "test/endpoint";
+        publisher.confirm_reservation(endpoint, 10).unwrap();
+        let id = ResourceId {
+            endpoint_session: endpoint.into(),
+            kind: ResourceKind::Pane,
+            id: "p1".into(),
+        };
+        let desired = BTreeMap::from([("lineup_agent".into(), Some("codex".into()))]);
+        let rep1 = publisher
+            .prepare(&id, &snapshot(0), None, &desired, 0, 5000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rep1.seq, 1);
+        publisher.acknowledge(&rep1, 0).unwrap();
+
+        let mut stored_snap = snapshot(0);
+        stored_snap.stored_keys.insert("lineup_agent".into());
+        assert!(
+            publisher
+                .prepare(&id, &stored_snap, None, &desired, 0, 5000)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(publisher.endpoint_window(endpoint), (1, 10));
+
+        let crowded = snapshot(33);
+        assert!(
+            publisher
+                .prepare(&id, &crowded, None, &desired, 0, 5000)
+                .is_err()
+        );
+        assert_eq!(publisher.endpoint_window(endpoint), (1, 10));
     }
 }

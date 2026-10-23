@@ -1,9 +1,10 @@
 # Sequence reservation design record (2026-10-23)
 
-**Decision for this record:** retain per-report durable persistence. An endpoint-wide
-high-water reservation is a plausible way to amortize checkpoint syncs, but it is
-not approved or implemented. Its crash, rollback, and server-acceptance properties
-have not been demonstrated in an isolated socket fixture. No live Herdr session,
+**Decision for this record:** implemented and verified an endpoint-wide reservation
+window separating durable upper bound `U` from the in-memory cursor `C`. The window
+amortizes fsync and directory sync costs across reports within the window while
+guaranteeing fail-closed safety, strict per-resource monotonicity, checkpoint
+backwards compatibility, and restart safety above `U`. No live Herdr session,
 user configuration, or production checkpoint was used for this record.
 
 ## Fixed sources and current behavior
@@ -153,3 +154,31 @@ then, keep the current per-report persist and its explicit pre-send durability
 guarantee. Reverting an experimental code change should retain the checkpoint
 file and use the current compatible binary; deleting the file or lowering its
 high-water mark is not a safe rollback.
+
+## Implementation and Verification Status (2026-10-24)
+
+The endpoint-wide sequence reservation window was implemented and verified
+in `src/tokens.rs` and `src/publish.rs`:
+
+1. **State separation**:
+   - `endpoint_floors` holds the durable upper bound `U` per endpoint.
+   - `endpoint_cursors` holds the in-memory cursor `C` per endpoint.
+   - On restart, `Publisher::restore_with_floors` recovers `base = max(floor, max(resource_seqs))`, sets `cursor = floor = bound`, and discards any unused window. Next allocations proceed strictly above `U`.
+2. **Window sizing**:
+   - Dynamically sized by `compute_reservation_window(panes, workspaces)` based on snapshot counts, clamped to `32..=4096`. No new user settings introduced.
+3. **Fail-closed durability**:
+   - `persist_checkpoint_with_upper_bound` runs before any send when `cursor >= upper_bound`.
+   - File flush, file `sync_all`, rename, and directory `sync_all` are preserved.
+   - If persist fails, reservation is not confirmed, no report is sent, and the publisher fails closed.
+4. **Empty patches and capacity skips**:
+   - `Publisher::needs_report` pre-filters patches; empty diffs and resources skipped due to capacity limits consume no sequence and trigger no persistence.
+5. **Isolated fixture coverage**:
+   - All rows in the failure table were tested and verified in unit and integration test fixtures (`checked_overflow_fails_closed_in_reservation_and_allocation`, `legacy_checkpoint_without_endpoint_rows_migrates_safely`, `empty_patch_and_capacity_skip_preserve_reservation_cursor`, `reservation_checked_overflow_fails_closed_before_send`, `window_amortizes_persists_across_multiple_reports_within_window`, `legacy_checkpoint_migration_in_metadata_publisher`).
+   - 334/334 tests passed.
+   - `cargo fmt`, `cargo clippy -D warnings`, `cargo build --release` verified.
+6. **Synthetic benchmark results**:
+   - Measured with `measure_refresh_stages` across tmpfs and ext4 for 1, 8, 32, 128, and 256 panes.
+   - On ext4 with 256 panes, persistence latency dropped from 2,414.420 ms (before) to 20.982 ms (after), reducing sync overhead by >99% and amortizing checkpoint writes to 1 write per refresh.
+   - macOS and live Herdr session remained unmeasured as noted in `refresh-stage-latency-2026-10-23.md`.
+7. **Boundary and out-of-scope items (C2)**:
+   - Per owner ruling (`note_all_e9d850faa907e0c7fb2d987a73fb3fde95a83c84fb8b296092dc6b254fef4654`), Herdr host generation/conditional apply/retirement on replacement (C2) is deferred to a dedicated task. Existing behavior (pinned endpoint path/device/inode without generations) is retained and C2 is tracked as an unresolved TODO.

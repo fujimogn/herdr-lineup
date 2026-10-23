@@ -204,16 +204,24 @@ contract (non-blocking I/O and `poll`, not `setsockopt`, because macOS returns
 
 Every live-key report SHALL
 carry `ttl_ms = 3 * refresh_interval_ms`, source `herdr-lineup`, and a strictly
-increasing per-resource `seq` persisted before sending. Clearing reports SHALL
-also use that source and increasing sequence. Restart SHALL preserve sequence
-progress for the same socket/session and resource.
+increasing per-resource `seq` covered by a durable per-endpoint upper bound
+persisted before sending. Clearing reports SHALL also use that source and
+increasing sequence. Restart SHALL discard unused reservation windows and continue
+strictly above the durable per-endpoint upper bound for the same socket/session
+and resource.
 
 After an authoritative snapshot, checkpoint rows for resources absent from that
 snapshot SHALL be removed only after their maximum reserved sequence is retained
-as a durable floor for the same endpoint. A resource ID that reappears on that
-endpoint SHALL use a sequence greater than that floor. Rows and floors for a
-different socket endpoint SHALL be removed once the current endpoint identity is
-verified; its metadata cannot be updated through the replaced endpoint.
+as a durable floor for the same endpoint. The publisher SHALL maintain a durable
+upper bound per endpoint covering all allocated sequences. When an allocation
+exceeds the durable upper bound, a new reservation window (sized to the authoritative
+pane and workspace counts, bounded within 32..=4096) SHALL be fsynced with its
+parent directory before any report using that sequence is sent. A resource ID that
+reappears on that endpoint SHALL use a sequence greater than that floor and bounded
+by the durable upper bound. Rows and floors for a different socket endpoint SHALL be
+removed once the current endpoint identity is verified; its metadata cannot be
+updated through the replaced endpoint. Empty patches and resources skipped due to
+capacity limits SHALL not allocate or consume sequences.
 
 The default refresh interval SHALL be 5,000 ms and TTL 15,000 ms. Startup and
 workspace focus SHALL invoke `ensure`; the publisher SHALL NOT subscribe to
