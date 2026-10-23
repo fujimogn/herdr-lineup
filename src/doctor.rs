@@ -33,38 +33,120 @@ pub(crate) fn font_mode_line(mode: &str) -> String {
     format!("Font mode: {mode}; {explanation}.")
 }
 
+/// Fixed doctor category for a statusLine directory read that did not finish.
+/// The line never includes a partial count, errno, path, or record bytes.
+const STATUSLINE_SCAN_INCOMPLETE: &str = "StatusLine records: scan incomplete";
+
 /// Counts regular files directly under `state/statusline` without following
-/// symlinks or reading file bytes. Missing or unreadable directories report
-/// zero records. The scan stops after `MAX_STATUSLINE_ENTRIES` entries.
+/// symlinks or reading file bytes. A missing directory, a symlink, or a
+/// directory that cannot be opened reports zero records. A directory read or
+/// entry stat error reports scan incomplete instead of a partial count. The
+/// scan stops after `MAX_STATUSLINE_ENTRIES` entries and marks that limit.
 pub(crate) fn statusline_records_line(state: &Path, now: SystemTime) -> String {
     statusline_records_line_limited(state, now, MAX_STATUSLINE_ENTRIES)
 }
 
 fn statusline_records_line_limited(state: &Path, now: SystemTime, limit: usize) -> String {
-    match scan_statusline_records(&state.join("statusline"), now, limit) {
-        Some((count, latest_age, true)) if count > 0 => {
+    render_statusline_scan(scan_statusline_records(
+        &state.join("statusline"),
+        now,
+        limit,
+    ))
+}
+
+#[cfg(test)]
+fn statusline_records_line_with(
+    state: &Path,
+    now: SystemTime,
+    limit: usize,
+    ops: &StatusLineScanOps,
+) -> String {
+    render_statusline_scan(scan_statusline_records_with(
+        &state.join("statusline"),
+        now,
+        limit,
+        ops,
+    ))
+}
+
+fn render_statusline_scan(scan: Option<StatusLineScan>) -> String {
+    match scan {
+        Some(StatusLineScan::Limit { count, latest_age }) if count > 0 => {
             format!(
                 "StatusLine records: {count} in scanned entries (latest in scanned entries: {latest_age}s ago; scan limit reached)"
             )
         }
-        Some((0, _, true)) => {
+        Some(StatusLineScan::Limit { count: 0, .. }) => {
             "StatusLine records: 0 in scanned entries (latest unavailable; scan limit reached)"
                 .to_string()
         }
-        Some((count, latest_age, false)) if count > 0 => {
+        Some(StatusLineScan::Complete { count, latest_age }) if count > 0 => {
             format!("StatusLine records: {count} (latest: {latest_age}s ago)")
         }
+        Some(StatusLineScan::Incomplete) => STATUSLINE_SCAN_INCOMPLETE.to_string(),
         _ => "StatusLine records: 0".to_string(),
     }
 }
+
+enum StatusLineScan {
+    Complete { count: usize, latest_age: u64 },
+    Limit { count: usize, latest_age: u64 },
+    Incomplete,
+}
+
+struct StatusLineScanOps {
+    readdir: unsafe extern "C" fn(*mut libc::DIR) -> *mut libc::dirent,
+    fstatat: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        *mut libc::stat,
+        libc::c_int,
+    ) -> libc::c_int,
+    closedir: unsafe extern "C" fn(*mut libc::DIR) -> libc::c_int,
+}
+
+unsafe extern "C" fn scan_readdir(dir: *mut libc::DIR) -> *mut libc::dirent {
+    unsafe { libc::readdir(dir) }
+}
+
+unsafe extern "C" fn scan_fstatat(
+    dirfd: libc::c_int,
+    path: *const libc::c_char,
+    buf: *mut libc::stat,
+    flags: libc::c_int,
+) -> libc::c_int {
+    unsafe { libc::fstatat(dirfd, path, buf, flags) }
+}
+
+unsafe extern "C" fn scan_closedir(dir: *mut libc::DIR) -> libc::c_int {
+    unsafe { libc::closedir(dir) }
+}
+
+const REAL_SCAN_OPS: StatusLineScanOps = StatusLineScanOps {
+    readdir: scan_readdir,
+    fstatat: scan_fstatat,
+    closedir: scan_closedir,
+};
 
 fn scan_statusline_records(
     directory: &Path,
     now: SystemTime,
     limit: usize,
-) -> Option<(usize, u64, bool)> {
+) -> Option<StatusLineScan> {
+    scan_statusline_records_with(directory, now, limit, &REAL_SCAN_OPS)
+}
+
+fn scan_statusline_records_with(
+    directory: &Path,
+    now: SystemTime,
+    limit: usize,
+    ops: &StatusLineScanOps,
+) -> Option<StatusLineScan> {
     if limit == 0 {
-        return Some((0, 0, true));
+        return Some(StatusLineScan::Limit {
+            count: 0,
+            latest_age: 0,
+        });
     }
     let metadata = fs::symlink_metadata(directory).ok()?;
     // `symlink_metadata` reports the link itself. A symlinked directory is not
@@ -88,14 +170,19 @@ fn scan_statusline_records(
     let mut count = 0usize;
     let mut newest: Option<SystemTime> = None;
     let mut examined = 0usize;
+    let mut failed = false;
     loop {
         if examined >= limit {
             break;
         }
-        // SAFETY: `dir` is open and this thread is its only user. A null result
-        // ends the listing; the entry pointer is valid until the next call.
-        let entry = unsafe { libc::readdir(dir) };
+        // A null `readdir` is EOF only when errno is unchanged. Set it to
+        // zero first so an earlier error is not reported as a short directory.
+        set_errno(0);
+        // SAFETY: `dir` is open and this thread is its only user. The entry
+        // pointer is valid until the next call.
+        let entry = unsafe { (ops.readdir)(dir) };
         if entry.is_null() {
+            failed = read_errno() != 0;
             break;
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
@@ -109,8 +196,12 @@ fn scan_statusline_records(
         // AT_SYMLINK_NOFOLLOW flag stats the entry itself and does not read it.
         let dirfd = unsafe { libc::dirfd(dir) };
         let rc =
-            unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW) };
-        if rc != 0 || (info.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            unsafe { (ops.fstatat)(dirfd, name.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 {
+            failed = true;
+            break;
+        }
+        if (info.st_mode & libc::S_IFMT) != libc::S_IFREG {
             continue;
         }
         count += 1;
@@ -123,8 +214,11 @@ fn scan_statusline_records(
             _ => modified,
         });
     }
-    // SAFETY: `dir` came from fdopendir and has not been closed.
-    unsafe { libc::closedir(dir) };
+    // SAFETY: `dir` came from fdopendir and this is its one close.
+    let close_rc = unsafe { (ops.closedir)(dir) };
+    if failed || close_rc != 0 {
+        return Some(StatusLineScan::Incomplete);
+    }
     let latest_age = newest
         .map(|modified| {
             now.duration_since(modified)
@@ -132,7 +226,38 @@ fn scan_statusline_records(
                 .unwrap_or(0)
         })
         .unwrap_or(0);
-    Some((count, latest_age, examined >= limit))
+    if examined >= limit {
+        Some(StatusLineScan::Limit { count, latest_age })
+    } else {
+        Some(StatusLineScan::Complete { count, latest_age })
+    }
+}
+
+fn set_errno(value: i32) {
+    // SAFETY: `errno_slot` points at this thread's errno cell.
+    unsafe {
+        *errno_slot() = value;
+    }
+}
+
+fn read_errno() -> i32 {
+    // SAFETY: `errno_slot` points at this thread's errno cell.
+    unsafe { *errno_slot() }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("statusLine errno checks support Linux and macOS only");
+
+#[cfg(target_os = "linux")]
+fn errno_slot() -> *mut i32 {
+    // SAFETY: glibc and musl expose the thread-local errno address.
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn errno_slot() -> *mut i32 {
+    // SAFETY: libSystem exposes the thread-local errno address.
+    unsafe { libc::__error() }
 }
 
 pub(crate) fn local_diagnostics(state: &Path, now: SystemTime) -> String {
@@ -448,6 +573,187 @@ mod tests {
 
         let uncapped = statusline_records_line_limited(mixed_state.path(), now, 3);
         assert_eq!(uncapped, "StatusLine records: 1 (latest: 25s ago)");
+    }
+
+    #[test]
+    fn statusline_scan_separates_eof_errors_and_limit_and_releases_the_directory() {
+        use std::cell::Cell;
+        thread_local! {
+            static FILES_RETURNED: Cell<usize> = const { Cell::new(0) };
+            static CLOSE_CALLS: Cell<usize> = const { Cell::new(0) };
+            static CLOSE_RELEASED: Cell<bool> = const { Cell::new(false) };
+        }
+
+        unsafe extern "C" fn readdir_eio_after_first_file(
+            dir: *mut libc::DIR,
+        ) -> *mut libc::dirent {
+            let entry = unsafe { libc::readdir(dir) };
+            if entry.is_null() {
+                return entry;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                return entry;
+            }
+            let seen = FILES_RETURNED.get();
+            if seen >= 1 {
+                set_errno(libc::EIO);
+                return std::ptr::null_mut();
+            }
+            FILES_RETURNED.set(seen + 1);
+            entry
+        }
+
+        unsafe extern "C" fn fstatat_eio(
+            _dirfd: libc::c_int,
+            _path: *const libc::c_char,
+            _buf: *mut libc::stat,
+            _flags: libc::c_int,
+        ) -> libc::c_int {
+            set_errno(libc::EIO);
+            -1
+        }
+
+        unsafe extern "C" fn fstatat_dirties_errno(
+            dirfd: libc::c_int,
+            path: *const libc::c_char,
+            buf: *mut libc::stat,
+            flags: libc::c_int,
+        ) -> libc::c_int {
+            let rc = unsafe { libc::fstatat(dirfd, path, buf, flags) };
+            if rc == 0 {
+                set_errno(libc::EIO);
+            }
+            rc
+        }
+
+        unsafe extern "C" fn closedir_tracking(dir: *mut libc::DIR) -> libc::c_int {
+            let fd = unsafe { libc::dirfd(dir) };
+            let rc = unsafe { libc::closedir(dir) };
+            CLOSE_CALLS.set(CLOSE_CALLS.get() + 1);
+            let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+            CLOSE_RELEASED.set(rc == 0 && !still_open);
+            rc
+        }
+
+        fn assert_directory_released() {
+            assert_eq!(CLOSE_CALLS.get(), 1);
+            assert!(CLOSE_RELEASED.get());
+        }
+
+        fn reset_probes() {
+            FILES_RETURNED.set(0);
+            CLOSE_CALLS.set(0);
+            CLOSE_RELEASED.set(false);
+        }
+
+        use std::time::{Duration, UNIX_EPOCH};
+
+        fn open_fd_count() -> usize {
+            let max = unsafe { libc::getdtablesize() }.clamp(0, 4096);
+            (0..max)
+                .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1)
+                .count()
+        }
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let secret = "binding-key-DO-NOT-PRINT-9f3a";
+        let state = tempfile::tempdir().unwrap();
+        let status = state.path().join("statusline");
+        std::fs::create_dir(&status).unwrap();
+        for name in ["one.json", "two.json"] {
+            let path = status.join(name);
+            std::fs::write(&path, secret).unwrap();
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(15))
+                .unwrap();
+        }
+        let empty_state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(empty_state.path().join("statusline")).unwrap();
+
+        let eio_ops = StatusLineScanOps {
+            readdir: readdir_eio_after_first_file,
+            fstatat: scan_fstatat,
+            closedir: closedir_tracking,
+        };
+        let eof_ops = StatusLineScanOps {
+            readdir: scan_readdir,
+            fstatat: fstatat_dirties_errno,
+            closedir: closedir_tracking,
+        };
+        let limit_ops = StatusLineScanOps {
+            readdir: scan_readdir,
+            fstatat: scan_fstatat,
+            closedir: closedir_tracking,
+        };
+        let fstat_ops = StatusLineScanOps {
+            readdir: scan_readdir,
+            fstatat: fstatat_eio,
+            closedir: closedir_tracking,
+        };
+
+        let before = open_fd_count();
+        for _ in 0..32 {
+            reset_probes();
+            set_errno(libc::EIO);
+            let empty = statusline_records_line(empty_state.path(), now);
+            assert_eq!(empty, "StatusLine records: 0");
+            assert!(!empty.contains(secret));
+
+            reset_probes();
+            let eof =
+                statusline_records_line_with(state.path(), now, MAX_STATUSLINE_ENTRIES, &eof_ops);
+            assert_eq!(eof, "StatusLine records: 2 (latest: 15s ago)");
+            assert_directory_released();
+            assert!(!eof.contains(secret));
+            assert!(!eof.contains("one.json"));
+
+            reset_probes();
+            let limited = statusline_records_line_with(state.path(), now, 1, &limit_ops);
+            assert_eq!(
+                limited,
+                "StatusLine records: 1 in scanned entries (latest in scanned entries: 15s ago; scan limit reached)"
+            );
+            assert_directory_released();
+            assert!(!limited.contains("scan incomplete"));
+            assert!(!limited.contains(secret));
+
+            reset_probes();
+            let failed =
+                statusline_records_line_with(state.path(), now, MAX_STATUSLINE_ENTRIES, &eio_ops);
+            assert_eq!(failed, STATUSLINE_SCAN_INCOMPLETE);
+            assert!(!failed.chars().any(|character| character.is_ascii_digit()));
+            assert!(!failed.contains(secret));
+            assert!(!failed.contains("one.json") && !failed.contains("two.json"));
+            assert!(!failed.contains("EIO"));
+            assert_directory_released();
+
+            reset_probes();
+            let stat_failed =
+                statusline_records_line_with(state.path(), now, MAX_STATUSLINE_ENTRIES, &fstat_ops);
+            assert_eq!(stat_failed, STATUSLINE_SCAN_INCOMPLETE);
+            assert!(
+                !stat_failed
+                    .chars()
+                    .any(|character| character.is_ascii_digit())
+            );
+            assert!(!stat_failed.contains(secret));
+            assert!(!stat_failed.contains("EIO"));
+            assert_directory_released();
+        }
+        let after = open_fd_count();
+        assert!(
+            after <= before.saturating_add(8),
+            "directory fd leaked: before {before} after {after}"
+        );
+
+        let zero_limit = statusline_records_line_limited(state.path(), now, 0);
+        assert_eq!(
+            zero_limit,
+            "StatusLine records: 0 in scanned entries (latest unavailable; scan limit reached)"
+        );
     }
 
     #[test]
