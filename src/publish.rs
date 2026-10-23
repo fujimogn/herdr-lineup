@@ -1492,11 +1492,14 @@ impl MetadataPublisher {
         let response = self.request_before(transport, "session.snapshot", deadline);
         let socket_elapsed = socket_start.elapsed();
         self.record_stage(|stages| stages.socket += socket_elapsed);
-        let (id, response) = response?;
-        let result = protocol::parse_snapshot(&id, &response)
-            .map_err(|_| io::Error::other("invalid snapshot response"))?;
+        let result = response.and_then(|(id, response)| {
+            protocol::parse_snapshot(&id, &response)
+                .map_err(|_| io::Error::other("invalid snapshot response"))
+        });
+        // Failed snapshot attempts are measured too.
         let snapshot_elapsed = stage_start.elapsed();
         self.record_stage(|stages| stages.snapshot += snapshot_elapsed);
+        let result = result?;
         self.reservation_window =
             compute_reservation_window(result.panes.len(), result.workspaces.len());
         Ok(result)
