@@ -21,15 +21,16 @@ P owns one publisher-lifetime `Arc<ReaderDiagnostics>` and passes a clone to
 each fresh `ReadCycle::with_diagnostics`. D reuses that Arc; it must not create
 a second registry or reset counters per refresh/reconnect.
 
-## 2. Sampling choice for commander decision
+## 2. Sampling choice (commander approved)
 
 | Approach | Benefit | Limitation |
 | --- | --- | --- |
-| Recommended: live best-effort sampling on each control health request | A worker released after a caller timeout becomes inactive without waiting for another refresh | Reader samples and completed-attempt metrics have different observation times; provider samples are not transactional |
+| Adopted: live best-effort sampling on each control health request | A worker released after a caller timeout becomes inactive without waiting for another refresh | Reader samples and completed-attempt metrics have different observation times; provider samples are not transactional |
 | Alternative: freeze reader samples when each refresh finishes | Aligns capture with completed-attempt health | Worker active can remain true after release until another refresh; requires explicit frozen-attempt labeling and monotonic sample age, never a claim about current activity |
 
-Use the live approach, pending commander decision. Sample after receiving the
-valid `health` command and before serialization. `sampling=live_best_effort`
+Commander ruling `note-reader-control-design-go-rulings-01` adopts live sampling,
+the opaque handle seam and the fallback ladder below. Sample once per response,
+after receiving valid `health` and before serialization. `sampling=live_best_effort`
 means sequential per-provider samples during this request, not an atomic view
 at accept time or at doctor print time. No wall-clock timestamp is required.
 Health, total duration, stage histograms and P deadline skips retain their
@@ -115,7 +116,8 @@ A compact synthetic JSON calculation for the schema above, `/fixture.sock`,
 6536 bytes including newline (reader object alone: 3524). This is a design
 budget estimate, not a measurement of the future Rust serializer or a bound
 for arbitrary paths; the exact production serializer fixture is mandatory.
-Before writing, serialize and check exact bytes plus newline. If oversized,
+Before writing, serialize and check exact bytes plus newline. Reuse the one
+reader sample through all fallback attempts; never resample. If oversized,
 omit the entire reader extension and retry; if still oversized, omit optional
 `refresh_observation` and `refresh_deadline_skips` together and retry. Preserve
 all Health fields, including capacity count. Missing diagnostics then decode
@@ -125,7 +127,8 @@ The implementation fixture must measure six available providers with u64::MAX
 for every counter, false booleans (longer JSON), maximum stage histograms,
 deadline counters and an escaped long synthetic socket path. Assert fallback
 keeps a valid Health and makes each removed extension unavailable; also cover
-normal six-provider payloads and the exact 8192-byte newline boundary.
+normal payloads, near-limit Health, exactly 8192 bytes including newline and
+8193 bytes including newline (rejected), with a single sampling call per response.
 
 Keep plugin, socket key/path, live SessionLock, nonce format and endpoint checks
 in `read_control`; keep stop nonce/plugin/key/endpoint and peer PID verification
