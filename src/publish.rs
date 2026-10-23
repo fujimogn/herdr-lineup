@@ -736,6 +736,11 @@ pub(crate) fn compute_reservation_window(pane_count: usize, workspace_count: usi
 pub struct MetadataPublisher {
     planner: tokens::Publisher,
     checkpoint_loaded: bool,
+    /// Set by any failed checkpoint write. The on-disk upper bound is then
+    /// unknown (a rename may land before the directory sync fails), so no
+    /// refresh, clear or reconnect may reserve or send again. Only a new
+    /// instance that reloads the checkpoint resumes publication.
+    persistence_poisoned: bool,
     directory: PathBuf,
     socket_key: String,
     endpoint: Option<String>,
@@ -760,7 +765,18 @@ pub struct MetadataPublisher {
     #[cfg(test)]
     checkpoint_persists: std::sync::atomic::AtomicU64,
     #[cfg(test)]
+    persist_fault: std::sync::Mutex<Option<PersistStage>>,
+    #[cfg(test)]
     stages: std::sync::Mutex<StageTimes>,
+}
+
+/// Checkpoint write steps where tests inject a failure.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistStage {
+    FileSync,
+    Rename,
+    DirectorySync,
 }
 
 #[cfg(test)]
@@ -804,6 +820,7 @@ impl MetadataPublisher {
         Ok(Self {
             planner: tokens::Publisher::default(),
             checkpoint_loaded: false,
+            persistence_poisoned: false,
             directory,
             socket_key,
             endpoint: None,
@@ -826,6 +843,8 @@ impl MetadataPublisher {
             local_readings: BTreeMap::new(),
             #[cfg(test)]
             checkpoint_persists: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            persist_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             stages: std::sync::Mutex::new(StageTimes::default()),
         })
@@ -1104,7 +1123,40 @@ impl MetadataPublisher {
         Ok(())
     }
 
-    fn persist(&self) -> io::Result<()> {
+    fn ensure_publishable(&self) -> io::Result<()> {
+        if self.persistence_poisoned {
+            return Err(io::Error::other(
+                "sequence checkpoint persistence is uncertain; restart required",
+            ));
+        }
+        Ok(())
+    }
+
+    fn persist(&mut self) -> io::Result<()> {
+        let floors = self.planner.checkpoint_floors();
+        self.write_checkpoint(floors)
+    }
+
+    fn persist_checkpoint_with_upper_bound(
+        &mut self,
+        endpoint: &str,
+        upper_bound: u64,
+    ) -> io::Result<()> {
+        let mut floors = self.planner.checkpoint_floors();
+        floors.insert(endpoint.into(), upper_bound);
+        self.write_checkpoint(floors)
+    }
+
+    fn write_checkpoint(&mut self, floors: BTreeMap<String, u64>) -> io::Result<()> {
+        self.ensure_publishable()?;
+        let result = self.write_checkpoint_file(floors);
+        if result.is_err() {
+            self.persistence_poisoned = true;
+        }
+        result
+    }
+
+    fn write_checkpoint_file(&self, floors: BTreeMap<String, u64>) -> io::Result<()> {
         #[cfg(test)]
         let stage_start = Instant::now();
         let mut rows: Vec<_> = self
@@ -1122,23 +1174,24 @@ impl MetadataPublisher {
                 seq,
             })
             .collect();
-        rows.extend(
-            self.planner
-                .checkpoint_floors()
-                .into_iter()
-                .map(|(endpoint, seq)| CheckpointRow {
-                    endpoint,
-                    kind: "endpoint".into(),
-                    id: String::new(),
-                    seq,
-                }),
-        );
+        rows.extend(floors.into_iter().map(|(endpoint, seq)| CheckpointRow {
+            endpoint,
+            kind: "endpoint".into(),
+            id: String::new(),
+            seq,
+        }));
         let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
         serde_json::to_writer(file.as_file_mut(), &rows)?;
         file.flush()?;
+        #[cfg(test)]
+        self.inject_persist_fault(PersistStage::FileSync)?;
         file.as_file().sync_all()?;
+        #[cfg(test)]
+        self.inject_persist_fault(PersistStage::Rename)?;
         file.persist(self.directory.join("sequences.json"))
             .map_err(|_| io::Error::other("cannot persist sequence checkpoint"))?;
+        #[cfg(test)]
+        self.inject_persist_fault(PersistStage::DirectorySync)?;
         File::open(&self.directory)?.sync_all()?;
         #[cfg(test)]
         {
@@ -1150,49 +1203,10 @@ impl MetadataPublisher {
         Ok(())
     }
 
-    fn persist_checkpoint_with_upper_bound(
-        &self,
-        endpoint: &str,
-        upper_bound: u64,
-    ) -> io::Result<()> {
-        #[cfg(test)]
-        let stage_start = Instant::now();
-        let mut rows: Vec<_> = self
-            .planner
-            .checkpoint()
-            .into_iter()
-            .map(|(resource, seq)| CheckpointRow {
-                endpoint: resource.endpoint_session,
-                kind: match resource.kind {
-                    ResourceKind::Pane => "pane",
-                    ResourceKind::Workspace => "workspace",
-                }
-                .into(),
-                id: resource.id,
-                seq,
-            })
-            .collect();
-        let mut floors = self.planner.checkpoint_floors();
-        floors.insert(endpoint.into(), upper_bound);
-        rows.extend(floors.into_iter().map(|(endpoint, seq)| CheckpointRow {
-            endpoint,
-            kind: "endpoint".into(),
-            id: String::new(),
-            seq,
-        }));
-        let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
-        serde_json::to_writer(file.as_file_mut(), &rows)?;
-        file.flush()?;
-        file.as_file().sync_all()?;
-        file.persist(self.directory.join("sequences.json"))
-            .map_err(|_| io::Error::other("cannot persist sequence checkpoint"))?;
-        File::open(&self.directory)?.sync_all()?;
-        #[cfg(test)]
-        {
-            let _ = self.checkpoint_persists.fetch_add(1, Ordering::Relaxed);
-            let mut stages = self.stages.lock().unwrap();
-            stages.add("persist", stage_start.elapsed());
-            stages.checkpoint_rows = rows.len();
+    #[cfg(test)]
+    fn inject_persist_fault(&self, stage: PersistStage) -> io::Result<()> {
+        if *self.persist_fault.lock().unwrap() == Some(stage) {
+            return Err(io::Error::other(format!("injected {stage:?} failure")));
         }
         Ok(())
     }
@@ -1222,6 +1236,7 @@ impl MetadataPublisher {
     fn snapshot(&mut self, transport: &mut Transport) -> io::Result<protocol::Snapshot> {
         #[cfg(test)]
         let stage_start = Instant::now();
+        self.ensure_publishable()?;
         self.load_checkpoint()?;
         let identity = transport.identity();
         let endpoint = format!("{}:{}:{}", self.socket_key, identity.device, identity.inode);
@@ -1270,6 +1285,7 @@ impl MetadataPublisher {
         desired: &tokens::Tokens,
         deadline: Option<Instant>,
     ) -> io::Result<()> {
+        self.ensure_publishable()?;
         if deadline.is_none() {
             self.check_shutdown()?;
         }
@@ -1972,6 +1988,8 @@ impl daemon::Publisher for MetadataPublisher {
         Ok(())
     }
     fn reconnected(&mut self) {
+        // `persistence_poisoned` survives: memory may hold a lower upper bound
+        // than disk after an uncertain write.
         self.planner = tokens::Publisher::restore_with_floors(
             self.planner.checkpoint(),
             self.planner.checkpoint_floors(),
@@ -2320,9 +2338,26 @@ mod tests {
         clock: Arc<std::sync::atomic::AtomicU64>,
         template: Arc<std::sync::Mutex<Value>>,
     ) -> std::thread::JoinHandle<()> {
+        sequence_server(listener, clock, template, Arc::default())
+    }
+
+    /// One received metadata report: resource ID, seq, and whether it applied.
+    type ReportLog = Arc<std::sync::Mutex<Vec<(String, u64, bool)>>>;
+
+    // Like Herdr, a report whose seq is not newer than the last accepted seq
+    // for the same resource and source is answered `ok` but not applied. The
+    // accepted seq outlives the resource leaving the snapshot, so a reused ID
+    // must also move forward.
+    fn sequence_server(
+        listener: UnixListener,
+        clock: Arc<std::sync::atomic::AtomicU64>,
+        template: Arc<std::sync::Mutex<Value>>,
+        log: ReportLog,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let mut resources = BTreeMap::<String, BTreeMap<String, (Value, u64)>>::new();
+            let mut accepted = BTreeMap::<(String, String), u64>::new();
             loop {
                 let request = receive(&mut stream);
                 let now = clock.load(Ordering::Acquire);
@@ -2357,13 +2392,21 @@ mod tests {
                             .as_str()
                             .or_else(|| params["workspace_id"].as_str())
                             .unwrap();
-                        let tokens = resources.entry(id.into()).or_default();
-                        let ttl = params["ttl_ms"].as_u64().unwrap();
-                        for (key, value) in params["tokens"].as_object().unwrap() {
-                            if value.is_null() {
-                                tokens.remove(key);
-                            } else {
-                                tokens.insert(key.clone(), (value.clone(), now + ttl));
+                        let seq = params["seq"].as_u64().unwrap();
+                        let source = params["source"].as_str().unwrap();
+                        let last = accepted.entry((id.into(), source.into())).or_default();
+                        let applied = seq > *last;
+                        log.lock().unwrap().push((id.into(), seq, applied));
+                        if applied {
+                            *last = seq;
+                            let tokens = resources.entry(id.into()).or_default();
+                            let ttl = params["ttl_ms"].as_u64().unwrap();
+                            for (key, value) in params["tokens"].as_object().unwrap() {
+                                if value.is_null() {
+                                    tokens.remove(key);
+                                } else {
+                                    tokens.insert(key.clone(), (value.clone(), now + ttl));
+                                }
                             }
                         }
                         json!({"id":request["id"],"result":{"type":"ok"}})
@@ -7010,5 +7053,204 @@ mod tests {
         }
         assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 1);
         server.join().unwrap();
+    }
+
+    fn endpoint_upper_bound_on_disk(dir: &Path) -> Option<u64> {
+        let bytes = std::fs::read(dir.join("sequences.json")).ok()?;
+        let rows: Vec<CheckpointRow> = serde_json::from_slice(&bytes).unwrap();
+        rows.into_iter()
+            .find(|row| row.kind == "endpoint")
+            .map(|row| row.seq)
+    }
+
+    fn report_logo(
+        publisher: &mut MetadataPublisher,
+        transport: &mut Transport,
+        pane: &str,
+        logo: &str,
+    ) -> io::Result<()> {
+        let snapshot = publisher.snapshot(transport)?;
+        let keys = snapshot
+            .panes
+            .iter()
+            .find(|candidate| candidate.pane_id == pane)
+            .map(|candidate| candidate.stored_keys.clone())
+            .unwrap_or_default();
+        let resource = publisher.resource(ResourceKind::Pane, pane);
+        let desired = BTreeMap::from([("lineup_logo".into(), Some(logo.into()))]);
+        publisher.report(transport, &resource, &keys, None, &desired, None)
+    }
+
+    #[test]
+    fn stale_sequence_server_applies_reports_across_window_restart_and_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
+        let log = ReportLog::default();
+        let server = sequence_server(
+            UnixListener::bind(&socket).unwrap(),
+            clock,
+            template.clone(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(state.clone(), "fake".into(), Homes::default()).unwrap();
+
+        // Cross the first window boundary: 40 reports need exactly two
+        // reservation writes and no other checkpoint write.
+        let reports = MIN_RESERVATION_WINDOW + 8;
+        for index in 0..reports {
+            report_logo(
+                &mut publisher,
+                &mut transport,
+                "w1:p1",
+                &format!("a{index}"),
+            )
+            .unwrap();
+        }
+        assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 2);
+        let first_upper_bound = endpoint_upper_bound_on_disk(&state).unwrap();
+        assert_eq!(first_upper_bound, MIN_RESERVATION_WINDOW * 2);
+
+        // Restart discards the unused part of the window: the first seq is
+        // above the old durable upper bound, not just above the last sent seq.
+        drop(publisher);
+        let mut publisher =
+            MetadataPublisher::new(state.clone(), "fake".into(), Homes::default()).unwrap();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "restart").unwrap();
+        assert!(log.lock().unwrap().last().unwrap().1 > first_upper_bound);
+
+        // The pane leaves the authoritative snapshot and its ID comes back.
+        let removed = std::mem::take(
+            template.lock().unwrap()["result"]["snapshot"]["panes"]
+                .as_array_mut()
+                .unwrap(),
+        );
+        let snapshot = publisher.snapshot(&mut transport).unwrap();
+        publisher.reconcile_missing(&snapshot).unwrap();
+        template.lock().unwrap()["result"]["snapshot"]["panes"] = Value::Array(removed);
+        report_logo(&mut publisher, &mut transport, "w1:p1", "reused").unwrap();
+
+        // A publisher that lost the checkpoint is answered `ok` but ignored.
+        let lost = dir.path().join("lost");
+        std::fs::create_dir(&lost).unwrap();
+        let mut forgetful = MetadataPublisher::new(lost, "fake".into(), Homes::default()).unwrap();
+        report_logo(&mut forgetful, &mut transport, "w1:p1", "stale").unwrap();
+
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+
+        let log = log.lock().unwrap();
+        let (stale, applied) = log.split_last().unwrap();
+        assert_eq!(applied.len() as u64, reports + 2);
+        assert!(applied.iter().all(|(_, _, applied)| *applied));
+        assert!(applied.windows(2).all(|pair| pair[0].1 < pair[1].1));
+        assert_eq!(stale, &("w1:p1".to_string(), 1, false));
+        assert_eq!(
+            response["result"]["snapshot"]["panes"][0]["tokens"]["lineup_logo"],
+            "reused"
+        );
+    }
+
+    #[test]
+    fn uncertain_checkpoint_write_poisons_publication_until_new_instance() {
+        for stage in [
+            PersistStage::FileSync,
+            PersistStage::Rename,
+            PersistStage::DirectorySync,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("fake.sock");
+            let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
+            let log = ReportLog::default();
+            let server = sequence_server(
+                UnixListener::bind(&socket).unwrap(),
+                clock,
+                template,
+                log.clone(),
+            );
+            let mut transport = Transport::connect(&socket).unwrap();
+            let state = dir.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            let mut publisher =
+                MetadataPublisher::new(state.clone(), "fake".into(), Homes::default()).unwrap();
+
+            let snapshot = publisher.snapshot(&mut transport).unwrap();
+            let endpoint = publisher.endpoint.clone().unwrap();
+            let resource = publisher.resource(ResourceKind::Pane, "w1:p1");
+            let desired = BTreeMap::from([("lineup_logo".into(), Some("Codex".into()))]);
+            publisher.reservation_window = MAX_RESERVATION_WINDOW;
+            *publisher.persist_fault.lock().unwrap() = Some(stage);
+            assert!(
+                publisher
+                    .report(
+                        &mut transport,
+                        &resource,
+                        &snapshot.panes[0].stored_keys,
+                        None,
+                        &desired,
+                        None,
+                    )
+                    .is_err()
+            );
+            // Only a rename that already happened leaves the new upper bound.
+            let expected_disk =
+                (stage == PersistStage::DirectorySync).then_some(MAX_RESERVATION_WINDOW);
+            assert_eq!(endpoint_upper_bound_on_disk(&state), expected_disk);
+
+            // With the fault gone, the poison alone must stop every path from
+            // writing a smaller upper bound or sending a frame.
+            *publisher.persist_fault.lock().unwrap() = None;
+            assert!(
+                publisher
+                    .report(
+                        &mut transport,
+                        &resource,
+                        &snapshot.panes[0].stored_keys,
+                        None,
+                        &desired,
+                        None,
+                    )
+                    .is_err()
+            );
+            assert!(
+                publisher
+                    .reserve_window_for_endpoint(&endpoint, MIN_RESERVATION_WINDOW)
+                    .is_err()
+            );
+            assert!(publisher.persist().is_err());
+            assert!(
+                publisher
+                    .refresh(&mut transport, &crate::config::Config::default())
+                    .is_err()
+            );
+            publisher.reconnected();
+            assert!(publisher.snapshot(&mut transport).is_err());
+            assert!(publisher.clear(&mut transport).is_err());
+            assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 0);
+            assert_eq!(endpoint_upper_bound_on_disk(&state), expected_disk);
+            assert!(log.lock().unwrap().is_empty(), "{stage:?} sent a report");
+
+            // A new instance reloads whatever the disk holds and resumes
+            // above it.
+            drop(publisher);
+            let mut restarted =
+                MetadataPublisher::new(state.clone(), "fake".into(), Homes::default()).unwrap();
+            report_logo(&mut restarted, &mut transport, "w1:p1", "Codex").unwrap();
+            restarted.request(&mut transport, "test.finish").unwrap();
+            server.join().unwrap();
+            let log = log.lock().unwrap();
+            assert_eq!(log.len(), 1);
+            assert!(log[0].2);
+            assert_eq!(log[0].1, expected_disk.unwrap_or_default() + 1);
+        }
     }
 }

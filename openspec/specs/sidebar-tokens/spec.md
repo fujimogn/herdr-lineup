@@ -216,11 +216,15 @@ as a durable floor for the same endpoint. The publisher SHALL maintain a durable
 upper bound per endpoint covering all allocated sequences. When an allocation
 exceeds the durable upper bound, a new reservation window (sized to the authoritative
 pane and workspace counts, bounded within 32..=4096) SHALL be fsynced with its
-parent directory before any report using that sequence is sent. A resource ID that
-reappears on that endpoint SHALL use a sequence greater than that floor and bounded
-by the durable upper bound. Rows and floors for a different socket endpoint SHALL be
-removed once the current endpoint identity is verified; its metadata cannot be
-updated through the replaced endpoint. Empty patches and resources skipped due to
+parent directory before any report using that sequence is sent. If any
+checkpoint write fails, including a directory sync after a successful rename, the
+publisher SHALL send no further report and write no further checkpoint, across
+refresh, clear, and reconnect, until a new publisher instance reloads the
+checkpoint. A resource ID that reappears on that endpoint SHALL use a sequence
+greater than the endpoint cursor within the same process, and greater than the
+loaded durable upper bound after a restart. Rows and floors for a different
+socket endpoint SHALL be removed once the current endpoint identity is verified;
+its metadata cannot be updated through the replaced endpoint. Empty patches and resources skipped due to
 capacity limits SHALL not allocate or consume sequences.
 
 The default refresh interval SHALL be 5,000 ms and TTL 15,000 ms. Startup and
