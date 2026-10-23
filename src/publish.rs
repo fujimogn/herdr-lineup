@@ -193,43 +193,378 @@ struct KimiSnapshot {
     observed: Instant,
 }
 
+#[derive(Clone, Copy, Default)]
+struct KimiShared {
+    last_stamp: Option<crate::quota_kimi::SourceStamp>,
+    last_state: Option<crate::quota_kimi::SourceState>,
+    snapshot: Option<KimiSnapshot>,
+}
+
+#[cfg(test)]
+impl KimiShared {
+    fn new(snapshot: Option<KimiSnapshot>) -> Self {
+        let last_stamp = snapshot.map(|s| s.stamp);
+        let last_state = last_stamp.map(crate::quota_kimi::SourceState::Present);
+        Self {
+            last_stamp,
+            last_state,
+            snapshot,
+        }
+    }
+}
+
+fn kimi_source_differs(
+    last_stamp: Option<crate::quota_kimi::SourceStamp>,
+    last_state: Option<crate::quota_kimi::SourceState>,
+    current_state: crate::quota_kimi::SourceState,
+) -> bool {
+    match current_state {
+        crate::quota_kimi::SourceState::Present(current_stamp) => match last_stamp {
+            Some(stamp) => stamp != current_stamp,
+            None => match last_state {
+                Some(crate::quota_kimi::SourceState::Missing) => true,
+                _ => true,
+            },
+        },
+        crate::quota_kimi::SourceState::Missing => {
+            last_stamp.is_some()
+                || matches!(last_state, Some(crate::quota_kimi::SourceState::Present(_)))
+        }
+        crate::quota_kimi::SourceState::Transient { credential } => {
+            match (credential, last_stamp) {
+                (Some(cred), Some(stamp)) => cred != stamp.credential,
+                _ => false,
+            }
+        }
+    }
+}
+
+fn prepare_kimi_worker(
+    before: crate::quota_kimi::SourceState,
+    previous: &mut Option<model::WeeklySample>,
+    previous_stamp: &mut Option<crate::quota_kimi::SourceStamp>,
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
+) -> u64 {
+    let worker_source_changed = match before {
+        crate::quota_kimi::SourceState::Present(stamp) => {
+            previous_stamp.is_some_and(|prev| prev != stamp)
+        }
+        crate::quota_kimi::SourceState::Missing => previous_stamp.is_some() || previous.is_some(),
+        crate::quota_kimi::SourceState::Transient {
+            credential: Some(cred),
+        } => previous_stamp.is_some_and(|prev| prev.credential != cred),
+        crate::quota_kimi::SourceState::Transient { credential: None } => false,
+    };
+    if worker_source_changed {
+        *previous = None;
+        *previous_stamp = match before {
+            crate::quota_kimi::SourceState::Present(stamp) => Some(stamp),
+            _ => None,
+        };
+    }
+
+    if let Ok(mut shared) = source.lock() {
+        if kimi_source_differs(shared.last_stamp, shared.last_state, before) {
+            *previous = None;
+            *previous_stamp = match before {
+                crate::quota_kimi::SourceState::Present(stamp) => Some(stamp),
+                _ => None,
+            };
+            shared.last_stamp = match before {
+                crate::quota_kimi::SourceState::Present(stamp) => Some(stamp),
+                _ => None,
+            };
+            shared.last_state = Some(before);
+            shared.snapshot = None;
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            shared.last_state = Some(before);
+            match before {
+                crate::quota_kimi::SourceState::Present(stamp) => {
+                    *previous_stamp = Some(stamp);
+                    shared.last_stamp = Some(stamp);
+                }
+                crate::quota_kimi::SourceState::Missing => {
+                    *previous = None;
+                    *previous_stamp = None;
+                    shared.last_stamp = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    epoch.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_kimi_worker(
+    before: crate::quota_kimi::SourceState,
+    outcome: crate::quota_kimi::Outcome,
+    after: crate::quota_kimi::SourceState,
+    previous: &mut Option<model::WeeklySample>,
+    previous_stamp: &mut Option<crate::quota_kimi::SourceStamp>,
+    last_success: &mut Option<Instant>,
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
+    epoch_before: u64,
+    auth_expiry: Option<SystemTime>,
+    now: SystemTime,
+    instant: Instant,
+) -> Option<model::WeeklySample> {
+    prepare_kimi_worker(before, previous, previous_stamp, source, epoch);
+
+    if let crate::quota_kimi::Outcome::Unavailable(failure) = outcome
+        && !failure.is_transient()
+    {
+        *previous = None;
+        if let Ok(mut shared) = source.lock() {
+            shared.snapshot = None;
+            shared.last_state = Some(after);
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    match after {
+        crate::quota_kimi::SourceState::Present(after_stamp) => {
+            let changed = previous_stamp.is_some_and(|prev| prev != after_stamp);
+            if changed {
+                *previous = None;
+            }
+
+            let same_as_before = before == crate::quota_kimi::SourceState::Present(after_stamp);
+            let same_source = match *previous_stamp {
+                Some(prev) => prev == after_stamp,
+                None => {
+                    if let Ok(shared) = source.lock() {
+                        shared
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|s| s.stamp == after_stamp)
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            let sample = if same_as_before {
+                if matches!(outcome, crate::quota_kimi::Outcome::Weekly(_)) {
+                    *last_success = Some(instant);
+                }
+                kimi_sample_after_poll(*previous, outcome, now)
+            } else if same_source {
+                // Recovered to same source after transient before:
+                // Do not adopt poll outcome across transition, but retain existing valid sample
+                if let Ok(mut shared) = source.lock() {
+                    if epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch_before {
+                        shared.snapshot = None;
+                        *previous = None;
+                        *previous_stamp = None;
+                        None
+                    } else if let Some(snapshot) = shared.snapshot {
+                        if snapshot.stamp == after_stamp
+                            && snapshot.auth_expiry > now
+                            && model::retain_known_reset_after_failure(Some(snapshot.sample), now)
+                                .is_some()
+                        {
+                            Some(snapshot.sample)
+                        } else {
+                            shared.snapshot = None;
+                            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                *previous = None;
+                if let Ok(mut shared) = source.lock() {
+                    shared.snapshot = None;
+                    shared.last_stamp = Some(after_stamp);
+                    shared.last_state = Some(after);
+                    epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                None
+            };
+            *previous = sample;
+            *previous_stamp = Some(after_stamp);
+            if same_as_before && let Ok(mut shared) = source.lock() {
+                if epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch_before {
+                    shared.snapshot = None;
+                    *previous = None;
+                    *previous_stamp = None;
+                    return None;
+                }
+                if let Some(sample) = sample {
+                    let expiry = auth_expiry.or_else(|| shared.snapshot.map(|s| s.auth_expiry));
+                    let observed = (*last_success).or_else(|| shared.snapshot.map(|s| s.observed));
+                    if let (Some(auth_expiry), Some(observed)) = (expiry, observed) {
+                        shared.snapshot = Some(KimiSnapshot {
+                            sample,
+                            stamp: after_stamp,
+                            auth_expiry,
+                            observed,
+                        });
+                        shared.last_stamp = Some(after_stamp);
+                        shared.last_state = Some(after);
+                    }
+                } else {
+                    shared.snapshot = None;
+                    epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            sample
+        }
+        crate::quota_kimi::SourceState::Missing => {
+            *previous = None;
+            *previous_stamp = None;
+            if let Ok(mut shared) = source.lock() {
+                shared.snapshot = None;
+                shared.last_stamp = None;
+                shared.last_state = Some(after);
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            None
+        }
+        crate::quota_kimi::SourceState::Transient { credential } => {
+            if let Some(cred) = credential {
+                let cred_mismatch = if let Ok(shared) = source.lock() {
+                    shared
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|s| s.stamp.credential != cred)
+                } else {
+                    false
+                };
+                if cred_mismatch || previous_stamp.is_some_and(|prev| prev.credential != cred) {
+                    *previous = None;
+                    *previous_stamp = None;
+                    if let Ok(mut shared) = source.lock() {
+                        shared.snapshot = None;
+                        shared.last_stamp = None;
+                        shared.last_state = Some(after);
+                        epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    return None;
+                }
+            }
+            if let Ok(mut shared) = source.lock() {
+                shared.last_state = Some(after);
+                if epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch_before {
+                    shared.snapshot = None;
+                    *previous = None;
+                    *previous_stamp = None;
+                    None
+                } else if let Some(snapshot) = shared.snapshot {
+                    if snapshot.auth_expiry <= now
+                        || model::retain_known_reset_after_failure(Some(snapshot.sample), now)
+                            .is_none()
+                    {
+                        shared.snapshot = None;
+                        epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        *previous = None;
+                        None
+                    } else {
+                        *previous = Some(snapshot.sample);
+                        Some(snapshot.sample)
+                    }
+                } else {
+                    *previous = None;
+                    None
+                }
+            } else {
+                *previous = None;
+                None
+            }
+        }
+    }
+}
+
 fn current_kimi_weekly(
-    source: &std::sync::Mutex<Option<KimiSnapshot>>,
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
     home: Option<&Path>,
     config: &Config,
     now: SystemTime,
     instant: Instant,
 ) -> Option<model::WeeklySample> {
-    current_kimi_weekly_with_stamp(source, config, now, instant, || {
-        home.and_then(|home| {
-            crate::quota_kimi::source_stamp(&crate::quota_kimi::credential_path(home))
-        })
+    current_kimi_weekly_with_state(source, epoch, config, now, instant, || match home {
+        Some(home) => crate::quota_kimi::source_state(&crate::quota_kimi::credential_path(home)),
+        None => crate::quota_kimi::SourceState::Missing,
     })
 }
 
-fn current_kimi_weekly_with_stamp(
-    source: &std::sync::Mutex<Option<KimiSnapshot>>,
+fn current_kimi_weekly_with_state(
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
     config: &Config,
     now: SystemTime,
     instant: Instant,
-    stamp: impl FnOnce() -> Option<crate::quota_kimi::SourceStamp>,
+    state: impl FnOnce() -> crate::quota_kimi::SourceState,
 ) -> Option<model::WeeklySample> {
     if !config.weekly_enabled(Agent::Kimi) {
-        if let Ok(mut source) = source.try_lock() {
-            *source = None;
+        if let Ok(mut shared) = source.try_lock()
+            && (shared.snapshot.is_some()
+                || shared.last_stamp.is_some()
+                || shared.last_state.is_some())
+        {
+            shared.snapshot = None;
+            shared.last_stamp = None;
+            shared.last_state = None;
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         return None;
     }
-    let current_stamp = stamp();
-    let snapshot = source.try_lock().ok().and_then(|mut source| {
-        if source.is_some_and(|snapshot| {
-            Some(snapshot.stamp) != current_stamp
-                || snapshot.auth_expiry <= now
-                || model::clear_expired_reset(Some(snapshot.sample), now).is_none()
-        }) {
-            *source = None;
+    let current_state = state();
+    let mut guard = match source.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(_) => source.lock().ok(),
+    };
+    let snapshot = guard.as_deref_mut().and_then(|shared| {
+        if kimi_source_differs(shared.last_stamp, shared.last_state, current_state) {
+            shared.last_stamp = match current_state {
+                crate::quota_kimi::SourceState::Present(stamp) => Some(stamp),
+                _ => None,
+            };
+            shared.last_state = Some(current_state);
+            shared.snapshot = None;
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return None;
         }
-        *source
+
+        shared.last_state = Some(current_state);
+        if let crate::quota_kimi::SourceState::Present(stamp) = current_state {
+            shared.last_stamp = Some(stamp);
+        }
+
+        let current = shared.snapshot?;
+        let keep = match current_state {
+            crate::quota_kimi::SourceState::Present(stamp) => {
+                current.stamp == stamp
+                    && current.auth_expiry > now
+                    && model::clear_expired_reset(Some(current.sample), now).is_some()
+            }
+            crate::quota_kimi::SourceState::Missing => false,
+            crate::quota_kimi::SourceState::Transient { credential } => {
+                let same_account = match credential {
+                    Some(cred) => cred == current.stamp.credential,
+                    None => true,
+                };
+                same_account
+                    && current.auth_expiry > now
+                    && model::retain_known_reset_after_failure(Some(current.sample), now).is_some()
+            }
+        };
+        if keep {
+            Some(current)
+        } else {
+            shared.snapshot = None;
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
     });
     fresh_kimi_weekly(
         snapshot.map(|snapshot| snapshot.sample),
@@ -238,6 +573,21 @@ fn current_kimi_weekly_with_stamp(
         config.usage_max_age_ms,
         config.refresh_interval_ms,
     )
+}
+
+#[cfg(test)]
+fn current_kimi_weekly_with_stamp(
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
+    config: &Config,
+    now: SystemTime,
+    instant: Instant,
+    stamp: impl FnOnce() -> Option<crate::quota_kimi::SourceStamp>,
+) -> Option<model::WeeklySample> {
+    current_kimi_weekly_with_state(source, epoch, config, now, instant, || match stamp() {
+        Some(stamp) => crate::quota_kimi::SourceState::Present(stamp),
+        None => crate::quota_kimi::SourceState::Missing,
+    })
 }
 
 fn repository_read_once(
@@ -288,7 +638,8 @@ pub struct MetadataPublisher {
     kimi_weekly: Option<model::WeeklyWorker>,
     weekly_diagnostics_initialized: bool,
     grok_observed: Arc<std::sync::Mutex<Option<Instant>>>,
-    kimi_source: Arc<std::sync::Mutex<Option<KimiSnapshot>>>,
+    kimi_source: Arc<std::sync::Mutex<KimiShared>>,
+    kimi_epoch: Arc<std::sync::atomic::AtomicU64>,
     codex_control: Arc<crate::quota_codex::QueryControl>,
     headings: BTreeMap<String, HeadingCache>,
     local_readings: BTreeMap<String, model::UsageReading>,
@@ -321,7 +672,8 @@ impl MetadataPublisher {
             kimi_weekly: None,
             weekly_diagnostics_initialized: false,
             grok_observed: Arc::new(std::sync::Mutex::new(None)),
-            kimi_source: Arc::new(std::sync::Mutex::new(None)),
+            kimi_source: Arc::new(std::sync::Mutex::new(KimiShared::default())),
+            kimi_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
             headings: BTreeMap::new(),
             local_readings: BTreeMap::new(),
@@ -470,6 +822,7 @@ impl MetadataPublisher {
             );
             let directory = self.directory.clone();
             let source = self.kimi_source.clone();
+            let epoch = self.kimi_epoch.clone();
             let mut previous = None;
             let mut previous_stamp = None;
             let mut last_success = None;
@@ -478,43 +831,43 @@ impl MetadataPublisher {
                 settings.interval(),
                 move || {
                     let now = SystemTime::now();
-                    let (sample, result) = match client.as_mut() {
+                    let instant = Instant::now();
+                    let (_, result) = match client.as_mut() {
                         Ok(client) => {
-                            let before = client.source_stamp();
-                            if before != previous_stamp {
-                                previous = None;
-                            }
+                            let before = client.source_state();
+                            let epoch_before = prepare_kimi_worker(
+                                before,
+                                &mut previous,
+                                &mut previous_stamp,
+                                &source,
+                                &epoch,
+                            );
                             let outcome = client.poll();
-                            let after = client.source_stamp();
-                            if matches!(outcome, crate::quota_kimi::Outcome::Weekly(_)) {
-                                last_success = Some(Instant::now());
-                            }
-                            let sample = if before == after && after.is_some() {
-                                kimi_sample_after_poll(previous, outcome, now)
-                            } else {
-                                None
-                            };
-                            previous_stamp = after;
-                            if let Ok(mut source) = source.lock() {
-                                *source = sample.and_then(|sample| {
-                                    Some(KimiSnapshot {
-                                        sample,
-                                        stamp: after?,
-                                        auth_expiry: client.auth_expiry()?,
-                                        observed: last_success?,
-                                    })
-                                });
-                            }
+                            let after = client.source_state();
+                            let sample = step_kimi_worker(
+                                before,
+                                outcome,
+                                after,
+                                &mut previous,
+                                &mut previous_stamp,
+                                &mut last_success,
+                                &source,
+                                &epoch,
+                                epoch_before,
+                                client.auth_expiry(),
+                                now,
+                                instant,
+                            );
                             (sample, client.last_result())
                         }
                         Err(failure) => {
                             if let Ok(mut source) = source.lock() {
-                                *source = None;
+                                source.snapshot = None;
+                                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                             (None, failure.diagnostic())
                         }
                     };
-                    previous = sample;
                     let _ = write_weekly_result(&directory, WeeklyProvider::Kimi, result);
                 },
             )?);
@@ -825,6 +1178,7 @@ impl MetadataPublisher {
         );
         let kimi_weekly = current_kimi_weekly(
             &self.kimi_source,
+            &self.kimi_epoch,
             self.homes.kimi.as_deref(),
             config,
             now,
@@ -2359,6 +2713,7 @@ mod tests {
         let observe = |publisher: &MetadataPublisher| {
             current_kimi_weekly(
                 &publisher.kimi_source,
+                &publisher.kimi_epoch,
                 publisher.homes.kimi.as_deref(),
                 &enabled,
                 SystemTime::now(),
@@ -2388,7 +2743,7 @@ mod tests {
                 // with a blocking lock so a try_lock failure is not mistaken
                 // for the source being cleared.
                 observe(publisher);
-                let actually_cleared = publisher.kimi_source.lock().unwrap().is_none();
+                let actually_cleared = publisher.kimi_source.lock().unwrap().snapshot.is_none();
                 let reset_reached = reset_at.is_none_or(|reset| SystemTime::now() >= reset);
                 if actually_cleared && reset_reached {
                     return;
@@ -2610,8 +2965,9 @@ mod tests {
             kimi_weekly_enabled: true,
             ..Config::default()
         };
-        let cache = std::sync::Mutex::new(Some(snapshot));
-        assert!(current_kimi_weekly(&cache, Some(home), &enabled, now, instant).is_some());
+        let cache = std::sync::Mutex::new(KimiShared::new(Some(snapshot)));
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_some());
         for config in [
             Config {
                 allow_network: false,
@@ -2626,21 +2982,24 @@ mod tests {
                 ..enabled.clone()
             },
         ] {
-            *cache.lock().unwrap() = Some(snapshot);
-            assert!(current_kimi_weekly(&cache, Some(home), &config, now, instant).is_none());
-            assert!(cache.lock().unwrap().is_none());
+            *cache.lock().unwrap() = KimiShared::new(Some(snapshot));
+            assert!(
+                current_kimi_weekly(&cache, &epoch, Some(home), &config, now, instant).is_none()
+            );
+            assert!(cache.lock().unwrap().snapshot.is_none());
         }
-        *cache.lock().unwrap() = Some(snapshot);
+        *cache.lock().unwrap() = KimiShared::new(Some(snapshot));
         std::fs::write(&auth_file, "fake-credential-two-longer").unwrap();
-        assert!(current_kimi_weekly(&cache, Some(home), &enabled, now, instant).is_none());
-        assert!(cache.lock().unwrap().is_none());
-        *cache.lock().unwrap() = Some(KimiSnapshot {
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+        *cache.lock().unwrap() = KimiShared::new(Some(KimiSnapshot {
             stamp: crate::quota_kimi::source_stamp(&auth_file).unwrap(),
             ..snapshot
-        });
+        }));
         assert!(
             current_kimi_weekly(
                 &cache,
+                &epoch,
                 Some(home),
                 &enabled,
                 now + Duration::from_secs(120),
@@ -2651,9 +3010,748 @@ mod tests {
     }
 
     #[test]
+    fn kimi_credential_stat_distinguishes_transient_failure_from_missing_and_account_switch() {
+        use crate::quota_kimi::SourceState;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let credentials = home.join("credentials");
+        std::fs::create_dir(&credentials).unwrap();
+        let auth_file = credentials.join("kimi-code.json");
+        std::fs::write(&auth_file, "fake-credential-account-a").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_file).unwrap();
+
+        let other_file = credentials.join("other.json");
+        std::fs::write(&other_file, "fake-credential-account-b").unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&other_file).unwrap();
+        std::fs::remove_file(&other_file).unwrap();
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let make_snapshot = |resets_in_secs: u64, auth_expires_in_secs: u64| KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 25.0,
+                resets_at: Some(now + Duration::from_secs(resets_in_secs)),
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(auth_expires_in_secs),
+            observed: instant,
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::new(Some(make_snapshot(300, 600))));
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Transient { credential: None }
+        });
+        assert_eq!(sample.unwrap().used_percent, 25.0);
+        assert!(cache.lock().unwrap().snapshot.is_some());
+
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_a)
+        });
+        assert_eq!(sample.unwrap().used_percent, 25.0);
+        assert!(cache.lock().unwrap().snapshot.is_some());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 60)));
+        let sample = current_kimi_weekly_with_state(
+            &cache,
+            &epoch,
+            &enabled,
+            now + Duration::from_secs(61),
+            instant,
+            || SourceState::Transient { credential: None },
+        );
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(60, 300)));
+        let sample = current_kimi_weekly_with_state(
+            &cache,
+            &epoch,
+            &enabled,
+            now + Duration::from_secs(61),
+            instant,
+            || SourceState::Transient { credential: None },
+        );
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 25.0,
+                resets_at: None,
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(600),
+            observed: instant,
+        }));
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_a)
+        });
+        assert_eq!(sample.unwrap().used_percent, 25.0);
+        assert!(cache.lock().unwrap().snapshot.is_some());
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Transient { credential: None }
+        });
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 600)));
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Missing
+        });
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 600)));
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_b)
+        });
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 600)));
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Transient {
+                credential: Some(stamp_b.credential),
+            }
+        });
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 600)));
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_some());
+
+        let original_mode = std::fs::metadata(&credentials)
+            .unwrap()
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_some());
+        assert!(cache.lock().unwrap().snapshot.is_some());
+
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+        std::fs::remove_file(&auth_file).unwrap();
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn kimi_worker_state_transitions_handle_in_flight_switch_and_transient_failures() {
+        use crate::quota_kimi::{Failure, Outcome, SourceState, WeeklyUsage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+        let transient_a = SourceState::Transient {
+            credential: Some(a.credential),
+        };
+        let transient_b = SourceState::Transient {
+            credential: Some(b.credential),
+        };
+        let transient_unknown = SourceState::Transient { credential: None };
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let reset = Some(now + Duration::from_secs(3600));
+        let weekly = |used_percent| {
+            Outcome::Weekly(WeeklyUsage {
+                used_percent,
+                resets_at: reset,
+            })
+        };
+
+        for (name, before, outcome, after, initial, expected, stamp) in [
+            (
+                "switch during successful poll",
+                SourceState::Present(a),
+                weekly(20.0),
+                SourceState::Present(b),
+                Some(10.0),
+                None,
+                Some(b),
+            ),
+            (
+                "switch before transient poll",
+                SourceState::Present(b),
+                Outcome::Unavailable(Failure::Transient),
+                transient_unknown,
+                Some(10.0),
+                None,
+                None,
+            ),
+            (
+                "missing before transient poll",
+                SourceState::Missing,
+                Outcome::Unavailable(Failure::Transient),
+                transient_unknown,
+                Some(10.0),
+                None,
+                None,
+            ),
+            (
+                "expired poll after transient stat",
+                SourceState::Present(a),
+                Outcome::Unavailable(Failure::AuthExpired),
+                transient_unknown,
+                Some(10.0),
+                None,
+                None,
+            ),
+            (
+                "same source transient",
+                SourceState::Present(a),
+                Outcome::Unavailable(Failure::Transient),
+                transient_a,
+                Some(30.0),
+                Some(30.0),
+                Some(a),
+            ),
+            (
+                "unknown reset transient",
+                SourceState::Present(a),
+                Outcome::Unavailable(Failure::Transient),
+                transient_a,
+                None,
+                None,
+                None,
+            ),
+            (
+                "auth I/O transient",
+                transient_a,
+                Outcome::Unavailable(Failure::AuthIo),
+                transient_a,
+                Some(35.0),
+                Some(35.0),
+                Some(a),
+            ),
+            (
+                "recover same source",
+                transient_a,
+                Outcome::Unavailable(Failure::Transient),
+                SourceState::Present(a),
+                Some(35.0),
+                Some(35.0),
+                Some(a),
+            ),
+            (
+                "recover different source",
+                transient_a,
+                Outcome::Unavailable(Failure::Transient),
+                SourceState::Present(b),
+                Some(35.0),
+                None,
+                Some(b),
+            ),
+            (
+                "changed credential during transient poll",
+                SourceState::Present(a),
+                Outcome::Unavailable(Failure::Transient),
+                transient_b,
+                Some(35.0),
+                None,
+                None,
+            ),
+            (
+                "new credential before successful poll",
+                transient_b,
+                weekly(50.0),
+                transient_b,
+                Some(35.0),
+                None,
+                None,
+            ),
+        ] {
+            let initial_sample = model::WeeklySample {
+                used_percent: initial.unwrap_or(40.0),
+                resets_at: initial.map(|_| reset).unwrap_or(None),
+            };
+            let cache = std::sync::Mutex::new(KimiShared::new(Some(KimiSnapshot {
+                sample: initial_sample,
+                stamp: a,
+                auth_expiry: now + Duration::from_secs(3600),
+                observed: instant,
+            })));
+            let epoch = std::sync::atomic::AtomicU64::new(0);
+            let mut previous = Some(initial_sample);
+            let mut previous_stamp = Some(a);
+            let mut last_success = Some(instant);
+            let result = step_kimi_worker(
+                before,
+                outcome,
+                after,
+                &mut previous,
+                &mut previous_stamp,
+                &mut last_success,
+                &cache,
+                &epoch,
+                0,
+                Some(now + Duration::from_secs(3600)),
+                now,
+                instant,
+            );
+            assert_eq!(result.map(|sample| sample.used_percent), expected, "{name}");
+            assert_eq!(previous.is_some(), expected.is_some(), "{name}");
+            assert_eq!(
+                cache.lock().unwrap().snapshot.is_some(),
+                expected.is_some(),
+                "{name}"
+            );
+            if let Some(stamp) = stamp {
+                assert_eq!(previous_stamp, Some(stamp), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_account_switch_invalidates_shared_cache_before_poll_completes() {
+        use crate::quota_kimi::SourceState;
+        use std::sync::Arc;
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let source = Arc::new(std::sync::Mutex::new(KimiShared::new(Some(KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 25.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(3600),
+            observed: instant,
+        }))));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let mut previous = Some(model::WeeklySample {
+            used_percent: 25.0,
+            resets_at: Some(now + Duration::from_secs(3600)),
+        });
+        let mut previous_stamp = Some(stamp_a);
+
+        let before = SourceState::Present(stamp_b);
+        prepare_kimi_worker(before, &mut previous, &mut previous_stamp, &source, &epoch);
+
+        let concurrent_read =
+            current_kimi_weekly_with_state(&source, &epoch, &enabled, now, instant, || {
+                SourceState::Transient { credential: None }
+            });
+        assert!(concurrent_read.is_none());
+        assert!(source.lock().unwrap().snapshot.is_none());
+        assert!(previous.is_none());
+    }
+
+    #[test]
+    fn kimi_reader_invalidation_during_poll_prevents_worker_from_repopulating_old_sample() {
+        use crate::quota_kimi::{Outcome, SourceState, WeeklyUsage};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::new(Some(KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 15.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(3600),
+            observed: instant,
+        })));
+        let epoch = AtomicU64::new(0);
+
+        let mut previous = Some(model::WeeklySample {
+            used_percent: 15.0,
+            resets_at: Some(now + Duration::from_secs(3600)),
+        });
+        let mut previous_stamp = Some(stamp_a);
+        let mut last_success = Some(instant);
+
+        let epoch_before = prepare_kimi_worker(
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &cache,
+            &epoch,
+        );
+        assert_eq!(epoch_before, 0);
+
+        let reader_result =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+        assert!(reader_result.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+        assert!(epoch.load(Ordering::SeqCst) > epoch_before);
+
+        let worker_sample = step_kimi_worker(
+            SourceState::Present(stamp_a),
+            Outcome::Weekly(WeeklyUsage {
+                used_percent: 20.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            }),
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &mut last_success,
+            &cache,
+            &epoch,
+            epoch_before,
+            Some(now + Duration::from_secs(3600)),
+            now,
+            instant,
+        );
+        assert!(worker_sample.is_none());
+        assert!(previous.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        let next_reader =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Transient { credential: None }
+            });
+        assert!(next_reader.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn kimi_reader_source_change_with_empty_cache_increments_epoch_and_avoids_starvation() {
+        use crate::quota_kimi::{Outcome, SourceState, WeeklyUsage};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::default());
+        let epoch = AtomicU64::new(0);
+
+        let mut previous = None;
+        let mut previous_stamp = None;
+        let mut last_success = None;
+
+        let epoch_before = prepare_kimi_worker(
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &cache,
+            &epoch,
+        );
+
+        for _ in 0..5 {
+            let r = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_a)
+            });
+            assert!(r.is_none());
+            assert_eq!(epoch.load(Ordering::SeqCst), epoch_before);
+        }
+
+        let r = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_b)
+        });
+        assert!(r.is_none());
+        let epoch_after_switch = epoch.load(Ordering::SeqCst);
+        assert!(epoch_after_switch > epoch_before);
+
+        for _ in 0..5 {
+            let r = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+            assert!(r.is_none());
+            assert_eq!(epoch.load(Ordering::SeqCst), epoch_after_switch);
+        }
+
+        let worker_sample = step_kimi_worker(
+            SourceState::Present(stamp_a),
+            Outcome::Weekly(WeeklyUsage {
+                used_percent: 20.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            }),
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &mut last_success,
+            &cache,
+            &epoch,
+            epoch_before,
+            Some(now + Duration::from_secs(3600)),
+            now,
+            instant,
+        );
+        assert!(worker_sample.is_none());
+        assert!(previous.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        let next_reader =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Transient { credential: None }
+            });
+        assert!(next_reader.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn kimi_reader_records_switch_before_worker_prepare_and_transient_failure_keeps_cache_empty() {
+        use crate::quota_kimi::{Failure, Outcome, SourceState};
+        use std::sync::atomic::AtomicU64;
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::new(Some(KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 15.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(3600),
+            observed: instant,
+        })));
+        let epoch = AtomicU64::new(0);
+
+        let mut previous = Some(model::WeeklySample {
+            used_percent: 15.0,
+            resets_at: Some(now + Duration::from_secs(3600)),
+        });
+        let mut previous_stamp = Some(stamp_a);
+        let mut last_success = Some(instant);
+
+        let reader_result =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+        assert!(reader_result.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+        assert_eq!(cache.lock().unwrap().last_stamp, Some(stamp_b));
+        assert_eq!(
+            cache.lock().unwrap().last_state,
+            Some(SourceState::Present(stamp_b))
+        );
+
+        let epoch_before = prepare_kimi_worker(
+            SourceState::Present(stamp_b),
+            &mut previous,
+            &mut previous_stamp,
+            &cache,
+            &epoch,
+        );
+        assert!(
+            previous.is_none(),
+            "worker previous sample must be discarded on account switch"
+        );
+        assert_eq!(previous_stamp, Some(stamp_b));
+
+        let worker_sample = step_kimi_worker(
+            SourceState::Present(stamp_b),
+            Outcome::Unavailable(Failure::Transient),
+            SourceState::Present(stamp_b),
+            &mut previous,
+            &mut previous_stamp,
+            &mut last_success,
+            &cache,
+            &epoch,
+            epoch_before,
+            Some(now + Duration::from_secs(3600)),
+            now,
+            instant,
+        );
+
+        assert!(worker_sample.is_none());
+        assert!(previous.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        let next_reader =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+        assert!(next_reader.is_none());
+    }
+
+    #[test]
+    fn kimi_reader_selector_change_across_transient_failures_increments_epoch_and_avoids_starvation()
+     {
+        use crate::quota_kimi::{Outcome, SourceState, WeeklyUsage};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let credentials = home.join("credentials");
+        std::fs::create_dir_all(&credentials).unwrap();
+        let auth_file = credentials.join("kimi-code.json");
+        let config_file = home.join("config.toml");
+        std::fs::write(&auth_file, "same-token").unwrap();
+
+        let state_a = crate::quota_kimi::source_state(&auth_file);
+        let stamp_a = match state_a {
+            SourceState::Present(stamp) => stamp,
+            _ => panic!("expected Present for state_a"),
+        };
+        assert!(stamp_a.selector.is_none());
+
+        std::fs::write(&config_file, "selector = 1").unwrap();
+        let state_b = crate::quota_kimi::source_state(&auth_file);
+        let stamp_b = match state_b {
+            SourceState::Present(stamp) => stamp,
+            _ => panic!("expected Present for state_b"),
+        };
+        assert!(stamp_b.selector.is_some());
+        assert_eq!(stamp_a.credential, stamp_b.credential);
+        assert_ne!(stamp_a, stamp_b);
+
+        let state_transient = SourceState::Transient {
+            credential: Some(stamp_a.credential),
+        };
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::default());
+        let epoch = AtomicU64::new(0);
+
+        let mut previous = None;
+        let mut previous_stamp = None;
+        let mut last_success = None;
+
+        let epoch_before = prepare_kimi_worker(
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &cache,
+            &epoch,
+        );
+
+        let outcome = Outcome::Weekly(WeeklyUsage {
+            used_percent: 20.0,
+            resets_at: Some(now + Duration::from_secs(3600)),
+        });
+
+        let r1 = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            state_transient
+        });
+        assert!(r1.is_none());
+        assert_eq!(epoch.load(Ordering::SeqCst), epoch_before);
+
+        let r2 = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_b)
+        });
+        assert!(r2.is_none());
+        let epoch_after_switch = epoch.load(Ordering::SeqCst);
+        assert!(
+            epoch_after_switch > epoch_before,
+            "epoch must increment on selector change"
+        );
+
+        let r3 = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            state_transient
+        });
+        assert!(r3.is_none());
+        assert_eq!(epoch.load(Ordering::SeqCst), epoch_after_switch);
+
+        for _ in 0..5 {
+            let r = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+            assert!(r.is_none());
+            assert_eq!(epoch.load(Ordering::SeqCst), epoch_after_switch);
+        }
+
+        let worker_sample = step_kimi_worker(
+            SourceState::Present(stamp_a),
+            outcome,
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &mut last_success,
+            &cache,
+            &epoch,
+            epoch_before,
+            Some(now + Duration::from_secs(3600)),
+            now,
+            instant,
+        );
+        assert!(worker_sample.is_none());
+        assert!(previous.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        let next_reader =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                state_transient
+            });
+        assert!(next_reader.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+    }
+
+    #[test]
     fn disabled_kimi_never_checks_credential_stamp() {
         let now = SystemTime::now();
-        let cache = std::sync::Mutex::new(None);
+        let cache = std::sync::Mutex::new(KimiShared::default());
+        let epoch = std::sync::atomic::AtomicU64::new(0);
         for config in [
             Config::default(),
             Config {
@@ -2668,9 +3766,14 @@ mod tests {
             },
         ] {
             assert!(
-                current_kimi_weekly_with_stamp(&cache, &config, now, Instant::now(), || panic!(
-                    "credential path was checked"
-                ))
+                current_kimi_weekly_with_stamp(
+                    &cache,
+                    &epoch,
+                    &config,
+                    now,
+                    Instant::now(),
+                    || panic!("credential path was checked")
+                )
                 .is_none()
             );
         }
@@ -2775,7 +3878,7 @@ mod tests {
         publisher.codex_weekly = Some(workers.remove(0));
         publisher.grok_weekly = Some(workers.remove(0));
         publisher.kimi_weekly = Some(workers.remove(0));
-        *publisher.kimi_source.lock().unwrap() = Some(KimiSnapshot {
+        *publisher.kimi_source.lock().unwrap() = KimiShared::new(Some(KimiSnapshot {
             sample: model::WeeklySample {
                 used_percent: 10.0,
                 resets_at: Some(SystemTime::now() + Duration::from_secs(86400)),
@@ -2784,7 +3887,7 @@ mod tests {
                 .unwrap(),
             auth_expiry: SystemTime::now() + Duration::from_secs(86400),
             observed: Instant::now(),
-        });
+        }));
         publisher.set_shutdown(shutdown.clone());
         struct AssociatedReader;
         impl UsageReader for AssociatedReader {
