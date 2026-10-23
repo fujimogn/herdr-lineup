@@ -167,7 +167,7 @@ pub struct WorkspaceFairQueue {
 | Subsystem | File | Concrete Responsibilities |
 |---|---|---|
 | **Daemon Scheduler** | `src/publish.rs` | 1. Owns `WorkspaceFairQueue` and drives attempt-based rotation.<br>2. Computes `cycle_budget_deadline = Instant::now() + Duration::from_millis(1000)`.<br>3. Clamps query deadlines and skips spawning when budget is exhausted.<br>4. Tracks `HeadingCache.confirmed` and enforces 30s staleness fallback. |
-| **Downstream Cache & Identity** | `src/ship_time.rs` | 1. Executes mandatory `rev-parse` and `for-each-ref` on every cycle (§9).<br>2. Owns `BoundedRepositoryCache` (LRU max 64 entries).<br>3. Enforces that `$COMMON_DIR/refs/replace/` must be `Absent` for caching.<br>4. Enforces the 30s hard revalidation limit on cache hits.<br>5. Enforces pre/post query fingerprint matching ($F_{\text{pre}} == F_{\text{post}}$).<br>6. Returns typed `RepositoryObservation`. |
+| **Downstream Cache & Identity** | `src/ship_time.rs` | 1. Executes mandatory `rev-parse` and `for-each-ref` on every cycle, and a common-directory `rev-parse` on every hit (§9).<br>2. Owns `BoundedRepositoryCache` (LRU max 64 entries).<br>3. Enforces that `$COMMON_DIR/refs/replace/` must be `Absent` for caching.<br>4. Enforces the 30s hard revalidation limit on cache hits.<br>5. Enforces pre/post query fingerprint matching ($F_{\text{pre}} == F_{\text{post}}$).<br>6. Returns typed `RepositoryObservation`. |
 | **Process Lifecycle** | `src/ship_time.rs` | Unchanged: `git_output`, `GitChild`, `process_group(0)`, `waitid(WNOWAIT)`, `killpg(SIGKILL)`. |
 
 ### 6.2 In-Memory Capacity Bounds
@@ -183,8 +183,8 @@ The following 20 isolated fixture scenarios specify verification requirements in
 
 | Fixture ID | Test Scenario | Expected Outcome & Verified Invariant |
 |---|---|---|
-| **F-01** | Subdirectory `cwd` (`repo/src/deep`) | Cycle 1: 3 processes. Cycle 2: 2 processes (`rev-parse`, `for-each-ref`). Correct repository name resolved. |
-| **F-02** | Linked Worktree Sharing | 3 linked worktrees of 1 repo. Worktree 1 runs slow path; Worktrees 2 & 3 run 2 processes (`rev-parse`, `for-each-ref`) and hit downstream cache on identical `common_dir`. |
+| **F-01** | Subdirectory `cwd` (`repo/src/deep`) | Cycle 1: 3 processes. Cycle 2: 3 processes (`rev-parse` from cwd and from the common directory, `for-each-ref`; `worktree list` elided). Correct repository name resolved. |
+| **F-02** | Linked Worktree Sharing | 3 linked worktrees of 1 repo. Worktree 1 runs slow path; Worktrees 2 & 3 run 3 processes (both `rev-parse` checks, `for-each-ref`) and hit downstream cache on identical `common_dir`. |
 | **F-03** | Worktree Topology Addition | `git worktree add`. `$COMMON_DIR/worktrees/` mtime shifts -> triggers slow path `worktree list`. |
 | **F-04** | Loose Ref Update | `git update-ref refs/remotes/origin/main`. Loose ref mtime shifts -> triggers slow path `for-each-ref`. |
 | **F-05** | Packed-Refs Transition | `git pack-refs --all`. Loose ref deleted, `packed-refs` created. Both transitions detected atomically. |
@@ -212,7 +212,7 @@ The following 20 isolated fixture scenarios specify verification requirements in
 | Capability | Current Code (`96829df`) | Proposed Implementation (Pending) |
 |---|---|---|
 | `cwd` Identity & Security | Native Git in all 3 processes | Native Git preserved in mandatory `rev-parse` |
-| Subprocess Execution | 3 processes unconditionally per `cwd` | 2 processes (`rev-parse`, `for-each-ref`) per `cwd` on a downstream hit; `worktree list` elided (§9) |
+| Subprocess Execution | 3 processes unconditionally per `cwd` | 3 processes per `cwd` on a downstream hit: `worktree list` is replaced by a common-directory `rev-parse`; no process-count reduction is claimed (§9) |
 | Replacement Object Support | Verified via baseline unit test | Simple guard: `refs/replace` present -> uncacheable; dual query catches packed refs |
 | Downstream `common_dir` Cache | None | LRU max 64 entries in `ship_time.rs` with 30s hard revalidation limit |
 | Observation API | `RepositoryRead` enum only | `RepositoryObservation` struct with explicit `verified_at` timestamp |
@@ -228,7 +228,8 @@ The downstream cache in `src/ship_time.rs` implements this contract, narrowed by
 
 ### 9.1 Narrowed Cache Scope (Supersedes §1, §3, §4 Where They Differ)
 
-- **Only the `worktree list` result (main root and repository name) is cached.** Refs, timestamps, and object reads are never cached across cycles: `rev-parse` and `for-each-ref` run on every observation. A hit runs 2 Git children; a miss runs 3.
+- **Only the `worktree list` result (main root and repository name) is cached.** Refs, timestamps, and object reads are never cached across cycles: `rev-parse` and `for-each-ref` run on every observation.
+- **Common-directory refusal is checked natively on every hit.** `safe.directory` is decided per path, so a permitted workspace can run `rev-parse` and `for-each-ref` while `worktree list` from the common directory is refused (dubious ownership, exit 128). A hit therefore runs `git -C <common> rev-parse --path-format=absolute --git-common-dir` in place of `worktree list` and requires its canonical output to equal the cache key; refusal, unparsable output, or a mismatch discards the entry and returns `Complete(None)` without `verified_at`. A miss needs no extra probe because `worktree list` itself runs from the common directory. Both a hit and a miss run 3 Git children; the cache elides only `worktree list` and claims no process-count reduction.
 - A hit is returned only after `for-each-ref` succeeds and the whole compound fingerprint taken before the queries still matches after them, with the main root present and unchanged. Otherwise the entry is discarded and the result is `Complete(None)` without `verified_at`.
 - A failed `for-each-ref` (for example a missing or unreadable object, which makes Git exit non-zero) discards the entry and returns `Complete(None)` without `verified_at`. Only successful output without `refs/remotes/origin/main` (absent or broken ref) is an absence that keeps the name. This changes the previous behaviour for a ref to a missing object, which used to keep the name with `—`.
 - A hit's `verified_at` is the cached root's original verification instant (the older of root and ref verification), so a hit never extends the 30 s age; only a full `worktree list` read verifies the root again. Uncached successes report `now`; interruptions report `None` and change no entry.
@@ -252,4 +253,4 @@ The downstream cache in `src/ship_time.rs` implements this contract, narrowed by
 
 ### 9.4 Fixture Coverage
 
-`src/ship_time.rs` tests cover the API side of F-01 to F-12 and F-19 with full-query (`worktree list`) counts and verification instants. For F-13 they cover only the API part (uncached successes report fresh `verified_at`); the 40 s / 45 s publication fallback is not wired and remains for the wiring task. Further fixtures cover configuration change and include, refusal clearing all entries, unsupported repository format, re-initialization at the same path (ABA), loose, packed, unreadable, and alternate-target object loss after a warm entry, a ref to a missing object, inaccessible dependencies, a dependency change after the fingerprint during both a hit and a full read, interruption by the caller deadline and after a completed full query, main root rename, and LRU eviction. Each guard was mutated once to confirm that at least one test fails; the `files` format check and the `reftable/` stat fail only when both are removed, and the main root stat cannot be isolated by a fixture.
+`src/ship_time.rs` tests cover common-directory refusal hidden behind a permitted workspace (isolated global configuration and a test-only Git environment seam using `GIT_TEST_ASSUME_DIFFERENT_OWNER`, which production sanitizing drops; no user configuration or ownership is changed), and the API side of F-01 to F-12 and F-19 with full-query (`worktree list`) counts and verification instants. For F-13 they cover only the API part (uncached successes report fresh `verified_at`); the 40 s / 45 s publication fallback is not wired and remains for the wiring task. Further fixtures cover configuration change and include, refusal clearing all entries, unsupported repository format, re-initialization at the same path (ABA), loose, packed, unreadable, and alternate-target object loss after a warm entry, a ref to a missing object, inaccessible dependencies, a dependency change after the fingerprint during both a hit and a full read, interruption by the caller deadline and after a completed full query, main root rename, and LRU eviction. Each guard was mutated once to confirm that at least one test fails; the `files` format check and the `reftable/` stat fail only when both are removed, and the main root stat cannot be isolated by a fixture.

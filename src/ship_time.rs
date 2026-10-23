@@ -153,10 +153,11 @@ struct CachedRepository {
 
 /// Downstream heading cache keyed by canonical Git common directory. Every
 /// observation runs `rev-parse` natively for identity, ownership and
-/// repository-format checks and `for-each-ref` for the ship time; only
-/// `worktree list` is elided while the compound fingerprint matches before
-/// and after the queries and the entry is fresh (two children on a hit,
-/// three on a miss).
+/// repository-format checks and `for-each-ref` for the ship time. A hit
+/// replaces `worktree list` with a native `rev-parse` from the common
+/// directory, so both run three children; only `worktree list` is elided,
+/// and only while the compound fingerprint matches before and after the
+/// queries and the entry is fresh.
 #[derive(Default)]
 pub(crate) struct RepositoryCache {
     entries: HashMap<PathBuf, CachedRepository>,
@@ -365,8 +366,22 @@ impl RepositoryCache {
                 && entry.fingerprint == before
                 && now.saturating_duration_since(entry.verified_at) < VERIFIED_TTL
         });
-        let (root, name) = match cached {
-            Some(entry) => (entry.root.clone(), None),
+        let (root, name) = match cached.map(|entry| entry.root.clone()) {
+            Some(root) => {
+                // safe.directory is decided per path: a permitted workspace
+                // does not permit the common directory that worktree list
+                // reads. Repeat that native refusal check instead of letting
+                // the cache hide it.
+                let identity = output(
+                    &common,
+                    &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                )
+                .and_then(|value| Path::new(value.strip_suffix('\n')?).canonicalize().ok());
+                if identity.as_ref() != Some(&common) {
+                    return Outcome::Discard(common);
+                }
+                (root, None)
+            }
             None => {
                 #[cfg(test)]
                 {
@@ -504,6 +519,10 @@ fn git_command(cwd: &Path) -> Command {
     command
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_ALLOW_PROTOCOL", "");
+    #[cfg(test)]
+    tests::TEST_GIT_ENV.with_borrow(|env| {
+        command.envs(env.iter().map(|(key, value)| (key, value)));
+    });
     command
 }
 
@@ -1309,6 +1328,67 @@ mod tests {
         assert!(status.success());
         let repo = read_repository(&newline_repo).expect("must parse repo path with newlines");
         assert_eq!(repo.name, "repo\nwith\nnewline");
+    }
+
+    thread_local! {
+        /// Test-only environment for production Git children on this thread;
+        /// production sanitizing would drop these variables otherwise.
+        pub(super) static TEST_GIT_ENV: std::cell::RefCell<Vec<(String, std::ffi::OsString)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    // Clears the injected Git environment even when an assertion panics.
+    struct GitEnvGuard;
+
+    impl GitEnvGuard {
+        fn set(env: Vec<(String, std::ffi::OsString)>) -> Self {
+            TEST_GIT_ENV.set(env);
+            Self
+        }
+    }
+
+    impl Drop for GitEnvGuard {
+        fn drop(&mut self) {
+            TEST_GIT_ENV.take();
+        }
+    }
+
+    #[test]
+    fn common_directory_refusal_is_not_hidden_by_a_cache_hit() {
+        let fixture = Fixture::with_origin_main();
+        let linked = fixture.linked("permitted-linked").canonicalize().unwrap();
+        let global = fixture.root.join("isolated-global.cfg");
+        let permit = |paths: &[&Path]| {
+            let lines: String = paths
+                .iter()
+                .map(|path| format!("\tdirectory = {}\n", path.display()))
+                .collect();
+            std::fs::write(&global, format!("[safe]\n{lines}")).unwrap();
+        };
+        // Every repository is foreign-owned; only listed paths are safe.
+        let _env = GitEnvGuard::set(vec![
+            ("GIT_TEST_ASSUME_DIFFERENT_OWNER".to_owned(), "1".into()),
+            ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".into()),
+            ("GIT_CONFIG_GLOBAL".to_owned(), global.clone().into()),
+        ]);
+        let common = fixture.common();
+        permit(&[&linked, &common]);
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        assert_eq!(ship(&observe(&mut cache, &linked, t0)), Some(DAY_ONE));
+        assert_eq!(ship(&observe(&mut cache, &linked, t0)), Some(DAY_ONE));
+        assert_eq!(cache.full_queries, 1);
+        // Withdrawing only the common directory keeps workspace queries
+        // working while worktree list would be refused.
+        permit(&[&linked]);
+        assert!(is_unverified_absence(&observe(&mut cache, &linked, t0)));
+        assert!(cache.entries.is_empty());
+        assert!(is_unverified_absence(&observe(&mut cache, &linked, t0)));
+        assert_eq!(cache.full_queries, 2, "a miss is refused by worktree list");
+        permit(&[&linked, &common]);
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(observe(&mut cache, &linked, t1).verified_at, Some(t1));
+        assert_eq!(cache.full_queries, 3);
     }
 
     // Cache fixtures inject the verification clock; Git children still run
