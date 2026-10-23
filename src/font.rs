@@ -357,7 +357,13 @@ fn apply_with(
     let mut changed_paths = Vec::new();
     let result: io::Result<()> = (|| {
         if removing {
-            for (path, text) in &changes {
+            for ((path, text), (_, original)) in changes.iter().zip(&originals) {
+                if &fs::read(path)? != original {
+                    return Err(conflict(&format!(
+                        "Configuration file was modified concurrently at {}; leaving it unchanged",
+                        path.display()
+                    )));
+                }
                 writer(path, text.as_bytes())?;
                 changed_paths.push(path.clone());
             }
@@ -401,7 +407,13 @@ fn apply_with(
                 file.sync_all()?;
                 changed_paths.push(locations.font.clone());
             }
-            for (path, text) in &changes {
+            for ((path, text), (_, original)) in changes.iter().zip(&originals) {
+                if &fs::read(path)? != original {
+                    return Err(conflict(&format!(
+                        "Configuration file was modified concurrently at {}; leaving it unchanged",
+                        path.display()
+                    )));
+                }
                 writer(path, text.as_bytes())?;
                 changed_paths.push(path.clone());
             }
@@ -411,28 +423,33 @@ fn apply_with(
     if let Err(error) = result {
         let mut failures = Vec::new();
         for (path, bytes) in originals.iter().rev() {
-            if let Err(rollback) = write_atomic(path, bytes) {
+            if changed_paths.contains(path)
+                && let Err(rollback) = write_atomic(path, bytes)
+            {
                 failures.push(rollback.to_string());
             }
         }
-        if font_existed && !locations.font.exists() {
+        if font_existed && !locations.font.exists() && changed_paths.contains(&locations.font) {
             if let Err(rollback) = write_atomic(&locations.font, FONT) {
                 failures.push(rollback.to_string());
             }
         } else if created_font
             && locations.font.exists()
+            && changed_paths.contains(&locations.font)
             && let Err(rollback) = fs::remove_file(&locations.font)
         {
             failures.push(rollback.to_string());
         }
-        if let Some(bytes) = old_journal {
-            if let Err(rollback) = write_atomic(&journal, &bytes) {
+        if changed_paths.contains(&journal) && failures.is_empty() {
+            if let Some(bytes) = old_journal {
+                if let Err(rollback) = write_atomic(&journal, &bytes) {
+                    failures.push(rollback.to_string());
+                }
+            } else if journal.exists()
+                && let Err(rollback) = fs::remove_file(&journal)
+            {
                 failures.push(rollback.to_string());
             }
-        } else if journal.exists()
-            && let Err(rollback) = fs::remove_file(&journal)
-        {
-            failures.push(rollback.to_string());
         }
         return Err(conflict(&format!(
             "Font action failed: {error}; rollback errors: {failures:?}"
@@ -1036,6 +1053,80 @@ mod tests {
         assert_eq!(fs::read(&ghostty).unwrap(), before);
         assert!(locations.font.exists());
         uninstall(&locations).unwrap();
+    }
+
+    #[test]
+    fn concurrent_external_edit_before_write_is_preserved_and_recovers() {
+        for removing in [false, true] {
+            let (_root, locations) = fixture();
+            let ghostty = locations.config.join("ghostty/config");
+            let kitty = locations.config.join("kitty/kitty.conf");
+            for path in [&ghostty, &kitty] {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "# original\n").unwrap();
+            }
+            if removing {
+                install(&locations).unwrap();
+            }
+            let external_edit = "# concurrent external edit\n";
+            let mut writes = 0;
+            let result = apply_with(&locations, removing, |path, bytes| {
+                writes += 1;
+                if path == kitty {
+                    // While writing kitty, simulate a concurrent edit to ghostty
+                    // right before its write phase.
+                    let current = fs::read_to_string(&ghostty).unwrap();
+                    fs::write(&ghostty, format!("{current}{external_edit}")).unwrap();
+                }
+                write_atomic(path, bytes)
+            });
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains(&ghostty.display().to_string()),
+                "error message should identify conflicting path: {err_msg}"
+            );
+
+            // 1. External edit bytes are preserved and not overwritten.
+            let ghostty_content = fs::read_to_string(&ghostty).unwrap();
+            assert!(
+                ghostty_content.contains(external_edit),
+                "external edit must be preserved: {ghostty_content}"
+            );
+
+            // 2. The first file was rolled back (only modified files rolled back).
+            if removing {
+                // In uninstall, kitty had its block removed, then rolled back to include START block.
+                assert!(fs::read_to_string(&kitty).unwrap().contains(START));
+                // Font was not removed because action failed before font deletion.
+                assert!(locations.font.exists());
+                // Can recover from journal: uninstall succeeds and retains external edit.
+                uninstall(&locations).unwrap();
+                assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
+                assert_eq!(
+                    fs::read_to_string(&ghostty).unwrap(),
+                    format!("# original\n{external_edit}")
+                );
+                assert!(!locations.font.exists());
+            } else {
+                // In install, kitty had block added, then rolled back to original.
+                assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
+                // Font was rolled back.
+                assert!(!locations.font.exists());
+                // Can recover: subsequent install succeeds, preserving external edit.
+                install(&locations).unwrap();
+                assert!(fs::read_to_string(&kitty).unwrap().contains(START));
+                let ghostty_after = fs::read_to_string(&ghostty).unwrap();
+                assert!(ghostty_after.contains(external_edit));
+                assert!(ghostty_after.contains(START));
+                uninstall(&locations).unwrap();
+                assert_eq!(fs::read_to_string(&kitty).unwrap(), "# original\n");
+                assert_eq!(
+                    fs::read_to_string(&ghostty).unwrap(),
+                    format!("# original\n{external_edit}")
+                );
+            }
+        }
     }
 
     #[test]
