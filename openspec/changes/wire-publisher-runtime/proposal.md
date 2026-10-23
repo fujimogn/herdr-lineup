@@ -46,7 +46,8 @@ None.
 
 ## Impact
 
-`src/publish.rs` and `src/daemon.rs` only. No on-disk format changes: the
+`src/publish.rs`, `src/daemon.rs` and `src/doctor.rs`. No on-disk format changes: the
 sequence checkpoint is untouched and queues, heading states and stage values
 are memory-only. The clear path keeps its own three-second deadline. Reader
-diagnostics stay unexposed until a later doctor task.
+diagnostics are exposed as optional advisory control data and fixed doctor text,
+with one live sample per response and health-preserving 8 KiB frame fallback.

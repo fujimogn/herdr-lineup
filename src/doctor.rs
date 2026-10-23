@@ -401,8 +401,74 @@ fn stage_metrics_line(label: &str, stats: &crate::daemon::StageDurationStats) ->
     )
 }
 
+fn reader_metrics_report(readers: Option<&crate::daemon::ReaderDiagnosticsData>) -> String {
+    use crate::daemon::{READER_LABELS, ReaderEntry};
+    let Some(readers) = readers else {
+        return "Reader diagnostics: unavailable".to_owned();
+    };
+    let mut text = "Reader diagnostics: live best-effort; sampled during control request; providers nontransactional; refresh metrics describe completed attempts".to_owned();
+    text.push_str(
+        "; counters advisory and saturating; zero attempts means no observed bounded calls",
+    );
+    for label in READER_LABELS {
+        let line = match readers.providers.get(label) {
+            Some(ReaderEntry::Available { sample: s }) => {
+                let wait = if s.caller_wait_count == 0 {
+                    "wait unmeasured".to_owned()
+                } else {
+                    format!(
+                        "wait count {}; total {} ns; max {} ns",
+                        s.caller_wait_count, s.caller_wait_total_ns, s.caller_wait_max_ns
+                    )
+                };
+                format!(
+                    "attempts {} count; busy {} count; deadline {} count; shutdown {} count; spawn failures {} count; worker failures {} count; completed {} count; invalid {} count; {wait}; sampling skips {} count; worker active {}; timed-out worker active {}; shutdown worker active {}",
+                    s.attempts,
+                    s.busy_rejections,
+                    s.deadline_ends,
+                    s.shutdown_ends,
+                    s.spawn_failures,
+                    s.worker_failures,
+                    s.completed,
+                    s.invalid,
+                    s.sampling_skips,
+                    s.worker_active,
+                    s.timed_out_worker_active,
+                    s.shutdown_worker_active
+                )
+            }
+            Some(ReaderEntry::Contended) => "unavailable (contended)".to_owned(),
+            Some(ReaderEntry::Poisoned) => "unavailable (poisoned)".to_owned(),
+            Some(ReaderEntry::Incomplete) => "unavailable (incomplete)".to_owned(),
+            _ => "unavailable".to_owned(),
+        };
+        let note = if label == "hermes" {
+            "; no bounded worker; empty slot is not a read measurement"
+        } else {
+            ""
+        };
+        text.push_str(&format!("\nReader {label}: {line}{note}"));
+    }
+    text
+}
+
+fn deadline_metrics_report(skips: Option<&crate::daemon::DeadlineSkipObservation>) -> String {
+    match skips {
+        None => "Refresh deadline skips: unavailable".to_owned(),
+        Some(s) => format!(
+            "Refresh deadline skips: {} attempts count; latest deadline-skip attempt resources: deadline {} count; capacity {} count; retained across later attempts",
+            s.attempt_count, s.last_deadline_skipped, s.last_capacity_skipped
+        ),
+    }
+}
+
 fn daemon_diagnostic_text(view: &ControlView) -> Result<String, (String, io::Error)> {
-    let metrics = refresh_metrics_report(view.observation.as_ref());
+    let metrics = format!(
+        "{}\n{}\n{}",
+        refresh_metrics_report(view.observation.as_ref()),
+        deadline_metrics_report(view.deadline_skips.as_ref()),
+        reader_metrics_report(view.reader_diagnostics.as_ref())
+    );
     let last_refresh_ms = match refresh_diagnostic(&view.health) {
         Ok(last_refresh_ms) => last_refresh_ms,
         Err(error) => return Err((metrics, error)),
@@ -1092,6 +1158,8 @@ Refresh counts: reports 2; checkpoints 1"
         let failed = daemon_diagnostic_text(&ControlView {
             health: health.clone(),
             observation: Some(observation.clone()),
+            deadline_skips: None,
+            reader_diagnostics: None,
         })
         .unwrap_err();
         assert_eq!(failed.1.to_string(), "daemon refresh is unhealthy");
@@ -1106,6 +1174,8 @@ Refresh counts: reports 2; checkpoints 1"
         let starting = daemon_diagnostic_text(&ControlView {
             health: health.clone(),
             observation: None,
+            deadline_skips: None,
+            reader_diagnostics: None,
         })
         .unwrap_err();
         assert!(
@@ -1120,11 +1190,78 @@ Refresh counts: reports 2; checkpoints 1"
         let ready = daemon_diagnostic_text(&ControlView {
             health,
             observation: Some(observation),
+            deadline_skips: None,
+            reader_diagnostics: None,
         })
         .unwrap();
         let metrics_at = ready.find("Refresh duration").unwrap();
         let uptime_at = ready.find("last refresh 9 ms after startup").unwrap();
         assert!(metrics_at < uptime_at);
         assert!(ready.contains("Metadata capacity exhausted: 1 resource skipped"));
+    }
+    #[test]
+    fn reader_unavailable_is_printed_before_first_refresh_error() {
+        let raw = serde_json::json!({
+            "plugin": "herdr-lineup", "socket_path": "/fixture.sock",
+            "socket_key": "fixture", "endpoint": {"device": 1, "inode": 2},
+            "nonce": "synthetic", "pid": 7, "last_refresh_ms": null,
+            "refresh_failed": false
+        });
+        let view =
+            crate::daemon::control_view_from_frame(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        let (text, error) = daemon_diagnostic_text(&view).unwrap_err();
+        assert!(text.contains("Reader diagnostics: unavailable"));
+        assert!(text.contains("Refresh deadline skips: unavailable"));
+        assert!(error.to_string().contains("first refresh"));
+    }
+    // Formatting must never copy arbitrary wire labels or claim an unmeasured wait is zero.
+    #[test]
+    fn reader_doctor_uses_fixed_labels_units_and_retained_deadline_meaning() {
+        let raw = serde_json::json!({
+            "plugin":"herdr-lineup", "socket_path":"/never-display-path", "socket_key":"never-display-key",
+            "endpoint":{"device":1,"inode":2}, "nonce":"never-display-nonce", "pid":7,
+            "last_refresh_ms":null, "refresh_failed":true,
+            "refresh_deadline_skips":{"attempt_count":3,"last_deadline_skipped":4,"last_capacity_skipped":2},
+            "reader_diagnostics":{"version":1,"sampling":"live_best_effort","providers":{
+                "claude":{"status":"available","sample":{
+                    "attempts":0,"busy_rejections":0,"deadline_ends":0,"shutdown_ends":0,
+                    "spawn_failures":0,"worker_failures":0,"completed":0,"invalid":0,
+                    "caller_wait_count":0,"caller_wait_total_ns":0,"caller_wait_max_ns":0,"sampling_skips":0,
+                    "worker_active":false,"timed_out_worker_active":false,"shutdown_worker_active":false}},
+                "agy":{"status":"contended"},"codex":{"status":"poisoned"},"grok":{"status":"incomplete"},
+                "hermes":{"status":"arbitrary-secret"},"arbitrary-secret-label":{"status":"incomplete"}
+            }}
+        });
+        let mut raw = raw;
+        let mut measured = raw["reader_diagnostics"]["providers"]["claude"].clone();
+        measured["sample"]["caller_wait_count"] = serde_json::json!(u64::MAX);
+        measured["sample"]["caller_wait_total_ns"] = serde_json::json!(u64::MAX);
+        raw["reader_diagnostics"]["providers"]["kimi"] = measured;
+        let view =
+            crate::daemon::control_view_from_frame(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        let (text, error) = daemon_diagnostic_text(&view).unwrap_err();
+        assert_eq!(error.to_string(), "daemon refresh is unhealthy");
+        assert!(text.contains("live best-effort") && text.contains("providers nontransactional"));
+        assert!(text.contains("refresh metrics describe completed attempts"));
+        assert!(text.contains("Reader claude: attempts 0 count;"));
+        assert!(text.contains("wait unmeasured"));
+        assert!(
+            text.contains(
+                "wait count 18446744073709551615; total 18446744073709551615 ns; max 0 ns"
+            )
+        );
+        assert!(text.contains("Reader agy: unavailable (contended)"));
+        assert!(text.contains("Reader codex: unavailable (poisoned)"));
+        assert!(text.contains("Reader grok: unavailable (incomplete)"));
+        assert!(text.contains("Reader hermes: unavailable; no bounded worker"));
+        assert!(text.contains("latest deadline-skip attempt resources: deadline 4 count; capacity 2 count; retained across later attempts"));
+        assert!(!text.contains("never-display") && !text.contains("arbitrary-secret"));
+        let zero = crate::daemon::DeadlineSkipObservation {
+            attempt_count: 0,
+            last_deadline_skipped: 0,
+            last_capacity_skipped: 0,
+        };
+        assert!(deadline_metrics_report(Some(&zero)).contains("0 attempts count"));
+        assert!(deadline_metrics_report(None).contains("unavailable"));
     }
 }

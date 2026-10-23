@@ -629,6 +629,23 @@ impl ReaderDiagnostics {
     }
 }
 
+// Synthetic source state for sibling control/doctor boundary tests only.
+#[cfg(test)]
+impl ReaderDiagnostics {
+    pub(crate) fn test_with_slot(&self, provider: Provider, run: impl FnOnce()) {
+        let _guard = self.slots[Self::index(provider)].lock().unwrap();
+        run();
+    }
+
+    pub(crate) fn test_seed(&self, provider: Provider, sample: ReaderSnapshot) {
+        self.slots[Self::index(provider)].lock().unwrap().totals = sample;
+    }
+
+    pub(crate) fn test_unknown(&self, provider: Provider) {
+        self.unknown_worker[Self::index(provider)].store(true, Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 struct ReaderObservation {
     diagnostics: std::sync::Arc<ReaderDiagnostics>,
