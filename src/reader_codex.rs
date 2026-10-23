@@ -32,10 +32,10 @@ impl UsageReader for CodexReader {
         {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
-        let cycle = cycle.clone();
-        bounded_read(request, source, &BUSY, move |request| {
+        let worker_cycle = cycle.clone();
+        let job = move |request: &ReadRequest<'_>| {
             let started = std::time::Instant::now();
-            match read_session_in_cycle(request, &cycle) {
+            match read_session_in_cycle(request, &worker_cycle) {
                 Ok((percent, time)) => {
                     let evaluated = ReadRequest {
                         now: request.now_after(started),
@@ -45,7 +45,11 @@ impl UsageReader for CodexReader {
                 }
                 Err(reason) => UsageReading::missing(request, source, reason),
             }
-        })
+        };
+        match cycle.diagnostics() {
+            Some(diagnostics) => bounded_read_observed(request, source, &BUSY, diagnostics, job),
+            None => bounded_read(request, source, &BUSY, job),
+        }
     }
 }
 fn rollout(path: &Path) -> bool {
@@ -342,6 +346,113 @@ fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Obse
 }
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+    #[test]
+    #[ignore = "run alone: discovery ancestor stamps must not race unrelated fixtures"]
+    fn diagnostic_routing_isolated() {
+        const CHILD: &str = "HERDR_LINEUP_CODEX_ROUTING_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("codex") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reader_codex::tests::diagnostic_routing_isolated",
+                    "--nocapture",
+                    "--ignored",
+                ])
+                .env(CHILD, "codex")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostics = std::sync::Arc::new(ReaderDiagnostics::default());
+        let cycle = ReadCycle::with_diagnostics(diagnostics.clone());
+        let plain = ReadCycle::new();
+        let mut first = identity(Provider::Codex);
+        first.repository_identity = "/synthetic/repo".into();
+        let mut second = first.clone();
+        second.native_session_id = "session-2".into();
+        let base = request(&first, dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        for id in [&first, &second] {
+            let text = format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"total_tokens\":26000}},\"model_context_window\":212000}}}}}}\n",
+                id.native_session_id
+            );
+            std::fs::write(
+                dir.path()
+                    .join(format!("sessions/rollout-{}.jsonl", id.native_session_id)),
+                text,
+            )
+            .unwrap();
+        }
+        // Separate pane identities share this refresh's discovery owner.
+        for id in [&first, &second] {
+            let r = request(id, dir.path());
+            assert_routing_sample(CodexReader.read_in_cycle(&r, &cycle).context);
+            wait_for_routing_worker();
+        }
+        assert_eq!(cycle.discovery_scan_count(), 1);
+        let snapshot = diagnostics.snapshot(Provider::Codex).unwrap();
+        assert_eq!((snapshot.attempts, snapshot.completed), (2, 2));
+        assert_eq!(snapshot.busy_rejections, 0);
+        assert!(!snapshot.worker_active);
+        for id in [&first, &second] {
+            assert_routing_sample(
+                CodexReader
+                    .read_in_cycle(&request(id, dir.path()), &plain)
+                    .context,
+            );
+            wait_for_routing_worker();
+        }
+        assert_eq!(plain.discovery_scan_count(), 1);
+        assert_routing_sample(CodexReader.read(&base).context);
+        wait_for_routing_worker();
+        assert_eq!(diagnostics.snapshot(Provider::Codex).unwrap().attempts, 2);
+
+        // Rejection before bounded_read starts has no diagnostic attempt.
+        let mut unassociated = first.clone();
+        unassociated.provider = Provider::Hermes;
+        assert_eq!(
+            CodexReader
+                .read_in_cycle(&request(&unassociated, dir.path()), &cycle)
+                .context,
+            UsageOutcome::Unavailable(MissingReason::Unassociated)
+        );
+        assert_eq!(diagnostics.snapshot(Provider::Codex).unwrap().attempts, 2);
+        // Invalid timeout is detected inside bounded_read, so it is counted.
+        let invalid = ReadRequest {
+            timeout: Duration::MAX,
+            ..base
+        };
+        assert_eq!(
+            CodexReader.read_in_cycle(&invalid, &cycle).context,
+            UsageOutcome::Unavailable(MissingReason::Invalid)
+        );
+        let snapshot = diagnostics.snapshot(Provider::Codex).unwrap();
+        assert_eq!(
+            (snapshot.attempts, snapshot.completed, snapshot.invalid),
+            (3, 2, 1)
+        );
+        assert_eq!(snapshot.sampling_skips, 0);
+    }
+
+    fn assert_routing_sample(outcome: UsageOutcome) {
+        let UsageOutcome::Available(percent) = outcome else {
+            panic!("expected available context: {outcome:?}");
+        };
+        assert!((percent - 7.0).abs() < 1e-9);
+    }
+
+    fn wait_for_routing_worker() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while BUSY.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn typed_tail_ignores_valid_non_objects_and_rejects_completed_corruption() {
         let dir = tempfile::tempdir().unwrap();

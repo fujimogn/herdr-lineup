@@ -213,6 +213,11 @@ impl Discovery {
 }
 
 impl ReadCycle {
+    #[cfg(test)]
+    pub(crate) fn discovery_scan_count(&self) -> usize {
+        self.scans.load(Ordering::Relaxed)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
