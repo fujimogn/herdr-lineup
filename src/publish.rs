@@ -280,9 +280,22 @@ pub struct MetadataPublisher {
     codex_control: Arc<crate::quota_codex::QueryControl>,
     headings: BTreeMap<String, HeadingCache>,
     local_readings: BTreeMap<String, model::UsageReading>,
-    /// Successful `sequences.json` writes. Tests assert one write per report.
+    /// Successful `sequences.json` writes. Tests assert one write per window.
     #[cfg(test)]
     checkpoint_persists: std::sync::atomic::AtomicU64,
+    /// One-shot fault injected into the next `persist()`.
+    #[cfg(test)]
+    persist_fault: Option<PersistFault>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistFault {
+    /// The temporary file cannot be created or written.
+    BeforeWrite,
+    /// The rename succeeded but the directory sync failed, leaving durability
+    /// of the new checkpoint uncertain.
+    AfterRename,
 }
 impl MetadataPublisher {
     /// Construction performs no state I/O. The daemon acquires its session lock
@@ -315,6 +328,8 @@ impl MetadataPublisher {
             local_readings: BTreeMap::new(),
             #[cfg(test)]
             checkpoint_persists: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            persist_fault: None,
         })
     }
 
@@ -567,12 +582,23 @@ impl MetadataPublisher {
             }
             Err(_) => return Err(io::Error::other("cannot read sequence checkpoint")),
         };
-        self.planner = tokens::Publisher::restore_with_floors(checkpoint.0, checkpoint.1);
+        self.planner = tokens::Publisher::restore_with_bounds(checkpoint.0, checkpoint.1);
         self.checkpoint_loaded = true;
         Ok(())
     }
 
-    fn persist(&self) -> io::Result<()> {
+    /// Write the per-resource cursors and the per-endpoint durable upper bound.
+    /// Both fsyncs stay: the bound is the only thing standing between a crash
+    /// and a reused sequence. Success clears the planner's pending flag; any
+    /// failure leaves it set so no report is sent from an uncertain window.
+    fn persist(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            if self.persist_fault == Some(PersistFault::BeforeWrite) {
+                self.persist_fault = None;
+                return Err(io::Error::other("injected checkpoint write failure"));
+            }
+        }
         let mut rows: Vec<_> = self
             .planner
             .checkpoint()
@@ -590,7 +616,7 @@ impl MetadataPublisher {
             .collect();
         rows.extend(
             self.planner
-                .checkpoint_floors()
+                .checkpoint_bounds()
                 .into_iter()
                 .map(|(endpoint, seq)| CheckpointRow {
                     endpoint,
@@ -605,7 +631,15 @@ impl MetadataPublisher {
         file.as_file().sync_all()?;
         file.persist(self.directory.join("sequences.json"))
             .map_err(|_| io::Error::other("cannot persist sequence checkpoint"))?;
+        #[cfg(test)]
+        {
+            if self.persist_fault == Some(PersistFault::AfterRename) {
+                self.persist_fault = None;
+                return Err(io::Error::other("injected directory sync failure"));
+            }
+        }
         File::open(&self.directory)?.sync_all()?;
+        self.planner.checkpoint_persisted();
         #[cfg(test)]
         {
             let _ = self.checkpoint_persists.fetch_add(1, Ordering::Relaxed);
@@ -636,8 +670,13 @@ impl MetadataPublisher {
         }
         self.endpoint = Some(endpoint);
         let (id, response) = self.request(transport, "session.snapshot")?;
-        protocol::parse_snapshot(&id, &response)
-            .map_err(|_| io::Error::other("invalid snapshot response"))
+        let snapshot = protocol::parse_snapshot(&id, &response)
+            .map_err(|_| io::Error::other("invalid snapshot response"))?;
+        // One reservation window covers every report this snapshot can produce.
+        let panes = snapshot.panes.len();
+        self.planner
+            .set_window(panes.saturating_add(snapshot.workspaces.len()));
+        Ok(snapshot)
     }
 
     fn resource(&self, kind: ResourceKind, id: &str) -> ResourceId {
@@ -689,9 +728,15 @@ impl MetadataPublisher {
         else {
             return Ok(());
         };
-        // Reserve durably BEFORE the first byte can reach Herdr. Even an ambiguous
-        // response burns this seq; retry/restart must use a strictly newer one.
-        self.persist()?;
+        // Reserve durably BEFORE the first byte can reach Herdr. The planner
+        // raised the endpoint's durable upper bound only when this seq left the
+        // persisted window; inside the window the checkpoint on disk already
+        // covers it. Even an ambiguous response burns this seq; retry/restart
+        // must use a strictly newer one. A failed or uncertain write keeps the
+        // pending flag set, so nothing is sent until a later persist succeeds.
+        if self.planner.checkpoint_pending() {
+            self.persist()?;
+        }
         self.request_seq = self
             .request_seq
             .checked_add(1)
@@ -717,9 +762,8 @@ impl MetadataPublisher {
         self.planner
             .acknowledge(&report, now_ms)
             .map_err(|_| io::Error::other("invalid metadata reservation"))?;
-        // `acknowledge` records acceptance only. `checkpoint()` is the high-water
-        // sequence already saved before the send, so another persist would
-        // rewrite the same bytes.
+        // `acknowledge` records acceptance only. The durable bound saved before
+        // the send already covers this seq, so no persist follows the reply.
         Ok(())
     }
 
@@ -1160,10 +1204,8 @@ impl daemon::Publisher for MetadataPublisher {
         Ok(())
     }
     fn reconnected(&mut self) {
-        self.planner = tokens::Publisher::restore_with_floors(
-            self.planner.checkpoint(),
-            self.planner.checkpoint_floors(),
-        );
+        // Keep cursors, bounds and any pending window; only cached values go.
+        self.planner.reconnected();
     }
 }
 
@@ -3385,8 +3427,12 @@ mod tests {
         assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 1);
         let reserved = std::fs::read(dir.path().join("sequences.json")).unwrap();
         let rows: Vec<CheckpointRow> = serde_json::from_slice(&reserved).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].seq, 1);
+        // Without a snapshot the window is one seq: cursor row plus the
+        // endpoint's durable upper bound, both at 1.
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].kind.as_str(), rows[0].seq), ("pane", 1));
+        assert_eq!((rows[1].kind.as_str(), rows[1].seq), ("endpoint", 1));
+        assert!(!publisher.planner.checkpoint_pending());
         // Acceptance does not move the high-water mark, so rewriting the
         // checkpoint after acknowledge stores the same bytes.
         publisher.persist().unwrap();
@@ -3496,8 +3542,157 @@ mod tests {
         let rows: Vec<CheckpointRow> =
             serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
                 .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].seq, 1);
+        // Nine panes and one workspace size the window: the first clear report
+        // reserved seq 1 and raised the endpoint bound to 10 before sending.
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].kind.as_str(), rows[0].seq), ("pane", 1));
+        assert_eq!((rows[1].kind.as_str(), rows[1].seq), ("endpoint", 10));
+    }
+
+    #[test]
+    fn persist_failure_fails_closed_until_a_later_checkpoint_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let request = receive(&mut stream);
+            writeln!(
+                stream.get_mut(),
+                "{}",
+                json!({"id": request["id"], "result": {"type": "ok"}})
+            )
+            .unwrap();
+            request
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let resource = ResourceId {
+            endpoint_session: "endpoint".into(),
+            kind: ResourceKind::Pane,
+            id: "w1:p1".into(),
+        };
+        let desired = BTreeMap::from([("lineup_agent".into(), Some("codex".into()))]);
+        let checkpoint = dir.path().join("sequences.json");
+        // A write failure leaves no checkpoint; a directory sync failure leaves
+        // a renamed file whose durability is unknown. Neither may send.
+        for fault in [PersistFault::BeforeWrite, PersistFault::AfterRename] {
+            publisher.persist_fault = Some(fault);
+            publisher
+                .report(
+                    &mut transport,
+                    &resource,
+                    &BTreeSet::new(),
+                    None,
+                    &desired,
+                    None,
+                )
+                .unwrap_err();
+            assert!(publisher.planner.checkpoint_pending());
+            assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 0);
+            assert_eq!(checkpoint.exists(), fault == PersistFault::AfterRename);
+        }
+        // The consumed seqs 1 and 2 are never reused; the next report persists
+        // bound 3 first and only then reaches the socket.
+        publisher
+            .report(
+                &mut transport,
+                &resource,
+                &BTreeSet::new(),
+                None,
+                &desired,
+                None,
+            )
+            .unwrap();
+        let sent = server.join().unwrap();
+        assert_eq!(sent["method"], "pane.report_metadata");
+        assert_eq!(sent["params"]["seq"], 3);
+        assert!(!publisher.planner.checkpoint_pending());
+        assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 1);
+        let rows: Vec<CheckpointRow> =
+            serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+        assert_eq!((rows[0].kind.as_str(), rows[0].seq), ("pane", 3));
+        assert_eq!((rows[1].kind.as_str(), rows[1].seq), ("endpoint", 3));
+    }
+
+    #[test]
+    fn window_amortizes_checkpoint_writes_across_refresh_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let server = token_server(UnixListener::bind(&socket).unwrap(), clock);
+        let mut transport = Transport::connect(&socket).unwrap();
+        let identity = transport.identity();
+        let endpoint = format!("fake:{}:{}", identity.device, identity.inode);
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let config = crate::config::Config::default();
+        let rows = || -> Vec<CheckpointRow> {
+            serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
+                .unwrap()
+        };
+        let bound = |rows: &[CheckpointRow]| {
+            rows.iter()
+                .find(|row| row.kind == "endpoint" && row.endpoint == endpoint)
+                .map(|row| row.seq)
+        };
+        // One pane and one workspace: the pane report opens a window of two and
+        // the workspace report fits inside it.
+        publisher
+            .refresh_with_readers(&mut transport, &config, &TimeoutReader, &TimeoutReader)
+            .unwrap();
+        assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 1);
+        assert_eq!(bound(&rows()), Some(2));
+        // Clearing uses the same allocator: both clears take seq 2 inside the
+        // window, so shutdown needs no further checkpoint write.
+        publisher.clear(&mut transport).unwrap();
+        assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 1);
+        assert_eq!(bound(&rows()), Some(2));
+        let pane = publisher.resource(ResourceKind::Pane, "w1:p1");
+        let workspace = publisher.resource(ResourceKind::Workspace, "w1");
+        assert_eq!(publisher.planner.checkpoint()[&pane], 2);
+        assert_eq!(publisher.planner.checkpoint()[&workspace], 2);
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        assert!(
+            response["result"]["snapshot"]["panes"][0]["tokens"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|key| !key.starts_with("lineup_"))
+        );
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+        // The on-disk cursors are stale but the bound covers every sent seq, so
+        // a restart continues strictly above it for both resources.
+        let mut restarted =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        restarted.load_checkpoint().unwrap();
+        assert_eq!(restarted.planner.checkpoint_bounds()[&endpoint], 2);
+        for resource in [pane, workspace] {
+            let key = match resource.kind {
+                ResourceKind::Pane => "lineup_agent",
+                ResourceKind::Workspace => "lineup_repo",
+            };
+            let report = restarted
+                .planner
+                .prepare(
+                    &resource,
+                    &tokens::ResourceSnapshot {
+                        exists: true,
+                        stored_keys: BTreeSet::new(),
+                    },
+                    None,
+                    &BTreeMap::from([(key.into(), Some("v".into()))]),
+                    0,
+                    5000,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.seq, 3);
+        }
     }
 
     #[test]
@@ -4056,16 +4251,17 @@ mod tests {
                     line.clear();
                     stream.read_line(&mut line).unwrap();
                     let request: Value = serde_json::from_str(&line).unwrap();
+                    // Before any byte arrives, the endpoint's durable upper
+                    // bound on disk already covers the sequence being sent.
                     let rows: Vec<CheckpointRow> =
                         serde_json::from_slice(&std::fs::read(&server_checkpoint).unwrap())
                             .unwrap();
-                    assert!(rows.iter().any(|row| row.id
-                        == request["params"][if request["method"] == "pane.report_metadata" {
-                            "pane_id"
-                        } else {
-                            "workspace_id"
-                        }]
-                        && row.seq == request["params"]["seq"]));
+                    let seq = request["params"]["seq"].as_u64().unwrap();
+                    assert!(
+                        rows.iter()
+                            .any(|row| row.kind == "endpoint" && row.seq >= seq),
+                        "seq {seq} sent outside the durable window"
+                    );
                     let response = json!({"id":request["id"], "result":{"type":"ok"}});
                     writeln!(stream.get_mut(), "{response}").unwrap();
                     remember_tokens(&mut stored, &request);
@@ -4090,10 +4286,13 @@ mod tests {
         publisher
             .refresh_with_readers(&mut transport, &config, &TimeoutReader, &TimeoutReader)
             .unwrap();
+        // Three reports, one window of two: a single checkpoint write.
+        assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 1);
         let mut restarted = MetadataPublisher::new(state, "fake-socket".into(), homes).unwrap();
         restarted
             .refresh_with_readers(&mut transport, &config, &TimeoutReader, &TimeoutReader)
             .unwrap();
+        assert_eq!(restarted.checkpoint_persists.load(Ordering::Relaxed), 1);
         let reports = server.join().unwrap();
         assert_eq!(reports[0]["params"]["tokens"]["lineup_agent"], "codex");
         assert_eq!(reports[0]["params"]["tokens"]["lineup_context_text"], "42%");
@@ -4115,8 +4314,10 @@ mod tests {
                 .values()
                 .all(Value::is_null)
         );
+        // The restart discards the unused window and continues above the
+        // durable bound (2) for both resources, not from each stale cursor.
         assert_eq!(reports[3]["params"]["seq"], 3);
-        assert_eq!(reports[4]["params"]["seq"], 2);
+        assert_eq!(reports[4]["params"]["seq"], 3);
     }
 
     #[test]

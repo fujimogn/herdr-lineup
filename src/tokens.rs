@@ -302,6 +302,7 @@ pub struct Report {
 }
 #[derive(Clone, Debug, Default)]
 struct ResourceState {
+    /// In-memory cursor: the last sequence reserved for this resource.
     high_water: u64,
     accepted: Tokens,
     published_ms: BTreeMap<String, u64>,
@@ -309,25 +310,77 @@ struct ResourceState {
     reserved: Option<Report>,
 }
 
-/// Pure planner. The daemon must durably persist `checkpoint()` after every
-/// successful `prepare()` and BEFORE sending its report. If persistence fails,
-/// do not send. Only call `acknowledge()` after the server accepts the report.
-/// Restoring a checkpoint intentionally drops cached values and forces a full
-/// authoritative republish, retaining per-endpoint/session/resource sequences.
-#[derive(Clone, Debug, Default)]
+/// Per-endpoint sequence bookkeeping. `floor` is the prune/restart floor: no
+/// resource on the endpoint allocates at or below it. `bound` is the durable
+/// upper bound U: every sequence ever reserved on the endpoint is `<= bound`,
+/// and a raised bound must reach disk before any sequence above the previously
+/// persisted bound is sent. `floor <= bound` always holds.
+#[derive(Clone, Copy, Debug, Default)]
+struct EndpointState {
+    floor: u64,
+    bound: u64,
+}
+
+/// Pure planner with windowed sequence reservation. `prepare()` advances an
+/// in-memory per-resource cursor; when the cursor passes the endpoint's durable
+/// upper bound it raises that bound by one window and sets `checkpoint_pending`.
+/// The daemon must durably persist `checkpoint()` and `checkpoint_bounds()`
+/// whenever `checkpoint_pending()` is true, BEFORE sending the report, then
+/// call `checkpoint_persisted()`. If persistence fails, do not send anything:
+/// the pending flag stays set so the next attempt persists first. Only call
+/// `acknowledge()` after the server accepts the report.
+/// Restoring a checkpoint discards the unused part of every window: all
+/// resources on an endpoint continue strictly above its persisted bound, and
+/// cached values are dropped so the next cycle republishes authoritatively.
+#[derive(Clone, Debug)]
 pub struct Publisher {
     resources: BTreeMap<ResourceId, ResourceState>,
-    endpoint_floors: BTreeMap<String, u64>,
+    endpoints: BTreeMap<String, EndpointState>,
+    window: u64,
+    checkpoint_pending: bool,
+}
+impl Default for Publisher {
+    fn default() -> Self {
+        Self {
+            resources: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+            window: 1,
+            checkpoint_pending: false,
+        }
+    }
 }
 impl Publisher {
     pub fn restore(checkpoint: BTreeMap<ResourceId, u64>) -> Self {
-        Self::restore_with_floors(checkpoint, BTreeMap::new())
+        Self::restore_with_bounds(checkpoint, BTreeMap::new())
     }
 
-    pub fn restore_with_floors(
+    /// `bounds` are the persisted `endpoint` rows. Older checkpoints persisted
+    /// every reserved sequence per resource and wrote an endpoint row only after
+    /// pruning, so the durable upper bound of an endpoint is the maximum of its
+    /// row and its resource sequences. Every resource restarts above it.
+    pub fn restore_with_bounds(
         checkpoint: BTreeMap<ResourceId, u64>,
-        endpoint_floors: BTreeMap<String, u64>,
+        bounds: BTreeMap<String, u64>,
     ) -> Self {
+        let mut endpoints: BTreeMap<String, EndpointState> = bounds
+            .into_iter()
+            .map(|(endpoint, bound)| {
+                (
+                    endpoint,
+                    EndpointState {
+                        floor: bound,
+                        bound,
+                    },
+                )
+            })
+            .collect();
+        for (resource, high_water) in &checkpoint {
+            let state = endpoints
+                .entry(resource.endpoint_session.clone())
+                .or_default();
+            state.bound = state.bound.max(*high_water);
+            state.floor = state.bound;
+        }
         Self {
             resources: checkpoint
                 .into_iter()
@@ -341,10 +394,12 @@ impl Publisher {
                     )
                 })
                 .collect(),
-            endpoint_floors,
+            endpoints,
+            ..Self::default()
         }
     }
 
+    /// Per-resource cursors. They never exceed their endpoint bound.
     pub fn checkpoint(&self) -> BTreeMap<ResourceId, u64> {
         self.resources
             .iter()
@@ -352,21 +407,60 @@ impl Publisher {
             .collect()
     }
 
-    pub fn checkpoint_floors(&self) -> BTreeMap<String, u64> {
-        self.endpoint_floors.clone()
+    /// Durable upper bound per endpoint, written as the `endpoint` checkpoint
+    /// row. It subsumes the prune floor, so one row per endpoint suffices.
+    pub fn checkpoint_bounds(&self) -> BTreeMap<String, u64> {
+        self.endpoints
+            .iter()
+            .filter_map(|(endpoint, state)| {
+                let bound = state.bound.max(state.floor);
+                (bound > 0).then(|| (endpoint.clone(), bound))
+            })
+            .collect()
+    }
+
+    /// True once a reservation left the persisted window. Stays true across
+    /// failed persists and reconnects until `checkpoint_persisted()`.
+    pub fn checkpoint_pending(&self) -> bool {
+        self.checkpoint_pending
+    }
+
+    /// Call only after `checkpoint()`/`checkpoint_bounds()` reached disk.
+    pub fn checkpoint_persisted(&mut self) {
+        self.checkpoint_pending = false;
+    }
+
+    /// Size one reservation window from the authoritative snapshot: one
+    /// sequence per reportable pane and workspace. A resource consumes at most
+    /// one sequence per report attempt, so the busiest resource completes at
+    /// least `reports` attempts per checkpoint write, and a restart discards at
+    /// most that many unused sequences per endpoint. No new user setting is
+    /// involved; zero resources never report, so the window stays at least 1.
+    pub fn set_window(&mut self, reports: usize) {
+        self.window = u64::try_from(reports).unwrap_or(u64::MAX).max(1);
+    }
+
+    /// The transport reconnected to the same endpoint. Drop cached values so
+    /// the next cycle republishes authoritatively, but keep cursors, floors,
+    /// bounds and the pending flag: every reservation, sent or not, stays
+    /// consumed and the durable window is unchanged.
+    pub fn reconnected(&mut self) {
+        for state in self.resources.values_mut() {
+            *state = ResourceState {
+                high_water: state.high_water,
+                ..ResourceState::default()
+            };
+        }
     }
 
     /// The authoritative snapshot permits removal of absent resource rows.
-    /// Their maximum reserved sequence remains as a durable endpoint floor,
-    /// so a resource ID reused by this same server cannot restart at seq 1.
+    /// Their maximum reserved sequence remains as the endpoint floor, so a
+    /// resource ID reused by this same server cannot restart at seq 1. The
+    /// floor never exceeds the durable bound, which already covers it on disk.
     /// A different endpoint has no access to the prior server's metadata.
     pub fn prune_for_snapshot(&mut self, endpoint: &str, live: &BTreeSet<ResourceId>) -> bool {
         let mut changed = false;
-        let mut floor = self
-            .endpoint_floors
-            .get(endpoint)
-            .copied()
-            .unwrap_or_default();
+        let mut floor = self.endpoints.get(endpoint).map_or(0, |s| s.floor);
         self.resources.retain(|resource, state| {
             if resource.endpoint_session != endpoint {
                 changed = true;
@@ -379,13 +473,18 @@ impl Publisher {
             }
             true
         });
-        self.endpoint_floors.retain(|key, _| {
+        self.endpoints.retain(|key, _| {
             let keep = key == endpoint;
             changed |= !keep;
             keep
         });
         if floor > 0 {
-            changed |= self.endpoint_floors.insert(endpoint.into(), floor) != Some(floor);
+            let state = self.endpoints.entry(endpoint.into()).or_default();
+            if state.floor != floor {
+                state.floor = floor;
+                state.bound = state.bound.max(floor);
+                changed = true;
+            }
         }
         changed
     }
@@ -483,16 +582,25 @@ impl Publisher {
         if tokens.is_empty() {
             return Ok(None);
         }
+        // Every failure above returns before this point, so capacity skips and
+        // empty patches consume neither a sequence nor window space.
+        let endpoint = self
+            .endpoints
+            .entry(resource.endpoint_session.clone())
+            .or_default();
         let seq = state
             .high_water
-            .max(
-                self.endpoint_floors
-                    .get(&resource.endpoint_session)
-                    .copied()
-                    .unwrap_or_default(),
-            )
+            .max(endpoint.floor)
             .checked_add(1)
             .ok_or(PatchError::SequenceExhausted)?;
+        if seq > endpoint.bound {
+            // Cursors are overflow-checked above, so a final window that is
+            // shorter than requested near u64::MAX remains safe.
+            endpoint.bound = seq
+                .checked_add(self.window.saturating_sub(1))
+                .unwrap_or(u64::MAX);
+            self.checkpoint_pending = true;
+        }
         let report = Report {
             resource: resource.clone(),
             source: SOURCE,
@@ -1215,6 +1323,8 @@ mod tests {
                 .seq,
             first.seq + 1
         );
+        // A restart starts every resource of the endpoint above its durable
+        // bound, even one that never reported before.
         assert_eq!(
             restarted
                 .prepare(
@@ -1228,7 +1338,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .seq,
-            1
+            first.seq + 1
         );
         let mut other = resource("p1");
         other.endpoint_session = "new/socket/session".into();
@@ -1274,8 +1384,12 @@ mod tests {
         assert!(!publisher.checkpoint().contains_key(&pane));
         assert!(!publisher.checkpoint().contains_key(&old));
 
+        assert_eq!(
+            publisher.checkpoint_bounds(),
+            BTreeMap::from([(pane.endpoint_session.clone(), 17)])
+        );
         let mut restarted =
-            Publisher::restore_with_floors(publisher.checkpoint(), publisher.checkpoint_floors());
+            Publisher::restore_with_bounds(publisher.checkpoint(), publisher.checkpoint_bounds());
         let report = restarted
             .prepare(
                 &pane,
@@ -1288,6 +1402,240 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(report.seq, 18);
+    }
+
+    fn single(key: &str) -> Tokens {
+        Tokens::from([(key.into(), Some("v".into()))])
+    }
+    fn try_reserve(
+        publisher: &mut Publisher,
+        resource: &ResourceId,
+        now_ms: u64,
+    ) -> Result<Option<Report>, PatchError> {
+        let desired = single("lineup_agent");
+        publisher.prepare(resource, &snapshot(0), None, &desired, now_ms, 5000)
+    }
+    fn reserve(publisher: &mut Publisher, id: &str, now_ms: u64) -> Report {
+        try_reserve(publisher, &resource(id), now_ms)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn reservation_window_persists_once_per_window_and_restart_skips_unused_part() {
+        let mut publisher = Publisher::default();
+        publisher.set_window(3);
+        assert!(!publisher.checkpoint_pending());
+        assert!(publisher.checkpoint_bounds().is_empty());
+        let first = reserve(&mut publisher, "p1", 0);
+        assert_eq!(first.seq, 1);
+        assert!(publisher.checkpoint_pending());
+        let endpoint = resource("p1").endpoint_session;
+        assert_eq!(
+            publisher.checkpoint_bounds(),
+            BTreeMap::from([(endpoint.clone(), 3)])
+        );
+        publisher.checkpoint_persisted();
+        // Unacknowledged (failed or ambiguous) sends still consume the cursor.
+        for expected in [2, 3] {
+            assert_eq!(reserve(&mut publisher, "p1", 0).seq, expected);
+            assert!(!publisher.checkpoint_pending());
+        }
+        // Another resource starts at 1 and shares the endpoint window.
+        for expected in [1, 2, 3] {
+            assert_eq!(reserve(&mut publisher, "p2", 0).seq, expected);
+            assert!(!publisher.checkpoint_pending());
+        }
+        let fourth = reserve(&mut publisher, "p1", 0);
+        assert_eq!(fourth.seq, 4);
+        assert!(publisher.checkpoint_pending());
+        assert_eq!(
+            publisher.checkpoint_bounds(),
+            BTreeMap::from([(endpoint.clone(), 6)])
+        );
+        publisher.checkpoint_persisted();
+        // The persisted rows carry the cursors; the bound covers every sent seq.
+        assert_eq!(publisher.checkpoint()[&resource("p1")], 4);
+        assert_eq!(publisher.checkpoint()[&resource("p2")], 3);
+
+        let mut restarted =
+            Publisher::restore_with_bounds(publisher.checkpoint(), publisher.checkpoint_bounds());
+        assert!(!restarted.checkpoint_pending());
+        assert_eq!(restarted.checkpoint_bounds()[&endpoint], 6);
+        // Unused seqs 5..=6 are discarded; every resource, including a new one,
+        // continues above the bound and the first allocation opens a window.
+        restarted.set_window(2);
+        assert_eq!(reserve(&mut restarted, "p2", 0).seq, 7);
+        assert!(restarted.checkpoint_pending());
+        assert_eq!(restarted.checkpoint_bounds()[&endpoint], 8);
+        restarted.checkpoint_persisted();
+        assert_eq!(reserve(&mut restarted, "p1", 0).seq, 7);
+        assert_eq!(reserve(&mut restarted, "p3", 0).seq, 7);
+        assert!(!restarted.checkpoint_pending());
+        let mut other = resource("p1");
+        other.endpoint_session = "new/socket/session".into();
+        let moved = try_reserve(&mut restarted, &other, 0).unwrap().unwrap();
+        assert_eq!(moved.seq, 1);
+        assert_eq!(restarted.checkpoint_bounds()[&other.endpoint_session], 2);
+    }
+
+    #[test]
+    fn older_checkpoints_migrate_to_the_maximum_durable_sequence() {
+        let endpoint = resource("p1").endpoint_session;
+        // Pre-window checkpoints persisted every resource seq and wrote an
+        // endpoint floor only after pruning; the floor may lag the resources.
+        let mut migrated = Publisher::restore_with_bounds(
+            BTreeMap::from([(resource("p1"), 40), (resource("p2"), 12)]),
+            BTreeMap::from([(endpoint.clone(), 5)]),
+        );
+        assert_eq!(
+            migrated.checkpoint_bounds(),
+            BTreeMap::from([(endpoint.clone(), 40)])
+        );
+        migrated.set_window(4);
+        assert_eq!(reserve(&mut migrated, "p2", 0).seq, 41);
+        assert_eq!(reserve(&mut migrated, "p1", 0).seq, 41);
+        assert_eq!(migrated.checkpoint_bounds()[&endpoint], 44);
+        // Checkpoints without any endpoint row behave the same way.
+        let mut legacy = Publisher::restore(BTreeMap::from([(resource("p1"), 40)]));
+        assert_eq!(legacy.checkpoint_bounds()[&endpoint], 40);
+        assert_eq!(reserve(&mut legacy, "p1", 0).seq, 41);
+    }
+
+    #[test]
+    fn window_extension_saturates_and_cursor_overflow_is_checked() {
+        let endpoint = resource("p1").endpoint_session;
+        let mut publisher = Publisher::restore(BTreeMap::from([(resource("p1"), u64::MAX - 1)]));
+        publisher.set_window(usize::MAX);
+        assert_eq!(reserve(&mut publisher, "p1", 0).seq, u64::MAX);
+        assert_eq!(publisher.checkpoint_bounds()[&endpoint], u64::MAX);
+        assert!(publisher.checkpoint_pending());
+        publisher.checkpoint_persisted();
+        assert_eq!(
+            try_reserve(&mut publisher, &resource("p1"), 0).unwrap_err(),
+            PatchError::SequenceExhausted
+        );
+        // The floor lifts a fresh resource to the last seq of the saturated
+        // window; after that nothing remains on this endpoint.
+        assert_eq!(reserve(&mut publisher, "p2", 0).seq, u64::MAX);
+        assert!(!publisher.checkpoint_pending());
+        assert_eq!(
+            try_reserve(&mut publisher, &resource("p2"), 0).unwrap_err(),
+            PatchError::SequenceExhausted
+        );
+        let bounds = BTreeMap::from([(endpoint, u64::MAX)]);
+        let mut bounded = Publisher::restore_with_bounds(BTreeMap::new(), bounds);
+        assert_eq!(
+            try_reserve(&mut bounded, &resource("p9"), 0).unwrap_err(),
+            PatchError::SequenceExhausted
+        );
+    }
+
+    #[test]
+    fn capacity_skips_and_empty_patches_leave_window_untouched() {
+        let mut publisher = Publisher::default();
+        publisher.set_window(4);
+        let id = resource("p1");
+        let mut row = row();
+        row.usage.as_mut().unwrap().weekly_remaining_pct = Some(67.0);
+        let desired = pane_tokens(&row, LogoMode::Text, false, 0);
+        assert_eq!(
+            publisher.prepare(&id, &snapshot(29), row.occupant.as_ref(), &desired, 0, 5000),
+            Err(PatchError::ResourceCapacity)
+        );
+        assert!(!publisher.checkpoint_pending());
+        assert!(publisher.checkpoint_bounds().is_empty());
+        assert!(publisher.checkpoint().is_empty());
+        let report = reserve(&mut publisher, "p1", 0);
+        publisher.checkpoint_persisted();
+        publisher.acknowledge(&report, 0).unwrap();
+        // Unchanged live values before renewal produce no report and no reservation.
+        let stored = ResourceSnapshot {
+            exists: true,
+            stored_keys: BTreeSet::from(["lineup_agent".to_owned()]),
+        };
+        assert!(
+            publisher
+                .prepare(&id, &stored, None, &single("lineup_agent"), 1, 5000)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(publisher.checkpoint()[&id], 1);
+        assert!(!publisher.checkpoint_pending());
+        // A missing resource never reserves either.
+        assert!(
+            publisher
+                .prepare(
+                    &id,
+                    &ResourceSnapshot::default(),
+                    None,
+                    &single("lineup_agent"),
+                    1,
+                    5000
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(publisher.checkpoint()[&id], 1);
+        assert_eq!(publisher.checkpoint_bounds()[&id.endpoint_session], 4);
+    }
+
+    #[test]
+    fn reconnect_keeps_cursors_window_and_pending_flag_but_republishes() {
+        let mut publisher = Publisher::default();
+        publisher.set_window(5);
+        let id = resource("p1");
+        let first = reserve(&mut publisher, "p1", 0);
+        publisher.checkpoint_persisted();
+        publisher.acknowledge(&first, 0).unwrap();
+        let lost = reserve(&mut publisher, "p1", 6000);
+        assert_eq!(lost.seq, 2);
+        // Response lost: the daemon reconnects without acknowledging.
+        publisher.reconnected();
+        assert_eq!(
+            publisher.acknowledge(&lost, 6001),
+            Err(PatchError::UnreservedReport)
+        );
+        let republished = publisher
+            .prepare(&id, &snapshot(0), None, &single("lineup_agent"), 6001, 5000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(republished.seq, 3);
+        assert!(!publisher.checkpoint_pending());
+        assert_eq!(publisher.checkpoint_bounds()[&id.endpoint_session], 5);
+        // A pending window survives the reconnect until the daemon persists it.
+        let mut pending = Publisher::default();
+        reserve(&mut pending, "p1", 0);
+        pending.reconnected();
+        assert!(pending.checkpoint_pending());
+        assert_eq!(reserve(&mut pending, "p1", 0).seq, 2);
+        assert!(pending.checkpoint_pending());
+    }
+
+    #[test]
+    fn pruned_resource_inside_an_unused_window_keeps_floor_below_bound() {
+        let mut publisher = Publisher::default();
+        publisher.set_window(8);
+        let gone = resource("gone");
+        let live = resource("live");
+        for _ in 0..5 {
+            reserve(&mut publisher, "gone", 0);
+        }
+        reserve(&mut publisher, "live", 0);
+        publisher.checkpoint_persisted();
+        assert!(
+            publisher.prune_for_snapshot(&gone.endpoint_session, &BTreeSet::from([live.clone()]))
+        );
+        assert!(!publisher.checkpoint().contains_key(&gone));
+        // The bound (8) already covers the pruned cursor (5) on disk.
+        assert_eq!(publisher.checkpoint_bounds()[&gone.endpoint_session], 8);
+        assert_eq!(reserve(&mut publisher, "gone", 0).seq, 6);
+        assert_eq!(reserve(&mut publisher, "live", 0).seq, 2);
+        assert!(!publisher.checkpoint_pending());
+        let mut restarted =
+            Publisher::restore_with_bounds(publisher.checkpoint(), publisher.checkpoint_bounds());
+        assert_eq!(reserve(&mut restarted, "gone", 0).seq, 9);
+        assert_eq!(reserve(&mut restarted, "live", 0).seq, 9);
     }
 
     #[test]
