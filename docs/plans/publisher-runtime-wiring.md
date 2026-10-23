@@ -92,7 +92,9 @@ expire while the request is in flight, so the design does **not** guarantee
 that the cycle deadline never cuts an in-flight exchange.
 
 - Not admitted: a deadline skip. No frame was written. Not an error, no
-  reconnect, the item is not rotated (§5).
+  reconnect. The resource counts once in `deadline_skipped` (§7). Whether it
+  was rotated is decided separately by §5: a pane whose reader call already
+  started stays rotated; nothing is undone.
 - Admitted, then the exchange fails for any reason, including `E` or a local
   cap expiring after the frame may have been written: an ambiguous error. The
   prepared sequence is burned, the request is never resent (invariant 4), the
@@ -104,14 +106,18 @@ The snapshot request is always started at cycle start with deadline `E`.
 
 Live keys carry `ttl_ms = 3 × refresh_interval_ms` (15 s by default) and are
 renewed once a resource is at least one interval old. The daemon schedules the
-next refresh one interval after the previous one ends. The gap between two
-sends of one resource is at most `D + I + b`, where `D` is the cycle duration,
-`I` the interval and `b` the resource's offset in the next cycle. At defaults
-with admission ending at `E − 2 s`, the gap can reach 17 s, above the 15 s
-TTL, and rotation (§5) makes that ordering likely when cycles run long.
+next refresh one interval after the previous one ends. When the next cycle
+does send the resource, the gap between the two sends is at most `D + I + b`,
+where `D` is the cycle duration, `I` the interval and `b` the resource's
+offset in that next cycle. At defaults with admission ending at `E − 2 s`,
+that gap can reach 17 s, above the 15 s TTL, and rotation (§5) makes that
+ordering likely when cycles run long. When a resource is deferred for one or
+more cycles (deadline skip, or a cycle that ends early on an error), the gap
+grows by a further `D + I` per deferred cycle and has no fixed bound.
 
-This is accepted degraded behavior and goes into the spec delta: the key
-expires and disappears; it never shows a wrong value. The refresh period, the
+Both cases are accepted degraded behavior and go into the spec delta under
+these conditions: the key expires and disappears; it never shows a wrong
+value. The refresh period, the
 TTL multiplier and their defaults are not changed. The clamp alternative was
 rejected. A `timeout` executable, process isolation and socket reuse stay out
 of scope.
@@ -127,16 +133,23 @@ Both queues use one private helper type `FairQueue<K>` in `publish.rs`.
   (`pass`), once, with a `visited` set for this cycle. Rotation moves items
   inside the real queue but never adds to `pass`, so no item is revisited in
   the same cycle and the loop ends after at most N steps.
-- **Attempt:** when an item's first budgeted I/O starts, move it to the tail of
-  the real queue at that moment, even if the attempt then times out or fails.
-- **Skip:** an item not started because its stage budget is exhausted stays
-  where it is. Once one item is skipped for budget, the rest of `pass` is
-  skipped too (counted, not started, not rotated, not revisited).
+- **Attempt:** when an item's first budgeted I/O starts (defined per queue in
+  §5.1 and §5.2), move it to the tail of the real queue at that moment, even if
+  the attempt then times out or fails. A rotation is never undone.
+- **Not started:** an item whose budgeted I/O does not start keeps its place.
+- **Rotation and skip counting are separate.** Rotation records who started
+  I/O. `deadline_skipped` (§7) records which resources the deadline prevented
+  from completing their processing or a needed send, once per ID per cycle,
+  whether or not the item was rotated.
+- **Stopping:** the Git queue stops starting reads once `G` is exhausted. The
+  send queue does not stop at the first skip; §5.2 defines what each later item
+  still does.
 - **Progress (conditional):** if the cycle reaches the stage with its initial
   budget, is not shut down, and the publisher is not poisoned, the first item of
-  `pass` is started, so at least one item rotates per such cycle and every item
-  is started within N such cycles. A cycle that ends earlier (snapshot error,
-  shutdown, poison, ambiguous exchange) gives no progress guarantee.
+  `pass` that needs budgeted I/O is started, so at least one item rotates per
+  such cycle and every such item is started within N such cycles. A cycle that
+  ends earlier (snapshot error, shutdown, poison, ambiguous exchange) gives no
+  progress guarantee.
 
 ### 5.1 Git queue (key: workspace ID)
 
@@ -170,11 +183,30 @@ Panes and workspaces share one queue so workspace reports cannot starve behind
 panes. A pane item runs observe → plan → send (invariant 7). A workspace item
 runs plan → send from the already-resolved headings.
 
-An item's first budgeted I/O is its reader call, or its metadata exchange if it
-has no reader call. A pane whose reader I/O started is an attempt and rotates
-even if its planner then needs no report. An item that starts neither is not
-an attempt. A report skipped for budget after the reader ran leaves the item
-already rotated by the reader attempt; it is not revisited this cycle.
+Every item of `pass` is visited once, in order, while the cycle has not ended
+on an error, shutdown or poison. Two budgets apply independently:
+
+- **Reader budget** (`min(reader deadline, E)`): if it is positive, the pane
+  calls the reader API. Calling it is the attempt and rotates the pane, even
+  when the reader returns immediately (for example its internal BUSY result).
+  If it is zero, the reader API is not called and the pane gets a `Timeout`
+  observation. That observation goes through today's timeout handling: a valid
+  cached observation for the same identity and source is restored, otherwise
+  the numeric keys clear. Reader expiry therefore skips only reader I/O; it
+  does not end the pass.
+- **Admission** (`E − now ≥ 2 s`, §4.2): if the planned report needs a frame
+  and admission passes, the metadata exchange starts. Starting it is the
+  attempt and rotates the item if it was not already rotated by a reader call.
+  If admission fails, no frame is written and the resource counts once in
+  `deadline_skipped`. Later items are still visited: a later item whose
+  planner needs no frame completes without I/O and is not counted.
+
+So a pane, workspace, no-reader pane or reader-expired pane that sends a frame
+is an attempt; one that neither calls the reader nor sends a frame is not an
+attempt and keeps its place. A pane whose reader ran and whose needed report
+was then refused admission (for example after a reservation persist consumed
+the budget) stays rotated and is also counted. No item is revisited this
+cycle.
 
 `first_pane_ids` keeps using snapshot order, never queue order, so heading
 placement and logo indentation do not move with rotation.
@@ -217,9 +249,17 @@ alone:
 ```rust
 pub(crate) struct RefreshSkip {
     pub capacity_skipped: u64,
-    pub deadline_skipped: u64, // queue items not started this cycle
+    /// Resources whose needed send the deadline prevented this cycle,
+    /// counted once per resource ID, independent of rotation.
+    pub deadline_skipped: u64,
 }
 ```
+
+Reader timeouts caused by an expired reader budget are not counted here; they
+are ordinary `Timeout` observations under the provider-readers contract. A
+workspace whose Git read was not started is not counted either; its heading
+state (§6) decides what it sends, and only a refused admission for that send
+counts.
 
 The daemon classifies by payload before error kind. `deadline_skipped > 0`
 does not set `refresh_failed`, does not reconnect, and logs
@@ -300,15 +340,17 @@ checkpoint written by the new code is valid for the old code.
 
 | # | Task | Fixture | Proves |
 |---|---|---|---|
-| F1 | P | Fake socket delays every report by 400 ms; 12 panes; reader timeout set so few reports fit | Result has `deadline_skipped > 0`; no reconnect; every resource is acknowledged within ⌈N/k⌉ cycles; unstarted items keep their order |
+| F1 | P | Fake socket delays every report by 400 ms; 12 panes; reader timeout set so few reports fit | Result has `deadline_skipped` equal to the number of resources whose needed frame was refused, each ID once; no reconnect; every resource is acknowledged within ⌈N/k⌉ cycles; items that started no I/O keep their order |
 | F2 | P | Server reads a report and never replies | Error, not skip; single request ID observed; sequence burned, not reused; daemon reconnects |
-| F3 | P | Injected slow reservation persist that leaves `E − now < 2 s` | Skip with no frame written; `U` unchanged or higher; next cycle continues above it |
+| F3 | P | Last pane of `pass`: its reader runs, then an injected slow reservation persist leaves `E − now < 2 s` | No frame written; `deadline_skipped` counts that pane once; the pane stays rotated (not undone); `U` unchanged or higher; next cycle continues above it |
 | F4 | P | Injected delay between admission and exchange so `E` expires in flight | Ambiguous error, never a skip; no resend; sequence burned |
 | F5 | P | Checkpoint fault during a budgeted cycle | Poisoned; later cycles return the poison error, never a skip |
 | F6 | P | Shutdown set mid-cycle | `Interrupted`, not a deadline skip; clear still uses its own deadline |
 | F7 | P | Workspaces placed after many panes, budget for half | Workspace reports are sent within the queue bound |
 | F8 | P | Reader for pane 2 checks a file written by the fake socket when it acknowledges pane 1 | observe → plan → send order kept |
-| F9 | P | Pane whose reader runs but needs no report, followed by a budget skip | Reader pane rotated; skipped panes keep order; no item visited twice in the cycle |
+| F9 | P | Pane whose reader runs but needs no report, followed by a refused admission | Reader pane rotated and not counted; refused pane counted once; panes that started no I/O keep order; no item visited twice in the cycle |
+| F9a | P | Pane A consumes the reader deadline; then pane B with a valid cached observation, workspace W, a no-reader pane, and a pane whose planner needs no frame, all while `E` admission remains | B gets a `Timeout` observation without a reader call, restores its cache and sends its renewal; W, the no-reader pane and B send and rotate; the no-frame pane neither rotates nor counts; `deadline_skipped` is 0 |
+| F9b | P | Reader API returns BUSY immediately with a positive reader budget | Counts as an attempt and rotates the pane |
 | F10 | P | Two Codex panes, same home | One discovery scan per refresh; a new refresh starts with an empty cycle |
 | F11 | P | Three repositories, the first stalls Git past 1 s | Queue `[A,B,C]` → `[B,C,A]` after cycle 1, B and C not rotated while skipped; every workspace started within 3 cycles that reach Git with full budget |
 | F12 | P | Two workspaces share one cwd that stalls Git | One Git read per cycle; only the starting workspace rotates; the loop ends after N steps |
@@ -329,3 +371,14 @@ send null and `Complete(None)` is Unknown; `publish.rs` and `daemon.rs` change
 together in task P from a base after the stage histogram lane; reader
 diagnostics wiring is the later task D. Open item: confirm the openspec change
 path proposed in §1.
+
+`note-publisher-design-nogo-01` (review
+`reviews/publisher-runtime-design-sol61-high.md`, NO-GO on `831552f`): rotation
+and `deadline_skipped` are separate and a rotation is never undone; reader
+expiry skips only reader I/O and yields a `Timeout` observation while the pass
+continues under `E` admission; attempts are reader API calls with a positive
+budget or started metadata exchanges; the `D + I + b` gap holds only when the
+next cycle sends the resource, and multi-cycle deferral is unbounded degraded
+behavior. Interpretation to confirm: a pane that sends after a reader-expired
+`Timeout` observation has completed its processing and is not counted in
+`deadline_skipped`.
