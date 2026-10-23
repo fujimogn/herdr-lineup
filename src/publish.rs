@@ -2381,10 +2381,16 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
-        let wait_cleared = |publisher: &MetadataPublisher| {
+        let wait_cleared = |publisher: &MetadataPublisher, reset_at: Option<SystemTime>| {
             let deadline = Instant::now() + Duration::from_secs(8);
             loop {
-                if observe(publisher).is_none() {
+                // Apply expiry/clear logic, then verify the actual source
+                // with a blocking lock so a try_lock failure is not mistaken
+                // for the source being cleared.
+                observe(publisher);
+                let actually_cleared = publisher.kimi_source.lock().unwrap().is_none();
+                let reset_reached = reset_at.is_none_or(|reset| SystemTime::now() >= reset);
+                if actually_cleared && reset_reached {
                     return;
                 }
                 assert!(
@@ -2474,7 +2480,7 @@ mod tests {
         assert!(resetless.resets_at.is_none());
         script.insert("phase-resetless".into(), FixtureReply::status(500));
         publish(&script);
-        wait_cleared(&publisher);
+        wait_cleared(&publisher, None);
         wait_diagnostic("kimi=transient");
 
         let reset =
@@ -2487,7 +2493,7 @@ mod tests {
         publish(&script);
         credential("phase-reset", long_expiry);
         let reset_at = wait_percent(&publisher, 75.0).resets_at.unwrap();
-        wait_cleared(&publisher);
+        wait_cleared(&publisher, Some(reset_at));
         assert!(SystemTime::now() >= reset_at);
 
         let expires_at = SystemTime::now()
