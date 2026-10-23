@@ -2,6 +2,14 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/fujimogn/herdr-lineup/releases)
 
+## Unreleased
+
+Development after v0.2.2 updates CI, release tooling, and the locked dependency set. Plugin behavior is unchanged in this section.
+
+- Maintenance: **CI** runs light checks on pushes to `develop` and on pull requests: Actionlint, gitleaks, formatting, Clippy, and `cargo test` (unit, integration, and doc tests). Pushes to `main` and `v*` tags keep the full checks, including the release build, binary-license check, CLI help, version and release-note gates, and the dependency audit.
+- Maintenance: **Release tooling** pins develop-tools to 0.6.2, takes English release notes from the dated changelog section, and runs the release version check from the pre-push hook on a tag-only push.
+- Maintenance: **Dependencies** refresh nine locked crates, including ureq 3.5.0 and webpki-roots 1.0.11, for the pinned Rust 1.99.1 toolchain.
+
 ## 0.2.2 (2026-10-21)
 
 The 0.2.1 tag was pushed without a GitHub Release because its changelog section was undated; 0.2.2 carries the same changes.
