@@ -73,8 +73,11 @@ pushes the tag. The workflow never tags or pushes on its own.
    ```sh
    .develop-tools/resolve release release check
    ```
-   It dispatches `.github/workflows/platform-check.yml` on `main` (the
-   `release.preflightWorkflow` in `.develop-tools.json`) and waits for that run.
+   It dispatches `.github/workflows/platform-check.yml` (the
+   `release.preflightWorkflow` in `.develop-tools.json`) on the integration
+   branch HEAD (`develop`) and waits for that run only. Before dispatch,
+   confirm `origin/develop` and `origin/main` both point to the same verified
+   release commit, and keep them unchanged through the check and tagging.
    The workflow calls the shared platform check, which runs Clippy, a release
    build, nextest, and doc tests on each OS in `platforms` (`linux` and
    `macos`). The commit must already be on `origin/main`, and `gh` must be
@@ -85,8 +88,11 @@ pushes the tag. The workflow never tags or pushes on its own.
    earlier, update the date and land that reviewed change first. A human tags
    the verified release commit on `main` and pushes only the tag:
    ```sh
-   git tag -a vX.Y.Z <release-commit> -m 'Release vX.Y.Z'
-   git push origin vX.Y.Z
+   notes_file=$(mktemp /tmp/herdr-lineup-release-notes.XXXXXX)
+   scripts/extract-release-notes.sh X.Y.Z > "$notes_file" &&
+     git tag -a vX.Y.Z <release-commit> -F "$notes_file" &&
+     git push origin vX.Y.Z
+   rm "$notes_file"
    ```
    Before any build, the workflow requires the tag's commit to be reachable
    from `origin/main`, the latest CI `push` run for that commit on `main` to
@@ -99,8 +105,10 @@ pushes the tag. The workflow never tags or pushes on its own.
    then checks the tag against the manifests and lockfile, runs
    `cargo test --locked`, builds on `ubuntu-latest` and `macos-latest`, and
    creates a GitHub Release titled
-   `vX.Y.Z`. The body is the extractor's output, including
-   `## X.Y.Z (YYYY-MM-DD)`, and the attachments are the Linux and macOS archives
+   `vX.Y.Z`. A nonempty annotated tag message takes precedence for the body;
+   the command above uses the full extracted notes, including
+   `## X.Y.Z (YYYY-MM-DD)`. Lightweight tags and empty annotations fall back
+   to the dated changelog section. The attachments are the Linux and macOS archives
    plus `SHA256SUMS.txt`. Missing release notes fail publication. Re-running
    the same tag rebuilds and verifies the artifacts; if its GitHub Release
    already exists, publication succeeds without changing its notes or assets.

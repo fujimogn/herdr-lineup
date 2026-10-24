@@ -1,8 +1,11 @@
 # Reader diagnostics control and doctor design
 
 **Status:** D control/doctor and all five local reader worker producers are
-implemented and integrated in the local candidate; nothing is shipped.
-**Implementation source:** `0220da64f8545f89b6daca211553f486b271057f`.
+included in the v0.3.0 release contents; the owner authorized the batch on
+2026-10-24. Delivery is recorded by the
+[v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0).
+This preparation record does not establish publication.
+**Historical implementation source:** `0220da64f8545f89b6daca211553f486b271057f`.
 Commander-owned inclusive Sol 6.1 high review is GO through
 `91268267f46061f5f0aaf46711ea10158bad0873`; see the full range in
 [the coverage record](../reviews/review-followup-coverage.md).

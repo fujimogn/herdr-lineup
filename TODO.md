@@ -3,8 +3,10 @@
 Open work after the 2026-10-23 reviews. Finding IDs, implementation source
 `0220da64f8545f89b6daca211553f486b271057f`, fixtures and limits are mapped in
 `docs/reviews/review-followup-coverage.md`. Working rules are in
-`docs/plans/review-followups-plan.md`. This is a local unshipped candidate;
-all release versions remain 0.2.2.
+`docs/plans/review-followups-plan.md`. The implemented items below are included
+in the v0.3.0 release contents.
+Publication and artifacts are recorded by the [v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0);
+this preparation record does not establish publication.
 
 ## Open
 
@@ -42,7 +44,7 @@ Start only when the named condition is met; these are not obligations.
   displayed metadata on replacement. Current pane-bound Agy behavior stays.
   See `docs/reviews/agy-occupant-generation.md` for the planned host contract.
 
-## Completed in the local candidate (unshipped)
+## Implemented in the v0.3.0 release contents
 
 - [x] Commander-owned inclusive GPT-6.1 Sol high GO for fixed range
   `d3ccbc17d3f8344d466015fac580cd0fe3b60269..91268267f46061f5f0aaf46711ea10158bad0873`;
@@ -68,7 +70,7 @@ Start only when the named condition is met; these are not obligations.
 - [x] C1 combined 4,096-entry cap, duplicate-ID refusal and cumulative
   fallback accounting documented and covered by boundary fixtures.
 - [x] Canonical runtime specs synchronized and change archived; P/D plans
-  record implemented local status.
+  record implemented status and historical source evidence.
 - [x] H1/M1 partial mitigation: no automatic rollback, pre-removal recheck;
   the residual races remain open above.
 - [x] N1 wired synthetic cold-refresh observations: tmpfs and ext4, five pane

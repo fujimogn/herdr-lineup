@@ -15,7 +15,7 @@ Those files are the primary evidence for what the reviews said. This record
 keeps only the finding ID, the code evidence, the remaining limit, and the
 judgment condition.
 
-## Source snapshot
+## Historical implementation source snapshot
 
 - Implementation source snapshot: `0220da64f8545f89b6daca211553f486b271057f`.
   It contains integration base `9d2b4a23eca9d0e46839d54a0a84d9920c749c7f`
@@ -25,8 +25,11 @@ judgment condition.
 - Both original reviews targeted `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`.
   Older snapshots (`96829df`, `d95e5b5`, `1787386`) are historical foundations,
   not the current implementation status.
-- The candidate is local and unshipped; it is not acceptance, integration into
-  `develop`, a push, or a live observation. All release versions stay 0.2.2.
+- These implementations are included in the v0.3.0 release contents. The
+  owner lifted the shipment hold on 2026-10-24. Delivery is recorded by the
+  [v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0);
+  this historical snapshot and local verification do not establish publication
+  or a live observation.
 - P runtime wiring, D control/doctor wiring, and all five local reader worker
   producers are connected. Canonical contracts are in `openspec/specs/`;
   the synchronized delta is archived at
@@ -38,7 +41,7 @@ judgment condition.
 
 | Class | Meaning | Completion rule |
 | --- | --- | --- |
-| `fixed-in-candidate` | The reviewed behavior is present at the snapshot and a regression check exists in tree. | Not shipped. Do not describe it as released or as accepted by the ship gate. |
+| `fixed-in-candidate` | The reviewed behavior is present at the snapshot and a regression check exists in tree. | Inclusion in v0.3.0 does not establish release publication or ship-gate acceptance; use the linked tag and Release for delivery. |
 | `partial` | Part of the finding is in the snapshot. The named remainder is still open. | Do not mark the finding closed. |
 | `measurement-only` | An isolated fixture result is recorded. Product behavior is unchanged. | Do not treat the numbers as a budget, a speed-up, or a macOS or live Herdr result. |
 | `conditional` | The review proposed it only under a condition that is not met. | Not an implementation obligation. Keep the reason and the open condition. |
