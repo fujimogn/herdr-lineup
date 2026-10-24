@@ -153,19 +153,29 @@ sequence_tool() {
     python3 - "$@" <<'PYSEQ'
 import glob, json, sys
 
-def is_seq(value):
-    return type(value) is int and value >= 1
+U64_MAX = 2**64 - 1
+FIELDS = {'endpoint', 'kind', 'id', 'seq'}
+KINDS = {'endpoint', 'workspace', 'pane'}
+
+# Mirror the loader in src/publish.rs: CheckpointRow is deny_unknown_fields with
+# seq: u64, kinds are endpoint/workspace/pane, and resources are unique.
+def is_u64(value):
+    return type(value) is int and 0 <= value <= U64_MAX
 
 def summarize(rows, workspace, pane):
     """Endpoint floor (exactly one) plus optional tested resources, each <= floor."""
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         raise ValueError('checkpoint is not a list of rows')
     for r in rows:
-        if not all(isinstance(r.get(k), str) for k in ('endpoint', 'kind', 'id')) or not is_seq(r.get('seq')):
-            raise ValueError('checkpoint row has an invalid type')
+        if set(r) != FIELDS or r['kind'] not in KINDS or not is_u64(r['seq']) \
+                or not all(isinstance(r[k], str) for k in ('endpoint', 'kind', 'id')):
+            raise ValueError('checkpoint row has an invalid field, kind, or type')
+    resources = [(r['endpoint'], r['kind'], r['id']) for r in rows if r['kind'] != 'endpoint']
+    if len(resources) != len(set(resources)):
+        raise ValueError('duplicate checkpoint resource row')
     floors = [r for r in rows if r['kind'] == 'endpoint']
-    if len(floors) != 1 or floors[0]['id'] != '':
-        raise ValueError('expected exactly one endpoint floor row with an empty id')
+    if len(floors) != 1 or floors[0]['id'] != '' or floors[0]['seq'] < 1:
+        raise ValueError('expected exactly one endpoint floor row with an empty id and seq >= 1')
     result = {'endpoint': floors[0]['seq']}
     for kind, target in [('workspace', workspace), ('pane', pane)]:
         matches = [r['seq'] for r in rows if r['kind'] == kind and r['id'] == target]
@@ -192,16 +202,19 @@ if sys.argv[1] == 'self-test':
     # The first reservation writes only the endpoint floor row.
     if summarize([floor], 'w1', 'w1:p1') != {'endpoint': 32}: sys.exit('FAIL: endpoint-only checkpoint rejected')
     if summarize([floor, pane], 'w1', 'w1:p1') != {'endpoint': 32, 'pane': 30}: sys.exit('FAIL: resource row rejected')
+    if summarize([dict(floor, seq=U64_MAX)], 'w1', 'w1:p1') != {'endpoint': U64_MAX}: sys.exit('FAIL: u64 maximum rejected')
     for bad in [[], [floor, floor], [dict(floor, id='x')], [dict(floor, seq=0)],
                 [dict(floor, seq=True)], [dict(floor, seq='32')], [floor, dict(pane, seq=33)],
-                [floor, pane, pane], {'rows': [floor]}]:
+                [floor, pane, pane], {'rows': [floor]}, [dict(floor, seq=U64_MAX + 1)],
+                [floor, dict(pane, kind='tab')], [dict(floor, extra=1)], [{k: floor[k] for k in ('kind', 'id', 'seq')}],
+                [floor, dict(pane, id='w1:p9'), dict(pane, id='w1:p9')]]:
         if not rejected(summarize, bad, 'w1', 'w1:p1'): sys.exit('FAIL: invalid checkpoint accepted')
     first = {'endpoint': 32, 'pane': 30}
     for good in [first, {'endpoint': 64, 'pane': 30}, {'endpoint': 64, 'pane': 31, 'workspace': 2}]:
         if not non_decreasing(first, good): sys.exit('FAIL: unchanged or advanced checkpoint rejected')
     for bad in [{'endpoint': 31, 'pane': 30}, {'endpoint': 32, 'pane': 29}, {'endpoint': 32}]:
         if non_decreasing(first, bad): sys.exit('FAIL: regressed checkpoint accepted')
-    print('PASS: checkpoint validation accepts endpoint-only/unchanged floors, rejects missing/duplicate/invalid/regressed rows')
+    print('PASS: checkpoint validation accepts endpoint-only/unchanged floors, rejects missing/duplicate/unknown/out-of-range/regressed rows')
 elif sys.argv[1] == 'record':
     paths = glob.glob(sys.argv[2] + '/session-*/sequences.json')
     if len(paths) != 1: sys.exit('Expected one isolated sequence checkpoint')
