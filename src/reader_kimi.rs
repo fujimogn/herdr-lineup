@@ -4,6 +4,7 @@
 //! alias's window keys.
 
 use crate::model::*;
+use crate::reader_cache::FingerprintCache;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -16,19 +17,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CACHE_ENTRIES: usize = 128;
 type Turn = (f64, SystemTime, String);
+type WireCache = FingerprintCache<(PathBuf, String), Result<Turn, MissingReason>>;
+type WindowCache = FingerprintCache<(PathBuf, String), Result<f64, MissingReason>>;
 
-struct CachedWire {
-    fingerprint: Fingerprint,
-    observation: Result<Turn, MissingReason>,
-}
-static CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), CachedWire>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CACHE: LazyLock<Mutex<WireCache>> =
+    LazyLock::new(|| Mutex::new(FingerprintCache::new(CACHE_ENTRIES)));
 type StateBinding = Result<Option<(String, PathBuf)>, MissingReason>;
-static STATE_CACHE: LazyLock<Mutex<HashMap<PathBuf, (Fingerprint, StateBinding)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-type CachedWindow = (Fingerprint, Result<f64, MissingReason>);
-static WINDOW_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), CachedWindow>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static STATE_CACHE: LazyLock<Mutex<FingerprintCache<PathBuf, StateBinding>>> =
+    LazyLock::new(|| Mutex::new(FingerprintCache::new(MAX_DIRECTORY_ENTRIES)));
+static WINDOW_CACHE: LazyLock<Mutex<WindowCache>> =
+    LazyLock::new(|| Mutex::new(FingerprintCache::new(CACHE_ENTRIES)));
 
 pub struct KimiReader;
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -36,15 +34,20 @@ static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 static TEST_GATE: Mutex<()> = Mutex::new(());
 impl UsageReader for KimiReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+        self.read_in_cycle(request, &ReadCycle::new())
+    }
+
+    fn read_in_cycle(&self, request: &ReadRequest<'_>, cycle: &ReadCycle) -> UsageReading {
         #[cfg(test)]
         let _gate = TEST_GATE.lock().unwrap_or_else(|error| error.into_inner());
         let source = SourceKind::KimiSession;
         if !associated(request, Provider::Kimi) {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
-        bounded_read(request, source, &BUSY, move |request| {
+        let worker_cycle = cycle.clone();
+        let job = move |request: &ReadRequest<'_>| {
             let started = std::time::Instant::now();
-            match read_session(request) {
+            match read_session_in_cycle(request, &worker_cycle) {
                 Ok((percent, time)) => {
                     let evaluated = ReadRequest {
                         now: request.now_after(started),
@@ -54,17 +57,27 @@ impl UsageReader for KimiReader {
                 }
                 Err(reason) => UsageReading::missing(request, source, reason),
             }
-        })
+        };
+        match cycle.diagnostics() {
+            Some(diagnostics) => bounded_read_observed(request, source, &BUSY, diagnostics, job),
+            None => bounded_read(request, source, &BUSY, job),
+        }
     }
 }
 
+#[cfg(test)]
 fn read_session(request: &ReadRequest<'_>) -> Result<(f64, SystemTime), MissingReason> {
+    read_session_in_cycle(request, &ReadCycle::new())
+}
+
+fn read_session_in_cycle(
+    request: &ReadRequest<'_>,
+    cycle: &ReadCycle,
+) -> Result<(f64, SystemTime), MissingReason> {
     let mut budget = Budget::new(request);
     let wanted = lexical_absolute(&request.identity.repository_identity)
         .ok_or(MissingReason::Unassociated)?;
-    let states = budget.files(&request.home.join("sessions"), 2, |path| {
-        path.file_name().is_some_and(|name| name == "state.json")
-    })?;
+    let states = cycle.files(&mut budget, request.home, DiscoveryKind::Kimi)?;
     let mut matched = Vec::new();
     let mut saw_state = false;
     let mut unproven_duplicate = false;
@@ -113,15 +126,14 @@ fn read_session(request: &ReadRequest<'_>) -> Result<(f64, SystemTime), MissingR
 fn state_binding(budget: &Budget, path: &Path) -> Result<Option<(String, PathBuf)>, MissingReason> {
     let mut file = budget.open(path)?;
     let before = Fingerprint::of(&file.metadata().map_err(|error| io_reason(&error))?);
-    if let Some((fingerprint, binding)) = STATE_CACHE
+    if let Some(binding) = STATE_CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .get(path)
-        && *fingerprint == before
+        .get(&path.to_path_buf(), before)
     {
         budget.check()?;
         if stable_file(path, &file, before)? {
-            return binding.clone();
+            return binding;
         }
         return Err(MissingReason::SourceError);
     }
@@ -143,11 +155,10 @@ fn state_binding(budget: &Budget, path: &Path) -> Result<Option<(String, PathBuf
                 )
                 .map(|(id, cwd)| (id.to_owned(), cwd))
         });
-    let mut cache = STATE_CACHE.lock().map_err(|_| MissingReason::SourceError)?;
-    if cache.len() >= MAX_DIRECTORY_ENTRIES {
-        cache.clear();
-    }
-    cache.insert(path.to_path_buf(), (before, binding.clone()));
+    STATE_CACHE
+        .lock()
+        .map_err(|_| MissingReason::SourceError)?
+        .insert(path.to_path_buf(), before, binding.clone());
     binding
 }
 
@@ -204,7 +215,8 @@ fn openat(dir: &File, name: &str, flags: i32) -> Result<File, MissingReason> {
     let name = std::ffi::CString::new(name).map_err(|_| MissingReason::Invalid)?;
     // SAFETY: `dir` is an open directory and `name` is one NUL-terminated path
     // component. `O_NOFOLLOW` makes a symlink return an error instead of a target.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    // `O_CLOEXEC` keeps both the directory and file descriptors from surviving exec.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io_reason(&std::io::Error::last_os_error()));
     }
@@ -226,11 +238,10 @@ fn read_wire(
     if let Some(cached) = CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .get(&key)
-        && cached.fingerprint == fingerprint
+        .get(&key, fingerprint)
     {
         budget.check()?;
-        return cached.observation.clone();
+        return cached;
     }
     let text = read_jsonl_tail(budget, &mut file, fingerprint.size, |_| Ok(()))?;
     budget.check()?;
@@ -250,17 +261,10 @@ fn read_wire(
         result,
         Err(MissingReason::Timeout | MissingReason::SourceError | MissingReason::PermissionDenied)
     ) {
-        let mut cache = CACHE.lock().map_err(|_| MissingReason::SourceError)?;
-        if cache.len() >= CACHE_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(
-            key,
-            CachedWire {
-                fingerprint,
-                observation: result.clone(),
-            },
-        );
+        CACHE
+            .lock()
+            .map_err(|_| MissingReason::SourceError)?
+            .insert(key, fingerprint, result.clone());
     }
     result
 }
@@ -406,15 +410,14 @@ fn model_window(budget: &Budget, home: &Path, alias: &str) -> Result<f64, Missin
     let mut file = budget.open(&path)?;
     let before = Fingerprint::of(&file.metadata().map_err(|error| io_reason(&error))?);
     let key = (path.clone(), alias.to_owned());
-    if let Some((fingerprint, window)) = WINDOW_CACHE
+    if let Some(window) = WINDOW_CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .get(&key)
-        && *fingerprint == before
+        .get(&key, before)
     {
         budget.check()?;
         if stable_file(&path, &file, before)? {
-            return *window;
+            return window;
         }
         return Err(MissingReason::SourceError);
     }
@@ -423,13 +426,10 @@ fn model_window(budget: &Budget, home: &Path, alias: &str) -> Result<f64, Missin
         return Err(MissingReason::SourceError);
     }
     let window = parse_window(&bytes, alias);
-    let mut cache = WINDOW_CACHE
+    WINDOW_CACHE
         .lock()
-        .map_err(|_| MissingReason::SourceError)?;
-    if cache.len() >= CACHE_ENTRIES {
-        cache.clear();
-    }
-    cache.insert(key, (before, window));
+        .map_err(|_| MissingReason::SourceError)?
+        .insert(key, before, window);
     window
 }
 
@@ -506,9 +506,136 @@ fn lexical_absolute(value: &str) -> Option<PathBuf> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_routing_isolated() {
+        const CHILD: &str = "HERDR_LINEUP_KIMI_ROUTING_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("kimi") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reader_kimi::tests::diagnostic_routing_isolated",
+                    "--nocapture",
+                ])
+                .env(CHILD, "kimi")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostics = std::sync::Arc::new(ReaderDiagnostics::default());
+        let cycle = ReadCycle::with_diagnostics(diagnostics.clone());
+        let plain = ReadCycle::new();
+        let mut first = identity(Provider::Kimi);
+        first.repository_identity = "/synthetic/repo".into();
+        let mut second = first.clone();
+        second.native_session_id = "session-2".into();
+        let base = request(&first, dir.path());
+        for id in [&first, &second] {
+            install(
+                dir.path(),
+                &id.native_session_id,
+                "/synthetic/repo",
+                75,
+                fresh_ms(&base),
+                "",
+            );
+        }
+        // Separate pane identities share this refresh's discovery owner.
+        for id in [&first, &second] {
+            let r = request(id, dir.path());
+            assert_routing_sample(KimiReader.read_in_cycle(&r, &cycle).context);
+            wait_for_routing_worker();
+        }
+        assert!((1..=2).contains(&cycle.discovery_scan_count()));
+        let snapshot = diagnostics.snapshot(Provider::Kimi).unwrap();
+        assert_eq!((snapshot.attempts, snapshot.completed), (2, 2));
+        assert_eq!(snapshot.busy_rejections, 0);
+        assert!(!snapshot.worker_active);
+        for id in [&first, &second] {
+            assert_routing_sample(
+                KimiReader
+                    .read_in_cycle(&request(id, dir.path()), &plain)
+                    .context,
+            );
+            wait_for_routing_worker();
+        }
+        assert!((1..=2).contains(&plain.discovery_scan_count()));
+        assert_routing_sample(KimiReader.read(&base).context);
+        wait_for_routing_worker();
+        assert_eq!(diagnostics.snapshot(Provider::Kimi).unwrap().attempts, 2);
+
+        // Rejection before bounded_read starts has no diagnostic attempt.
+        let mut unassociated = first.clone();
+        unassociated.provider = Provider::Hermes;
+        assert_eq!(
+            KimiReader
+                .read_in_cycle(&request(&unassociated, dir.path()), &cycle)
+                .context,
+            UsageOutcome::Unavailable(MissingReason::Unassociated)
+        );
+        assert_eq!(diagnostics.snapshot(Provider::Kimi).unwrap().attempts, 2);
+        // Invalid timeout is detected inside bounded_read, so it is counted.
+        let invalid = ReadRequest {
+            timeout: Duration::MAX,
+            ..base
+        };
+        assert_eq!(
+            KimiReader.read_in_cycle(&invalid, &cycle).context,
+            UsageOutcome::Unavailable(MissingReason::Invalid)
+        );
+        let snapshot = diagnostics.snapshot(Provider::Kimi).unwrap();
+        assert_eq!(
+            (snapshot.attempts, snapshot.completed, snapshot.invalid),
+            (3, 2, 1)
+        );
+        assert_eq!(snapshot.sampling_skips, 0);
+    }
+
+    fn assert_routing_sample(outcome: UsageOutcome) {
+        let UsageOutcome::Available(percent) = outcome else {
+            panic!("expected available context: {outcome:?}");
+        };
+        assert!((percent - 7.5).abs() < 1e-9);
+    }
+
+    fn wait_for_routing_worker() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while BUSY.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
     use super::*;
     use crate::model::tests::{identity, request};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn raw_openat_directory_and_file_keep_cloexec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/wire.jsonl"), b"{}\n").unwrap();
+        let root = open_directory(dir.path()).unwrap();
+        let child = openat(
+            &root,
+            "nested",
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )
+        .unwrap();
+        let file = openat(
+            &child,
+            "wire.jsonl",
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+        .unwrap();
+        for descriptor in [&child, &file] {
+            let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
 
     #[test]
     fn typed_wire_ignores_valid_non_objects_and_rejects_completed_corruption() {
@@ -613,6 +740,51 @@ mod tests {
         identity.native_session_id = session.into();
         identity.repository_identity = cwd.into();
         KimiReader.read(&request(&identity, home)).context
+    }
+
+    #[test]
+    fn cycle_adapter_rechecks_state_content_and_new_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut id = identity(Provider::Kimi);
+        id.repository_identity = "/synthetic/repo".into();
+        let r = request(&id, dir.path());
+        install(
+            dir.path(),
+            "session-1",
+            "/synthetic/repo",
+            75,
+            fresh_ms(&r),
+            "",
+        );
+        let cycle = ReadCycle::new();
+        let first = read_session_in_cycle(&r, &cycle).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        let state = dir
+            .path()
+            .join("sessions/wd_synthetic/session-1/state.json");
+        // A file rewrite does not change its parent directory stamp. The
+        // adapter must still revalidate the state binding on a listing hit.
+        fs::write(&state, r#"{"id":"session-1","cwd":"/synthetic/else"}"#).unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Unassociated)
+        );
+        fs::write(&state, r#"{"id":"session-1","cwd":"/synthetic/repo"}"#).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        let duplicate = dir.path().join("sessions/other/session-1");
+        fs::create_dir_all(&duplicate).unwrap();
+        fs::copy(&state, duplicate.join("state.json")).unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Unassociated)
+        );
+        fs::rename(duplicate.join("state.json"), duplicate.join("ignored")).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        fs::write(&state, b"broken").unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Unassociated)
+        );
     }
 
     #[test]
@@ -1065,6 +1237,50 @@ mod tests {
             .join("sessions/wd_synthetic/session-1/state.json");
         std::fs::write(&state, r#"{"id":"other-session","cwd":"/synthetic/repo"}"#).unwrap();
         assert_eq!(read_session(&base), Err(MissingReason::Unassociated));
+    }
+
+    #[test]
+    fn cached_wire_replacement_and_symlink_are_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = identity(Provider::Kimi);
+        let now = fresh_ms(&request(&bound, dir.path()));
+        install(dir.path(), "session-1", "/synthetic/repo", 75, now, "");
+        let wire = dir
+            .path()
+            .join("sessions/wd_synthetic/session-1/agents/main/wire.jsonl");
+        assert_eq!(
+            read_at(dir.path(), "session-1", "/synthetic/repo"),
+            UsageOutcome::Available(7.5)
+        );
+
+        let metadata = std::fs::metadata(&wire).unwrap();
+        let replacement = wire.with_extension("replacement");
+        std::fs::write(
+            &replacement,
+            std::fs::read_to_string(&wire)
+                .unwrap()
+                .replace("\"tokens\":75", "\"tokens\":85"),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(metadata.modified().unwrap())
+            .unwrap();
+        std::fs::rename(&replacement, &wire).unwrap();
+        assert_eq!(
+            read_at(dir.path(), "session-1", "/synthetic/repo"),
+            UsageOutcome::Available(8.5)
+        );
+
+        let saved = wire.with_extension("saved");
+        std::fs::rename(&wire, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &wire).unwrap();
+        assert!(!matches!(
+            read_at(dir.path(), "session-1", "/synthetic/repo"),
+            UsageOutcome::Available(_)
+        ));
     }
 
     #[test]

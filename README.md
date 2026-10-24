@@ -54,7 +54,7 @@ The source build during installation can take several minutes.
    Review Herdr's source and command preview before confirming. The manifest's
    `cargo build --release --locked` command runs after confirmation and before
    registration; if the build fails, Herdr does not register Lineup. To pin the
-   v0.2.0 release, add `--ref v0.2.0`. Use `--yes` only when you already trust
+   v0.2.2 release, add `--ref v0.2.2`. Use `--yes` only when you already trust
    the source and want to skip the interactive confirmation. If you previously
    linked a local checkout, run `herdr plugin unlink herdr-lineup` before
    installing; installation over a local link is refused.
@@ -86,7 +86,7 @@ When installing or upgrading:
   user settings in `HERDR_PLUGIN_CONFIG_DIR`.
 - There is no `herdr plugin update`. To upgrade, install again.
 - Pin a version with a release tag:
-  `herdr plugin install fujimogn/herdr-lineup --ref v0.2.0`.
+  `herdr plugin install fujimogn/herdr-lineup --ref v0.2.2`.
 - Before downgrading, stop Lineup and preserve its state directory. Newer
   releases may write `endpoint` rows to the per-session `sequences.json`
   checkpoint when pruning absent resources. An older binary that does not
@@ -367,18 +367,29 @@ kitty, or `font-codepoint-map = U+E1A0-U+E1BA=Herdr Agent Icons Max` for Ghostty
 Uninstall removes only recorded, byte-identical blocks and a font file that
 Lineup installed. If it removes no owned files, it reports that nothing managed
 was removed and still exits successfully. A preexisting identical font is
-preserved. If you removed a whole managed block by hand, retry either font
-action: it drops the stale
-ownership entry and continues. An install interrupted after a terminal write
-can also be retried because the ownership record is saved first. A partly
-removed or edited block still causes a conflict. Keep
-`$HERDR_PLUGIN_STATE_DIR/font-ownership.json`: each `entries` item contains the
-config `path` and exact `owned` text, including newlines. Restore that text
-exactly once in the matching file, preserving your unrelated edits, then retry
-uninstall. If a terminal config is temporarily missing during uninstall, its
-ownership entry is retained so its managed block can be removed after the file
-returns. Keep the same home, XDG paths, and state directory used for install;
-do not delete the ownership record to bypass a conflict.
+preserved. If you removed a whole managed block by hand, a later action can
+drop that stale ownership entry. A partly removed or edited block causes a
+conflict. Keep `$HERDR_PLUGIN_STATE_DIR/font-ownership.json`: each `entries`
+item contains the config `path` and exact `owned` text, including newlines.
+Before changing a font or terminal file, an action writes a `pending` action
+and affected paths to the journal. On a later failure it leaves earlier writes,
+a partially written font, and current terminal files in place, and refuses
+another font action while `pending` exists. A preflight or initial journal
+write failure may leave no `pending` record; a concurrent journal edit may
+replace one. In either case, inspect the reported path, the journal, and
+current files before deciding whether any action is safe. Establish which
+bytes are Lineup-owned and which are external edits, then make a manual
+recovery plan. If ownership cannot be established, stop and keep the files
+and journal for manual help.
+Do not delete the journal or simply retry to bypass the refusal. For a
+modified managed block, restore its exact recorded text once while preserving
+unrelated edits only after confirming its ownership. If a terminal config is
+temporarily missing during uninstall, its ownership entry is retained so its
+managed block can be removed after the file returns. Keep the same home, XDG
+paths, and state directory used for install. Successful actions check file
+bytes and the font's device and inode before removal, but an external edit
+between a check and rename or unlink can still race the action. Avoid
+concurrent edits while running it.
 
 ### Account quota (opt-in)
 
@@ -394,6 +405,14 @@ and reads Grok's existing auth key from `GROK_AUTH_FILE` when set, otherwise
 `GROK_HOME/auth.json` when `GROK_HOME` is set, otherwise `~/.grok/auth.json`.
 It does not try another source if the selected file cannot be read. No
 credentials are displayed or persisted by Lineup. Do not restart the Herdr server.
+Lineup compares the selected key and optional user ID in memory on each sidebar
+refresh and before and after a billing request. Once a refresh observes a
+changed or unreadable auth source, it clears the previous weekly value; a
+failed request for the new account cannot reuse it. A change immediately after
+the source read can remain visible until the next refresh. A temporary failure
+for the same source keeps a previous weekly value only while its known reset
+remains in the future. No daemon restart is needed to discard the old Grok
+weekly value after the switch is observed.
 
 Kimi weekly quota needs a separate opt-in in the same file:
 
@@ -464,12 +483,12 @@ existing agent settings before changing them; startup does not edit them.
    will update automatically.
 
    Alternatively, download the archive for your OS and architecture and
-   `SHA256SUMS.txt` from the [release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.2.0).
+   `SHA256SUMS.txt` from the [release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.2.2).
    From the download directory, select the archive you downloaded and its
    matching line in `SHA256SUMS.txt` (replace the example filename). On Linux:
 
    ```sh
-   ARCHIVE=herdr-lineup-v0.2.0-linux-x86_64.tar.gz
+   ARCHIVE=herdr-lineup-v0.2.2-linux-x86_64.tar.gz
    CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
      printf '%s\n' "$CHECKSUM_LINE" | sha256sum -c -
    ```
@@ -477,7 +496,7 @@ existing agent settings before changing them; startup does not edit them.
    On macOS, use the same selection with your downloaded macOS archive:
 
    ```sh
-   ARCHIVE=herdr-lineup-v0.2.0-macos-arm64.tar.gz
+   ARCHIVE=herdr-lineup-v0.2.2-macos-arm64.tar.gz
    CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
      printf '%s\n' "$CHECKSUM_LINE" | shasum -a 256 -c -
    ```
@@ -560,8 +579,11 @@ existing agent settings before changing them; startup does not edit them.
    regular records were found (also check the state directory's permissions);
    otherwise `StatusLine records: <count> (latest: <N>s ago)` reports the count
    and newest record age. The scan examines at most 1,024 directory entries
-   without following symlinks. This is a storage diagnostic, not proof that a
-   record belongs to the current pane. Check that the relevant pane gains usage data.
+   without following symlinks; when it reaches that limit, the line says
+   `in scanned entries` and `scan limit reached`, and a directory or entry
+   read error prints `StatusLine records: scan incomplete` instead of a partial count.
+   This is a storage diagnostic, not proof that a record belongs to the
+   current pane. Check that the relevant pane gains usage data.
 
 Usage is shown in the sidebar only. `herdr-lineup statusline` does not render
 a status line and does not print a pace label. `herdr-lineup statusline --help`
@@ -583,6 +605,12 @@ pane. Antigravity ignores any conversation id in the JSON. Herdr panes provide
 observation. Antigravity's weekly remaining is the active model's weekly quota
 pool. When the model does not select a pool, the only pool present is used; two
 pools leave weekly unavailable.
+
+Known limitation: an Antigravity record is bound only to the pane ID, without
+an occupant generation. If another Antigravity session later runs in the same
+pane, it can show the previous occupant's last values until a new
+observation arrives. Fixing this needs an occupant generation from the Herdr
+host and is tracked separately; it is not resolved in this version.
 
 Context stays `—` until an observation matches the pane, then retains the last
 valid value while that exact session or pane binding matches. Idle Claude,
@@ -731,9 +759,9 @@ credentials, paths, response bodies and error text are never recorded.
 
 Temporary failures retain the last success until its known reset; authentication
 failures clear it. Before the first successful query, after reset, and for Grok
-MONTHLY allowances, weekly stays `—`. Period names containing `WEEKLY`
-(case-insensitive, including enum prefixes) supply weekly usage; `MONTHLY`
-periods remain unavailable for 7d. Without a reset, Grok's remaining percentage
+MONTHLY allowances, weekly stays `—`. Case-insensitive `WEEKLY` and
+`BILLING_PERIOD_TYPE_WEEKLY` supply weekly usage; `NON_WEEKLY`, `BIWEEKLY`,
+and `WEEK` do not. `MONTHLY` periods remain unavailable for 7d. Without a reset, Grok's remaining percentage
 is shown without a countdown and expires after the greater of `usage_max_age_ms`
 and Grok's five-minute query interval plus its query timeout and one sidebar
 refresh interval from the last successful query. Codex quota without a reset
@@ -832,7 +860,7 @@ inactive state dots are cleared with JSON null.
 
 | Workspace token | Value |
 | --- | --- |
-| `lineup_repo` | Repository name, or `—` outside Git |
+| `lineup_repo` | Repository name, or cleared when unresolved |
 | `lineup_ship_unix` | Local `origin/main` commit timestamp, or cleared |
 | `lineup_ship_text` | `HH:MM` today, otherwise `M/D`, or `—` |
 
@@ -846,10 +874,23 @@ and uses `—` for its ship-time text. The full pane contract has 14 keys, withi
 Herdr's 16 keys per report and 32 stored keys per resource; unrelated keys are
 preserved and counted before publication.
 
-`doctor` distinguishes metadata capacity skips from refresh failures. It shows
-the number of resources skipped during the latest refresh; skips alone do not
-make it fail. A real refresh failure still exits nonzero. It also checks the
-control socket path length before trying to connect.
+`doctor` distinguishes capacity skips, deadline deferrals and refresh errors.
+Skips alone are healthy; a real refresh error still exits nonzero. Before that
+result it prints total and per-stage duration histograms (snapshot, Git,
+reader, checkpoint persistence, socket), report/checkpoint counts and outcomes.
+Stages overlap, so their durations must not be added. `last refresh <N> ms
+after startup` is uptime, not refresh duration.
+
+Reader diagnostics cover Claude, Agy, Codex, Grok and Kimi bounded workers:
+attempts, BUSY rejections, caller deadline/shutdown ends, accepted completions,
+waits and retained-worker gauges. They are live best-effort samples taken for
+the control request, independent of completed refresh metrics; providers and
+fields are not transactional. A completion may contain missing usage. Hermes
+has no bounded worker, so its empty slot is not a read measurement. Missing,
+legacy, contended or invalid diagnostics show unavailable, not measured zero.
+Deadline-skip diagnostics are separate from reader deadline counters and keep
+the latest skip attempt across later attempts. The control socket path length
+is checked before connect.
 
 ### Per-session publisher
 
@@ -870,6 +911,23 @@ to a replaced server. Deadlines use
 non-blocking I/O and `poll` against one monotonic deadline. On macOS,
 `setsockopt` on a socket the peer has closed returns `EINVAL`, so the deadline
 is not applied with `setsockopt`.
+The local candidate uses a cooperative refresh envelope of
+`2 s + 1 s + reader_timeout_ms + 2 s` (7 s by default). Git headings share a
+one-second cycle budget and use an attempt-based fair queue. The persistent
+Git cache stores only worktree root/name; a hit still runs three children,
+and interrupted reads can use a confirmed heading for at most 30 s without
+renewing that age on a cache hit. No speed improvement has been measured.
+One discovery cycle is shared across panes in each refresh, with the existing
+combined 4,096-entry Codex cap and cumulative fallback accounting.
+
+Panes and workspaces share a fair send queue. A required report with less
+than 2 s of envelope remaining is deferred without writing a frame. An
+admitted exchange that fails can be ambiguous: its sequence is burned, never
+replayed. Sequence windows are durable before send; an uncertain checkpoint
+write stops publication until a new daemon instance reloads it. The envelope
+cannot interrupt synchronous filesystem work, fsync or process reaping, and
+is not an SLO or a strict wall-clock bound. Deferred renewals may expire and
+disappear in degraded cycles. The default refresh interval stays 5 s.
 See the [Herdr plugin documentation](https://herdr.dev/docs/plugins/)
 and [SECURITY.md](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md).
 

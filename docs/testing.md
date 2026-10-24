@@ -165,7 +165,7 @@ no credentials, real provider sessions, or authenticated API calls were used.
 This rerun establishes Linux metadata behavior at that older commit; it adds no
 macOS runtime or visual rendering evidence.
 
-## Current main rerun
+## Historical main rerun (2026-10-13)
 
 On 2026-10-13, on Linux with Herdr 0.9.3, the checks that do not attach to a
 user's session were re-run against
@@ -201,3 +201,59 @@ binary used by the harness was built with `cargo build --release --locked`.
 Not re-run: macOS on a real machine, an authenticated provider pane, real-agent
 usage, and visual sidebar or font rendering. The isolated home has no provider
 authentication, so those checks stay outside this rerun.
+
+
+## Shared transport deadlines (isolated socket fixtures)
+
+`Transport::connect_before(path, deadline)`,
+`reconnect_same_endpoint_before(deadline)`, `send_line_before(frame, deadline)`,
+and `receive_line_before(deadline)` accept an absolute monotonic `Instant`.
+Pass the **same** instant through connect, send (including any reconnect after
+an already completed response), and receive. Each connect uses the earlier of
+that instant and its one-second local cap; each frame uses the earlier of that
+instant and its 500 ms local cap. Progress, retries, trickled bytes, and an
+implicit reconnect do not renew the caller's budget. The crate-level
+`connect_stream_before`, `write_frame_before`, and `read_frame_before` expose
+the same caps for internal control transports. Existing methods retain their
+per-operation local caps without imposing a new shared budget.
+
+An expired instant returns `TimedOut` before a new connection or frame starts,
+even when the reader already buffers a complete frame. Expiry before send or
+explicit reconnect leaves the previous connection state unchanged. Once a
+send/reconnect attempt starts, an I/O or endpoint-validation error makes the
+transport unusable for send, receive, and connection checks. Every receive
+error, including preflight expiry, also invalidates the transport: the request
+may already have been accepted. Only an explicit successful reconnect to the
+original endpoint restores usability. No failed or uncertain request is
+automatically replayed. A caller must reconcile application-level ambiguity
+before deciding whether to issue a new request. Low-level frame callers must
+discard their stream after errors; those helpers do not own transport state.
+
+Endpoint checks still read the path, socket type, owner, device, and inode
+before and after connection and frame I/O. Descriptor metadata alone cannot
+replace those checks. Nonblocking I/O, `poll`, close-on-exec descriptors,
+newline framing, the existing frame limit, and complete-frame handling after
+EOF remain in place. Synchronous filesystem/path checks, allocation, scheduling,
+and stream teardown do not have a strict wall-time bound.
+
+Run `cargo test --locked socket::tests` for private temporary Unix listeners
+and socket pairs. Fixtures cover expired connect/send/read (including buffered
+bytes), shared send/reconnect/read budgets, slow/trickled reads, write
+backpressure, incomplete responses, explicit recovery, endpoint replacement,
+and legacy wrappers. Linux additionally exercises a saturated listen backlog;
+these tests change only their own listener descriptors. They do not change
+process-wide descriptor limits or require serializing the whole suite. New
+checks use exact deadline/cap relations and error/state assertions rather than
+tight elapsed-time upper bounds. Existing legacy timing tests remain intact.
+No real Herdr session, configuration, credentials, or provider API is used.
+
+Production publication now passes the shared envelope through snapshot and
+metadata exchanges. Clear passes its own 3 s deadline. The default refresh
+envelope is 7 s, derived from local caps; it is cooperative and can be
+exceeded by synchronous OS work or scheduling. A refused admission writes
+no frame; an admitted ambiguous exchange burns its sequence and ends the
+cycle. See [runtime wiring](plans/publisher-runtime-wiring.md) and the
+[source/fixture map](reviews/review-followup-coverage.md) L3 for the current
+contract, deadline-skip versus capacity/error behavior, and fair queues.
+Linux fixtures do not establish macOS runtime behavior or a visible-latency
+SLO. Sequence reservation and uncertainty remain the publisher's responsibility.

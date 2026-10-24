@@ -37,29 +37,66 @@ pub struct Transport {
     identity: EndpointIdentity,
     reader: BufReader<UnixStream>,
     response_complete: bool,
+    reusable: bool,
 }
 impl Transport {
     pub fn connect(path: &Path) -> io::Result<Self> {
+        Self::connect_with_deadline(path, None)
+    }
+    /// Share the caller's absolute deadline; connecting still has a one-second cap.
+    pub fn connect_before(path: &Path, deadline: Instant) -> io::Result<Self> {
+        Self::connect_with_deadline(path, Some(deadline))
+    }
+    fn connect_with_deadline(path: &Path, deadline: Option<Instant>) -> io::Result<Self> {
+        check_deadline(deadline)?;
         if !path.is_absolute() {
             return Err(io::Error::other("HERDR_SOCKET_PATH must be absolute"));
         }
         let identity = EndpointIdentity::read(path)?;
-        let stream = connect_stream(path)?;
+        let stream = match deadline {
+            Some(deadline) => connect_stream_before(path, deadline)?,
+            None => connect_stream(path)?,
+        };
         let transport = Self {
             path: path.into(),
             identity,
             reader: BufReader::new(stream),
             response_complete: false,
+            reusable: true,
         };
         transport.verify_endpoint()?;
+        check_deadline(deadline)?;
         Ok(transport)
     }
     pub fn reconnect_same_endpoint(&mut self) -> io::Result<()> {
+        self.reconnect_with_deadline(None)
+    }
+    /// Explicit recovery discards the previous stream, never replaying its request.
+    pub fn reconnect_same_endpoint_before(&mut self, deadline: Instant) -> io::Result<()> {
+        self.reconnect_with_deadline(Some(deadline))
+    }
+    fn reconnect_with_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        check_deadline(deadline)?;
+        // Failed recovery must not make the old, possibly ambiguous stream usable.
+        self.reusable = false;
         self.verify_endpoint()?;
-        let stream = connect_stream(&self.path)?;
+        let stream = match deadline {
+            Some(deadline) => connect_stream_before(&self.path, deadline)?,
+            None => connect_stream(&self.path)?,
+        };
         self.verify_endpoint()?;
+        check_deadline(deadline)?;
         self.reader = BufReader::new(stream);
         self.response_complete = false;
+        self.reusable = true;
+        Ok(())
+    }
+    fn require_reusable(&self) -> io::Result<()> {
+        if !self.reusable {
+            return Err(io::Error::other(
+                "socket requires explicit reconnect after failure",
+            ));
+        }
         Ok(())
     }
     pub fn identity(&self) -> EndpointIdentity {
@@ -81,28 +118,69 @@ impl Transport {
         })
     }
     pub fn send_line(&mut self, frame: &[u8]) -> io::Result<()> {
-        self.verify_endpoint()?;
+        self.send_with_deadline(frame, None)
+    }
+    /// Reconnect (after a complete response) and write share the caller's budget.
+    pub fn send_line_before(&mut self, frame: &[u8], deadline: Instant) -> io::Result<()> {
+        self.send_with_deadline(frame, Some(deadline))
+    }
+    fn send_with_deadline(&mut self, frame: &[u8], deadline: Option<Instant>) -> io::Result<()> {
+        check_deadline(deadline)?;
+        self.require_reusable()?;
         if frame.len() > MAX_FRAME_BYTES || frame.contains(&b'\n') {
             return Err(io::Error::other("invalid outbound frame"));
         }
-        // Herdr's ordinary JSON API closes after one response. Never replay
-        // a possibly accepted request: open the next connection before sending.
-        if self.response_complete {
-            self.reconnect_same_endpoint()?;
+        let result = (|| {
+            self.verify_endpoint()?;
+            // Herdr closes after one response. Only a completed response permits
+            // automatic reconnect; an uncertain request is never replayed.
+            if self.response_complete {
+                self.reconnect_with_deadline(deadline)?;
+            }
+            match deadline {
+                Some(deadline) => write_frame_before(self.reader.get_mut(), frame, deadline)?,
+                None => write_frame(self.reader.get_mut(), frame)?,
+            }
+            self.response_complete = false;
+            self.verify_endpoint()?;
+            check_deadline(deadline)
+        })();
+        if result.is_err() {
+            self.reusable = false;
         }
-        write_frame(self.reader.get_mut(), frame)?;
-        self.verify_endpoint()
+        result
     }
     pub fn receive_line(&mut self) -> io::Result<Vec<u8>> {
-        self.verify_endpoint()?;
-        let frame = read_frame(&mut self.reader, MAX_FRAME_BYTES)?;
-        self.verify_endpoint()?;
-        self.response_complete = true;
-        Ok(frame)
+        self.receive_with_deadline(None)
+    }
+    /// Use the same absolute deadline passed to connect/send for one request.
+    pub fn receive_line_before(&mut self, deadline: Instant) -> io::Result<Vec<u8>> {
+        self.receive_with_deadline(Some(deadline))
+    }
+    fn receive_with_deadline(&mut self, deadline: Option<Instant>) -> io::Result<Vec<u8>> {
+        self.require_reusable()?;
+        let result = (|| {
+            // Even a preflight read timeout abandons a possibly accepted request.
+            check_deadline(deadline)?;
+            self.verify_endpoint()?;
+            let frame = match deadline {
+                Some(deadline) => read_frame_before(&mut self.reader, MAX_FRAME_BYTES, deadline)?,
+                None => read_frame(&mut self.reader, MAX_FRAME_BYTES)?,
+            };
+            self.verify_endpoint()?;
+            check_deadline(deadline)?;
+            self.response_complete = true;
+            Ok(frame)
+        })();
+        if result.is_err() {
+            self.reusable = false;
+        }
+        result
     }
     /// Detect unexpected disconnect; EOF after a full response is normal.
     pub fn check_connection(&self) -> io::Result<()> {
         use std::os::fd::AsRawFd;
+        self.require_reusable()?;
         self.verify_endpoint()?;
         if self.response_complete {
             return Ok(());
@@ -128,6 +206,14 @@ impl Transport {
 }
 /// Connect with a real deadline, including a saturated Unix listen backlog.
 pub(crate) fn connect_stream(path: &Path) -> io::Result<UnixStream> {
+    connect_stream_before(path, Instant::now() + Duration::from_secs(1))
+}
+
+pub(crate) fn connect_stream_before(
+    path: &Path,
+    caller_deadline: Instant,
+) -> io::Result<UnixStream> {
+    let deadline = capped_deadline(caller_deadline, Duration::from_secs(1))?;
     use std::os::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
@@ -148,7 +234,6 @@ pub(crate) fn connect_stream(path: &Path) -> io::Result<UnixStream> {
     {
         address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
     }
-    let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -166,6 +251,7 @@ pub(crate) fn connect_stream(path: &Path) -> io::Result<UnixStream> {
             return Err(io::Error::last_os_error());
         }
         stream.set_nonblocking(true)?;
+        check_deadline(Some(deadline))?;
         let status = unsafe {
             libc::connect(
                 fd,
@@ -233,9 +319,25 @@ pub(crate) fn connect_stream(path: &Path) -> io::Result<UnixStream> {
                 break;
             }
         }
+        check_deadline(Some(deadline))?;
         stream.set_nonblocking(false)?;
         return Ok(stream);
     }
+}
+
+fn check_deadline(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "socket deadline exceeded",
+        ));
+    }
+    Ok(())
+}
+
+fn capped_deadline(caller: Instant, local_cap: Duration) -> io::Result<Instant> {
+    check_deadline(Some(caller))?;
+    Ok(caller.min(Instant::now() + local_cap))
 }
 
 /// Wait against one monotonic deadline without changing socket options.
@@ -274,10 +376,18 @@ fn wait_ready(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> 
 }
 
 pub(crate) fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> io::Result<()> {
+    write_frame_before(stream, frame, Instant::now() + Duration::from_millis(500))
+}
+
+pub(crate) fn write_frame_before(
+    stream: &mut UnixStream,
+    frame: &[u8],
+    caller_deadline: Instant,
+) -> io::Result<()> {
+    let deadline = capped_deadline(caller_deadline, Duration::from_millis(500))?;
     let mut bytes = Vec::with_capacity(frame.len() + 1);
     bytes.extend_from_slice(frame);
     bytes.push(b'\n');
-    let deadline = Instant::now() + Duration::from_millis(500);
     // fcntl affects the local fd, unlike setsockopt which macOS rejects after
     // peer shutdown (EINVAL). Nonblocking I/O plus poll preserves the deadline.
     stream.set_nonblocking(true)?;
@@ -291,6 +401,7 @@ pub(crate) fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> io::Result<(
             ));
         }
         wait_ready(stream, libc::POLLOUT, deadline)?;
+        check_deadline(Some(deadline))?;
         match stream.write(remaining_bytes) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -310,11 +421,19 @@ pub(crate) fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> io::Result<(
             Err(error) => return Err(error),
         }
     }
-    Ok(())
+    check_deadline(Some(deadline))
 }
 
 pub(crate) fn read_frame(reader: &mut BufReader<UnixStream>, limit: usize) -> io::Result<Vec<u8>> {
-    let deadline = Instant::now() + Duration::from_millis(500);
+    read_frame_before(reader, limit, Instant::now() + Duration::from_millis(500))
+}
+
+pub(crate) fn read_frame_before(
+    reader: &mut BufReader<UnixStream>,
+    limit: usize,
+    caller_deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    let deadline = capped_deadline(caller_deadline, Duration::from_millis(500))?;
     reader.get_mut().set_nonblocking(true)?;
     let mut frame = Vec::new();
     loop {
@@ -330,6 +449,7 @@ pub(crate) fn read_frame(reader: &mut BufReader<UnixStream>, limit: usize) -> io
         if reader.buffer().is_empty() {
             wait_ready(reader.get_ref(), libc::POLLIN, deadline)?;
         }
+        check_deadline(Some(deadline))?;
         let buffer = match reader.fill_buf() {
             Ok(buffer) => buffer,
             Err(error)
@@ -357,6 +477,7 @@ pub(crate) fn read_frame(reader: &mut BufReader<UnixStream>, limit: usize) -> io
         reader.consume(count);
         if end.is_some() {
             frame.pop();
+            check_deadline(Some(deadline))?;
             return Ok(frame);
         }
     }
@@ -366,6 +487,348 @@ pub(crate) fn read_frame(reader: &mut BufReader<UnixStream>, limit: usize) -> io
 mod tests {
     use super::*;
     #[test]
+    fn deadline_api_preserves_descriptor_and_frame_boundaries() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let client = connect_stream_before(&path, deadline).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.write_all(b"1234\nsecond\n").unwrap();
+        drop(peer);
+        let mut reader = BufReader::new(client);
+        assert_eq!(
+            read_frame_before(&mut reader, 5, deadline).unwrap(),
+            b"1234"
+        );
+        assert_eq!(
+            read_frame_before(&mut reader, 7, deadline).unwrap(),
+            b"second"
+        );
+        assert_eq!(
+            read_frame_before(&mut reader, 7, deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"12345\n").unwrap();
+        assert!(read_frame_before(&mut BufReader::new(client), 5, deadline).is_err());
+        let mut transport = Transport::connect_before(&path, deadline).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        assert!(transport.send_line_before(b"bad\nframe", deadline).is_err());
+        assert!(
+            transport
+                .send_line_before(&vec![b'x'; MAX_FRAME_BYTES + 1], deadline)
+                .is_err()
+        );
+        // Rejected input never touches the wire or poisons the transport.
+        transport.send_line_before(b"valid", deadline).unwrap();
+        let mut request = String::new();
+        BufReader::new(peer.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert_eq!(request, "valid\n");
+        peer.write_all(b"ok\n").unwrap();
+        assert_eq!(transport.receive_line_before(deadline).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn caller_deadline_is_not_reset_and_long_budgets_keep_local_caps() {
+        let caller = Instant::now() + Duration::from_millis(250);
+        assert_eq!(
+            capped_deadline(caller, Duration::from_secs(1)).unwrap(),
+            caller
+        );
+        assert_eq!(
+            capped_deadline(caller, Duration::from_millis(500)).unwrap(),
+            caller
+        );
+        let before = Instant::now();
+        let far = before + Duration::from_secs(60);
+        let connect = capped_deadline(far, Duration::from_secs(1)).unwrap();
+        let after = Instant::now();
+        assert!(
+            (before + Duration::from_secs(1)..=after + Duration::from_secs(1)).contains(&connect)
+        );
+        let before = Instant::now();
+        let frame = capped_deadline(far, Duration::from_millis(500)).unwrap();
+        let after = Instant::now();
+        assert!(
+            (before + Duration::from_millis(500)..=after + Duration::from_millis(500))
+                .contains(&frame)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reconnect_uses_remaining_caller_budget_with_full_backlog() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut transport = Transport::connect(&path).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued = UnixStream::connect(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        assert_eq!(
+            transport
+                .reconnect_same_endpoint_before(deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(Instant::now() >= deadline);
+        assert!(transport.check_connection().is_err());
+        assert!(transport.send_line(b"never").is_err());
+        // Draining only the queued connection proves timeout did not connect.
+        let (_queued_peer, _) = listener.accept().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let recovery = Instant::now() + Duration::from_secs(5);
+        transport.reconnect_same_endpoint_before(recovery).unwrap();
+        let (_fresh, _) = listener.accept().unwrap();
+        assert!(transport.check_connection().is_ok());
+    }
+
+    #[test]
+    fn failed_write_requires_explicit_reconnect_without_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut transport = Transport::connect(&path).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        assert_eq!(
+            transport
+                .send_line_before(&vec![b'x'; MAX_FRAME_BYTES], deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(transport.send_line(b"no-replay").is_err());
+        assert!(transport.receive_line().is_err());
+        assert!(transport.check_connection().is_err());
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        transport.reconnect_same_endpoint().unwrap();
+        let (fresh, _) = listener.accept().unwrap();
+        transport.send_line(b"new-request").unwrap();
+        let mut request = String::new();
+        BufReader::new(fresh).read_line(&mut request).unwrap();
+        assert_eq!(request, "new-request\n");
+    }
+
+    #[test]
+    fn expired_deadline_starts_no_connect_or_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let expired = Instant::now();
+        assert_eq!(
+            Transport::connect_before(&path, expired)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            connect_stream_before(&path, expired).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let mut transport = Transport::connect(&path).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        assert_eq!(
+            transport
+                .send_line_before(b"never", expired)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        use std::io::Read;
+        assert_eq!(
+            peer.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // Preflight expiry leaves a connection usable: no bytes were sent.
+        transport.send_line(b"request").unwrap();
+        peer.write_all(b"complete\n").unwrap();
+        assert_eq!(
+            transport.receive_line_before(expired).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(transport.receive_line().is_err());
+        assert!(transport.send_line(b"must-not-replay").is_err());
+        transport.reconnect_same_endpoint().unwrap();
+        let (_fresh, _) = listener.accept().unwrap();
+        assert_eq!(
+            transport
+                .send_line_before(b"no-reconnect", expired)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let (mut client, mut other) = UnixStream::pair().unwrap();
+        assert_eq!(
+            write_frame_before(&mut client, b"never", expired)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        other.write_all(b"buffered\n").unwrap();
+        let mut reader = BufReader::new(client);
+        reader.fill_buf().unwrap();
+        assert_eq!(
+            read_frame_before(&mut reader, 8192, expired)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(read_frame(&mut reader, 8192).unwrap(), b"buffered");
+    }
+
+    #[test]
+    fn caller_deadline_is_shared_through_reconnect_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let mut transport = Transport::connect_before(&path, deadline).unwrap();
+        let (mut first, _) = listener.accept().unwrap();
+        transport.send_line_before(b"first", deadline).unwrap();
+        first.write_all(b"ok\n").unwrap();
+        assert_eq!(transport.receive_line_before(deadline).unwrap(), b"ok");
+        transport.send_line_before(b"second", deadline).unwrap();
+        let (_second, _) = listener.accept().unwrap();
+        assert_eq!(
+            transport.receive_line_before(deadline).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(Instant::now() >= deadline);
+        assert_eq!(
+            transport
+                .reconnect_same_endpoint_before(deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(transport.send_line(b"no-replay").is_err());
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn caller_caps_trickle_read_and_backpressure_write() {
+        let (read, mut write) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..8 {
+                if write.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            // This would complete within the local 500 ms cap if the caller
+            // deadline were ignored or renewed by each trickled byte.
+            let _ = write.write_all(b"\n");
+        });
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let mut reader = BufReader::new(read);
+        assert_eq!(
+            read_frame_before(&mut reader, 8192, deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(Instant::now() >= deadline);
+        drop(reader);
+        writer.join().unwrap();
+        let (mut client, _peer) = UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        assert_eq!(
+            write_frame_before(&mut client, &vec![b'x'; MAX_FRAME_BYTES], deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn endpoint_replacement_is_rejected_by_deadline_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut transport = Transport::connect_before(&path, deadline).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        transport.send_line_before(b"request", deadline).unwrap();
+        peer.write_all(b"ok\n").unwrap();
+        fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        assert!(transport.receive_line_before(deadline).is_err());
+        assert!(transport.send_line_before(b"never", deadline).is_err());
+        assert!(transport.reconnect_same_endpoint_before(deadline).is_err());
+        assert_eq!(
+            replacement.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn incomplete_response_requires_explicit_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut transport = Transport::connect(&path).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        transport.send_line(b"request").unwrap();
+        peer.write_all(b"partial").unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(
+            transport.receive_line().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(transport.send_line(b"must-not-replay").is_err());
+        assert!(transport.check_connection().is_err());
+        transport.reconnect_same_endpoint().unwrap();
+        let (mut fresh_peer, _) = listener.accept().unwrap();
+        transport.send_line(b"fresh").unwrap();
+        let mut request = String::new();
+        BufReader::new(fresh_peer.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert_eq!(request, "fresh\n");
+        fresh_peer.write_all(b"ok\n").unwrap();
+        assert_eq!(transport.receive_line().unwrap(), b"ok");
+    }
+    #[test]
     fn reconnects_only_to_unchanged_endpoint() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("herdr.sock");
@@ -373,7 +836,19 @@ mod tests {
         let mut transport = Transport::connect(&path).unwrap();
         let (peer, _) = listener.accept().unwrap();
         drop(peer);
-        assert!(transport.check_connection().is_err());
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut disconnected = false;
+        while Instant::now() < deadline {
+            if transport.check_connection().is_err() {
+                disconnected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            disconnected,
+            "socket did not observe peer EOF before deadline"
+        );
         transport.reconnect_same_endpoint().unwrap();
         let _new_peer = listener.accept().unwrap();
         assert!(transport.check_connection().is_ok());

@@ -93,9 +93,9 @@ jobs:
           pattern: artifact-*
           path: dist/
           merge-multiple: true
-      # 注釈付き tag に本文があれば注釈を、無ければ（軽量 tag・空の注釈）scripts/extract-release-notes.sh の抽出を本文にする。
-      # 軽量 tag の %(contents) は commit の message になるので、注釈の有無は object の型で見る。
-      # checkout が取った tag の ref が注釈を保つとは限らないので、読む前に origin から取り直す。
+      # Use a nonempty tag annotation, otherwise scripts/extract-release-notes.sh.
+      # Inspect the object type: a lightweight tag's %(contents) is the commit message.
+      # Refetch from origin before reading; checkout may not preserve the annotation.
       - name: Assemble checksums and release notes
         run: |
           set -euo pipefail

@@ -14,6 +14,7 @@ pub mod quota_diagnostic;
 pub mod quota_grok;
 pub mod quota_kimi;
 pub mod reader_agy;
+mod reader_cache;
 pub mod reader_claude;
 pub mod reader_codex;
 pub mod reader_grok;

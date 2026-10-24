@@ -38,6 +38,15 @@ to one `daemon.log.1` generation. The detached daemon's stdout and stderr are
 discarded. Git and Codex children discard stderr; their bounded stdout is
 parsed for local commit metadata and quota results, respectively.
 
+Refresh and reader diagnostics contain only fixed providers, categories,
+saturating counters and monotonic durations. They contain no session identity,
+paths, usage values, credentials or error text. Control samples reader state
+best-effort independently of completed refresh metrics; unavailable/legacy
+samples are not successful zero reads. Hermes has no local worker. These
+observations neither cancel an OS-stalled worker nor establish a strict
+filesystem deadline. C2 occupant-generation binding remains unresolved in a
+separate Herdr host task; see the README's Antigravity limitation.
+
 ## Local data read by the Grok billing client
 
 `quota_grok::Client` is polled by the dedicated daemon worker only with network
@@ -57,8 +66,9 @@ proxy settings are inherited, matching the retired quota client. Dependency wire
 headers, credential paths or underlying library error messages. No telemetry
 or conversation/session data is sent.
 
-Quota values are held only in memory. Case-insensitive period names containing
-`WEEKLY` expose used percent and optional reset time; `MONTHLY` returns
+Quota values are held only in memory. Case-insensitive `WEEKLY` and
+`BILLING_PERIOD_TYPE_WEEKLY` expose used percent and optional reset time;
+`NON_WEEKLY`, `BIWEEKLY`, and `WEEK` do not. `MONTHLY` returns
 `NonWeekly`, so weekly displays stay missing. Without a reset, publication
 expires the value after the greater of `usage_max_age_ms` and the Grok query
 interval plus its timeout and one sidebar refresh interval from the last
@@ -72,7 +82,23 @@ credentials), invalid responses, and failures without an earlier success return
 missing data. All failure paths are throttled; expired reset times clear cached
 usage. The synchronous client runs only on its worker. Its one configured auth
 source supplies weekly quota to all Grok panes independently of local context.
-Restart the Lineup daemon after account changes to discard cached quota.
+The client and foreground publisher compare the exact selected key and optional
+user ID in memory. Once the foreground refresh observes a change, unreadable
+source, or unknown source, it clears the old sample. A file change immediately
+after that refresh's source read can remain visible until the next refresh. The
+worker checks the source before and after HTTP and publishes only if the
+foreground has not observed another source in the meantime. A
+failed request retains an old sample only for the same source and only with a
+still-future known reset. A daemon restart is not needed to discard an old
+Grok weekly value after an observed account switch. Source identities, response
+bodies, and credentials are never written to diagnostics or plugin state.
+
+The foreground rereads the selected auth file once per refresh, with the
+existing 64 KiB file bound and nonblocking open. A synthetic 48-byte auth file
+measured 1,000 source reads in 3.58 ms on the development host (debug test
+build, 2026-10-23); this is a local cost measurement, not a service latency
+claim. At the default five-second refresh interval, it adds one bounded local
+read and parse per cycle.
 
 The daemon saves only fixed query-result categories in private per-session
 `weekly-codex.json`, `weekly-grok.json`, and `weekly-kimi.json` files under

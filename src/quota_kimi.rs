@@ -17,29 +17,37 @@ const CREDENTIAL_RELATIVE_PATH: &str = "credentials/kimi-code.json";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
-    interval: Duration,
-    timeout: Duration,
+    cadence: crate::model::AccountCadence,
 }
 
 impl Settings {
     pub fn new(interval: Duration, timeout: Duration) -> Self {
         Self {
-            interval: interval.clamp(Duration::from_secs(60), Duration::from_secs(3600)),
-            timeout: timeout.clamp(Duration::from_secs(1), Duration::from_secs(30)),
+            cadence: crate::model::AccountCadence::new(interval, timeout),
+        }
+    }
+
+    /// Bypass the production cadence clamp for an isolated worker fixture.
+    #[cfg(test)]
+    pub(crate) fn exact_for_test(interval: Duration, timeout: Duration) -> Self {
+        Self {
+            cadence: crate::model::AccountCadence::exact(interval, timeout),
         }
     }
 
     pub fn interval(self) -> Duration {
-        self.interval
+        self.cadence.interval()
     }
     pub fn timeout(self) -> Duration {
-        self.timeout
+        self.cadence.timeout()
     }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self::new(Duration::from_secs(300), Duration::from_secs(10))
+        Self {
+            cadence: crate::model::AccountCadence::default_account(),
+        }
     }
 }
 
@@ -59,7 +67,7 @@ pub enum Failure {
 
 impl Failure {
     pub fn is_transient(self) -> bool {
-        self == Self::Transient
+        matches!(self, Self::Transient | Self::AuthIo)
     }
 
     pub(crate) fn diagnostic(self) -> crate::quota_diagnostic::WeeklyResult {
@@ -163,7 +171,7 @@ impl Client {
 
     fn with_endpoint(auth_file: PathBuf, settings: Settings, endpoint: String) -> Self {
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(settings.timeout))
+            .timeout_global(Some(settings.timeout()))
             .max_redirects(0)
             .https_only(!cfg!(test))
             .build()
@@ -187,8 +195,8 @@ impl Client {
         self.last_auth_expiry
     }
 
-    pub(crate) fn source_stamp(&self) -> Option<SourceStamp> {
-        source_stamp(&self.auth_file)
+    pub(crate) fn source_state(&self) -> SourceState {
+        source_state(&self.auth_file)
     }
 
     /// At most one request per interval; the caller owns any sample retention.
@@ -200,7 +208,7 @@ impl Client {
         if self.next_request.is_some_and(|next| now < next) {
             return Outcome::Throttled;
         }
-        self.next_request = Some(now + self.settings.interval);
+        self.next_request = Some(now + self.settings.interval());
         let outcome = self.fetch(wall_now);
         self.last_result = match outcome {
             Outcome::Weekly(_) => crate::quota_diagnostic::WeeklyResult::Ok,
@@ -264,12 +272,19 @@ impl Client {
 /// Non-secret file identity; a changed credential or OAuth selector invalidates a sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SourceStamp {
-    credential: FileStamp,
-    selector: Option<FileStamp>,
+    pub(crate) credential: FileStamp,
+    pub(crate) selector: Option<FileStamp>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileStamp {
+pub(crate) enum SourceState {
+    Present(SourceStamp),
+    Missing,
+    Transient { credential: Option<FileStamp> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileStamp {
     device: u64,
     inode: u64,
     mode: u32,
@@ -280,34 +295,86 @@ struct FileStamp {
     changed_nanoseconds: i64,
 }
 
-fn file_stamp(path: &Path) -> Option<FileStamp> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    Some(FileStamp {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        mode: metadata.mode(),
-        size: metadata.len(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
+impl FileStamp {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            size: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatError {
+    Missing,
+    Transient,
+}
+
+fn stat_file(path: &Path) -> Result<FileStamp, StatError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                Err(StatError::Missing)
+            } else {
+                Ok(FileStamp::from_metadata(&metadata))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(StatError::Missing),
+        Err(_) => Err(StatError::Transient),
+    }
+}
+
+fn stat_optional_file(path: &Path) -> Result<Option<FileStamp>, StatError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                Err(StatError::Missing)
+            } else {
+                Ok(Some(FileStamp::from_metadata(&metadata)))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(StatError::Transient),
+    }
+}
+
+pub(crate) fn source_state(auth_file: &Path) -> SourceState {
+    let home = match auth_file.parent().and_then(Path::parent) {
+        Some(home) => home,
+        None => return SourceState::Missing,
+    };
+    let credential = match stat_file(auth_file) {
+        Ok(stamp) => stamp,
+        Err(StatError::Missing) => return SourceState::Missing,
+        Err(StatError::Transient) => return SourceState::Transient { credential: None },
+    };
+    let selector = match stat_optional_file(&home.join("config.toml")) {
+        Ok(selector) => selector,
+        Err(StatError::Missing) => return SourceState::Missing,
+        Err(StatError::Transient) => {
+            return SourceState::Transient {
+                credential: Some(credential),
+            };
+        }
+    };
+    SourceState::Present(SourceStamp {
+        credential,
+        selector,
     })
 }
 
+#[cfg(test)]
 pub(crate) fn source_stamp(auth_file: &Path) -> Option<SourceStamp> {
-    let home = auth_file.parent()?.parent()?;
-    if !std::fs::symlink_metadata(auth_file)
-        .ok()?
-        .file_type()
-        .is_file()
-    {
-        return None;
+    match source_state(auth_file) {
+        SourceState::Present(stamp) => Some(stamp),
+        SourceState::Missing | SourceState::Transient { .. } => None,
     }
-    let credential = file_stamp(auth_file)?;
-    Some(SourceStamp {
-        credential,
-        selector: file_stamp(&home.join("config.toml")),
-    })
 }
 
 #[derive(Deserialize)]
@@ -717,5 +784,62 @@ mod tests {
             assert!(!format!("{outcome:?}").contains("fake-token"));
             assert_eq!(client.poll_at(now, SystemTime::now()), Outcome::Throttled);
         }
+    }
+
+    #[test]
+    fn source_state_distinguishes_present_missing_symlink_and_transient_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".kimi-code");
+        let credentials = home.join("credentials");
+        std::fs::create_dir_all(&credentials).unwrap();
+        let auth_file = credentials.join("kimi-code.json");
+
+        // Missing when file does not exist
+        assert_eq!(source_state(&auth_file), SourceState::Missing);
+        assert_eq!(source_stamp(&auth_file), None);
+
+        // Present when regular file exists
+        std::fs::write(&auth_file, "token-a").unwrap();
+        let state = source_state(&auth_file);
+        assert!(matches!(state, SourceState::Present(stamp) if stamp.selector.is_none()));
+        assert!(source_stamp(&auth_file).is_some());
+
+        // Selector is present when regular config.toml exists
+        let config_file = home.join("config.toml");
+        std::fs::write(&config_file, "key = 'val'").unwrap();
+        let state_with_config = source_state(&auth_file);
+        assert!(
+            matches!(state_with_config, SourceState::Present(stamp) if stamp.selector.is_some())
+        );
+
+        // Config as directory is Missing (invalid shape)
+        std::fs::remove_file(&config_file).unwrap();
+        std::fs::create_dir(&config_file).unwrap();
+        assert_eq!(source_state(&auth_file), SourceState::Missing);
+        std::fs::remove_dir(&config_file).unwrap();
+
+        // Symlink credential is treated as Missing
+        let symlink_file = credentials.join("link.json");
+        std::os::unix::fs::symlink(&auth_file, &symlink_file).unwrap();
+        assert_eq!(source_state(&symlink_file), SourceState::Missing);
+
+        // PermissionDenied on parent directory is Transient without credential
+        let original_mode = std::fs::metadata(&credentials)
+            .unwrap()
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            source_state(&auth_file),
+            SourceState::Transient { credential: None }
+        );
+        assert_eq!(source_stamp(&auth_file), None);
+
+        // Restore permissions -> Present again
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+        assert!(matches!(source_state(&auth_file), SourceState::Present(_)));
     }
 }
