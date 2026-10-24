@@ -279,3 +279,18 @@ cycle. See [runtime wiring](plans/publisher-runtime-wiring.md) and the
 contract, deadline-skip versus capacity/error behavior, and fair queues.
 Linux fixtures do not establish macOS runtime behavior or a visible-latency
 SLO. Sequence reservation and uncertainty remain the publisher's responsibility.
+
+## Control frame boundary fixture
+
+`reader_frame_exact_newline_boundary_and_oversized_health_failure` constrains
+its private socket pair's send buffer and uses a writer thread with a 500 ms
+write timeout. Reading runs concurrently; the receiver is dropped before the
+writer is joined, including after a read error. The test accepts an 8192-byte
+newline-terminated frame, rejects 8193 bytes specifically as an oversized frame,
+and preserves the two diagnostic samples.
+
+On Linux (2026-10-24), synchronous sending under the same buffer constraint
+failed with `WouldBlock` in a bounded run; concurrent sending passed. Restoring
+synchronous sending also failed in a bounded mutation run. This establishes
+the fixture's backpressure regression coverage, not a macOS rerun. Production
+framing and transport code are unchanged.

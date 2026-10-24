@@ -4345,16 +4345,42 @@ mod tests {
         let mut line = frame.clone();
         line.push(b'\n');
         let read_line = |line: Vec<u8>| {
+            use std::os::fd::AsRawFd;
+
             let (mut sender, receiver) = UnixStream::pair().unwrap();
-            sender.write_all(&line).unwrap();
-            drop(sender);
-            read_frame(&mut BufReader::new(receiver), 8192)
+            // Force backpressure even on hosts with large default socket buffers.
+            let send_buffer: libc::c_int = 1024;
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        sender.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&send_buffer as *const libc::c_int).cast(),
+                        std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+            sender
+                .set_write_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let writer = std::thread::spawn(move || sender.write_all(&line));
+            let mut reader = BufReader::new(receiver);
+            let result = read_frame(&mut reader, 8192);
+            // Release a stalled writer before joining, including on read errors.
+            drop(reader);
+            let written = writer.join();
+            written.unwrap().unwrap();
+            result
         };
         assert_eq!(read_line(line).unwrap(), frame);
         let mut over = frame.clone();
         over.push(b' ');
         over.push(b'\n');
-        assert!(read_line(over).is_err());
+        let error = read_line(over).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "socket frame is too large");
         state.health.socket_key.push('x');
         assert!(control_frame(&state).is_err());
         assert_eq!(
