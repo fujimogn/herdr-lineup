@@ -1,10 +1,13 @@
 # Publisher runtime wiring plan
 
 **Status:** P runtime wiring, D control/doctor diagnostics, and all local reader
-worker producers are implemented in the local candidate at
+worker producers are included in the v0.3.0 release contents. Historical
+implementation evidence is at
 `6be18304d6e39a0eb6d88164a866b449d9396946`, after their recorded review chains.
-This is not shipment or live verification; final combined verification belongs
-to the commander and the verification lane. The commander's decisions in
+The owner authorized this release batch on 2026-10-24. Delivery is recorded
+by the [v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0);
+this implementation record does not establish publication or live verification.
+The commander's decisions in
 `note-publisher-design-decisions-01` are incorporated. Design GO on `86ea771`
 (`note-publisher-design-go-handoff-01`). The synchronized spec delta is archived
 at `openspec/changes/archive/2026-10-24-wire-publisher-runtime/`.

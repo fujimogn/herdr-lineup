@@ -24,14 +24,15 @@ assignment is a `BLOCKED` touching request before any edit. Do not `cargo clean`
 by hand and do not recursively delete. Report a build that is likely to exceed
 1 GiB before starting it.
 
-## Done in the integration snapshot
+## Implemented in the v0.3.0 release contents
 
 The implementation source is
 `0220da64f8545f89b6daca211553f486b271057f`. P runtime wiring, D control/doctor
-wiring and all five worker producers are implemented locally alongside the
+wiring and all five worker producers are included in v0.3.0 alongside the
 first-wave fixes. The coverage table maps every original finding to source,
 fixtures and remaining limits; `TODO.md` keeps the open and completed items.
-The runtime plan and archived spec are linked there. No timing improvement,
+The runtime plan and archived spec are linked there. This source SHA is historical
+implementation evidence, not a release HEAD. No timing improvement,
 strict wall-clock guarantee, host C2 fix, or shipment follows from this status.
 
 ## Final inclusive review
@@ -79,8 +80,9 @@ batch exist.
    section in the same commit. Do not leave a completed item open.
 3. Correct stale review docs in the same batch. Keep historical text only
    under a heading that says it is historical.
-4. Update `CHANGELOG.md` Unreleased for behavior in the batch. Do not add a
-   version heading; the manifest version stays until a release.
+4. Update `CHANGELOG.md` Unreleased for behavior in a development batch. For
+   an authorized release, date that section, add a fresh empty Unreleased
+   section, and align the manifest and lockfile versions.
 5. Change README or `SECURITY.md` only where the batch changes behavior a user
    can observe.
 
@@ -97,7 +99,10 @@ commander instruction.
 ## Shipment
 
 Members do not push and do not request CI. The commander batches one
-integration candidate. The shipment hold remains until the owner lifts it.
+integration candidate. The owner lifted the shipment hold on 2026-10-24 for
+one v0.3.0 release batch. Delivery is recorded by the
+[v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0);
+this preparation plan does not establish publication.
 ACK, merge to `develop` or `main`, push, CI, and deploy are not implied by a
 green local test or by this plan.
 

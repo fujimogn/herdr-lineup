@@ -26,7 +26,7 @@ and vendored C terms.
 | `clap_lex@1.1.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `colorchoice@1.0.5` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `core-foundation-sys@0.8.7` | `MIT OR Apache-2.0` | `MIT` | macos |
-| `equivalent@1.0.2` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
+| `equivalent@1.0.3` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `errno@0.3.14` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `fastrand@2.5.0` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `getrandom@0.2.17` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
@@ -37,7 +37,7 @@ and vendored C terms.
 | `indexmap@2.14.2` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `is_terminal_polyfill@1.70.2` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `itoa@1.0.18` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `libc@0.2.190` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `libc@0.2.191` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `linux-raw-sys@0.12.1` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `MIT` | linux |
 | `log@0.4.34` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `memchr@2.8.3` | `Unlicense OR MIT` | `MIT` | linux, macos |
@@ -63,18 +63,18 @@ and vendored C terms.
 | `toml_parser@1.1.5+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `toml_writer@1.1.3+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `untrusted@0.9.0` | `ISC` | `ISC` | linux, macos |
-| `ureq@3.4.2` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `ureq-proto@0.6.4` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `ureq@3.5.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `ureq-proto@0.6.5` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `utf8-zero@0.8.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `utf8parse@0.2.2` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
-| `webpki-roots@1.0.10` | `CDLA-Permissive-2.0` | `CDLA-Permissive-2.0` | linux, macos |
+| `webpki-roots@1.0.11` | `CDLA-Permissive-2.0` | `CDLA-Permissive-2.0` | linux, macos |
 | `winnow@0.7.15` | `MIT` | `MIT` | linux, macos |
 | `winnow@1.0.4` | `MIT` | `MIT` | linux, macos |
 | `zeroize@1.9.1` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `zmij@1.0.23` | `MIT` | `MIT` | linux, macos |
 | `zstd@0.13.3` | `MIT` | `MIT` | linux, macos |
 | `zstd-safe@7.3.0` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
-| `zstd-sys@2.1.1+zstd.1.5.7` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
+| `zstd-sys@2.1.2+zstd.1.5.7` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
 <!-- dependency-list:end -->
 
 ## License text 1
@@ -333,7 +333,7 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
-- equivalent@1.0.2 `LICENSE-MIT`
+- equivalent@1.0.3 `LICENSE-MIT`
 
 ````text
 Copyright (c) 2016--2023
@@ -641,7 +641,7 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
-- libc@0.2.190 `LICENSE-MIT`
+- libc@0.2.191 `LICENSE-MIT`
 
 ````text
 Copyright (c) The Rust Project Developers
@@ -1414,7 +1414,7 @@ Source crates and license files:
 
 Source crates and license files:
 
-- ureq-proto@0.6.4 `LICENSE-MIT.txt`
+- ureq-proto@0.6.5 `LICENSE-MIT.txt`
 
 ````text
 Copyright 2022 Martin Algesten
@@ -1430,7 +1430,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Source crates and license files:
 
-- ureq@3.4.2 `LICENSE-MIT`
+- ureq@3.5.0 `LICENSE-MIT`
 
 ````text
 MIT License
@@ -1494,7 +1494,7 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
-- webpki-roots@1.0.10 `LICENSE`
+- webpki-roots@1.0.11 `LICENSE`
 
 ````text
 # Community Data License Agreement - Permissive - Version 2.0
@@ -1627,7 +1627,7 @@ DEALINGS IN THE SOFTWARE.
 Source crates and license files:
 
 - zstd-safe@7.3.0 `LICENSE`
-- zstd-sys@2.1.1+zstd.1.5.7 `LICENSE`
+- zstd-sys@2.1.2+zstd.1.5.7 `LICENSE`
 
 ````text
 BSD 3-Clause License
@@ -1664,7 +1664,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Source crates and license files:
 
-- zstd-sys@2.1.1+zstd.1.5.7 `LICENSE.BSD-3-Clause`
+- zstd-sys@2.1.2+zstd.1.5.7 `LICENSE.BSD-3-Clause`
 
 ````text
 The auto-generated bindings are under the 3-clause BSD license:

@@ -54,7 +54,7 @@ The source build during installation can take several minutes.
    Review Herdr's source and command preview before confirming. The manifest's
    `cargo build --release --locked` command runs after confirmation and before
    registration; if the build fails, Herdr does not register Lineup. To pin the
-   v0.2.2 release, add `--ref v0.2.2`. Use `--yes` only when you already trust
+   v0.3.0 release, add `--ref v0.3.0`. Use `--yes` only when you already trust
    the source and want to skip the interactive confirmation. If you previously
    linked a local checkout, run `herdr plugin unlink herdr-lineup` before
    installing; installation over a local link is refused.
@@ -86,7 +86,7 @@ When installing or upgrading:
   user settings in `HERDR_PLUGIN_CONFIG_DIR`.
 - There is no `herdr plugin update`. To upgrade, install again.
 - Pin a version with a release tag:
-  `herdr plugin install fujimogn/herdr-lineup --ref v0.2.2`.
+  `herdr plugin install fujimogn/herdr-lineup --ref v0.3.0`.
 - Before downgrading, stop Lineup and preserve its state directory. Newer
   releases may write `endpoint` rows to the per-session `sequences.json`
   checkpoint when pruning absent resources. An older binary that does not
@@ -483,12 +483,12 @@ existing agent settings before changing them; startup does not edit them.
    will update automatically.
 
    Alternatively, download the archive for your OS and architecture and
-   `SHA256SUMS.txt` from the [release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.2.2).
+   `SHA256SUMS.txt` from the [release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0).
    From the download directory, select the archive you downloaded and its
    matching line in `SHA256SUMS.txt` (replace the example filename). On Linux:
 
    ```sh
-   ARCHIVE=herdr-lineup-v0.2.2-linux-x86_64.tar.gz
+   ARCHIVE=herdr-lineup-v0.3.0-linux-x86_64.tar.gz
    CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
      printf '%s\n' "$CHECKSUM_LINE" | sha256sum -c -
    ```
@@ -496,7 +496,7 @@ existing agent settings before changing them; startup does not edit them.
    On macOS, use the same selection with your downloaded macOS archive:
 
    ```sh
-   ARCHIVE=herdr-lineup-v0.2.2-macos-arm64.tar.gz
+   ARCHIVE=herdr-lineup-v0.3.0-macos-arm64.tar.gz
    CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
      printf '%s\n' "$CHECKSUM_LINE" | shasum -a 256 -c -
    ```

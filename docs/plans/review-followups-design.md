@@ -9,8 +9,10 @@ finding, and the integration snapshot it was read from, is
 `rejected-wrong-basis` rows R1 and R2, and it does not treat `partial`,
 `conditional`, or `separate-task` rows as done.
 
-`develop` does not contain the integration line. Shipment stays on hold until
-the owner asks for one batch.
+The owner authorized one v0.3.0 batch on 2026-10-24 and lifted the shipment
+hold. The reviewed integration line is included in the release preparation.
+Delivery is recorded by the [v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0),
+not by this design record.
 
 ## Approach
 
@@ -60,4 +62,5 @@ change runs encoding, whitespace, and link checks instead of a Rust build.
 
 Benchmark fixtures use synthetic data and must not delete a non-`/tmp` root.
 Each task is its own commit. Rollback is the previous local commit, without
-rewriting history. Shipment is a separate owner decision.
+rewriting history. The owner authorized the v0.3.0 batch; publication still
+follows the release gates in `docs/releasing.md`.
