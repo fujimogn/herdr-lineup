@@ -12,4 +12,4 @@ permissions:
 
 jobs:
   check:
-    uses: fujimogn/develop-tools-action/.github/workflows/platform-check.yml@c5fd99441093039cb47d3a2501795788801686c1 # v0.3.1
+    uses: fujimogn/develop-tools-action/.github/workflows/platform-check.yml@d9b4fcce621e2e22862bd0d9b696c8b67f170ce7 # v0.3.2

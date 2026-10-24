@@ -17,7 +17,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Install develop tools
-        uses: fujimogn/develop-tools-action@ce060b139009df9efed5d4b023b3081bf17d958d # v0.3.0
+        uses: fujimogn/develop-tools-action@d9b4fcce621e2e22862bd0d9b696c8b67f170ce7 # v0.3.2
       - name: Smoke installed binaries
         run: |
           develop-docs-check --version
