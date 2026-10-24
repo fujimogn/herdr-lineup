@@ -24,11 +24,11 @@ assignment is a `BLOCKED` touching request before any edit. Do not `cargo clean`
 by hand and do not recursively delete. Report a build that is likely to exceed
 1 GiB before starting it.
 
-## Implemented in the v0.3.0 release contents
+## Implemented in the v0.3.1 release contents
 
 The implementation source is
 `0220da64f8545f89b6daca211553f486b271057f`. P runtime wiring, D control/doctor
-wiring and all five worker producers are included in v0.3.0 alongside the
+wiring and all five worker producers are included in v0.3.1 alongside the
 first-wave fixes. The coverage table maps every original finding to source,
 fixtures and remaining limits; `TODO.md` keeps the open and completed items.
 The runtime plan and archived spec are linked there. This source SHA is historical
@@ -100,8 +100,9 @@ commander instruction.
 
 Members do not push and do not request CI. The commander batches one
 integration candidate. The owner lifted the shipment hold on 2026-10-24 for
-one v0.3.0 release batch. Delivery is recorded by the
-[v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0);
+one release batch. Maintainers selected v0.3.1 after the failed v0.3.0 macOS
+fixture attempt; its immutable tag has no GitHub Release. Delivery is recorded by the
+[v0.3.1 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.1);
 this preparation plan does not establish publication.
 ACK, merge to `develop` or `main`, push, CI, and deploy are not implied by a
 green local test or by this plan.

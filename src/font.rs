@@ -711,9 +711,48 @@ mod tests {
     }
 
     fn fixture() -> (tempfile::TempDir, Locations) {
-        let root = tempfile::tempdir().unwrap();
+        fixture_in(&env::temp_dir())
+    }
+
+    fn fixture_in(parent: &Path) -> (tempfile::TempDir, Locations) {
+        // Private planning and injected paths use the same resolved roots as callers.
+        let parent = fs::canonicalize(parent).unwrap();
+        let root = tempfile::tempdir_in(parent).unwrap();
         let locations = Locations::new(root.path(), None, None, &root.path().join("state"), false);
         (root, locations)
+    }
+
+    #[test]
+    fn fixture_resolves_symlinked_temp_parent() {
+        let parent = tempfile::tempdir().unwrap();
+        let alias = parent.path().join("alias");
+        std::os::unix::fs::symlink(parent.path(), &alias).unwrap();
+        let (root, locations) = fixture_in(&alias);
+        assert_eq!(root.path(), fs::canonicalize(root.path()).unwrap());
+        assert_eq!(locations.home, root.path());
+        let config = locations.config.join("kitty/kitty.conf");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "# original\n").unwrap();
+        FontPlan::build(&locations, false).unwrap();
+        assert!(!locations.state.exists());
+        assert_eq!(fs::read_to_string(&config).unwrap(), "# original\n");
+        install(&locations).unwrap();
+        let journal = locations.state.join("font-ownership.json");
+        let state = load_journal(&journal).unwrap();
+        assert_eq!(
+            serde_json::to_value(state).unwrap()["entries"][0]["path"],
+            json!(config)
+        );
+        let error = apply_with(&locations, true, |path, _| {
+            assert_eq!(path, config);
+            Err(conflict("injected alias fixture failure"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected alias fixture failure"));
+        assert_eq!(
+            load(&journal).unwrap()["pending"]["paths"],
+            json!([config, locations.font])
+        );
     }
 
     #[test]
