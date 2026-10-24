@@ -1,5 +1,6 @@
 {
   "version": "0.6.2",
+  "integrationBranch": "develop",
   "sha256": {
     "x86_64-unknown-linux-gnu": "213479e2a9ed08bd31000367418d40e3e507778b0cb43ca16d88ef5e983705fb",
     "aarch64-apple-darwin": "312c502e7612e93992c7e0546c548b3880c45d9feb674b732afaaf26c84ca7f9"
