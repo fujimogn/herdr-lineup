@@ -71,9 +71,18 @@ case "$(uname -s 2>/dev/null)/$(uname -m 2>/dev/null)" in
   *) unavailable '対象外の target' ;;
 esac
 
-[ -f .develop-tools.json ] || fail '.develop-tools.json がありません'
+manifest=
+if [ -f .config/develop-tools.json ] && [ -f .develop-tools.json ]; then
+  fail '.config/develop-tools.json と .develop-tools.json の両方があります'
+elif [ -f .config/develop-tools.json ]; then
+  manifest=.config/develop-tools.json
+elif [ -f .develop-tools.json ]; then
+  manifest=.develop-tools.json
+else
+  fail '.develop-tools.json がありません'
+fi
 cache_root=${XDG_CACHE_HOME:-$HOME/.cache}/develop-tools
-manifest_digest=$(checksum .develop-tools.json) || fail 'manifest の sha256 を計算できません'
+manifest_digest=$(checksum "$manifest") || fail 'manifest の sha256 を計算できません'
 index=$cache_root/.manifest-$target-$manifest_digest
 index_hit=0
 if [ -f "$index" ]; then
@@ -95,7 +104,7 @@ if [ "$index_hit" -eq 0 ]; then
   manifest_snapshot=$(mktemp "${TMPDIR:-/tmp}/develop-tools-manifest.XXXXXXXX") || unavailable 'manifest の一時 file を作れません'
   trap 'rm -f "$manifest_snapshot"' 0
   trap 'exit 1' 1 2 3 15
-  cp .develop-tools.json "$manifest_snapshot" || unavailable 'manifest を写せません'
+  cp "$manifest" "$manifest_snapshot" || unavailable 'manifest を写せません'
   manifest_digest=$(checksum "$manifest_snapshot") || fail 'manifest の sha256 を計算できません'
   index=$cache_root/.manifest-$target-$manifest_digest
   version=$(jq -er '.version | select(type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$manifest_snapshot" 2>/dev/null) || fail 'version を読めません'
@@ -110,7 +119,7 @@ cache_dir=$cache_base/$target
 marker=$cache_dir/.sha256
 write_index() {
   [ "$index_hit" -eq 0 ] || return 0
-  current_digest=$(checksum .develop-tools.json) || return 0
+  current_digest=$(checksum "$manifest") || return 0
   [ "$current_digest" = "$manifest_digest" ] || return 0
   printf '%s %s %s\n' "$manifest_digest" "$version" "$expected" > "$index" || :
 }
