@@ -1,6 +1,6 @@
 id = "herdr-lineup"
 name = "Lineup"
-version = "0.3.0"
+version = "0.3.1"
 # Minimum Herdr version for the sidebar metadata publisher and agent integrations.
 # Startup is one-shot; ensure must also recover after workspace.focused.
 min_herdr_version = "0.9.3"

@@ -294,3 +294,20 @@ failed with `WouldBlock` in a bounded run; concurrent sending passed. Restoring
 synchronous sending also failed in a bounded mutation run. This establishes
 the fixture's backpressure regression coverage, not a macOS rerun. Production
 framing and transport code are unchanged.
+
+## Font fixture temporary-root aliases
+
+The v0.3.0 Release run failed four font tests on macOS: raw temporary paths
+under `/var` disagreed with resolved `/private/var` paths, and private planning
+and journal calls rejected the alias. The shared platform check had normalized
+`TMPDIR` with `pwd -P`; its pass did not exercise the raw Release environment.
+
+The common fixture now canonicalizes its caller-selected temporary parent
+before creating the `TempDir`, so its returned root, private journal/plan calls,
+and injected path comparisons agree with resolved production roots.
+`fixture_resolves_symlinked_temp_parent` injects a private symlink parent and
+checks planning, journal paths and a failed terminal write. External bounded
+test processes with a private alias `TMPDIR` reproduced all four old failures
+on Linux and passed with the new fixture. No parent environment is mutated;
+production font actions and descendant-symlink refusal tests are unchanged.
+This is Linux alias regression evidence; a macOS rerun remains outstanding.

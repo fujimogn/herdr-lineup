@@ -4,9 +4,11 @@ Open work after the 2026-10-23 reviews. Finding IDs, implementation source
 `0220da64f8545f89b6daca211553f486b271057f`, fixtures and limits are mapped in
 `docs/reviews/review-followup-coverage.md`. Working rules are in
 `docs/plans/review-followups-plan.md`. The implemented items below are included
-in the v0.3.0 release contents.
-Publication and artifacts are recorded by the [v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0);
-this preparation record does not establish publication.
+in the v0.3.1 release contents.
+Publication and artifacts are recorded by the [v0.3.1 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.1);
+this preparation record does not establish publication. The immutable v0.3.0
+tag is a failed macOS fixture attempt without a GitHub Release; maintainers
+selected v0.3.1 to carry the owner-authorized release batch.
 
 ## Open
 
@@ -44,7 +46,7 @@ Start only when the named condition is met; these are not obligations.
   displayed metadata on replacement. Current pane-bound Agy behavior stays.
   See `docs/reviews/agy-occupant-generation.md` for the planned host contract.
 
-## Implemented in the v0.3.0 release contents
+## Implemented in the v0.3.1 release contents
 
 - [x] Commander-owned inclusive GPT-6.1 Sol high GO for fixed range
   `d3ccbc17d3f8344d466015fac580cd0fe3b60269..91268267f46061f5f0aaf46711ea10158bad0873`;

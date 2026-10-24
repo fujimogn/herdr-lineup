@@ -4,10 +4,11 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
-## 0.3.0 (2026-10-24)
+## 0.3.1 (2026-10-24)
 
 Lineup adds publisher runtime budgets and reader diagnostics, strengthens local reads and font recovery, and updates release tooling and locked dependencies.
 
+- Fix: **Font test fixtures** resolve a caller-selected temporary parent before creating fixture roots, so private planning, journal checks, and injected paths agree under aliases such as macOS `/var`. Production symlink guards and font actions are unchanged.
 - Fix: **Kimi weekly quota** adds end-to-end wiring tests and shares reset and retention helpers across providers while removing the unused `WeeklyWorker` sample cache. Credential-change handling remains provider-specific and is covered by the Kimi wiring tests.
 - Fix: **Font apply** compares planned original bytes before each write and refuses observed external edits. After the `pending` journal is written, a later failure leaves earlier writes, any partially written font, and the journal for manual recovery; it does not automatically delete or roll back files. An external edit between a check and a rename or unlink can still race the action.
 - Fix: **Kimi local reads** open session directories and files with close-on-exec, so child processes do not inherit those descriptors.
@@ -23,6 +24,10 @@ Lineup adds publisher runtime budgets and reader diagnostics, strengthens local 
 - Fix: **Release tooling** pins develop-tools to 0.6.2, takes release notes from a nonempty annotated tag message and otherwise from the dated changelog section, and runs the release version check from the pre-push hook on a tag-only push.
 - Fix: **Release gate** reports rate limits, authentication failures, missing resources, server errors, and connection failures from the GitHub API as separate messages without printing response bodies.
 - Fix: **Dependencies** refresh nine locked crates, including ureq 3.5.0 and webpki-roots 1.0.11, for the pinned Rust 1.99.1 toolchain.
+
+## 0.3.0 (2026-10-24)
+
+The immutable 0.3.0 tag remains, but its macOS font fixture tests failed and no GitHub Release was published. Version 0.3.1 includes its changes, listed above.
 
 ## 0.2.2 (2026-10-21)
 

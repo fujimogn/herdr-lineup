@@ -1,9 +1,9 @@
 # Reader diagnostics control and doctor design
 
 **Status:** D control/doctor and all five local reader worker producers are
-included in the v0.3.0 release contents; the owner authorized the batch on
+included in the v0.3.1 release contents; the owner authorized the batch on
 2026-10-24. Delivery is recorded by the
-[v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0).
+[v0.3.1 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.1).
 This preparation record does not establish publication.
 **Historical implementation source:** `0220da64f8545f89b6daca211553f486b271057f`.
 Commander-owned inclusive Sol 6.1 high review is GO through

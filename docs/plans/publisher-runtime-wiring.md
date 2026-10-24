@@ -1,11 +1,11 @@
 # Publisher runtime wiring plan
 
 **Status:** P runtime wiring, D control/doctor diagnostics, and all local reader
-worker producers are included in the v0.3.0 release contents. Historical
+worker producers are included in the v0.3.1 release contents. Historical
 implementation evidence is at
 `6be18304d6e39a0eb6d88164a866b449d9396946`, after their recorded review chains.
 The owner authorized this release batch on 2026-10-24. Delivery is recorded
-by the [v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0);
+by the [v0.3.1 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.1);
 this implementation record does not establish publication or live verification.
 The commander's decisions in
 `note-publisher-design-decisions-01` are incorporated. Design GO on `86ea771`

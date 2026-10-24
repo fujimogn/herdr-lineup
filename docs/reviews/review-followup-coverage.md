@@ -25,9 +25,9 @@ judgment condition.
 - Both original reviews targeted `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`.
   Older snapshots (`96829df`, `d95e5b5`, `1787386`) are historical foundations,
   not the current implementation status.
-- These implementations are included in the v0.3.0 release contents. The
+- These implementations are included in the v0.3.1 release contents. The
   owner lifted the shipment hold on 2026-10-24. Delivery is recorded by the
-  [v0.3.0 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.0);
+  [v0.3.1 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.1);
   this historical snapshot and local verification do not establish publication
   or a live observation.
 - P runtime wiring, D control/doctor wiring, and all five local reader worker
@@ -41,7 +41,7 @@ judgment condition.
 
 | Class | Meaning | Completion rule |
 | --- | --- | --- |
-| `fixed-in-candidate` | The reviewed behavior is present at the snapshot and a regression check exists in tree. | Inclusion in v0.3.0 does not establish release publication or ship-gate acceptance; use the linked tag and Release for delivery. |
+| `fixed-in-candidate` | The reviewed behavior is present at the snapshot and a regression check exists in tree. | Inclusion in v0.3.1 does not establish release publication or ship-gate acceptance; use the linked tag and Release for delivery. |
 | `partial` | Part of the finding is in the snapshot. The named remainder is still open. | Do not mark the finding closed. |
 | `measurement-only` | An isolated fixture result is recorded. Product behavior is unchanged. | Do not treat the numbers as a budget, a speed-up, or a macOS or live Herdr result. |
 | `conditional` | The review proposed it only under a condition that is not met. | Not an implementation obligation. Keep the reason and the open condition. |
