@@ -69,9 +69,12 @@ The isolated plugin state's `sequences.json` is sampled before and after that
 wait as a secondary consistency check. The publisher writes it only when it
 reserves a sequence window or prunes state, so the first sample may contain
 only the endpoint floor row, and renewals inside one window leave it unchanged.
-Each sample must contain exactly one endpoint floor row with an empty `id` and
-an integer `seq` of at least 1. Workspace and pane rows are optional; when
-present each is unique and at most the floor. Between the samples no value
+Every row must match the plugin loader's schema: exactly the fields
+`endpoint`, `kind`, `id`, and `seq`; a `kind` of `endpoint`, `workspace`, or
+`pane`; an unsigned 64-bit `seq`; and no duplicate resource rows. Each sample
+must contain exactly one endpoint floor row with an empty `id` and a `seq` of
+at least 1. Workspace and pane rows are optional; when present each is at most
+the floor. Between the samples no value
 may decrease and no recorded resource may disappear. Unchanged values pass.
 A checkpoint records reserved sequences, not accepted reports.
 
@@ -84,7 +87,8 @@ observe internal state the isolated runtime does not expose.
 After `stop`, another snapshot must contain no `lineup_` keys on any pane or
 workspace. Other plugins' keys are allowed. Self-tests exercise token rejection,
 checkpoint validation (endpoint-only and unchanged floors accepted; missing,
-duplicate, mistyped, over-floor, and regressed rows rejected), and detection of
+duplicate, mistyped, unknown-field, unknown-kind, out-of-range, over-floor, and
+regressed rows rejected), and detection of
 uncleared tokens without a real socket.
 These checks establish metadata publication, not visible sidebar/font rendering.
 
