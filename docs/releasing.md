@@ -86,11 +86,12 @@ pushes the tag. The workflow never tags or pushes on its own.
    date matches the tag date: the tagger date of an annotated tag, or the commit
    date of a lightweight tag. If release preparation happened
    earlier, update the date and land that reviewed change first. A human tags
-   the verified release commit on `main` and pushes only the tag:
+   the verified release commit on `main` and pushes only the tag. Use an unsigned
+   annotation and `--cleanup=verbatim` to preserve Markdown headings exactly:
    ```sh
    notes_file=$(mktemp /tmp/herdr-lineup-release-notes.XXXXXX)
    scripts/extract-release-notes.sh X.Y.Z > "$notes_file" &&
-     git tag -a vX.Y.Z <release-commit> -F "$notes_file" &&
+     git -c tag.gpgSign=false tag -a vX.Y.Z <release-commit> --cleanup=verbatim -F "$notes_file" &&
      git push origin vX.Y.Z
    rm "$notes_file"
    ```
