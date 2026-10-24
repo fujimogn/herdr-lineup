@@ -147,40 +147,71 @@ else:
 PYTOK
 }
 
-sequence_record() {
-    python3 - "$temp/state" "$workspace" "$pane" <<'PYSEQ'
+# The publisher writes sequences.json only when it reserves a sequence window or
+# prunes state, so renewals inside one window legitimately leave it unchanged.
+sequence_tool() {
+    python3 - "$@" <<'PYSEQ'
 import glob, json, sys
-paths = glob.glob(sys.argv[1] + '/session-*/sequences.json')
-if len(paths) != 1: sys.exit('Expected one isolated sequence checkpoint')
-rows = json.load(open(paths[0]))
-result = {}
-for kind, target in [('workspace', sys.argv[2]), ('pane', sys.argv[3])]:
-    matches = [r['seq'] for r in rows if r['kind'] == kind and r['id'] == target]
-    if len(matches) != 1: sys.exit('Expected one checkpoint per tested resource')
-    result[kind] = matches[0]
-print(json.dumps(result, sort_keys=True))
-PYSEQ
-}
 
-sequence_check() {
-    python3 - "$@" <<'PYSEQCHECK'
-import json, sys
+def is_seq(value):
+    return type(value) is int and value >= 1
 
-def advanced(first, second):
-    return all(type(first.get(k)) is int and type(second.get(k)) is int
-               and second[k] > first[k] >= 1 for k in ('workspace', 'pane'))
+def summarize(rows, workspace, pane):
+    """Endpoint floor (exactly one) plus optional tested resources, each <= floor."""
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise ValueError('checkpoint is not a list of rows')
+    for r in rows:
+        if not all(isinstance(r.get(k), str) for k in ('endpoint', 'kind', 'id')) or not is_seq(r.get('seq')):
+            raise ValueError('checkpoint row has an invalid type')
+    floors = [r for r in rows if r['kind'] == 'endpoint']
+    if len(floors) != 1 or floors[0]['id'] != '':
+        raise ValueError('expected exactly one endpoint floor row with an empty id')
+    result = {'endpoint': floors[0]['seq']}
+    for kind, target in [('workspace', workspace), ('pane', pane)]:
+        matches = [r['seq'] for r in rows if r['kind'] == kind and r['id'] == target]
+        if len(matches) > 1:
+            raise ValueError('duplicate checkpoint row for a tested resource')
+        if matches:
+            if matches[0] > result['endpoint']:
+                raise ValueError('resource sequence exceeds the endpoint floor')
+            result[kind] = matches[0]
+    return result
+
+def non_decreasing(first, second):
+    """Equal values are legal; a lower value or a vanished resource is not."""
+    return all(k in second and second[k] >= first[k] for k in first)
+
+def rejected(fn, *args):
+    try: fn(*args)
+    except ValueError: return True
+    return False
+
 if sys.argv[1] == 'self-test':
-    first = {'workspace': 1, 'pane': 2}
-    if not advanced(first, {'workspace': 2, 'pane': 3}): sys.exit('FAIL: renewal rejected')
-    for bad in [first, {'workspace': 2, 'pane': 2}, {'workspace': 2},
-                {'workspace': True, 'pane': 3}]:
-        if advanced(first, bad): sys.exit('FAIL: invalid renewal accepted')
-    print('PASS: renewal validation rejects unchanged or missing sequences')
+    floor = {'endpoint': 'ep', 'kind': 'endpoint', 'id': '', 'seq': 32}
+    pane = {'endpoint': 'ep', 'kind': 'pane', 'id': 'w1:p1', 'seq': 30}
+    # The first reservation writes only the endpoint floor row.
+    if summarize([floor], 'w1', 'w1:p1') != {'endpoint': 32}: sys.exit('FAIL: endpoint-only checkpoint rejected')
+    if summarize([floor, pane], 'w1', 'w1:p1') != {'endpoint': 32, 'pane': 30}: sys.exit('FAIL: resource row rejected')
+    for bad in [[], [floor, floor], [dict(floor, id='x')], [dict(floor, seq=0)],
+                [dict(floor, seq=True)], [dict(floor, seq='32')], [floor, dict(pane, seq=33)],
+                [floor, pane, pane], {'rows': [floor]}]:
+        if not rejected(summarize, bad, 'w1', 'w1:p1'): sys.exit('FAIL: invalid checkpoint accepted')
+    first = {'endpoint': 32, 'pane': 30}
+    for good in [first, {'endpoint': 64, 'pane': 30}, {'endpoint': 64, 'pane': 31, 'workspace': 2}]:
+        if not non_decreasing(first, good): sys.exit('FAIL: unchanged or advanced checkpoint rejected')
+    for bad in [{'endpoint': 31, 'pane': 30}, {'endpoint': 32, 'pane': 29}, {'endpoint': 32}]:
+        if non_decreasing(first, bad): sys.exit('FAIL: regressed checkpoint accepted')
+    print('PASS: checkpoint validation accepts endpoint-only/unchanged floors, rejects missing/duplicate/invalid/regressed rows')
+elif sys.argv[1] == 'record':
+    paths = glob.glob(sys.argv[2] + '/session-*/sequences.json')
+    if len(paths) != 1: sys.exit('Expected one isolated sequence checkpoint')
+    try: print(json.dumps(summarize(json.load(open(paths[0])), *sys.argv[3:5]), sort_keys=True))
+    except ValueError as error: sys.exit(f'Invalid sequence checkpoint: {error}')
 else:
-    first, second = [json.load(open(p)) for p in sys.argv[1:]]
-    if not advanced(first, second): sys.exit('Sequences did not advance for both resources')
-    print('Sequence renewal: ' + json.dumps(first, sort_keys=True) + ' -> ' + json.dumps(second, sort_keys=True))
-PYSEQCHECK
+    first, second = [json.load(open(p)) for p in sys.argv[2:4]]
+    if not non_decreasing(first, second): sys.exit('Sequence checkpoint regressed between samples')
+    print('Sequence checkpoint: ' + json.dumps(first, sort_keys=True) + ' -> ' + json.dumps(second, sort_keys=True))
+PYSEQ
 }
 
 # These tests never start Herdr or connect to a socket.
@@ -204,7 +235,7 @@ self_test() {
     unlink "$root/sessions/lineup-e2e-test/redirect"
     rmdir "$root/sessions/lineup-e2e-test" "$root/sessions/main" "$root/sessions" "$root"
     token_check self-test
-    sequence_check self-test
+    sequence_tool self-test
     echo 'PASS: main rejection, symlink rejection, safe path, all HERDR_* cleared'
 }
 
@@ -401,9 +432,10 @@ for kind, id_key, target in [('workspaces','workspace_id',sys.argv[2]),('panes',
 PYVIEW
     echo 'PASS: workspace heading and synthetic pane display tokens received'
     echo 'SKIP: real agent pane; isolated HOME has no provider authentication; synthetic occupant only'
-    sequence_record > "$temp/seq-first.json"
+    sequence_tool record "$temp/state" "$workspace" "$pane" > "$temp/seq-first.json"
     # The default TTL is 15 seconds; unchanged keys renew by 10 seconds.
-    # A second snapshot after 16 seconds plus a newer checkpoint proves renewal.
+    # Tokens in a snapshot taken 16 seconds later prove renewal; the checkpoint
+    # need only keep a valid, non-decreasing endpoint floor.
     sleep 16
     herdr_cmd api snapshot > "$temp/renewed.json"
     if ! token_check present "$temp/renewed.json" "$workspace" "$pane" "$ship_unix"; then
@@ -411,9 +443,9 @@ PYVIEW
         echo 'Tokens expired before renewal' >&2
         exit 1
     fi
-    sequence_record > "$temp/seq-second.json"
-    sequence_check "$temp/seq-first.json" "$temp/seq-second.json"
-    echo 'PASS: second snapshot after default TTL retains tokens with newer sequences'
+    sequence_tool record "$temp/state" "$workspace" "$pane" > "$temp/seq-second.json"
+    sequence_tool check "$temp/seq-first.json" "$temp/seq-second.json"
+    echo 'PASS: tokens retained after default TTL; checkpoint floor non-decreasing'
 else
     echo 'SKIP: publication tokens; rerun with --tokens to verify published sidebar metadata'
 fi

@@ -60,17 +60,32 @@ tokens, never full snapshots. Lifecycle and doctor diagnostics can print paths
 inside the private temporary session.
 
 A second snapshot is taken after sixteen seconds, longer than the default
-15,000 ms TTL. It must still contain the expected tokens. The isolated plugin
-state's `sequences.json` is sampled before and after that wait; the tested
-workspace and pane sequences must both advance. Herdr snapshots expose token
-values, not the publisher's per-source sequence. A checkpoint alone records
-reserved sequences and does not prove an accepted report; the later snapshot
-provides the complementary evidence that tokens remain live after their first
-TTL. This checks the default 5,000 ms refresh without changing settings.
+15,000 ms TTL. It must still contain the expected tokens; this retained
+display is the primary renewal evidence, and it checks the default 5,000 ms
+refresh without changing settings. Herdr snapshots expose token values, not
+the publisher's per-source sequence.
+
+The isolated plugin state's `sequences.json` is sampled before and after that
+wait as a secondary consistency check. The publisher writes it only when it
+reserves a sequence window or prunes state, so the first sample may contain
+only the endpoint floor row, and renewals inside one window leave it unchanged.
+Each sample must contain exactly one endpoint floor row with an empty `id` and
+an integer `seq` of at least 1. Workspace and pane rows are optional; when
+present each is unique and at most the floor. Between the samples no value
+may decrease and no recorded resource may disappear. Unchanged values pass.
+A checkpoint records reserved sequences, not accepted reports.
+
+This harness does not prove per-resource sequence ordering. That property is
+covered by Rust unit regression tests in `src/publish.rs`, such as
+`window_amortizes_persists_across_multiple_reports_within_window` and
+`stale_sequence_server_applies_reports_across_window_restart_and_reuse`, which
+observe internal state the isolated runtime does not expose.
 
 After `stop`, another snapshot must contain no `lineup_` keys on any pane or
 workspace. Other plugins' keys are allowed. Self-tests exercise token rejection,
-sequence progression, and detection of uncleared tokens without a real socket.
+checkpoint validation (endpoint-only and unchanged floors accepted; missing,
+duplicate, mistyped, over-floor, and regressed rows rejected), and detection of
+uncleared tokens without a real socket.
 These checks establish metadata publication, not visible sidebar/font rendering.
 
 An exit trap stops the plugin through its control endpoint, runs explicitly
@@ -138,8 +153,10 @@ current publication includes two U+2800 cells after it:
 
 After sixteen seconds, the second snapshot retained the expected values;
 workspace sequence advanced from `1` to `3` and pane sequence from `2` to `3`
-in the isolated checkpoint. `doctor` reported a healthy daemon, two `stop`
-calls passed, and the subsequent snapshot contained no `lineup_` tokens.
+in the isolated checkpoint (historical: observed under the earlier
+per-resource checkpoint protocol; the current harness does not require
+advancement). `doctor` reported a healthy daemon, two `stop` calls passed, and
+the subsequent snapshot contained no `lineup_` tokens.
 The trap confirmed deletion of the isolated session and private temporary
 directory. Real-agent pane verification was `SKIP`: the isolated HOME had no
 provider authentication. The synthetic pane is publication evidence only.
@@ -157,7 +174,8 @@ with the two harness/documentation commits applied to main
 including absent numeric usage tokens and `—` for context and weekly text.
 
 The snapshot after sixteen seconds retained the expected tokens. The isolated
-checkpoint advanced from workspace `1` / pane `2` to workspace `3` / pane `3`.
+checkpoint advanced from workspace `1` / pane `2` to workspace `3` / pane `3`
+(historical observation under the earlier per-resource checkpoint protocol).
 Doctor, idempotent stop, and the post-stop snapshot with no `lineup_` keys all
 passed. The trap confirmed isolated session and temporary-directory removal.
 Real-agent verification remained `SKIP` for the unauthenticated isolated HOME;
