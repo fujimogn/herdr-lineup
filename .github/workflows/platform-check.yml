@@ -1,6 +1,6 @@
 name: platform check
 
-# Check every OS that `.develop-tools.json` declares in `platforms` before a release.
+# Check every OS that `.config/develop-tools.json` declares in `platforms` before a release.
 # `release check` dispatches this workflow and `release <bump>` reads its `platform (<os>)` jobs.
 # The OS list and the runners live only in the shared workflow; this copy names neither.
 on:

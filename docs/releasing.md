@@ -32,9 +32,9 @@ pushes the tag. The workflow never tags or pushes on its own.
    scripts/test-check-release-gate.sh
    ```
    The version check must exit 0; before the tag exists it compares the version
-   files declared under `release.versionFiles` in `.develop-tools.json`. The
+   files declared under `release.versionFiles` in `.config/develop-tools.json`. The
    resolver downloads the pinned public develop-tools release and verifies its
-   SHA-256 against `.develop-tools.json`. This repository does not apply the
+   SHA-256 against `.config/develop-tools.json`. This repository does not apply the
    shared documentation rules of `develop-docs-check`; the Develop tools workflow
    only checks that the resolver fetches the pinned tools. The extractor accepts
    an optional changelog path: `scripts/extract-release-notes.sh X.Y.Z CHANGELOG.md`.
@@ -74,7 +74,7 @@ pushes the tag. The workflow never tags or pushes on its own.
    .develop-tools/resolve release release check
    ```
    It dispatches `.github/workflows/platform-check.yml` (the
-   `release.preflightWorkflow` in `.develop-tools.json`) on the integration
+   `release.preflightWorkflow` in `.config/develop-tools.json`) on the integration
    branch HEAD (`develop`) and waits for that run only. Before dispatch,
    confirm `origin/develop` and `origin/main` both point to the same verified
    release commit, and keep them unchanged through the check and tagging.
