@@ -117,8 +117,8 @@ pushes the tag. The workflow never tags or pushes on its own.
 ## Release artifacts
 
 Each archive is named `herdr-lineup-<tag>-<os>-<arch>.tar.gz`, for example
-`herdr-lineup-v0.2.0-linux-x86_64.tar.gz` or
-`herdr-lineup-v0.2.0-macos-arm64.tar.gz`. The build reads the runner's actual OS
+`herdr-lineup-v0.2.2-linux-x86_64.tar.gz` or
+`herdr-lineup-v0.2.2-macos-arm64.tar.gz`. The build reads the runner's actual OS
 and CPU architecture with `uname`; unsupported combinations fail packaging.
 Linux and macOS support `x86_64` and `arm64` labels (`aarch64` on Linux is
 normalized to `arm64`). The runner matrix produces one archive per OS, not
@@ -143,7 +143,7 @@ select the archive you downloaded and check only its entry (replace the example
 filename). On Linux:
 
 ```sh
-ARCHIVE=herdr-lineup-v0.2.0-linux-x86_64.tar.gz
+ARCHIVE=herdr-lineup-v0.2.2-linux-x86_64.tar.gz
 CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
   printf '%s\n' "$CHECKSUM_LINE" | sha256sum -c -
 ```
@@ -151,7 +151,7 @@ CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END 
 On macOS:
 
 ```sh
-ARCHIVE=herdr-lineup-v0.2.0-macos-arm64.tar.gz
+ARCHIVE=herdr-lineup-v0.2.2-macos-arm64.tar.gz
 CHECKSUM_LINE=$(awk -v archive="$ARCHIVE" '$2 == archive { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) &&
   printf '%s\n' "$CHECKSUM_LINE" | shasum -a 256 -c -
 ```

@@ -16,30 +16,30 @@ const MAX_BYTES: u64 = 64 * 1024;
 /// Bounded request cadence, independent of the daemon's refresh cadence.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
-    interval: Duration,
-    timeout: Duration,
+    cadence: crate::model::AccountCadence,
 }
 
 impl Settings {
     /// Clamp cadence to 60..=3600 seconds and request timeout to 1..=30 seconds.
     pub fn new(interval: Duration, timeout: Duration) -> Self {
         Self {
-            interval: interval.clamp(Duration::from_secs(60), Duration::from_secs(3600)),
-            timeout: timeout.clamp(Duration::from_secs(1), Duration::from_secs(30)),
+            cadence: crate::model::AccountCadence::new(interval, timeout),
         }
     }
 
     pub fn interval(self) -> Duration {
-        self.interval
+        self.cadence.interval()
     }
     pub fn timeout(self) -> Duration {
-        self.timeout
+        self.cadence.timeout()
     }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self::new(Duration::from_secs(300), Duration::from_secs(10))
+        Self {
+            cadence: crate::model::AccountCadence::default_account(),
+        }
     }
 }
 
@@ -86,6 +86,16 @@ pub enum Outcome {
     Unavailable(Failure),
 }
 
+fn weekly_sample(outcome: Outcome) -> Option<crate::model::WeeklySample> {
+    match outcome {
+        Outcome::Weekly(usage) => Some(crate::model::WeeklySample {
+            used_percent: usage.used_percent,
+            resets_at: usage.resets_at,
+        }),
+        Outcome::NonWeekly | Outcome::Unavailable(_) => None,
+    }
+}
+
 /// Resolve precedence without changing the process environment. No file is read.
 pub fn auth_path(
     auth_file: Option<OsString>,
@@ -110,6 +120,7 @@ pub struct Client {
     agent: ureq::Agent,
     next_request: Option<Instant>,
     cached: Outcome,
+    cached_source: Option<SourceStamp>,
     last_result: crate::quota_diagnostic::WeeklyResult,
     last_success: Option<Instant>,
 }
@@ -131,7 +142,7 @@ impl Client {
             auth_file,
             settings,
             BILLING_URL.to_owned(),
-            settings.timeout,
+            settings.timeout(),
         )
     }
 
@@ -158,6 +169,7 @@ impl Client {
             agent,
             next_request: None,
             cached: Outcome::Unavailable(Failure::AuthMissing),
+            cached_source: None,
             last_result: crate::quota_diagnostic::WeeklyResult::Pending,
             last_success: None,
         }
@@ -171,6 +183,14 @@ impl Client {
         self.last_result
     }
 
+    pub(crate) fn source_stamp(&self) -> Option<SourceStamp> {
+        source_stamp(&self.auth_file)
+    }
+
+    pub(crate) fn auth_file(&self) -> &Path {
+        &self.auth_file
+    }
+
     /// At most one request per configured interval, including after failures.
     /// Transient network/5xx failures keep the last weekly result until reset;
     /// authentication and schema failures clear it. Without success, return missing.
@@ -181,9 +201,31 @@ impl Client {
     }
 
     fn poll_at(&mut self, now: Instant, wall_now: SystemTime) -> Outcome {
+        let source = match read_credentials(&self.auth_file) {
+            Ok(source) => source,
+            Err(failure) => {
+                self.cached = Outcome::Unavailable(failure);
+                self.cached_source = None;
+                self.last_result = failure.diagnostic();
+                return self.cached;
+            }
+        };
+        if self.cached_source.as_ref() != Some(&source) {
+            self.cached = Outcome::Unavailable(Failure::AuthMissing);
+            self.last_success = None;
+            self.next_request = None;
+        }
+        self.cached_source = Some(source.clone());
         if self.next_request.is_none_or(|next| now >= next) {
-            self.next_request = Some(now + self.settings.interval);
-            let fetched = self.fetch();
+            self.next_request = Some(now + self.settings.interval());
+            let fetched = self.fetch(&source);
+            if self.source_stamp().as_ref() != Some(&source) {
+                self.cached = Outcome::Unavailable(Failure::AuthShape);
+                self.cached_source = None;
+                self.last_success = None;
+                self.last_result = Failure::AuthShape.diagnostic();
+                return self.cached;
+            }
             if matches!(fetched, Ok(Outcome::Weekly(_))) {
                 self.last_success = Some(Instant::now());
             }
@@ -194,28 +236,34 @@ impl Client {
             };
             self.cached = match fetched {
                 Ok(outcome) => outcome,
-                Err(Failure::Transient) if matches!(self.cached, Outcome::Weekly(usage) if usage.resets_at.is_some_and(|reset| reset > wall_now)) => {
+                Err(Failure::Transient)
+                    if crate::model::retain_known_reset_after_failure(
+                        weekly_sample(self.cached),
+                        wall_now,
+                    )
+                    .is_some() =>
+                {
                     self.cached
                 }
                 Err(failure) => Outcome::Unavailable(failure),
             };
         }
-        if matches!(self.cached, Outcome::Weekly(usage) if usage.resets_at.is_some_and(|reset| reset <= wall_now))
+        if weekly_sample(self.cached).is_some()
+            && crate::model::clear_expired_reset(weekly_sample(self.cached), wall_now).is_none()
         {
             self.cached = Outcome::Unavailable(Failure::InvalidResponse);
         }
         self.cached
     }
 
-    fn fetch(&self) -> Result<Outcome, Failure> {
-        let credentials = read_credentials(&self.auth_file)?;
+    fn fetch(&self, credentials: &SourceStamp) -> Result<Outcome, Failure> {
         let mut request = self
             .agent
             .get(&self.endpoint)
             .header("Authorization", format!("Bearer {}", credentials.key))
             .header("X-XAI-Token-Auth", "xai-grok-cli")
             .header("Accept", "application/json");
-        if let Some(user_id) = credentials.user_id {
+        if let Some(user_id) = &credentials.user_id {
             request = request.header("x-userid", user_id);
         }
         // Never format, store, log or return the HTTP library's errors.
@@ -254,10 +302,16 @@ struct Period {
     end: Option<String>,
 }
 
+fn confirmed_weekly(kind: &str) -> bool {
+    // Bare WEEKLY and the proto enum only. NON_WEEKLY, BIWEEKLY, and WEEK
+    // contain related letters but are not confirmed weekly periods.
+    matches!(kind, "WEEKLY" | "BILLING_PERIOD_TYPE_WEEKLY")
+}
+
 fn parse_billing(bytes: &[u8]) -> Result<Outcome, Failure> {
     let billing: Billing = serde_json::from_slice(bytes).map_err(|_| Failure::InvalidResponse)?;
     let kind = billing.config.current_period.r#type.to_ascii_uppercase();
-    if kind.contains("WEEKLY") {
+    if confirmed_weekly(&kind) {
         // Grok's proto3 schema omits the scalar for a new unused period.
         let used_percent = billing.config.credit_usage_percent.unwrap_or(0.0);
         if !used_percent.is_finite() || !(0.0..=100.0).contains(&used_percent) {
@@ -287,11 +341,12 @@ fn parse_billing(bytes: &[u8]) -> Result<Outcome, Failure> {
 // Only key and optional user_id survive deserialization. Unknown scalar fields
 // are discarded by the visitor, including creation, expiry and session content.
 // Multiple credential candidates are ambiguous: fail closed instead of guessing.
-struct Credentials {
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SourceStamp {
     key: String,
     user_id: Option<String>,
 }
-struct AuthNode(Vec<Credentials>);
+struct AuthNode(Vec<SourceStamp>);
 
 impl<'de> Deserialize<'de> for AuthNode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -330,7 +385,7 @@ impl<'de> Deserialize<'de> for AuthNode {
                     }
                 }
                 if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
-                    candidates.push(Credentials {
+                    candidates.push(SourceStamp {
                         key,
                         user_id: user_id.filter(|id| !id.is_empty()),
                     });
@@ -370,7 +425,11 @@ impl<'de> Deserialize<'de> for AuthNode {
     }
 }
 
-fn read_credentials(path: &Path) -> Result<Credentials, Failure> {
+pub(crate) fn source_stamp(path: &Path) -> Option<SourceStamp> {
+    read_credentials(path).ok()
+}
+
+fn read_credentials(path: &Path) -> Result<SourceStamp, Failure> {
     let file = open_regular(path)?;
     let mut bytes = Vec::new();
     file.take(MAX_BYTES + 1)
@@ -439,6 +498,27 @@ mod tests {
             parse_billing(br#"{"config":{"currentPeriod":{"type":"billing_period_monthly"}}}"#),
             Ok(Outcome::NonWeekly)
         );
+    }
+
+    #[test]
+    fn unconfirmed_week_labels_are_not_weekly() {
+        for kind in [
+            "NON_WEEKLY",
+            "BIWEEKLY",
+            "WEEK",
+            "non_weekly",
+            "biweekly",
+            "Week",
+        ] {
+            let body = format!(
+                r#"{{"config":{{"creditUsagePercent":35,"currentPeriod":{{"type":"{kind}","end":"2099-01-01T00:00:00Z"}}}}}}"#
+            );
+            assert_eq!(
+                parse_billing(body.as_bytes()),
+                Err(Failure::InvalidResponse),
+                "{kind}"
+            );
+        }
     }
 
     #[test]
@@ -702,6 +782,69 @@ mod tests {
             }
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn changed_key_or_user_cannot_retain_old_weekly_on_server_failure() {
+        for changed_auth in [
+            r#"{"key":"fake-b","user_id":"fake-user"}"#,
+            r#"{"key":"fake-test-secret","user_id":"fake-other-user"}"#,
+        ] {
+            let (url, handle) = server(200, WEEK, Duration::ZERO);
+            let (dir, mut client) = client(url, Duration::from_secs(1));
+            let now = Instant::now();
+            assert!(matches!(
+                client.poll_at(now, SystemTime::now()),
+                Outcome::Weekly(_)
+            ));
+            handle.join().unwrap();
+
+            std::fs::write(dir.path().join("auth.json"), changed_auth).unwrap();
+            let (url, handle) = server(500, "fake-response-secret", Duration::ZERO);
+            client.endpoint = url;
+            let result = client.poll_at(now + Duration::from_secs(300), SystemTime::now());
+            assert_eq!(result, Outcome::Unavailable(Failure::Transient));
+            assert!(!format!("{result:?}").contains("fake-response-secret"));
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn same_source_failure_retains_only_a_future_known_reset() {
+        let (url, handle) = server(200, WEEK, Duration::ZERO);
+        let (_dir, mut client) = client(url, Duration::from_secs(1));
+        let now = Instant::now();
+        let original = client.poll_at(now, SystemTime::now());
+        handle.join().unwrap();
+        let (url, handle) = server(500, "error", Duration::ZERO);
+        client.endpoint = url;
+        assert_eq!(
+            client.poll_at(now + Duration::from_secs(300), SystemTime::now()),
+            original
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            client.poll_at(
+                now + Duration::from_secs(301),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(4_102_444_800)
+            ),
+            Outcome::Unavailable(Failure::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn synthetic_source_stamp_read_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"key":"fake-measure-key","user_id":"fake-user"}"#).unwrap();
+        let started = Instant::now();
+        for _ in 0..1_000 {
+            assert!(source_stamp(&path).is_some());
+        }
+        eprintln!(
+            "grok synthetic auth stamp: 1000 reads in {:?}",
+            started.elapsed()
+        );
     }
 
     #[cfg(unix)]

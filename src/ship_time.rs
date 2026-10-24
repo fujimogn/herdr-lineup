@@ -1,9 +1,10 @@
 //! Local repository identity and origin/main commit-time headings.
 
 use std::{
+    collections::HashMap,
     io::Read,
     os::{fd::AsRawFd, unix::process::CommandExt},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -29,67 +30,434 @@ fn read_repository(cwd: &Path) -> Option<Repository> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum RepositoryRead {
     Complete(Option<Repository>),
     Interrupted,
 }
 
+/// One heading read together with the instant its data was verified by Git.
+/// A cache hit carries the original verification instant and never renews it.
+#[derive(Debug)]
+pub(crate) struct RepositoryObservation {
+    pub(crate) read: RepositoryRead,
+    pub(crate) verified_at: Option<Instant>,
+}
+
+/// The longest any single heading query may run, whatever the caller allows.
+const QUERY_LIMIT: Duration = Duration::from_secs(1);
+const CACHE_CAPACITY: usize = 64;
+/// A matching fingerprint is trusted only this long after the Git read.
+const VERIFIED_TTL: Duration = Duration::from_secs(30);
+
 /// Bound all Git commands for one heading and cancel them on daemon shutdown.
 /// Distinguish interruption from confirmed absence so publication can retain a
 /// previous heading only when its workspace identity is still authoritative.
+// Kept as the compatible uncached seam; the publisher now uses its own cache.
+#[allow(dead_code)]
 pub(crate) fn read_repository_controlled(
     cwd: &Path,
     shutdown: Option<&AtomicBool>,
 ) -> RepositoryRead {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let repository = read_repository_before(cwd, shutdown, deadline);
-    if Instant::now() >= deadline || shutdown.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-        RepositoryRead::Interrupted
-    } else {
-        RepositoryRead::Complete(repository)
+    // A fresh cache never hits, so this keeps the uncached full Git read.
+    RepositoryCache::default()
+        .observe(cwd, shutdown, Instant::now() + QUERY_LIMIT)
+        .read
+}
+
+/// Stat identity of one file or directory the downstream Git reads depend on.
+/// Normal absence is a state of its own; any other stat error is inaccessible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileFingerprint {
+    Absent,
+    Present {
+        dev: u64,
+        ino: u64,
+        size: u64,
+        mtime: (i64, i64),
+        ctime: (i64, i64),
+    },
+}
+
+struct Inaccessible;
+
+impl FileFingerprint {
+    fn read(path: &Path) -> Result<Self, Inaccessible> {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => Ok(Self::Present {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                size: meta.size(),
+                mtime: (meta.mtime(), meta.mtime_nsec()),
+                ctime: (meta.ctime(), meta.ctime_nsec()),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::Absent),
+            Err(_) => Err(Inaccessible),
+        }
     }
 }
 
-fn read_repository_before(
-    cwd: &Path,
-    shutdown: Option<&AtomicBool>,
-    deadline: Instant,
-) -> Option<Repository> {
-    let output = |path: &Path, args: &[&str]| git_output(path, args, deadline, shutdown);
-    let rev_parse = output(
-        cwd,
-        &[
-            "rev-parse",
-            "--is-inside-work-tree",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ],
-    )?;
-    let common = rev_parse.strip_prefix("true\n")?.strip_suffix('\n')?;
-    let common = Path::new(common).canonicalize().ok()?;
-    // The first worktree is the main working repository, even when cwd is a
-    // linked worktree. Query its common directory, not the linked root name.
-    let worktrees = output(&common, &["worktree", "list", "--porcelain", "-z"])?;
-    let root = worktrees.split('\0').next()?.strip_prefix("worktree ")?;
-    let root = Path::new(root).canonicalize().ok()?;
-    let name = root.file_name()?.to_str()?.to_owned();
-    // Unlike log, this format never verifies signatures through a configured
-    // GPG program. Keep the format free of signature verification atoms.
-    let ship_unix = output(
-        cwd,
-        &[
-            "for-each-ref",
-            "--format=%(refname) %(committerdate:unix)",
-            "refs/remotes/origin/main",
-        ],
-    )
-    .and_then(|value| {
-        // for-each-ref patterns also match descendants such as main/topic.
-        value
-            .lines()
-            .find_map(|line| line.strip_prefix("refs/remotes/origin/main ")?.parse().ok())
-    });
-    Some(Repository { name, ship_unix })
+/// Every common-directory dependency of `worktree list` and `for-each-ref`
+/// for a files-backend repository without replacement refs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompoundGitFingerprint {
+    common_dir: FileFingerprint,
+    config: FileFingerprint,
+    worktrees: FileFingerprint,
+    origin_main: FileFingerprint,
+    packed_refs: FileFingerprint,
+    alternates: FileFingerprint,
+    replace: FileFingerprint,
+    reftable: FileFingerprint,
+}
+
+impl CompoundGitFingerprint {
+    fn read(common: &Path) -> Result<Self, Inaccessible> {
+        let file = |relative: &str| FileFingerprint::read(&common.join(relative));
+        Ok(Self {
+            common_dir: FileFingerprint::read(common)?,
+            config: file("config")?,
+            worktrees: file("worktrees")?,
+            origin_main: file("refs/remotes/origin/main")?,
+            packed_refs: file("packed-refs")?,
+            alternates: file("objects/info/alternates")?,
+            replace: file("refs/replace")?,
+            reftable: file("reftable")?,
+        })
+    }
+
+    /// A replacement directory, empty or not, or a reftable directory makes
+    /// stat tracking unsound, so such repositories always run full Git.
+    fn trackable(&self) -> bool {
+        self.replace == FileFingerprint::Absent && self.reftable == FileFingerprint::Absent
+    }
+}
+
+/// Only the `worktree list` result is cached. Refs, timestamps and object
+/// reads are confirmed by `for-each-ref` on every observation.
+#[derive(Debug, Clone)]
+struct CachedRepository {
+    name: String,
+    fingerprint: CompoundGitFingerprint,
+    /// Git derives the main root from the common directory, so the common
+    /// fingerprint already covers it; this stat is defense in depth.
+    root: PathBuf,
+    root_fingerprint: FileFingerprint,
+    /// Set only by a full `worktree list` read; a hit never renews it.
+    verified_at: Instant,
+    /// Updated by hits to order least-recently-used eviction.
+    last_access: Instant,
+}
+
+/// Downstream heading cache keyed by canonical Git common directory. Every
+/// observation runs `rev-parse` natively for identity, ownership and
+/// repository-format checks and `for-each-ref` for the ship time. A hit
+/// replaces `worktree list` with a native `rev-parse` from the common
+/// directory, so both run three children; only `worktree list` is elided,
+/// and only while the compound fingerprint matches before and after the
+/// queries and the entry is fresh.
+#[derive(Default)]
+pub(crate) struct RepositoryCache {
+    entries: HashMap<PathBuf, CachedRepository>,
+    #[cfg(test)]
+    full_queries: usize,
+    #[cfg(test)]
+    after_git_queries: Option<Box<dyn FnMut()>>,
+}
+
+enum Outcome {
+    /// `rev-parse` refused cwd, so no common directory is known.
+    Rejected,
+    /// The common directory is known but its downstream read is unusable.
+    Discard(PathBuf),
+    /// The cached root with a ship time confirmed by Git in this observation.
+    Hit {
+        common: PathBuf,
+        ship_unix: Option<i64>,
+    },
+    Verified {
+        common: PathBuf,
+        repository: Repository,
+        store: Option<Box<CachedRepository>>,
+    },
+}
+
+impl RepositoryCache {
+    /// Observe the heading for `cwd` before the caller's absolute deadline,
+    /// itself clamped to the single-query limit. The deadline is cooperative:
+    /// Git children are polled against it and killed and reaped once it is
+    /// seen, but a reap or a synchronous stat blocked in the kernel can
+    /// outlast it, so it is not a strict wall-clock bound.
+    pub(crate) fn observe(
+        &mut self,
+        cwd: &Path,
+        shutdown: Option<&AtomicBool>,
+        deadline: Instant,
+    ) -> RepositoryObservation {
+        let now = Instant::now();
+        self.observe_at(cwd, shutdown, deadline.min(now + QUERY_LIMIT), now)
+    }
+
+    /// `now` stamps verification and ages entries; cancellation always uses
+    /// the real clock against `deadline`.
+    fn observe_at(
+        &mut self,
+        cwd: &Path,
+        shutdown: Option<&AtomicBool>,
+        deadline: Instant,
+        now: Instant,
+    ) -> RepositoryObservation {
+        let outcome = self.query(cwd, shutdown, deadline, now);
+        if Instant::now() >= deadline || shutdown.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            // An interrupted read proves nothing; leave every entry as it was.
+            return RepositoryObservation {
+                read: RepositoryRead::Interrupted,
+                verified_at: None,
+            };
+        }
+        let unverified = RepositoryObservation {
+            read: RepositoryRead::Complete(None),
+            verified_at: None,
+        };
+        match outcome {
+            Outcome::Rejected => {
+                // The refused cwd may belong to any cached repository, and
+                // only 64 entries exist: verify everything again from Git.
+                self.entries.clear();
+                unverified
+            }
+            Outcome::Discard(common) => {
+                self.entries.remove(&common);
+                unverified
+            }
+            Outcome::Hit { common, ship_unix } => {
+                let Some(entry) = self.entries.get_mut(&common) else {
+                    return unverified;
+                };
+                entry.last_access = now;
+                // The combined data is only as fresh as its older part, the
+                // cached root, so a hit never extends the entry's age.
+                RepositoryObservation {
+                    read: RepositoryRead::Complete(Some(Repository {
+                        name: entry.name.clone(),
+                        ship_unix,
+                    })),
+                    verified_at: Some(entry.verified_at),
+                }
+            }
+            Outcome::Verified {
+                common,
+                repository,
+                store,
+            } => {
+                match store {
+                    Some(entry) => self.insert(common, *entry),
+                    None => {
+                        self.entries.remove(&common);
+                    }
+                }
+                RepositoryObservation {
+                    read: RepositoryRead::Complete(Some(repository)),
+                    verified_at: Some(now),
+                }
+            }
+        }
+    }
+
+    fn insert(&mut self, common: PathBuf, entry: CachedRepository) {
+        if !self.entries.contains_key(&common) && self.entries.len() >= CACHE_CAPACITY {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_access)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(common, entry);
+    }
+
+    fn query(
+        &mut self,
+        cwd: &Path,
+        shutdown: Option<&AtomicBool>,
+        deadline: Instant,
+        now: Instant,
+    ) -> Outcome {
+        let output = |path: &Path, args: &[&str]| git_output(path, args, deadline, shutdown);
+        let Some(rev_parse) = output(
+            cwd,
+            &[
+                "rev-parse",
+                "--is-inside-work-tree",
+                "--path-format=absolute",
+                "--git-common-dir",
+                "--show-ref-format",
+            ],
+        ) else {
+            return Outcome::Rejected;
+        };
+        // The common directory may contain newlines; the format line cannot.
+        // Git without --show-ref-format echoes the option, an unknown backend.
+        let Some((common, ref_format)) = rev_parse
+            .strip_prefix("true\n")
+            .and_then(|value| value.strip_suffix('\n'))
+            .and_then(|value| value.rsplit_once('\n'))
+        else {
+            return Outcome::Rejected;
+        };
+        let Ok(common) = Path::new(common).canonicalize() else {
+            return Outcome::Rejected;
+        };
+        let Ok(before) = CompoundGitFingerprint::read(&common) else {
+            return Outcome::Discard(common);
+        };
+        let Ok(plain_config) = config_without_includes(&common) else {
+            return Outcome::Discard(common);
+        };
+        // Unlike log, this format never verifies signatures through a configured
+        // GPG program. Keep the format free of signature verification atoms.
+        // The refs/replace pattern detects packed-only replacement refs.
+        let Some(refs) = output(
+            cwd,
+            &[
+                "for-each-ref",
+                "--format=%(refname)%00%(symref)%00%(committerdate:unix)",
+                "refs/remotes/origin/main",
+                "refs/replace",
+            ],
+        ) else {
+            // A failed query is not a confirmed absence.
+            return Outcome::Discard(common);
+        };
+        let mut ship_unix = None;
+        let mut symbolic = false;
+        let mut replaced = false;
+        for line in refs.lines() {
+            let mut fields = line.split('\0');
+            let (Some(refname), Some(symref), Some(unix)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            // for-each-ref patterns also match descendants such as main/topic.
+            if refname == "refs/remotes/origin/main" {
+                ship_unix = unix.parse().ok();
+                symbolic = !symref.is_empty();
+            } else if refname.starts_with("refs/replace/") {
+                replaced = true;
+            }
+        }
+        // A symlinked loose ref changes with its target, which is not tracked.
+        let linked_ref = std::fs::symlink_metadata(common.join("refs/remotes/origin/main"))
+            .is_ok_and(|meta| meta.file_type().is_symlink());
+        let cacheable = ref_format == "files"
+            && before.trackable()
+            && plain_config
+            && !replaced
+            && !symbolic
+            && !linked_ref
+            && ship_unix.is_some();
+        let cached = self.entries.get(&common).filter(|entry| {
+            cacheable
+                && entry.fingerprint == before
+                && now.saturating_duration_since(entry.verified_at) < VERIFIED_TTL
+        });
+        let (root, name) = match cached.map(|entry| entry.root.clone()) {
+            Some(root) => {
+                // safe.directory is decided per path: a permitted workspace
+                // does not permit the common directory that worktree list
+                // reads. Repeat that native refusal check instead of letting
+                // the cache hide it.
+                let identity = output(
+                    &common,
+                    &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                )
+                .and_then(|value| Path::new(value.strip_suffix('\n')?).canonicalize().ok());
+                if identity.as_ref() != Some(&common) {
+                    return Outcome::Discard(common);
+                }
+                (root, None)
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    self.full_queries += 1;
+                }
+                // The first worktree is the main working repository, even when
+                // cwd is a linked worktree. Query its common directory, not the
+                // linked root name.
+                let root =
+                    output(&common, &["worktree", "list", "--porcelain", "-z"]).and_then(|list| {
+                        let root = list.split('\0').next()?.strip_prefix("worktree ")?;
+                        Path::new(root).canonicalize().ok()
+                    });
+                let Some((root, name)) = root.and_then(|root| {
+                    let name = root.file_name()?.to_str()?.to_owned();
+                    Some((root, name))
+                }) else {
+                    return Outcome::Discard(common);
+                };
+                (root, Some(name))
+            }
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.after_git_queries.as_mut() {
+            hook();
+        }
+        // Data read while a dependency changed may mix two states; never
+        // publish or cache it, whether the root came from Git or the cache.
+        let (Ok(after), Ok(root_fingerprint)) = (
+            CompoundGitFingerprint::read(&common),
+            FileFingerprint::read(&root),
+        ) else {
+            return Outcome::Discard(common);
+        };
+        if after != before || root_fingerprint == FileFingerprint::Absent {
+            return Outcome::Discard(common);
+        }
+        let Some(name) = name else {
+            if self
+                .entries
+                .get(&common)
+                .is_some_and(|entry| entry.root_fingerprint == root_fingerprint)
+            {
+                return Outcome::Hit { common, ship_unix };
+            }
+            return Outcome::Discard(common);
+        };
+        let repository = Repository { name, ship_unix };
+        let store = cacheable.then(|| {
+            Box::new(CachedRepository {
+                name: repository.name.clone(),
+                fingerprint: before,
+                root,
+                root_fingerprint,
+                verified_at: now,
+                last_access: now,
+            })
+        });
+        Outcome::Verified {
+            common,
+            repository,
+            store,
+        }
+    }
+}
+
+/// Included files are not tracked by the fingerprint, so a repository whose
+/// own configuration includes another file is never cached.
+fn config_without_includes(common: &Path) -> Result<bool, Inaccessible> {
+    match std::fs::read(common.join("config")) {
+        Ok(bytes) => Ok(!bytes
+            .to_ascii_lowercase()
+            .windows(b"include".len())
+            .any(|window| window == b"include")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Err(Inaccessible),
+    }
 }
 
 /// Format using the injected clock's timezone and date. Runtime callers should
@@ -150,6 +518,10 @@ fn git_command(cwd: &Path) -> Command {
     command
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_ALLOW_PROTOCOL", "");
+    #[cfg(test)]
+    tests::TEST_GIT_ENV.with_borrow(|env| {
+        command.envs(env.iter().map(|(key, value)| (key, value)));
+    });
     command
 }
 
@@ -493,6 +865,10 @@ mod tests {
         }
 
         fn new_in(parent: &Path) -> Self {
+            Self::init_in(parent, &[])
+        }
+
+        fn init_in(parent: &Path, init: &[&str]) -> Self {
             let cleanup = tempfile::Builder::new()
                 .prefix("herdr-lineup-ship-time-")
                 .tempdir_in(parent)
@@ -509,34 +885,13 @@ mod tests {
                 repo,
                 _cleanup: cleanup,
             };
-            fixture.git(&["init", "--initial-branch=main"], None);
+            fixture.git(&[&["init", "--initial-branch=main"], init].concat(), None);
             fixture.commit("2024-01-01T00:00:00Z");
             fixture
         }
 
         fn git(&self, args: &[&str], date: Option<&str>) -> String {
-            let mut command = Command::new("git");
-            command.arg("-C").arg(&self.repo).args(args);
-            for (key, _) in std::env::vars_os() {
-                if key.to_string_lossy().starts_with("GIT_") {
-                    command.env_remove(key);
-                }
-            }
-            command
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null");
-            if let Some(date) = date {
-                command
-                    .env("GIT_AUTHOR_DATE", date)
-                    .env("GIT_COMMITTER_DATE", date);
-            }
-            let output = command.output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            fixture_git(&self.repo, args, date)
         }
 
         fn commit(&self, date: &str) {
@@ -556,6 +911,31 @@ mod tests {
                 Some(date),
             );
         }
+    }
+
+    fn fixture_git(repo: &Path, args: &[&str], date: Option<&str>) -> String {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(repo).args(args);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        if let Some(date) = date {
+            command
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     #[test]
@@ -584,6 +964,77 @@ mod tests {
             read_repository(&fixture.repo).unwrap().ship_unix,
             Some(1_704_153_600)
         );
+    }
+
+    #[test]
+    fn packed_refs_are_read_and_refreshed_correctly() {
+        let fixture = Fixture::new();
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        assert_eq!(
+            read_repository(&fixture.repo).unwrap().ship_unix,
+            Some(1_704_067_200)
+        );
+        // Pack loose refs into .git/packed-refs
+        fixture.git(&["pack-refs", "--all"], None);
+        assert!(!fixture.repo.join(".git/refs/remotes/origin/main").exists());
+        assert!(fixture.repo.join(".git/packed-refs").exists());
+        assert_eq!(
+            read_repository(&fixture.repo).unwrap().ship_unix,
+            Some(1_704_067_200)
+        );
+        // Update ref after packing (creates a loose ref that shadows packed-refs)
+        fixture.commit("2024-01-02T00:00:00Z");
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        assert!(fixture.repo.join(".git/refs/remotes/origin/main").exists());
+        assert_eq!(
+            read_repository(&fixture.repo).unwrap().ship_unix,
+            Some(1_704_153_600)
+        );
+        // Pack again
+        fixture.git(&["pack-refs", "--all"], None);
+        assert!(!fixture.repo.join(".git/refs/remotes/origin/main").exists());
+        assert_eq!(
+            read_repository(&fixture.repo).unwrap().ship_unix,
+            Some(1_704_153_600)
+        );
+    }
+
+    #[test]
+    fn replace_refs_alter_committer_time_and_require_invalidation() {
+        let fixture = Fixture::new();
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        let initial_time = read_repository(&fixture.repo).unwrap().ship_unix;
+        assert_eq!(initial_time, Some(1_704_067_200));
+
+        // Create a second commit with different timestamp
+        fixture.commit("2024-01-02T00:00:00Z");
+        let head_commit = fixture.git(&["rev-parse", "HEAD"], None);
+        let origin_main_commit = fixture.git(&["rev-parse", "refs/remotes/origin/main"], None);
+
+        // Replace origin/main target commit with head_commit
+        fixture.git(&["replace", &origin_main_commit, &head_commit], None);
+
+        // Git for-each-ref respects git replace by default, yielding the replaced commit time
+        let replaced_time = read_repository(&fixture.repo).unwrap().ship_unix;
+        assert_eq!(replaced_time, Some(1_704_153_600));
+
+        // Pack replacement refs into packed-refs. Prune unlinks loose ref files,
+        // leaving the directory empty. Verify and remove the empty directory.
+        fixture.git(&["pack-refs", "--all", "--prune"], None);
+        let loose_replace = fixture.repo.join(".git/refs/replace");
+        if loose_replace.exists() {
+            std::fs::remove_dir(&loose_replace)
+                .expect("pack-refs --prune must leave refs/replace empty");
+        }
+        assert!(!loose_replace.exists());
+        // Packed-only replacement ref is still effective and yields replaced commit time
+        let packed_replaced_time = read_repository(&fixture.repo).unwrap().ship_unix;
+        assert_eq!(packed_replaced_time, Some(1_704_153_600));
+
+        // Delete replace ref
+        fixture.git(&["replace", "-d", &origin_main_commit], None);
+        let restored_time = read_repository(&fixture.repo).unwrap().ship_unix;
+        assert_eq!(restored_time, Some(1_704_067_200));
     }
 
     impl Fixture {
@@ -703,10 +1154,16 @@ mod tests {
 
     #[test]
     fn missing_or_broken_origin_main_does_not_run_configured_programs() {
-        for ref_contents in [
-            None,
-            Some("broken\n"),
-            Some("1111111111111111111111111111111111111111\n"),
+        // An absent or broken ref is a confirmed absence that keeps the name;
+        // Git fails on a missing object, which is never a confirmed absence.
+        let named = Some(Repository {
+            name: "canonical-repo".to_owned(),
+            ship_unix: None,
+        });
+        for (ref_contents, expected) in [
+            (None, named.clone()),
+            (Some("broken\n"), named),
+            (Some("1111111111111111111111111111111111111111\n"), None),
         ] {
             let fixture = Fixture::new();
             // Exercise the missing-object path of a partial clone as well.
@@ -736,13 +1193,7 @@ mod tests {
                         "Git executed a configured program: {marker:?}"
                     );
                 }
-                assert_eq!(
-                    repository,
-                    Some(Repository {
-                        name: "canonical-repo".to_owned(),
-                        ship_unix: None,
-                    })
-                );
+                assert_eq!(repository, expected);
             }
         }
     }
@@ -781,6 +1232,40 @@ mod tests {
         );
         assert_eq!(read_repository(&fixture.root), None);
         assert_eq!(read_repository(&fixture.repo.join(".git")), None);
+    }
+
+    #[test]
+    fn linked_worktree_lifecycle_add_and_remove() {
+        let fixture = Fixture::new();
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        let linked = fixture.root.join("ephemeral-worktree");
+        fixture.git(
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+            None,
+        );
+        assert_eq!(
+            read_repository(&linked),
+            Some(Repository {
+                name: "canonical-repo".to_owned(),
+                ship_unix: Some(1_704_067_200),
+            })
+        );
+        fixture.git(&["worktree", "remove", linked.to_str().unwrap()], None);
+        assert_eq!(read_repository(&linked), None);
+        // Main repository is unaffected
+        assert_eq!(
+            read_repository(&fixture.repo),
+            Some(Repository {
+                name: "canonical-repo".to_owned(),
+                ship_unix: Some(1_704_067_200),
+            })
+        );
     }
 
     #[test]
@@ -842,5 +1327,716 @@ mod tests {
         assert!(status.success());
         let repo = read_repository(&newline_repo).expect("must parse repo path with newlines");
         assert_eq!(repo.name, "repo\nwith\nnewline");
+    }
+
+    thread_local! {
+        /// Test-only environment for production Git children on this thread;
+        /// production sanitizing would drop these variables otherwise.
+        pub(super) static TEST_GIT_ENV: std::cell::RefCell<Vec<(String, std::ffi::OsString)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    // Clears the injected Git environment even when an assertion panics.
+    struct GitEnvGuard;
+
+    impl GitEnvGuard {
+        fn set(env: Vec<(String, std::ffi::OsString)>) -> Self {
+            TEST_GIT_ENV.set(env);
+            Self
+        }
+    }
+
+    impl Drop for GitEnvGuard {
+        fn drop(&mut self) {
+            TEST_GIT_ENV.take();
+        }
+    }
+
+    #[test]
+    fn common_directory_refusal_is_not_hidden_by_a_cache_hit() {
+        let fixture = Fixture::with_origin_main();
+        let linked = fixture.linked("permitted-linked").canonicalize().unwrap();
+        let global = fixture.root.join("isolated-global.cfg");
+        let permit = |paths: &[&Path]| {
+            let lines: String = paths
+                .iter()
+                .map(|path| format!("\tdirectory = {}\n", path.display()))
+                .collect();
+            std::fs::write(&global, format!("[safe]\n{lines}")).unwrap();
+        };
+        // Every repository is foreign-owned; only listed paths are safe.
+        let _env = GitEnvGuard::set(vec![
+            ("GIT_TEST_ASSUME_DIFFERENT_OWNER".to_owned(), "1".into()),
+            ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".into()),
+            ("GIT_CONFIG_GLOBAL".to_owned(), global.clone().into()),
+        ]);
+        let common = fixture.common();
+        permit(&[&linked, &common]);
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        assert_eq!(ship(&observe(&mut cache, &linked, t0)), Some(DAY_ONE));
+        assert_eq!(ship(&observe(&mut cache, &linked, t0)), Some(DAY_ONE));
+        assert_eq!(cache.full_queries, 1);
+        // Withdrawing only the common directory keeps workspace queries
+        // working while worktree list would be refused.
+        permit(&[&linked]);
+        assert!(is_unverified_absence(&observe(&mut cache, &linked, t0)));
+        assert!(cache.entries.is_empty());
+        assert!(is_unverified_absence(&observe(&mut cache, &linked, t0)));
+        assert_eq!(cache.full_queries, 2, "a miss is refused by worktree list");
+        permit(&[&linked, &common]);
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(observe(&mut cache, &linked, t1).verified_at, Some(t1));
+        assert_eq!(cache.full_queries, 3);
+    }
+
+    // Cache fixtures inject the verification clock; Git children still run
+    // against the real clock with the production one-second limit.
+    fn observe(cache: &mut RepositoryCache, cwd: &Path, now: Instant) -> RepositoryObservation {
+        cache.observe_at(cwd, None, Instant::now() + QUERY_LIMIT, now)
+    }
+
+    fn ship(observation: &RepositoryObservation) -> Option<i64> {
+        match &observation.read {
+            RepositoryRead::Complete(Some(repository)) => repository.ship_unix,
+            other => panic!("expected a repository, got {other:?}"),
+        }
+    }
+
+    fn is_unverified_absence(observation: &RepositoryObservation) -> bool {
+        matches!(observation.read, RepositoryRead::Complete(None))
+            && observation.verified_at.is_none()
+    }
+
+    const DAY_ONE: i64 = 1_704_067_200;
+    const DAY_TWO: i64 = 1_704_153_600;
+
+    impl Fixture {
+        fn with_origin_main() -> Self {
+            let fixture = Self::new();
+            fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+            fixture
+        }
+
+        fn common(&self) -> PathBuf {
+            self.repo.join(".git").canonicalize().unwrap()
+        }
+
+        fn linked(&self, name: &str) -> PathBuf {
+            let linked = self.root.join(name);
+            self.git(
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    linked.to_str().unwrap(),
+                    "HEAD",
+                ],
+                None,
+            );
+            linked
+        }
+    }
+
+    #[test]
+    fn subdirectory_cwd_hits_cache_after_one_full_query() {
+        let fixture = Fixture::with_origin_main();
+        let deep = fixture.repo.join("src/deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        // Normal absence is a fingerprint state and still allows hits.
+        assert!(!fixture.repo.join(".git/packed-refs").exists());
+        assert!(!fixture.repo.join(".git/worktrees").exists());
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        let first = observe(&mut cache, &deep, t0);
+        assert_eq!(
+            first.read.complete(),
+            Some(Repository {
+                name: "canonical-repo".to_owned(),
+                ship_unix: Some(DAY_ONE),
+            })
+        );
+        assert_eq!(first.verified_at, Some(t0));
+        let second = observe(&mut cache, &deep, t0 + Duration::from_secs(5));
+        assert_eq!(ship(&second), Some(DAY_ONE));
+        assert_eq!(second.verified_at, Some(t0));
+        assert_eq!(cache.full_queries, 1);
+        let entry = &cache.entries[&fixture.common()];
+        assert_eq!(entry.verified_at, t0);
+        assert_eq!(entry.last_access, t0 + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn linked_worktrees_share_the_entry_and_inherit_its_verification() {
+        let fixture = Fixture::with_origin_main();
+        let first = fixture.linked("first-linked");
+        let second = fixture.linked("second-linked");
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        assert_eq!(observe(&mut cache, &fixture.repo, t0).verified_at, Some(t0));
+        for (offset, cwd) in [(2, &first), (4, &second)] {
+            let observation = observe(&mut cache, cwd, t0 + Duration::from_secs(offset));
+            assert_eq!(observation.read.complete().unwrap().name, "canonical-repo");
+            assert_eq!(observation.verified_at, Some(t0));
+        }
+        assert_eq!(cache.full_queries, 1);
+    }
+
+    #[test]
+    fn worktree_add_and_remove_force_full_queries() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        let linked = fixture.linked("added-later");
+        assert_eq!(ship(&observe(&mut cache, &linked, t0)), Some(DAY_ONE));
+        assert_eq!(cache.full_queries, 2);
+        fixture.git(&["worktree", "remove", linked.to_str().unwrap()], None);
+        // The removed worktree is refused by rev-parse and clears the cache.
+        assert!(is_unverified_absence(&observe(&mut cache, &linked, t0)));
+        assert!(cache.entries.is_empty());
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        assert_eq!(cache.full_queries, 3);
+    }
+
+    #[test]
+    fn loose_and_packed_origin_main_changes_force_full_queries() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        fixture.commit("2024-01-02T00:00:00Z");
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_TWO));
+        assert_eq!(cache.full_queries, 2);
+        fixture.git(&["pack-refs", "--all"], None);
+        assert!(!fixture.repo.join(".git/refs/remotes/origin/main").exists());
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_TWO));
+        assert_eq!(cache.full_queries, 3);
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_TWO));
+        assert_eq!(cache.full_queries, 3);
+        // A packed value later shadowed by a new loose ref.
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD~"], None);
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        assert_eq!(cache.full_queries, 4);
+    }
+
+    impl Fixture {
+        /// Replace the origin/main commit with HEAD, a later commit.
+        fn replace_origin_main(&self) {
+            let head = self.git(&["rev-parse", "HEAD"], None);
+            let origin = self.git(&["rev-parse", "refs/remotes/origin/main"], None);
+            self.git(&["replace", &origin, &head], None);
+        }
+    }
+
+    #[test]
+    fn empty_replace_directory_after_warm_cache_disables_caching() {
+        let fixture = Fixture::with_origin_main();
+        fixture.commit("2024-01-02T00:00:00Z");
+        let replace = fixture.repo.join(".git/refs/replace");
+        assert!(!replace.exists());
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        assert!(cache.entries.contains_key(&fixture.common()));
+        std::fs::create_dir(&replace).unwrap();
+        let t1 = t0 + Duration::from_secs(1);
+        let observation = observe(&mut cache, &fixture.repo, t1);
+        assert_eq!(
+            (ship(&observation), observation.verified_at),
+            (Some(DAY_ONE), Some(t1))
+        );
+        assert!(cache.entries.is_empty(), "uncacheable read must evict");
+        observe(&mut cache, &fixture.repo, t1);
+        assert_eq!(cache.full_queries, 3);
+        fixture.replace_origin_main();
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t1)), Some(DAY_TWO));
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn initially_empty_replace_directory_is_never_cached() {
+        let fixture = Fixture::with_origin_main();
+        fixture.commit("2024-01-02T00:00:00Z");
+        std::fs::create_dir(fixture.repo.join(".git/refs/replace")).unwrap();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        for _ in 0..2 {
+            assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        }
+        assert_eq!(cache.full_queries, 2);
+        fixture.replace_origin_main();
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_TWO));
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn packed_only_replacement_is_never_cached() {
+        let fixture = Fixture::with_origin_main();
+        fixture.commit("2024-01-02T00:00:00Z");
+        fixture.replace_origin_main();
+        fixture.git(&["pack-refs", "--all", "--prune"], None);
+        let loose = fixture.repo.join(".git/refs/replace");
+        if loose.exists() {
+            std::fs::remove_dir(&loose).expect("pack-refs --prune must leave refs/replace empty");
+        }
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        for offset in [0, 1] {
+            let now = t0 + Duration::from_secs(offset);
+            let observation = observe(&mut cache, &fixture.repo, now);
+            assert_eq!(
+                (ship(&observation), observation.verified_at),
+                (Some(DAY_TWO), Some(now))
+            );
+        }
+        assert_eq!(cache.full_queries, 2);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn reftable_repository_is_never_cached() {
+        let fixture = Fixture::init_in(&std::env::temp_dir(), &["--ref-format=reftable"]);
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        fixture.commit("2024-01-02T00:00:00Z");
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_TWO));
+        assert_eq!(cache.full_queries, 2);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn symbolic_origin_main_is_never_cached() {
+        let fixture = Fixture::new();
+        fixture.git(
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/main",
+                "refs/heads/main",
+            ],
+            None,
+        );
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        // The symref file is unchanged while its target moves.
+        fixture.commit("2024-01-02T00:00:00Z");
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_TWO));
+        assert_eq!(cache.full_queries, 2);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn missing_ref_or_object_is_never_cached() {
+        let fixture = Fixture::new();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        for _ in 0..2 {
+            let observation = observe(&mut cache, &fixture.repo, t0);
+            assert_eq!(
+                (ship(&observation), observation.verified_at),
+                (None, Some(t0))
+            );
+        }
+        // A ref to an absent object reads as unavailable until the object exists.
+        let commit = fixture.git(&["cat-file", "commit", "HEAD"], None);
+        let commit = commit.replace("synthetic", "written later");
+        let path = fixture.root.join("later-commit");
+        std::fs::write(&path, commit).unwrap();
+        let oid = fixture.git(
+            &["hash-object", "-t", "commit", path.to_str().unwrap()],
+            None,
+        );
+        let refs = fixture.repo.join(".git/refs/remotes/origin");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), format!("{oid}\n")).unwrap();
+        assert!(is_unverified_absence(&observe(
+            &mut cache,
+            &fixture.repo,
+            t0
+        )));
+        fixture.git(
+            &["hash-object", "-t", "commit", "-w", path.to_str().unwrap()],
+            None,
+        );
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        // The failed query was discarded before worktree list.
+        assert_eq!(cache.full_queries, 3);
+        assert!(cache.entries.contains_key(&fixture.common()));
+    }
+
+    impl Fixture {
+        fn origin_main_object(&self) -> PathBuf {
+            let oid = self.git(&["rev-parse", "refs/remotes/origin/main"], None);
+            self.repo
+                .join(".git/objects")
+                .join(&oid[..2])
+                .join(&oid[2..])
+        }
+    }
+
+    // Object loss is outside the fingerprint, so only the per-observation
+    // for-each-ref can reveal it; a warm entry must not hide it.
+    #[test]
+    fn object_loss_after_a_warm_cache_is_never_hidden() {
+        use std::os::unix::fs::PermissionsExt;
+        let unreadable = unsafe { libc::geteuid() } != 0;
+        for scenario in ["loose", "packed", "unreadable", "alternate"] {
+            if scenario == "unreadable" && !unreadable {
+                continue;
+            }
+            let fixture = Fixture::with_origin_main();
+            let mut cwd = fixture.repo.clone();
+            let mut _guard = None;
+            if scenario == "packed" {
+                fixture.git(&["repack", "-a", "-d"], None);
+                assert!(!fixture.origin_main_object().exists());
+            }
+            if scenario == "alternate" {
+                // A borrower whose only copy of the object is in the lender.
+                let borrower = fixture.root.join("borrower");
+                fixture_git(
+                    &fixture.root,
+                    &["init", "--initial-branch=main", "borrower"],
+                    None,
+                );
+                let objects = fixture.repo.join(".git/objects").canonicalize().unwrap();
+                std::fs::write(
+                    borrower.join(".git/objects/info/alternates"),
+                    format!("{}\n", objects.display()),
+                )
+                .unwrap();
+                let oid = fixture.git(&["rev-parse", "HEAD"], None);
+                fixture_git(
+                    &borrower,
+                    &["update-ref", "refs/remotes/origin/main", &oid],
+                    None,
+                );
+                cwd = borrower;
+            }
+            let mut cache = RepositoryCache::default();
+            let t0 = Instant::now();
+            assert_eq!(
+                ship(&observe(&mut cache, &cwd, t0)),
+                Some(DAY_ONE),
+                "{scenario}"
+            );
+            match scenario {
+                "loose" => std::fs::remove_file(fixture.origin_main_object()).unwrap(),
+                "packed" => {
+                    for pack in std::fs::read_dir(fixture.repo.join(".git/objects/pack")).unwrap() {
+                        std::fs::remove_file(pack.unwrap().path()).unwrap();
+                    }
+                }
+                "unreadable" => {
+                    let object = fixture.origin_main_object();
+                    _guard = Some(ModeGuard(object.clone()));
+                    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000))
+                        .unwrap();
+                }
+                _ => std::fs::rename(
+                    fixture.repo.join(".git/objects"),
+                    fixture.root.join("moved-objects"),
+                )
+                .unwrap(),
+            }
+            let lost = observe(&mut cache, &cwd, t0 + Duration::from_secs(1));
+            assert!(is_unverified_absence(&lost), "{scenario}: {lost:?}");
+            assert!(cache.entries.is_empty(), "{scenario}");
+            assert_eq!(cache.full_queries, 1, "{scenario}");
+        }
+    }
+
+    #[test]
+    fn dependency_change_during_a_cache_hit_discards_the_entry() {
+        let fixture = Fixture::with_origin_main();
+        fixture.commit("2024-01-02T00:00:00Z");
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        let repo = fixture.repo.clone();
+        cache.after_git_queries = Some(Box::new(move || {
+            fixture_git(
+                &repo,
+                &["update-ref", "refs/remotes/origin/main", "HEAD"],
+                None,
+            );
+        }));
+        assert!(is_unverified_absence(&observe(
+            &mut cache,
+            &fixture.repo,
+            t0
+        )));
+        assert_eq!(
+            cache.full_queries, 1,
+            "the hit path must not run worktree list"
+        );
+        assert!(cache.entries.is_empty());
+        cache.after_git_queries = None;
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_TWO));
+    }
+
+    #[test]
+    fn dependency_change_during_full_query_discards_the_result() {
+        let fixture = Fixture::with_origin_main();
+        let first = fixture.git(&["rev-parse", "HEAD"], None);
+        fixture.commit("2024-01-02T00:00:00Z");
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        let repo = fixture.repo.clone();
+        cache.after_git_queries = Some(Box::new(move || {
+            fixture_git(
+                &repo,
+                &["update-ref", "refs/remotes/origin/main", &first],
+                None,
+            );
+        }));
+        assert!(is_unverified_absence(&observe(
+            &mut cache,
+            &fixture.repo,
+            t0
+        )));
+        assert!(cache.entries.is_empty(), "the old entry must be discarded");
+        cache.after_git_queries = None;
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        assert_eq!(cache.full_queries, 3);
+    }
+
+    #[test]
+    fn verified_entry_expires_after_thirty_seconds_without_renewal() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        let almost = t0 + VERIFIED_TTL - Duration::from_millis(1);
+        assert_eq!(
+            observe(&mut cache, &fixture.repo, almost).verified_at,
+            Some(t0)
+        );
+        assert_eq!(cache.full_queries, 1);
+        let expired = t0 + VERIFIED_TTL;
+        assert_eq!(
+            observe(&mut cache, &fixture.repo, expired).verified_at,
+            Some(expired)
+        );
+        assert_eq!(cache.full_queries, 2);
+        let later = expired + Duration::from_secs(1);
+        assert_eq!(
+            observe(&mut cache, &fixture.repo, later).verified_at,
+            Some(expired)
+        );
+        assert_eq!(cache.full_queries, 2);
+    }
+
+    #[test]
+    fn config_change_forces_and_included_config_disables_caching() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        fixture.git(&["config", "fixture.key", "value"], None);
+        observe(&mut cache, &fixture.repo, t0);
+        assert_eq!(cache.full_queries, 2);
+        // The fingerprint cannot follow included files.
+        let included = fixture.root.join("included.cfg");
+        std::fs::write(&included, "[fixture]\n\tother = value\n").unwrap();
+        fixture.git(
+            &["config", "include.path", included.to_str().unwrap()],
+            None,
+        );
+        for _ in 0..2 {
+            assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        }
+        assert_eq!(cache.full_queries, 4);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn rejected_identity_clears_every_entry() {
+        let fixture = Fixture::with_origin_main();
+        let linked = fixture.linked("broken-pointer");
+        let other = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        observe(&mut cache, &other.repo, t0);
+        assert_eq!(cache.entries.len(), 2);
+        std::fs::write(linked.join(".git"), "gitdir: /nonexistent/fixture/gitdir\n").unwrap();
+        assert!(is_unverified_absence(&observe(&mut cache, &linked, t0)));
+        assert!(cache.entries.is_empty());
+        // Every repository is verified again from a full read.
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(observe(&mut cache, &fixture.repo, t1).verified_at, Some(t1));
+        assert_eq!(cache.full_queries, 3);
+    }
+
+    #[test]
+    fn unsupported_repository_format_is_refused_every_time() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        fixture.git(&["config", "core.repositoryformatversion", "1"], None);
+        fixture.git(&["config", "extensions.fixtureUnknown", "true"], None);
+        for _ in 0..2 {
+            assert!(is_unverified_absence(&observe(
+                &mut cache,
+                &fixture.repo,
+                t0
+            )));
+        }
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.full_queries, 1);
+    }
+
+    #[test]
+    fn reinitialized_repository_at_the_same_path_forces_a_full_query() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        std::fs::remove_dir_all(fixture.repo.join(".git")).unwrap();
+        fixture.git(&["init", "--initial-branch=main"], None);
+        fixture.commit("2024-01-02T00:00:00Z");
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_TWO));
+        assert_eq!(cache.full_queries, 2);
+    }
+
+    #[test]
+    fn renamed_main_worktree_is_read_under_its_new_identity() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        // The main root contains the common directory, so moving the root
+        // changes the cache key; the old entry no longer serves any cwd.
+        let renamed = fixture.root.join("renamed-repo");
+        std::fs::rename(&fixture.repo, &renamed).unwrap();
+        assert!(is_unverified_absence(&observe(
+            &mut cache,
+            &fixture.repo,
+            t0
+        )));
+        let observation = observe(&mut cache, &renamed, t0);
+        assert_eq!(observation.read.complete().unwrap().name, "renamed-repo");
+        assert_eq!(cache.full_queries, 2);
+    }
+
+    // Restores a directory mode even when an assertion panics.
+    struct ModeGuard(PathBuf);
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn inaccessible_dependency_fails_closed_and_discards_the_entry() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        let origin = fixture.repo.join(".git/refs/remotes/origin");
+        let guard = ModeGuard(origin.clone());
+        std::fs::set_permissions(&origin, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(is_unverified_absence(&observe(
+            &mut cache,
+            &fixture.repo,
+            t0
+        )));
+        assert!(cache.entries.is_empty());
+        drop(guard);
+        assert_eq!(ship(&observe(&mut cache, &fixture.repo, t0)), Some(DAY_ONE));
+        assert_eq!(cache.full_queries, 2);
+    }
+
+    #[test]
+    fn interrupted_observation_leaves_the_entry_unchanged() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let t0 = Instant::now();
+        observe(&mut cache, &fixture.repo, t0);
+        // The caller deadline wins over the query limit and spawns nothing.
+        let elapsed = cache.observe(&fixture.repo, None, Instant::now());
+        assert!(matches!(elapsed.read, RepositoryRead::Interrupted));
+        assert_eq!(elapsed.verified_at, None);
+        // A full query that completes after its deadline stores nothing.
+        fixture.commit("2024-01-02T00:00:00Z");
+        fixture.git(&["update-ref", "refs/remotes/origin/main", "HEAD"], None);
+        cache.after_git_queries = Some(Box::new(|| std::thread::sleep(Duration::from_millis(300))));
+        let late = cache.observe_at(
+            &fixture.repo,
+            None,
+            Instant::now() + Duration::from_millis(200),
+            t0 + Duration::from_secs(1),
+        );
+        assert!(matches!(late.read, RepositoryRead::Interrupted));
+        assert_eq!(late.verified_at, None);
+        let stale = cache.entries[&fixture.common()].fingerprint.clone();
+        assert_eq!(cache.entries[&fixture.common()].verified_at, t0);
+        assert_ne!(
+            Some(stale),
+            CompoundGitFingerprint::read(&fixture.common()).ok(),
+            "the interrupted full query must not store its fingerprint"
+        );
+        assert_eq!(cache.full_queries, 2);
+    }
+
+    #[test]
+    fn full_cache_evicts_the_least_recently_accessed_entry() {
+        let t0 = Instant::now();
+        let fingerprint = CompoundGitFingerprint {
+            common_dir: FileFingerprint::Absent,
+            config: FileFingerprint::Absent,
+            worktrees: FileFingerprint::Absent,
+            origin_main: FileFingerprint::Absent,
+            packed_refs: FileFingerprint::Absent,
+            alternates: FileFingerprint::Absent,
+            replace: FileFingerprint::Absent,
+            reftable: FileFingerprint::Absent,
+        };
+        let entry = |access: u64| CachedRepository {
+            name: "synthetic".to_owned(),
+            fingerprint: fingerprint.clone(),
+            root: PathBuf::from("/synthetic"),
+            root_fingerprint: FileFingerprint::Absent,
+            verified_at: t0,
+            last_access: t0 + Duration::from_secs(access),
+        };
+        let key = |index: usize| PathBuf::from(format!("/common/{index}"));
+        let mut cache = RepositoryCache::default();
+        for index in 0..CACHE_CAPACITY {
+            cache.insert(key(index), entry(index as u64 + 1));
+        }
+        // Entry 0 was accessed most recently, so entry 1 is the oldest.
+        cache.entries.get_mut(&key(0)).unwrap().last_access = t0 + Duration::from_secs(1000);
+        cache.insert(key(0), entry(2000));
+        assert_eq!(cache.entries.len(), CACHE_CAPACITY);
+        cache.insert(key(CACHE_CAPACITY), entry(3000));
+        assert_eq!(cache.entries.len(), CACHE_CAPACITY);
+        assert!(!cache.entries.contains_key(&key(1)));
+        assert!(cache.entries.contains_key(&key(0)));
+    }
+
+    impl RepositoryRead {
+        fn complete(self) -> Option<Repository> {
+            match self {
+                Self::Complete(repository) => repository,
+                Self::Interrupted => panic!("unexpected interruption"),
+            }
+        }
     }
 }

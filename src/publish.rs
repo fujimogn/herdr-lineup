@@ -29,27 +29,108 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Debug)]
-pub(crate) struct CapacitySkip {
-    pub skipped_resources: u64,
+/// Resources one refresh skipped without an error. Both counts are kept as
+/// observed, so a cycle that hit both limits never reports either as zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RefreshSkip {
+    pub capacity_skipped: u64,
+    /// Resources whose needed send the cycle deadline prevented, counted once
+    /// per resource ID per refresh, independent of queue rotation.
+    pub deadline_skipped: u64,
 }
 
-impl std::fmt::Display for CapacitySkip {
+impl std::fmt::Display for RefreshSkip {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "metadata capacity exhausted; affected resources skipped"
+            "metadata refresh skipped resources (capacity {}, deadline {})",
+            self.capacity_skipped, self.deadline_skipped
         )
     }
 }
 
-impl std::error::Error for CapacitySkip {}
+impl std::error::Error for RefreshSkip {}
 
-pub(crate) fn capacity_skip_count(error: &io::Error) -> Option<u64> {
+impl RefreshSkip {
+    fn into_error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, self)
+    }
+}
+
+/// The typed skip payload of a refresh result, if the refresh was a skip.
+pub(crate) fn refresh_skip(error: &io::Error) -> Option<RefreshSkip> {
     error
         .get_ref()
-        .and_then(|source| source.downcast_ref::<CapacitySkip>())
-        .map(|skip| skip.skipped_resources)
+        .and_then(|source| source.downcast_ref::<RefreshSkip>())
+        .copied()
+}
+
+/// Initial cooperative budget terms of one refresh. These are the existing
+/// local caps, not measurements: a snapshot round trip, the whole-cycle Git
+/// budget, and one metadata round trip, which is also the admission threshold.
+#[derive(Clone, Copy, Debug)]
+struct CycleTerms {
+    snapshot: Duration,
+    git: Duration,
+    metadata: Duration,
+}
+
+impl Default for CycleTerms {
+    fn default() -> Self {
+        Self {
+            snapshot: Duration::from_secs(2),
+            git: Duration::from_secs(1),
+            metadata: Duration::from_secs(2),
+        }
+    }
+}
+
+/// A heading not confirmed by Git for this long is no longer published.
+const HEADING_FALLBACK: Duration = Duration::from_secs(30);
+/// Clear runs at shutdown under its own deadline, never a refresh envelope.
+const CLEAR_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Round-robin order shared across refreshes. Each refresh walks one copy of
+/// the order taken right after `sync`, so an item is visited at most once per
+/// cycle; `rotate` moves an item to the tail when its first budgeted I/O
+/// starts and is never undone.
+struct FairQueue<K> {
+    order: std::collections::VecDeque<K>,
+}
+
+impl<K> Default for FairQueue<K> {
+    fn default() -> Self {
+        Self {
+            order: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<K: Ord + Clone> FairQueue<K> {
+    /// Drop vanished keys, keep survivors in order, append new keys in the
+    /// given order, and return this cycle's pass.
+    fn sync(&mut self, current: impl IntoIterator<Item = K>) -> Vec<K> {
+        let mut live = BTreeSet::new();
+        let mut arrivals = Vec::new();
+        for key in current {
+            if live.insert(key.clone()) {
+                arrivals.push(key);
+            }
+        }
+        self.order.retain(|key| live.contains(key));
+        let known: BTreeSet<K> = self.order.iter().cloned().collect();
+        self.order
+            .extend(arrivals.into_iter().filter(|key| !known.contains(key)));
+        self.order.iter().cloned().collect()
+    }
+
+    fn rotate(&mut self, key: &K) {
+        if let Some(index) = self.order.iter().position(|item| item == key)
+            && let Some(item) = self.order.remove(index)
+        {
+            self.order.push_back(item);
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -121,21 +202,40 @@ fn restore_local_after_timeout(
     reading
 }
 
-fn fresh_grok_weekly(
+fn kimi_worker_settings() -> crate::quota_kimi::Settings {
+    #[cfg(test)]
+    if let Ok(value) = std::env::var("LINEUP_TEST_KIMI_INTERVAL_MS")
+        && let Ok(millis) = value.parse::<u64>()
+        && (1..60_000).contains(&millis)
+    {
+        return crate::quota_kimi::Settings::exact_for_test(
+            Duration::from_millis(millis),
+            Duration::from_secs(2),
+        );
+    }
+    crate::quota_kimi::Settings::default()
+}
+
+fn account_query_max_age(max_age_ms: u64, refresh_interval_ms: u64) -> Duration {
+    let cadence = model::AccountCadence::default_account();
+    let query_cycle =
+        cadence.interval() + cadence.timeout() + Duration::from_millis(refresh_interval_ms);
+    Duration::from_millis(max_age_ms).max(query_cycle)
+}
+
+fn fresh_account_weekly(
     sample: Option<model::WeeklySample>,
     observed: Option<Instant>,
     now: Instant,
     max_age_ms: u64,
     refresh_interval_ms: u64,
 ) -> Option<model::WeeklySample> {
-    let settings = crate::quota_grok::Settings::default();
-    let query_cycle =
-        settings.interval() + settings.timeout() + Duration::from_millis(refresh_interval_ms);
-    let max_age = Duration::from_millis(max_age_ms).max(query_cycle);
-    sample.filter(|value| {
-        value.resets_at.is_some()
-            || observed.is_some_and(|observed| now.saturating_duration_since(observed) <= max_age)
-    })
+    model::fresh_until_reset_or_age(
+        sample,
+        observed,
+        now,
+        account_query_max_age(max_age_ms, refresh_interval_ms),
+    )
 }
 
 fn kimi_sample_after_poll(
@@ -150,7 +250,7 @@ fn kimi_sample_after_poll(
         }),
         crate::quota_kimi::Outcome::Throttled => previous,
         crate::quota_kimi::Outcome::Unavailable(failure) if failure.is_transient() => {
-            previous.filter(|sample| sample.resets_at.is_some_and(|reset| reset > now))
+            model::retain_known_reset_after_failure(previous, now)
         }
         crate::quota_kimi::Outcome::Unavailable(_) => None,
     }
@@ -163,14 +263,67 @@ fn fresh_kimi_weekly(
     max_age_ms: u64,
     refresh_interval_ms: u64,
 ) -> Option<model::WeeklySample> {
-    let settings = crate::quota_kimi::Settings::default();
-    let query_cycle =
-        settings.interval() + settings.timeout() + Duration::from_millis(refresh_interval_ms);
-    let max_age = Duration::from_millis(max_age_ms).max(query_cycle);
-    sample.filter(|value| {
-        value.resets_at.is_some()
-            || observed.is_some_and(|observed| now.saturating_duration_since(observed) <= max_age)
-    })
+    fresh_account_weekly(sample, observed, now, max_age_ms, refresh_interval_ms)
+}
+
+#[derive(Default)]
+struct GrokSnapshot {
+    source: Option<crate::quota_grok::SourceStamp>,
+    generation: u64,
+    sample: Option<model::WeeklySample>,
+    observed: Option<Instant>,
+}
+
+impl GrokSnapshot {
+    fn observe(&mut self, source: Option<crate::quota_grok::SourceStamp>) {
+        if self.source != source {
+            self.generation = self.generation.wrapping_add(1);
+            self.source = source;
+            self.sample = None;
+            self.observed = None;
+        }
+    }
+
+    fn publish(
+        &mut self,
+        generation: u64,
+        source: &crate::quota_grok::SourceStamp,
+        sample: Option<model::WeeklySample>,
+        observed: Option<Instant>,
+    ) {
+        if self.generation == generation && self.source.as_ref() == Some(source) {
+            self.sample = sample;
+            self.observed = observed;
+        }
+    }
+}
+
+fn current_grok_weekly(
+    state: &std::sync::Mutex<GrokSnapshot>,
+    auth_file: Option<&Path>,
+    config: &Config,
+    now: SystemTime,
+    instant: Instant,
+) -> Option<model::WeeklySample> {
+    if !config.weekly_enabled(Agent::Grok) {
+        if let Ok(mut state) = state.lock() {
+            state.observe(None);
+        }
+        return None;
+    }
+    let source = auth_file.and_then(crate::quota_grok::source_stamp);
+    let Ok(mut state) = state.lock() else {
+        return None;
+    };
+    state.observe(source);
+    let sample = model::clear_expired_reset(state.sample, now);
+    fresh_account_weekly(
+        sample,
+        state.observed,
+        instant,
+        config.usage_max_age_ms,
+        config.refresh_interval_ms,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -181,43 +334,378 @@ struct KimiSnapshot {
     observed: Instant,
 }
 
+#[derive(Clone, Copy, Default)]
+struct KimiShared {
+    last_stamp: Option<crate::quota_kimi::SourceStamp>,
+    last_state: Option<crate::quota_kimi::SourceState>,
+    snapshot: Option<KimiSnapshot>,
+}
+
+#[cfg(test)]
+impl KimiShared {
+    fn new(snapshot: Option<KimiSnapshot>) -> Self {
+        let last_stamp = snapshot.map(|s| s.stamp);
+        let last_state = last_stamp.map(crate::quota_kimi::SourceState::Present);
+        Self {
+            last_stamp,
+            last_state,
+            snapshot,
+        }
+    }
+}
+
+fn kimi_source_differs(
+    last_stamp: Option<crate::quota_kimi::SourceStamp>,
+    last_state: Option<crate::quota_kimi::SourceState>,
+    current_state: crate::quota_kimi::SourceState,
+) -> bool {
+    match current_state {
+        crate::quota_kimi::SourceState::Present(current_stamp) => match last_stamp {
+            Some(stamp) => stamp != current_stamp,
+            None => match last_state {
+                Some(crate::quota_kimi::SourceState::Missing) => true,
+                _ => true,
+            },
+        },
+        crate::quota_kimi::SourceState::Missing => {
+            last_stamp.is_some()
+                || matches!(last_state, Some(crate::quota_kimi::SourceState::Present(_)))
+        }
+        crate::quota_kimi::SourceState::Transient { credential } => {
+            match (credential, last_stamp) {
+                (Some(cred), Some(stamp)) => cred != stamp.credential,
+                _ => false,
+            }
+        }
+    }
+}
+
+fn prepare_kimi_worker(
+    before: crate::quota_kimi::SourceState,
+    previous: &mut Option<model::WeeklySample>,
+    previous_stamp: &mut Option<crate::quota_kimi::SourceStamp>,
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
+) -> u64 {
+    let worker_source_changed = match before {
+        crate::quota_kimi::SourceState::Present(stamp) => {
+            previous_stamp.is_some_and(|prev| prev != stamp)
+        }
+        crate::quota_kimi::SourceState::Missing => previous_stamp.is_some() || previous.is_some(),
+        crate::quota_kimi::SourceState::Transient {
+            credential: Some(cred),
+        } => previous_stamp.is_some_and(|prev| prev.credential != cred),
+        crate::quota_kimi::SourceState::Transient { credential: None } => false,
+    };
+    if worker_source_changed {
+        *previous = None;
+        *previous_stamp = match before {
+            crate::quota_kimi::SourceState::Present(stamp) => Some(stamp),
+            _ => None,
+        };
+    }
+
+    if let Ok(mut shared) = source.lock() {
+        if kimi_source_differs(shared.last_stamp, shared.last_state, before) {
+            *previous = None;
+            *previous_stamp = match before {
+                crate::quota_kimi::SourceState::Present(stamp) => Some(stamp),
+                _ => None,
+            };
+            shared.last_stamp = match before {
+                crate::quota_kimi::SourceState::Present(stamp) => Some(stamp),
+                _ => None,
+            };
+            shared.last_state = Some(before);
+            shared.snapshot = None;
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            shared.last_state = Some(before);
+            match before {
+                crate::quota_kimi::SourceState::Present(stamp) => {
+                    *previous_stamp = Some(stamp);
+                    shared.last_stamp = Some(stamp);
+                }
+                crate::quota_kimi::SourceState::Missing => {
+                    *previous = None;
+                    *previous_stamp = None;
+                    shared.last_stamp = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    epoch.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_kimi_worker(
+    before: crate::quota_kimi::SourceState,
+    outcome: crate::quota_kimi::Outcome,
+    after: crate::quota_kimi::SourceState,
+    previous: &mut Option<model::WeeklySample>,
+    previous_stamp: &mut Option<crate::quota_kimi::SourceStamp>,
+    last_success: &mut Option<Instant>,
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
+    epoch_before: u64,
+    auth_expiry: Option<SystemTime>,
+    now: SystemTime,
+    instant: Instant,
+) -> Option<model::WeeklySample> {
+    prepare_kimi_worker(before, previous, previous_stamp, source, epoch);
+
+    if let crate::quota_kimi::Outcome::Unavailable(failure) = outcome
+        && !failure.is_transient()
+    {
+        *previous = None;
+        if let Ok(mut shared) = source.lock() {
+            shared.snapshot = None;
+            shared.last_state = Some(after);
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    match after {
+        crate::quota_kimi::SourceState::Present(after_stamp) => {
+            let changed = previous_stamp.is_some_and(|prev| prev != after_stamp);
+            if changed {
+                *previous = None;
+            }
+
+            let same_as_before = before == crate::quota_kimi::SourceState::Present(after_stamp);
+            let same_source = match *previous_stamp {
+                Some(prev) => prev == after_stamp,
+                None => {
+                    if let Ok(shared) = source.lock() {
+                        shared
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|s| s.stamp == after_stamp)
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            let sample = if same_as_before {
+                if matches!(outcome, crate::quota_kimi::Outcome::Weekly(_)) {
+                    *last_success = Some(instant);
+                }
+                kimi_sample_after_poll(*previous, outcome, now)
+            } else if same_source {
+                // Recovered to same source after transient before:
+                // Do not adopt poll outcome across transition, but retain existing valid sample
+                if let Ok(mut shared) = source.lock() {
+                    if epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch_before {
+                        shared.snapshot = None;
+                        *previous = None;
+                        *previous_stamp = None;
+                        None
+                    } else if let Some(snapshot) = shared.snapshot {
+                        if snapshot.stamp == after_stamp
+                            && snapshot.auth_expiry > now
+                            && model::retain_known_reset_after_failure(Some(snapshot.sample), now)
+                                .is_some()
+                        {
+                            Some(snapshot.sample)
+                        } else {
+                            shared.snapshot = None;
+                            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                *previous = None;
+                if let Ok(mut shared) = source.lock() {
+                    shared.snapshot = None;
+                    shared.last_stamp = Some(after_stamp);
+                    shared.last_state = Some(after);
+                    epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                None
+            };
+            *previous = sample;
+            *previous_stamp = Some(after_stamp);
+            if same_as_before && let Ok(mut shared) = source.lock() {
+                if epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch_before {
+                    shared.snapshot = None;
+                    *previous = None;
+                    *previous_stamp = None;
+                    return None;
+                }
+                if let Some(sample) = sample {
+                    let expiry = auth_expiry.or_else(|| shared.snapshot.map(|s| s.auth_expiry));
+                    let observed = (*last_success).or_else(|| shared.snapshot.map(|s| s.observed));
+                    if let (Some(auth_expiry), Some(observed)) = (expiry, observed) {
+                        shared.snapshot = Some(KimiSnapshot {
+                            sample,
+                            stamp: after_stamp,
+                            auth_expiry,
+                            observed,
+                        });
+                        shared.last_stamp = Some(after_stamp);
+                        shared.last_state = Some(after);
+                    }
+                } else {
+                    shared.snapshot = None;
+                    epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            sample
+        }
+        crate::quota_kimi::SourceState::Missing => {
+            *previous = None;
+            *previous_stamp = None;
+            if let Ok(mut shared) = source.lock() {
+                shared.snapshot = None;
+                shared.last_stamp = None;
+                shared.last_state = Some(after);
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            None
+        }
+        crate::quota_kimi::SourceState::Transient { credential } => {
+            if let Some(cred) = credential {
+                let cred_mismatch = if let Ok(shared) = source.lock() {
+                    shared
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|s| s.stamp.credential != cred)
+                } else {
+                    false
+                };
+                if cred_mismatch || previous_stamp.is_some_and(|prev| prev.credential != cred) {
+                    *previous = None;
+                    *previous_stamp = None;
+                    if let Ok(mut shared) = source.lock() {
+                        shared.snapshot = None;
+                        shared.last_stamp = None;
+                        shared.last_state = Some(after);
+                        epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    return None;
+                }
+            }
+            if let Ok(mut shared) = source.lock() {
+                shared.last_state = Some(after);
+                if epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch_before {
+                    shared.snapshot = None;
+                    *previous = None;
+                    *previous_stamp = None;
+                    None
+                } else if let Some(snapshot) = shared.snapshot {
+                    if snapshot.auth_expiry <= now
+                        || model::retain_known_reset_after_failure(Some(snapshot.sample), now)
+                            .is_none()
+                    {
+                        shared.snapshot = None;
+                        epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        *previous = None;
+                        None
+                    } else {
+                        *previous = Some(snapshot.sample);
+                        Some(snapshot.sample)
+                    }
+                } else {
+                    *previous = None;
+                    None
+                }
+            } else {
+                *previous = None;
+                None
+            }
+        }
+    }
+}
+
 fn current_kimi_weekly(
-    source: &std::sync::Mutex<Option<KimiSnapshot>>,
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
     home: Option<&Path>,
     config: &Config,
     now: SystemTime,
     instant: Instant,
 ) -> Option<model::WeeklySample> {
-    current_kimi_weekly_with_stamp(source, config, now, instant, || {
-        home.and_then(|home| {
-            crate::quota_kimi::source_stamp(&crate::quota_kimi::credential_path(home))
-        })
+    current_kimi_weekly_with_state(source, epoch, config, now, instant, || match home {
+        Some(home) => crate::quota_kimi::source_state(&crate::quota_kimi::credential_path(home)),
+        None => crate::quota_kimi::SourceState::Missing,
     })
 }
 
-fn current_kimi_weekly_with_stamp(
-    source: &std::sync::Mutex<Option<KimiSnapshot>>,
+fn current_kimi_weekly_with_state(
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
     config: &Config,
     now: SystemTime,
     instant: Instant,
-    stamp: impl FnOnce() -> Option<crate::quota_kimi::SourceStamp>,
+    state: impl FnOnce() -> crate::quota_kimi::SourceState,
 ) -> Option<model::WeeklySample> {
     if !config.weekly_enabled(Agent::Kimi) {
-        if let Ok(mut source) = source.try_lock() {
-            *source = None;
+        if let Ok(mut shared) = source.try_lock()
+            && (shared.snapshot.is_some()
+                || shared.last_stamp.is_some()
+                || shared.last_state.is_some())
+        {
+            shared.snapshot = None;
+            shared.last_stamp = None;
+            shared.last_state = None;
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         return None;
     }
-    let current_stamp = stamp();
-    let snapshot = source.try_lock().ok().and_then(|mut source| {
-        if source.is_some_and(|snapshot| {
-            Some(snapshot.stamp) != current_stamp
-                || snapshot.auth_expiry <= now
-                || snapshot.sample.resets_at.is_some_and(|reset| reset <= now)
-        }) {
-            *source = None;
+    let current_state = state();
+    let mut guard = match source.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(_) => source.lock().ok(),
+    };
+    let snapshot = guard.as_deref_mut().and_then(|shared| {
+        if kimi_source_differs(shared.last_stamp, shared.last_state, current_state) {
+            shared.last_stamp = match current_state {
+                crate::quota_kimi::SourceState::Present(stamp) => Some(stamp),
+                _ => None,
+            };
+            shared.last_state = Some(current_state);
+            shared.snapshot = None;
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return None;
         }
-        *source
+
+        shared.last_state = Some(current_state);
+        if let crate::quota_kimi::SourceState::Present(stamp) = current_state {
+            shared.last_stamp = Some(stamp);
+        }
+
+        let current = shared.snapshot?;
+        let keep = match current_state {
+            crate::quota_kimi::SourceState::Present(stamp) => {
+                current.stamp == stamp
+                    && current.auth_expiry > now
+                    && model::clear_expired_reset(Some(current.sample), now).is_some()
+            }
+            crate::quota_kimi::SourceState::Missing => false,
+            crate::quota_kimi::SourceState::Transient { credential } => {
+                let same_account = match credential {
+                    Some(cred) => cred == current.stamp.credential,
+                    None => true,
+                };
+                same_account
+                    && current.auth_expiry > now
+                    && model::retain_known_reset_after_failure(Some(current.sample), now).is_some()
+            }
+        };
+        if keep {
+            Some(current)
+        } else {
+            shared.snapshot = None;
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
     });
     fresh_kimi_weekly(
         snapshot.map(|snapshot| snapshot.sample),
@@ -228,20 +716,49 @@ fn current_kimi_weekly_with_stamp(
     )
 }
 
-fn repository_read_once(
-    readings: &mut BTreeMap<PathBuf, Result<Option<ship_time::Repository>, ()>>,
-    cwd: &Path,
-    read: impl FnOnce(&Path) -> ship_time::RepositoryRead,
-) -> ship_time::RepositoryRead {
-    let cached = readings
-        .entry(cwd.to_owned())
-        .or_insert_with(|| match read(cwd) {
-            ship_time::RepositoryRead::Complete(repository) => Ok(repository),
-            ship_time::RepositoryRead::Interrupted => Err(()),
-        });
-    match cached {
-        Ok(repository) => ship_time::RepositoryRead::Complete(repository.clone()),
-        Err(()) => ship_time::RepositoryRead::Interrupted,
+#[cfg(test)]
+fn current_kimi_weekly_with_stamp(
+    source: &std::sync::Mutex<KimiShared>,
+    epoch: &std::sync::atomic::AtomicU64,
+    config: &Config,
+    now: SystemTime,
+    instant: Instant,
+    stamp: impl FnOnce() -> Option<crate::quota_kimi::SourceStamp>,
+) -> Option<model::WeeklySample> {
+    current_kimi_weekly_with_state(source, epoch, config, now, instant, || match stamp() {
+        Some(stamp) => crate::quota_kimi::SourceState::Present(stamp),
+        None => crate::quota_kimi::SourceState::Missing,
+    })
+}
+
+/// What one cycle learned about a workspace heading from Git.
+#[derive(Clone, Debug)]
+enum HeadingRead {
+    /// Git returned a repository together with its verification instant.
+    Confirmed {
+        repository: ship_time::Repository,
+        verified_at: Instant,
+    },
+    Interrupted,
+    /// The cycle's Git budget ran out before this workspace was read.
+    NotAttempted,
+    /// No cwd, no repository, a rejection, or a result without verification.
+    Unknown,
+}
+
+impl From<ship_time::RepositoryObservation> for HeadingRead {
+    fn from(observation: ship_time::RepositoryObservation) -> Self {
+        match (observation.read, observation.verified_at) {
+            (ship_time::RepositoryRead::Complete(Some(repository)), Some(verified_at)) => {
+                Self::Confirmed {
+                    repository,
+                    verified_at,
+                }
+            }
+            (ship_time::RepositoryRead::Interrupted, _) => Self::Interrupted,
+            // `Complete(None)` also covers rejection and unreadable state.
+            _ => Self::Unknown,
+        }
     }
 }
 
@@ -258,14 +775,73 @@ struct HeadingCache {
     cwd: PathBuf,
     occupants: Vec<(String, Option<tokens::Occupant>)>,
     repository: ship_time::Repository,
+    /// The original Git verification instant; a fallback never renews it.
+    confirmed: Instant,
+}
+
+struct RefreshInventory {
+    snapshot: protocol::Snapshot,
+    now_unix: i64,
+    mode: tokens::LogoMode,
+    first_panes: BTreeSet<String>,
+    codex_weekly: Option<model::WeeklySample>,
+    grok_weekly: Option<model::WeeklySample>,
+    kimi_weekly: Option<model::WeeklySample>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceHeading {
+    resolved: bool,
+    desired: tokens::Tokens,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Headings {
+    by_workspace: BTreeMap<String, WorkspaceHeading>,
+}
+
+struct PaneObservation {
+    pane_id: String,
+    workspace_id: String,
+    stored_keys: BTreeSet<String>,
+    occupant: Option<tokens::Occupant>,
+    state: String,
+    usage: Option<tokens::Usage>,
+}
+
+struct PlannedPaneReport {
+    resource: ResourceId,
+    stored_keys: BTreeSet<String>,
+    occupant: Option<tokens::Occupant>,
+    desired: tokens::Tokens,
+}
+
+struct PlannedWorkspaceReport {
+    resource: ResourceId,
+    stored_keys: BTreeSet<String>,
+    desired: tokens::Tokens,
+}
+
+pub(crate) const MIN_RESERVATION_WINDOW: u64 = 32;
+pub(crate) const MAX_RESERVATION_WINDOW: u64 = 4096;
+
+pub(crate) fn compute_reservation_window(pane_count: usize, workspace_count: usize) -> u64 {
+    let candidate = (pane_count.saturating_add(workspace_count) as u64).max(MIN_RESERVATION_WINDOW);
+    candidate.min(MAX_RESERVATION_WINDOW)
 }
 
 pub struct MetadataPublisher {
     planner: tokens::Publisher,
     checkpoint_loaded: bool,
+    /// Set by any failed checkpoint write. The on-disk upper bound is then
+    /// unknown (a rename may land before the directory sync fails), so no
+    /// refresh, clear or reconnect may reserve or send again. Only a new
+    /// instance that reloads the checkpoint resumes publication.
+    persistence_poisoned: bool,
     directory: PathBuf,
     socket_key: String,
     endpoint: Option<String>,
+    reservation_window: u64,
     homes: Homes,
     started: Instant,
     request_seq: u64,
@@ -275,14 +851,125 @@ pub struct MetadataPublisher {
     grok_weekly: Option<model::WeeklyWorker>,
     kimi_weekly: Option<model::WeeklyWorker>,
     weekly_diagnostics_initialized: bool,
-    grok_observed: Arc<std::sync::Mutex<Option<Instant>>>,
-    kimi_source: Arc<std::sync::Mutex<Option<KimiSnapshot>>>,
+    grok_source: Arc<std::sync::Mutex<GrokSnapshot>>,
+    grok_auth_file: Option<PathBuf>,
+    kimi_source: Arc<std::sync::Mutex<KimiShared>>,
+    kimi_epoch: Arc<std::sync::atomic::AtomicU64>,
     codex_control: Arc<crate::quota_codex::QueryControl>,
     headings: BTreeMap<String, HeadingCache>,
     local_readings: BTreeMap<String, model::UsageReading>,
+    terms: CycleTerms,
+    git_queue: FairQueue<String>,
+    send_queue: FairQueue<ResourceId>,
+    repositories: ship_time::RepositoryCache,
+    /// Shared by every refresh's reader cycle for the publisher's lifetime.
+    reader_diagnostics: Arc<model::ReaderDiagnostics>,
+    /// Reset at the start of each refresh; `None` before the first one.
+    stages: std::sync::Mutex<Option<StageTimes>>,
     /// Successful `sequences.json` writes. Tests assert one write per report.
     #[cfg(test)]
     checkpoint_persists: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    persist_fault: std::sync::Mutex<Option<PersistStage>>,
+    #[cfg(test)]
+    hooks: TestHooks,
+}
+
+/// Replaces one heading's Git observation; receives the cwd and deadline.
+#[cfg(test)]
+type GitHook = dyn FnMut(&Path, Instant) -> ship_time::RepositoryObservation + Send;
+
+/// Injection points that let tests place time and I/O at exact boundaries.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    git: Option<Box<GitHook>>,
+    /// Runs after any reservation persist, before the admission check.
+    before_admission: Option<Box<dyn FnMut() + Send>>,
+    /// Runs after admission passed, right before the exchange starts.
+    before_exchange: Option<Box<dyn FnMut() + Send>>,
+    /// Replaces the refresh admission decision so fixtures need no timing.
+    admission: Option<Box<dyn FnMut() -> bool + Send>>,
+}
+
+/// Checkpoint write steps where tests inject a failure.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistStage {
+    FileSync,
+    Rename,
+    DirectorySync,
+}
+
+/// Stage timings of one refresh. Stages overlap: the snapshot exchange is in
+/// both `snapshot` and `socket`, and `persist` runs inside the send loop, so
+/// the sum is not the refresh duration.
+#[derive(Default, Clone, Debug)]
+struct StageTimes {
+    snapshot: Duration,
+    git: Duration,
+    reader: Duration,
+    /// Successful and failed checkpoint writes, including pruning.
+    persist: Duration,
+    socket: Duration,
+    /// Acknowledged metadata reports.
+    reports: u64,
+    /// Successful `sequences.json` writes, not rows.
+    checkpoints: u64,
+    #[cfg(test)]
+    refresh: Duration,
+    #[cfg(test)]
+    pipeline: Duration,
+    #[cfg(test)]
+    checkpoint_rows: usize,
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Whether a metadata request may start or the resource is skipped.
+#[derive(Clone, Copy)]
+enum ReportMode {
+    /// Refresh: admission needs `terms.metadata` left before `envelope`.
+    /// `rotate` moves the resource to the send queue tail when the exchange
+    /// starts, unless its reader call already did.
+    Refresh { envelope: Instant, rotate: bool },
+    /// Clear keeps its own deadline and runs after shutdown.
+    Clear { deadline: Instant },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportOutcome {
+    NoFrame,
+    Acknowledged,
+    CapacitySkipped,
+    DeadlineSkipped,
+}
+
+/// The shared reader deadline of one refresh, already capped by its envelope,
+/// and that refresh's reader cycle.
+struct ReaderBudget<'a> {
+    deadline: Instant,
+    cycle: &'a model::ReadCycle,
+}
+
+/// One resource of the send pass.
+#[derive(Clone, Copy)]
+enum SendItem<'a> {
+    Pane(&'a protocol::Pane),
+    Workspace(&'a protocol::Workspace),
+}
+
+fn source_kind(provider: model::Provider) -> model::SourceKind {
+    match provider {
+        model::Provider::Claude => model::SourceKind::ClaudeStatusline,
+        model::Provider::Agy => model::SourceKind::AgyStatusline,
+        model::Provider::Codex => model::SourceKind::CodexRollout,
+        model::Provider::Grok => model::SourceKind::GrokSignals,
+        model::Provider::Kimi => model::SourceKind::KimiSession,
+        model::Provider::Hermes => model::SourceKind::HermesUnsupported,
+    }
 }
 impl MetadataPublisher {
     /// Construction performs no state I/O. The daemon acquires its session lock
@@ -296,9 +983,11 @@ impl MetadataPublisher {
         Ok(Self {
             planner: tokens::Publisher::default(),
             checkpoint_loaded: false,
+            persistence_poisoned: false,
             directory,
             socket_key,
             endpoint: None,
+            reservation_window: MIN_RESERVATION_WINDOW,
             homes,
             started: Instant::now(),
             request_seq: 0,
@@ -308,22 +997,55 @@ impl MetadataPublisher {
             grok_weekly: None,
             kimi_weekly: None,
             weekly_diagnostics_initialized: false,
-            grok_observed: Arc::new(std::sync::Mutex::new(None)),
-            kimi_source: Arc::new(std::sync::Mutex::new(None)),
+            grok_source: Arc::new(std::sync::Mutex::new(GrokSnapshot::default())),
+            grok_auth_file: None,
+            kimi_source: Arc::new(std::sync::Mutex::new(KimiShared::default())),
+            kimi_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             codex_control: Arc::new(crate::quota_codex::QueryControl::default()),
             headings: BTreeMap::new(),
             local_readings: BTreeMap::new(),
+            terms: CycleTerms::default(),
+            git_queue: FairQueue::default(),
+            send_queue: FairQueue::default(),
+            repositories: ship_time::RepositoryCache::default(),
+            reader_diagnostics: Arc::new(model::ReaderDiagnostics::default()),
+            stages: std::sync::Mutex::new(None),
             #[cfg(test)]
             checkpoint_persists: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            persist_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         })
     }
 
+    /// Update the current refresh's stage sample, if a refresh started.
+    fn record_stage(&self, update: impl FnOnce(&mut StageTimes)) {
+        let mut stages = self
+            .stages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(stages) = stages.as_mut() {
+            update(stages);
+        }
+    }
+
+    fn reset_stages(&self) {
+        *self
+            .stages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(StageTimes::default());
+    }
+
+    /// Decide the published repository: Confirmed, a bounded Fallback for an
+    /// interrupted or unattempted read, or `None` for Unknown.
     fn heading_repository(
         &mut self,
         workspace: &str,
         cwd: Option<&Path>,
         occupants: &[(String, Option<tokens::Occupant>)],
-        reading: ship_time::RepositoryRead,
+        read: HeadingRead,
+        now: Instant,
     ) -> Option<ship_time::Repository> {
         let Some(cwd) = cwd else {
             self.headings.remove(workspace);
@@ -336,27 +1058,50 @@ impl MetadataPublisher {
         {
             self.headings.remove(workspace);
         }
-        match reading {
-            ship_time::RepositoryRead::Interrupted => self
-                .headings
-                .get(workspace)
-                .map(|previous| previous.repository.clone()),
-            ship_time::RepositoryRead::Complete(Some(repository)) => {
+        match read {
+            HeadingRead::Confirmed {
+                repository,
+                verified_at,
+            } => {
                 self.headings.insert(
                     workspace.into(),
                     HeadingCache {
                         cwd: cwd.to_owned(),
                         occupants: occupants.to_vec(),
                         repository: repository.clone(),
+                        confirmed: verified_at,
                     },
                 );
                 Some(repository)
             }
-            ship_time::RepositoryRead::Complete(None) => {
+            HeadingRead::Interrupted | HeadingRead::NotAttempted => {
+                let fresh = self.headings.get(workspace).is_some_and(|previous| {
+                    now.saturating_duration_since(previous.confirmed) < HEADING_FALLBACK
+                });
+                if fresh {
+                    self.headings
+                        .get(workspace)
+                        .map(|previous| previous.repository.clone())
+                } else {
+                    self.headings.remove(workspace);
+                    None
+                }
+            }
+            HeadingRead::Unknown => {
                 self.headings.remove(workspace);
                 None
             }
         }
+    }
+
+    fn read_heading(&mut self, cwd: &Path, deadline: Instant) -> HeadingRead {
+        #[cfg(test)]
+        if let Some(hook) = self.hooks.git.as_mut() {
+            return hook(cwd, deadline).into();
+        }
+        self.repositories
+            .observe(cwd, self.shutdown.as_deref(), deadline)
+            .into()
     }
 
     fn start_weekly(&mut self, config: &Config) -> io::Result<()> {
@@ -426,29 +1171,48 @@ impl MetadataPublisher {
             let settings = crate::quota_grok::Settings::default();
             // Preserve resolution failures as fixed categories, not silent None.
             let mut client = crate::quota_grok::Client::from_env(settings);
+            self.grok_auth_file = client
+                .as_ref()
+                .ok()
+                .map(|client| client.auth_file().to_path_buf());
             let directory = self.directory.clone();
-            let observed = self.grok_observed.clone();
-            self.grok_weekly = Some(model::WeeklyWorker::start(
+            let source = self.grok_source.clone();
+            self.grok_weekly = Some(model::WeeklyWorker::start_effect(
                 shutdown.clone(),
                 settings.interval(),
                 move || {
-                    let (sample, result) = match client.as_mut() {
+                    let result = match client.as_mut() {
                         Ok(client) => {
+                            let before = client.source_stamp();
+                            let generation = source.lock().ok().map(|mut state| {
+                                state.observe(before.clone());
+                                state.generation
+                            });
                             let outcome = client.poll();
-                            if let Ok(mut observed) = observed.lock() {
-                                *observed = client.last_success();
+                            let after = client.source_stamp();
+                            if let Ok(mut state) = source.lock() {
+                                state.observe(after.clone());
+                                if let (Some(generation), Some(before)) = (generation, before)
+                                    && after.as_ref() == Some(&before)
+                                {
+                                    state.publish(
+                                        generation,
+                                        &before,
+                                        grok_sample(outcome),
+                                        client.last_success(),
+                                    );
+                                }
                             }
-                            (grok_sample(outcome), client.last_result())
+                            client.last_result()
                         }
-                        Err(failure) => (None, failure.diagnostic()),
+                        Err(failure) => failure.diagnostic(),
                     };
                     let _ = write_weekly_result(&directory, WeeklyProvider::Grok, result);
-                    sample
                 },
             )?);
         }
         if self.kimi_weekly.is_none() && config.weekly_enabled(Agent::Kimi) {
-            let settings = crate::quota_kimi::Settings::default();
+            let settings = kimi_worker_settings();
             #[cfg(not(test))]
             let mut client = crate::quota_kimi::Client::from_env(settings);
             #[cfg(test)]
@@ -458,53 +1222,53 @@ impl MetadataPublisher {
             );
             let directory = self.directory.clone();
             let source = self.kimi_source.clone();
+            let epoch = self.kimi_epoch.clone();
             let mut previous = None;
             let mut previous_stamp = None;
             let mut last_success = None;
-            self.kimi_weekly = Some(model::WeeklyWorker::start(
+            self.kimi_weekly = Some(model::WeeklyWorker::start_effect(
                 shutdown,
                 settings.interval(),
                 move || {
                     let now = SystemTime::now();
-                    let (sample, result) = match client.as_mut() {
+                    let instant = Instant::now();
+                    let (_, result) = match client.as_mut() {
                         Ok(client) => {
-                            let before = client.source_stamp();
-                            if before != previous_stamp {
-                                previous = None;
-                            }
+                            let before = client.source_state();
+                            let epoch_before = prepare_kimi_worker(
+                                before,
+                                &mut previous,
+                                &mut previous_stamp,
+                                &source,
+                                &epoch,
+                            );
                             let outcome = client.poll();
-                            let after = client.source_stamp();
-                            if matches!(outcome, crate::quota_kimi::Outcome::Weekly(_)) {
-                                last_success = Some(Instant::now());
-                            }
-                            let sample = if before == after && after.is_some() {
-                                kimi_sample_after_poll(previous, outcome, now)
-                            } else {
-                                None
-                            };
-                            previous_stamp = after;
-                            if let Ok(mut source) = source.lock() {
-                                *source = sample.and_then(|sample| {
-                                    Some(KimiSnapshot {
-                                        sample,
-                                        stamp: after?,
-                                        auth_expiry: client.auth_expiry()?,
-                                        observed: last_success?,
-                                    })
-                                });
-                            }
+                            let after = client.source_state();
+                            let sample = step_kimi_worker(
+                                before,
+                                outcome,
+                                after,
+                                &mut previous,
+                                &mut previous_stamp,
+                                &mut last_success,
+                                &source,
+                                &epoch,
+                                epoch_before,
+                                client.auth_expiry(),
+                                now,
+                                instant,
+                            );
                             (sample, client.last_result())
                         }
                         Err(failure) => {
                             if let Ok(mut source) = source.lock() {
-                                *source = None;
+                                source.snapshot = None;
+                                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                             (None, failure.diagnostic())
                         }
                     };
-                    previous = sample;
                     let _ = write_weekly_result(&directory, WeeklyProvider::Kimi, result);
-                    sample
                 },
             )?);
         }
@@ -572,7 +1336,49 @@ impl MetadataPublisher {
         Ok(())
     }
 
-    fn persist(&self) -> io::Result<()> {
+    fn ensure_publishable(&self) -> io::Result<()> {
+        if self.persistence_poisoned {
+            return Err(io::Error::other(
+                "sequence checkpoint persistence is uncertain; restart required",
+            ));
+        }
+        Ok(())
+    }
+
+    fn persist(&mut self) -> io::Result<()> {
+        let floors = self.planner.checkpoint_floors();
+        self.write_checkpoint(floors)
+    }
+
+    fn persist_checkpoint_with_upper_bound(
+        &mut self,
+        endpoint: &str,
+        upper_bound: u64,
+    ) -> io::Result<()> {
+        let mut floors = self.planner.checkpoint_floors();
+        floors.insert(endpoint.into(), upper_bound);
+        self.write_checkpoint(floors)
+    }
+
+    fn write_checkpoint(&mut self, floors: BTreeMap<String, u64>) -> io::Result<()> {
+        self.ensure_publishable()?;
+        let started = Instant::now();
+        let result = self.write_checkpoint_file(floors);
+        let elapsed = started.elapsed();
+        let written = result.is_ok();
+        self.record_stage(|stages| {
+            stages.persist += elapsed;
+            if written {
+                stages.checkpoints = stages.checkpoints.saturating_add(1);
+            }
+        });
+        if result.is_err() {
+            self.persistence_poisoned = true;
+        }
+        result
+    }
+
+    fn write_checkpoint_file(&self, floors: BTreeMap<String, u64>) -> io::Result<()> {
         let mut rows: Vec<_> = self
             .planner
             .checkpoint()
@@ -588,42 +1394,91 @@ impl MetadataPublisher {
                 seq,
             })
             .collect();
-        rows.extend(
-            self.planner
-                .checkpoint_floors()
-                .into_iter()
-                .map(|(endpoint, seq)| CheckpointRow {
-                    endpoint,
-                    kind: "endpoint".into(),
-                    id: String::new(),
-                    seq,
-                }),
-        );
+        rows.extend(floors.into_iter().map(|(endpoint, seq)| CheckpointRow {
+            endpoint,
+            kind: "endpoint".into(),
+            id: String::new(),
+            seq,
+        }));
         let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
         serde_json::to_writer(file.as_file_mut(), &rows)?;
         file.flush()?;
+        #[cfg(test)]
+        self.inject_persist_fault(PersistStage::FileSync)?;
         file.as_file().sync_all()?;
+        #[cfg(test)]
+        self.inject_persist_fault(PersistStage::Rename)?;
         file.persist(self.directory.join("sequences.json"))
             .map_err(|_| io::Error::other("cannot persist sequence checkpoint"))?;
+        #[cfg(test)]
+        self.inject_persist_fault(PersistStage::DirectorySync)?;
         File::open(&self.directory)?.sync_all()?;
         #[cfg(test)]
         {
             let _ = self.checkpoint_persists.fetch_add(1, Ordering::Relaxed);
+            let row_count = rows.len();
+            self.record_stage(|stages| stages.checkpoint_rows = row_count);
         }
         Ok(())
     }
 
-    fn request(&mut self, transport: &mut Transport, method: &str) -> io::Result<(String, Value)> {
+    #[cfg(test)]
+    fn inject_persist_fault(&self, stage: PersistStage) -> io::Result<()> {
+        if *self.persist_fault.lock().unwrap() == Some(stage) {
+            return Err(io::Error::other(format!("injected {stage:?} failure")));
+        }
+        Ok(())
+    }
+
+    fn reserve_window_for_endpoint(&mut self, endpoint: &str, window_size: u64) -> io::Result<()> {
+        let new_upper_bound = self
+            .planner
+            .plan_reservation(endpoint, window_size)
+            .map_err(|_| io::Error::other("sequence reservation exhausted"))?;
+        self.persist_checkpoint_with_upper_bound(endpoint, new_upper_bound)?;
+        self.planner
+            .confirm_reservation(endpoint, new_upper_bound)
+            .map_err(|_| io::Error::other("cannot confirm sequence reservation"))?;
+        Ok(())
+    }
+
+    fn request_before(
+        &mut self,
+        transport: &mut Transport,
+        method: &str,
+        deadline: Instant,
+    ) -> io::Result<(String, Value)> {
         self.request_seq = self
             .request_seq
             .checked_add(1)
             .ok_or_else(|| io::Error::other("request sequence exhausted"))?;
         let id = format!("lineup-{}", self.request_seq);
-        let response = exchange(transport, &json!({"id":id,"method":method,"params":{}}))?;
+        let response = exchange_before(
+            transport,
+            &json!({"id":id,"method":method,"params":{}}),
+            deadline,
+        )?;
         Ok((id, response))
     }
 
+    #[cfg(test)]
+    fn request(&mut self, transport: &mut Transport, method: &str) -> io::Result<(String, Value)> {
+        self.request_before(transport, method, unbounded_test_deadline())
+    }
+
+    #[cfg(test)]
     fn snapshot(&mut self, transport: &mut Transport) -> io::Result<protocol::Snapshot> {
+        self.snapshot_before(transport, unbounded_test_deadline())
+    }
+
+    /// The caller's absolute deadline also bounds the implicit reconnect.
+    fn snapshot_before(
+        &mut self,
+        transport: &mut Transport,
+        deadline: Instant,
+    ) -> io::Result<protocol::Snapshot> {
+        let stage_start = Instant::now();
+        self.ensure_publishable()?;
         self.load_checkpoint()?;
         let identity = transport.identity();
         let endpoint = format!("{}:{}:{}", self.socket_key, identity.device, identity.inode);
@@ -635,9 +1490,21 @@ impl MetadataPublisher {
             return Err(io::Error::other("publisher endpoint changed"));
         }
         self.endpoint = Some(endpoint);
-        let (id, response) = self.request(transport, "session.snapshot")?;
-        protocol::parse_snapshot(&id, &response)
-            .map_err(|_| io::Error::other("invalid snapshot response"))
+        let socket_start = Instant::now();
+        let response = self.request_before(transport, "session.snapshot", deadline);
+        let socket_elapsed = socket_start.elapsed();
+        self.record_stage(|stages| stages.socket += socket_elapsed);
+        let result = response.and_then(|(id, response)| {
+            protocol::parse_snapshot(&id, &response)
+                .map_err(|_| io::Error::other("invalid snapshot response"))
+        });
+        // Failed snapshot attempts are measured too.
+        let snapshot_elapsed = stage_start.elapsed();
+        self.record_stage(|stages| stages.snapshot += snapshot_elapsed);
+        let result = result?;
+        self.reservation_window =
+            compute_reservation_window(result.panes.len(), result.workspaces.len());
+        Ok(result)
     }
 
     fn resource(&self, kind: ResourceKind, id: &str) -> ResourceId {
@@ -648,6 +1515,9 @@ impl MetadataPublisher {
         }
     }
 
+    /// Test entry with the previous shape: `None` is a refresh-mode report
+    /// without an envelope, `Some` is a clear deadline. Skips become errors.
+    #[cfg(test)]
     fn report(
         &mut self,
         transport: &mut Transport,
@@ -657,7 +1527,39 @@ impl MetadataPublisher {
         desired: &tokens::Tokens,
         deadline: Option<Instant>,
     ) -> io::Result<()> {
-        if deadline.is_none() {
+        let mode = match deadline {
+            Some(deadline) => ReportMode::Clear { deadline },
+            None => ReportMode::Refresh {
+                envelope: unbounded_test_deadline(),
+                rotate: false,
+            },
+        };
+        match self.send_report(transport, resource, keys, occupant, desired, mode)? {
+            ReportOutcome::CapacitySkipped => Err(RefreshSkip {
+                capacity_skipped: 1,
+                deadline_skipped: 0,
+            }
+            .into_error()),
+            ReportOutcome::DeadlineSkipped => Err(RefreshSkip {
+                capacity_skipped: 0,
+                deadline_skipped: 1,
+            }
+            .into_error()),
+            ReportOutcome::NoFrame | ReportOutcome::Acknowledged => Ok(()),
+        }
+    }
+
+    fn send_report(
+        &mut self,
+        transport: &mut Transport,
+        resource: &ResourceId,
+        keys: &BTreeSet<String>,
+        occupant: Option<&tokens::Occupant>,
+        desired: &tokens::Tokens,
+        mode: ReportMode,
+    ) -> io::Result<ReportOutcome> {
+        self.ensure_publishable()?;
+        if matches!(mode, ReportMode::Refresh { .. }) {
             self.check_shutdown()?;
         }
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -665,33 +1567,44 @@ impl MetadataPublisher {
             exists: true,
             stored_keys: keys.clone(),
         };
-        let Some(report) = self
+        match self.planner.needs_report(
+            resource,
+            &snapshot,
+            occupant,
+            desired,
+            now_ms,
+            self.refresh_ms,
+        ) {
+            Ok(false) => return Ok(ReportOutcome::NoFrame),
+            Err(tokens::PatchError::ResourceCapacity | tokens::PatchError::ReportCapacity) => {
+                return Ok(ReportOutcome::CapacitySkipped);
+            }
+            Err(_) => return Err(io::Error::other("metadata planning failed")),
+            Ok(true) => {}
+        }
+
+        if !self
             .planner
-            .prepare(
-                resource,
-                &snapshot,
-                occupant,
-                desired,
-                now_ms,
-                self.refresh_ms,
-            )
-            .map_err(|error| match error {
-                tokens::PatchError::ResourceCapacity | tokens::PatchError::ReportCapacity => {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        CapacitySkip {
-                            skipped_resources: 1,
-                        },
-                    )
-                }
-                _ => io::Error::other("metadata planning failed"),
-            })?
-        else {
-            return Ok(());
+            .has_available_reservation(&resource.endpoint_session)
+        {
+            self.reserve_window_for_endpoint(&resource.endpoint_session, self.reservation_window)?;
+        }
+
+        let report = match self.planner.prepare(
+            resource,
+            &snapshot,
+            occupant,
+            desired,
+            now_ms,
+            self.refresh_ms,
+        ) {
+            Ok(Some(report)) => report,
+            Ok(None) => return Ok(ReportOutcome::NoFrame),
+            Err(tokens::PatchError::ResourceCapacity | tokens::PatchError::ReportCapacity) => {
+                return Ok(ReportOutcome::CapacitySkipped);
+            }
+            Err(_) => return Err(io::Error::other("metadata planning failed")),
         };
-        // Reserve durably BEFORE the first byte can reach Herdr. Even an ambiguous
-        // response burns this seq; retry/restart must use a strictly newer one.
-        self.persist()?;
         self.request_seq = self
             .request_seq
             .checked_add(1)
@@ -699,16 +1612,50 @@ impl MetadataPublisher {
         let id = format!("lineup-{}", self.request_seq);
         let request = protocol::metadata_request(&id, &report)
             .map_err(|_| io::Error::other("invalid metadata request"))?;
-        // Persistence may consume the budget checked by clear's caller. Recheck
-        // at the last possible point before starting the bounded socket exchange.
-        if let Some(deadline) = deadline {
-            check_clear_deadline(deadline)?;
-        } else {
-            // Clear must still run after shutdown. Refresh finishes a complete
-            // in-flight exchange but does not begin a new metadata frame.
-            self.check_shutdown()?;
+        #[cfg(test)]
+        if let Some(hook) = self.hooks.before_admission.as_mut() {
+            hook();
         }
-        let response = exchange(transport, &request)?;
+        // Persistence may consume the budget. Recheck at the last possible
+        // point before starting the bounded socket exchange. A request that is
+        // not started leaves its prepared sequence unused, never replayed.
+        let deadline = match mode {
+            ReportMode::Clear { deadline } => {
+                check_clear_deadline(deadline)?;
+                deadline
+            }
+            ReportMode::Refresh { envelope, rotate } => {
+                // Clear must still run after shutdown. Refresh finishes a complete
+                // in-flight exchange but does not begin a new metadata frame.
+                self.check_shutdown()?;
+                // Admission only reads the remaining budget: synchronous work
+                // or scheduling after it can still let `envelope` expire in
+                // flight, which is then an ambiguous error, not a skip.
+                let admitted =
+                    envelope.saturating_duration_since(Instant::now()) >= self.terms.metadata;
+                #[cfg(test)]
+                let admitted = match self.hooks.admission.as_mut() {
+                    Some(admission) => admission(),
+                    None => admitted,
+                };
+                if !admitted {
+                    return Ok(ReportOutcome::DeadlineSkipped);
+                }
+                if rotate {
+                    self.send_queue.rotate(resource);
+                }
+                envelope
+            }
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.hooks.before_exchange.as_mut() {
+            hook();
+        }
+        let socket_start = Instant::now();
+        let response = exchange_before(transport, &request, deadline);
+        let socket_elapsed = socket_start.elapsed();
+        self.record_stage(|stages| stages.socket += socket_elapsed);
+        let response = response?;
         let result = protocol::response_result(&id, &response)
             .map_err(|_| io::Error::other("metadata report rejected"))?;
         if result.get("type").and_then(Value::as_str) != Some("ok") {
@@ -717,10 +1664,11 @@ impl MetadataPublisher {
         self.planner
             .acknowledge(&report, now_ms)
             .map_err(|_| io::Error::other("invalid metadata reservation"))?;
+        self.record_stage(|stages| stages.reports = stages.reports.saturating_add(1));
         // `acknowledge` records acceptance only. `checkpoint()` is the high-water
         // sequence already saved before the send, so another persist would
         // rewrite the same bytes.
-        Ok(())
+        Ok(ReportOutcome::Acknowledged)
     }
 
     fn reconcile_missing(&mut self, snapshot: &protocol::Snapshot) -> io::Result<()> {
@@ -758,10 +1706,46 @@ impl MetadataPublisher {
         codex: &dyn UsageReader,
         grok: &dyn UsageReader,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        let stage_start = Instant::now();
+        let result = self.refresh_with_readers_inner(transport, config, codex, grok);
+        #[cfg(test)]
+        {
+            let elapsed = stage_start.elapsed();
+            self.record_stage(|stages| stages.pipeline += elapsed);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn refresh_cycle_with_readers(
+        &mut self,
+        transport: &mut Transport,
+        config: &Config,
+        codex: &dyn UsageReader,
+        grok: &dyn UsageReader,
+    ) -> io::Result<()> {
+        let stage_start = Instant::now();
+        self.reset_stages();
+        let result = config
+            .validate()
+            .and_then(|_| self.start_weekly(config))
+            .and_then(|_| self.refresh_with_readers(transport, config, codex, grok));
+        let elapsed = stage_start.elapsed();
+        self.record_stage(|stages| stages.refresh += elapsed);
+        result
+    }
+
+    fn collect_inventory(
+        &mut self,
+        transport: &mut Transport,
+        config: &Config,
+        envelope: Instant,
+    ) -> io::Result<RefreshInventory> {
         self.check_shutdown()?;
         config.validate()?;
         self.refresh_ms = config.refresh_interval_ms;
-        let snapshot = self.snapshot(transport)?;
+        let snapshot = self.snapshot_before(transport, envelope)?;
         self.check_shutdown()?;
         self.reconcile_missing(&snapshot)?;
         // Keep cached association only while the authoritative pane identity matches.
@@ -797,23 +1781,16 @@ impl MetadataPublisher {
                     .and_then(|worker| worker.sample(now))
             })
             .flatten();
-        let grok_weekly = config
-            .allow_network
-            .then(|| {
-                self.grok_weekly
-                    .as_ref()
-                    .and_then(|worker| worker.sample(now))
-            })
-            .flatten();
-        let grok_weekly = fresh_grok_weekly(
-            grok_weekly,
-            self.grok_observed.try_lock().ok().and_then(|value| *value),
+        let grok_weekly = current_grok_weekly(
+            &self.grok_source,
+            self.grok_auth_file.as_deref(),
+            config,
+            now,
             Instant::now(),
-            config.usage_max_age_ms,
-            config.refresh_interval_ms,
         );
         let kimi_weekly = current_kimi_weekly(
             &self.kimi_source,
+            &self.kimi_epoch,
             self.homes.kimi.as_deref(),
             config,
             now,
@@ -824,297 +1801,589 @@ impl MetadataPublisher {
             "text" => tokens::LogoMode::Text,
             _ => tokens::LogoMode::Auto,
         };
-        let mut skipped_resources = 0u64;
-        let local_now = chrono::Local::now();
-        let mut headings = BTreeMap::new();
-        let mut repository_readings = BTreeMap::new();
-        for workspace in &snapshot.workspaces {
-            self.check_shutdown()?;
-            let panes: Vec<_> = snapshot
-                .panes
-                .iter()
-                .filter(|pane| pane.workspace_id == workspace.workspace_id)
+        let first_panes = first_pane_ids(&snapshot)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        Ok(RefreshInventory {
+            snapshot,
+            now_unix,
+            mode,
+            first_panes,
+            codex_weekly,
+            grok_weekly,
+            kimi_weekly,
+        })
+    }
+
+    fn resolve_headings(
+        &mut self,
+        inventory: &RefreshInventory,
+        envelope: Instant,
+    ) -> io::Result<Headings> {
+        let started = Instant::now();
+        let result = self.resolve_headings_in_budget(inventory, envelope, started);
+        let elapsed = started.elapsed();
+        self.record_stage(|stages| stages.git += elapsed);
+        result
+    }
+
+    fn resolve_headings_in_budget(
+        &mut self,
+        inventory: &RefreshInventory,
+        envelope: Instant,
+        started: Instant,
+    ) -> io::Result<Headings> {
+        let git_deadline = (started + self.terms.git).min(envelope);
+        let snapshot = &inventory.snapshot;
+        let mut panes_by_workspace: BTreeMap<&str, Vec<&protocol::Pane>> = BTreeMap::new();
+        for pane in &snapshot.panes {
+            panes_by_workspace
+                .entry(pane.workspace_id.as_str())
+                .or_default()
+                .push(pane);
+        }
+        let workspace_cwd = |workspace: &protocol::Workspace| {
+            let panes: Vec<_> = panes_by_workspace
+                .get(workspace.workspace_id.as_str())
+                .into_iter()
+                .flatten()
                 .map(|pane| (pane.pane_id.as_str(), pane.cwd.as_deref().map(Path::new)))
                 .collect();
-            let cwd = ship_time::resolve_workspace_cwd(
+            ship_time::resolve_workspace_cwd(
                 workspace.checkout_path.as_deref().map(Path::new),
                 &panes,
-            );
-            let reading = cwd.map_or(ship_time::RepositoryRead::Complete(None), |cwd| {
-                repository_read_once(&mut repository_readings, cwd, |cwd| {
-                    ship_time::read_repository_controlled(cwd, self.shutdown.as_deref())
-                })
-            });
-            let occupants = snapshot
-                .panes
+            )
+            .map(Path::to_path_buf)
+        };
+        let workspaces: BTreeMap<&str, &protocol::Workspace> = snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.workspace_id.as_str(), workspace))
+            .collect();
+        let pass = self.git_queue.sync(
+            snapshot
+                .workspaces
                 .iter()
-                .filter(|pane| pane.workspace_id == workspace.workspace_id)
+                .map(|workspace| workspace.workspace_id.clone()),
+        );
+        // `reads` doubles as the visited set: no workspace is read twice.
+        let mut reads: BTreeMap<String, HeadingRead> = BTreeMap::new();
+        let mut by_cwd: BTreeMap<PathBuf, HeadingRead> = BTreeMap::new();
+        for id in pass {
+            if reads.contains_key(&id) {
+                continue;
+            }
+            let Some(workspace) = workspaces.get(id.as_str()) else {
+                continue;
+            };
+            self.check_shutdown()?;
+            let read = match workspace_cwd(workspace) {
+                None => HeadingRead::Unknown,
+                Some(cwd) => match by_cwd.get(&cwd) {
+                    // A shared result starts no Git I/O, so it does not rotate.
+                    Some(shared) => shared.clone(),
+                    None if Instant::now() >= git_deadline => HeadingRead::NotAttempted,
+                    None => {
+                        self.git_queue.rotate(&id);
+                        let read = self.read_heading(&cwd, git_deadline);
+                        by_cwd.insert(cwd, read.clone());
+                        read
+                    }
+                },
+            };
+            reads.insert(id, read);
+        }
+
+        let local_now = chrono::Local::now();
+        let now = Instant::now();
+        let mut by_workspace = BTreeMap::new();
+        for workspace in &snapshot.workspaces {
+            let cwd = workspace_cwd(workspace);
+            let occupants = panes_by_workspace
+                .get(workspace.workspace_id.as_str())
+                .into_iter()
+                .flatten()
                 .map(|pane| (pane.pane_id.clone(), pane.occupant.clone()))
                 .collect::<Vec<_>>();
-            let repository =
-                self.heading_repository(&workspace.workspace_id, cwd, &occupants, reading);
-            let ship = repository.as_ref().and_then(|repo| repo.ship_unix);
-            let resolved = repository.is_some();
-            let desired = BTreeMap::from([
-                (
-                    "lineup_repo".into(),
-                    Some(
-                        repository
-                            .map(|repo| repo.name)
-                            .unwrap_or_else(|| "—".into()),
-                    ),
-                ),
-                ("lineup_ship_unix".into(), ship.map(|unix| unix.to_string())),
-                (
-                    "lineup_ship_text".into(),
-                    Some(ship_time::format_ship_time(ship, &local_now)),
-                ),
-            ]);
-            headings.insert(workspace.workspace_id.as_str(), (resolved, desired));
-        }
-        // A single budget for the cycle prevents N panes multiplying the reader wait.
-        let deadline = Instant::now() + Duration::from_millis(config.reader_timeout_ms);
-        let first_panes = first_pane_ids(&snapshot);
-        for pane in &snapshot.panes {
-            self.check_shutdown()?;
-            let first_pane = first_panes.contains(pane.pane_id.as_str());
-            let occupant = pane
-                .occupant
-                .clone()
-                .filter(|who| config.has_provider(who.agent));
-            let usage = occupant.as_ref().and_then(|who| {
-                let agy = AgyReader {
-                    pane_id: pane.pane_id.clone(),
-                };
-                let native = match who.agent {
-                    Agent::Agy | Agent::Grok | Agent::Kimi => {
-                        who.native_session.clone().unwrap_or_default()
-                    }
-                    _ => who.native_session.clone()?,
-                };
-                let (provider, home, reader): (_, _, &dyn UsageReader) = match who.agent {
-                    Agent::Claude => (
-                        model::Provider::Claude,
-                        self.homes.statusline_state.as_ref()?,
-                        &ClaudeReader,
-                    ),
-                    Agent::Agy => (
-                        model::Provider::Agy,
-                        self.homes.statusline_state.as_ref()?,
-                        &agy,
-                    ),
-                    Agent::Codex => (model::Provider::Codex, self.homes.codex.as_ref()?, codex),
-                    Agent::Grok => (
-                        model::Provider::Grok,
-                        self.homes.grok.as_ref().unwrap_or(&self.directory),
-                        grok,
-                    ),
-                    Agent::Kimi => (
-                        model::Provider::Kimi,
-                        self.homes.kimi.as_ref().unwrap_or(&self.directory),
-                        &KimiReader,
-                    ),
-                    _ => return None,
-                };
-                // Snapshot has no pane-specific home/profile. Only the injected daemon
-                // home is searched, with an exact native id; never infer by cwd or use
-                // another session when a different pane profile is inaccessible.
-                let identity = model::SessionIdentity {
-                    provider,
-                    native_session_id: native.clone(),
-                    repository_identity: pane.cwd.clone().unwrap_or_default(),
-                };
-                // Repository discovery and earlier panes may take seconds. A
-                // newly written observation must be compared to this read's clock.
-                let now = SystemTime::now();
-                let request = model::ReadRequest {
-                    identity: &identity,
-                    home,
-                    now,
-                    max_age: Duration::from_millis(config.usage_max_age_ms),
-                    timeout: deadline.saturating_duration_since(Instant::now()),
-                    shutdown: self.shutdown.as_deref(),
-                };
-                let missing_home = (who.agent == Agent::Grok && self.homes.grok.is_none())
-                    || (who.agent == Agent::Kimi && self.homes.kimi.is_none());
-                let mut reading = if missing_home || (who.agent == Agent::Kimi && native.is_empty())
-                {
-                    // Billing account attribution does not require a local session
-                    // home. Do not search plugin state as a substitute for context.
-                    model::UsageReading::missing(
-                        &request,
-                        if who.agent == Agent::Kimi {
-                            model::SourceKind::KimiSession
-                        } else {
-                            model::SourceKind::GrokSignals
-                        },
-                        model::MissingReason::NotFound,
-                    )
-                } else {
-                    reader.read(&request)
-                };
-                if reading.identity != identity {
-                    self.local_readings.remove(&pane.pane_id);
-                    return None;
-                }
-                // A shared cycle budget can expire before this pane gets a turn.
-                // Do not turn a transient read timeout into loss of proven identity.
-                // EntryLimit is not transient: the directory stays over the cap, so
-                // the previous context must be dropped instead of kept without expiry.
-                // Cache local observations only; account workers retain their own
-                // reset/auth policy and are overlaid afresh below.
-                if reading.context
-                    == model::UsageOutcome::Unavailable(model::MissingReason::Timeout)
-                    && matches!(
-                        reading.weekly_remaining,
-                        model::UsageOutcome::Unavailable(_)
-                    )
-                    && let Some(previous) = self.local_readings.get(&pane.pane_id)
-                    && previous.identity == identity
-                    && previous.source_kind == reading.source_kind
-                {
-                    reading = restore_local_after_timeout(previous, now, request.max_age);
-                }
-                if reading.binding.is_some() {
-                    self.local_readings
-                        .insert(pane.pane_id.clone(), reading.clone());
-                } else {
-                    self.local_readings.remove(&pane.pane_id);
-                }
-                if config.allow_network {
-                    let weekly = match who.agent {
-                        // Herdr snapshots do not expose pane-specific CODEX_HOME or
-                        // profiles. Attribute the daemon home's quota only after its
-                        // rollout reader proves this exact native session belongs
-                        // there. Different homes remain unavailable; profiles sharing
-                        // a home cannot be distinguished, and auth changes require
-                        // restarting the daemon to discard the account cache.
-                        Agent::Codex
-                            if reading.binding
-                                == Some(model::UsageBinding::NativeSession(native.clone())) =>
-                        {
-                            codex_weekly
-                        }
-                        // Grok has one configured account, shared across all its
-                        // panes even when no local context/native id is available.
-                        Agent::Grok => grok_weekly,
-                        Agent::Kimi if config.weekly_enabled(Agent::Kimi) => kimi_weekly,
-                        _ => None,
-                    };
-                    if let Some(weekly) = weekly {
-                        reading.weekly_remaining =
-                            model::UsageOutcome::Available(100.0 - weekly.used_percent);
-                        reading.weekly_window = Some(model::WeeklyWindow::RollingSevenDays);
-                        reading.weekly_resets_at = weekly.resets_at;
-                        if matches!(who.agent, Agent::Grok | Agent::Kimi) {
-                            reading.binding = Some(model::UsageBinding::Pane(pane.pane_id.clone()));
-                        }
-                    }
-                }
-                Some(tokens::Usage {
-                    binding: reading.binding,
-                    occupant: who.clone(),
-                    context_pct: match reading.context {
-                        model::UsageOutcome::Available(value) => Some(value),
-                        _ => None,
-                    },
-                    weekly_remaining_pct: match reading.weekly_remaining {
-                        model::UsageOutcome::Available(value)
-                            if reading.weekly_window.is_some() =>
-                        {
-                            Some(value)
-                        }
-                        _ => None,
-                    },
-                    weekly_reset_unix: reading
-                        .weekly_resets_at
-                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                        .and_then(|age| i64::try_from(age.as_secs()).ok()),
-                })
-            });
-            self.check_shutdown()?;
-            let mut desired = tokens::pane_tokens(
-                &tokens::PaneInput {
-                    pane_id: pane.pane_id.clone(),
-                    occupant: occupant.clone(),
-                    state: Some(pane.state.clone()),
-                    usage,
-                },
-                mode,
-                false,
-                now_unix,
+            let read = reads
+                .remove(&workspace.workspace_id)
+                .unwrap_or(HeadingRead::NotAttempted);
+            let repository = self.heading_repository(
+                &workspace.workspace_id,
+                cwd.as_deref(),
+                &occupants,
+                read,
+                now,
             );
-            let (resolved, heading) = &headings[pane.workspace_id.as_str()];
-            if first_pane && *resolved {
-                desired.insert("lineup_group".into(), heading["lineup_repo"].clone());
-                desired.insert(
-                    "lineup_group_ship_text".into(),
-                    heading["lineup_ship_text"].clone(),
-                );
-            }
-            if !first_pane
-                && config.non_first_pane_logo_indent != 0
-                && let Some(Some(logo)) = desired.get_mut("lineup_logo")
-            {
-                logo.insert_str(
-                    0,
-                    &"\u{2800}".repeat(usize::from(config.non_first_pane_logo_indent)),
-                );
-            }
-            let resource = self.resource(ResourceKind::Pane, &pane.pane_id);
-            if let Err(error) = self.report(
-                transport,
-                &resource,
-                &pane.stored_keys,
-                occupant.as_ref(),
-                &desired,
-                None,
-            ) {
-                if capacity_skip_count(&error).is_some() {
-                    skipped_resources = skipped_resources.saturating_add(1);
-                    continue;
+            let resolved = repository.is_some();
+            // Unknown publishes null, never `—`: absence was not confirmed.
+            let desired = match repository {
+                Some(repository) => BTreeMap::from([
+                    (
+                        "lineup_ship_unix".into(),
+                        repository.ship_unix.map(|unix| unix.to_string()),
+                    ),
+                    (
+                        "lineup_ship_text".into(),
+                        Some(ship_time::format_ship_time(
+                            repository.ship_unix,
+                            &local_now,
+                        )),
+                    ),
+                    ("lineup_repo".into(), Some(repository.name)),
+                ]),
+                None => tokens::WORKSPACE_KEYS
+                    .iter()
+                    .map(|key| ((*key).into(), None))
+                    .collect(),
+            };
+            by_workspace.insert(
+                workspace.workspace_id.clone(),
+                WorkspaceHeading { resolved, desired },
+            );
+        }
+        Ok(Headings { by_workspace })
+    }
+
+    fn observe_pane(
+        &mut self,
+        inventory: &RefreshInventory,
+        config: &Config,
+        pane: &protocol::Pane,
+        budget: &ReaderBudget<'_>,
+        codex: &dyn UsageReader,
+        grok: &dyn UsageReader,
+    ) -> io::Result<(PaneObservation, bool)> {
+        let mut reader_called = false;
+        let occupant = pane
+            .occupant
+            .clone()
+            .filter(|who| config.has_provider(who.agent));
+        let usage = occupant.as_ref().and_then(|who| {
+            let agy = AgyReader {
+                pane_id: pane.pane_id.clone(),
+            };
+            let native = match who.agent {
+                Agent::Agy | Agent::Grok | Agent::Kimi => {
+                    who.native_session.clone().unwrap_or_default()
                 }
-                // Do not continue I/O after an ambiguous response: reconnect/reconcile.
-                return Err(error);
+                _ => who.native_session.clone()?,
+            };
+            let (provider, home, reader): (_, _, &dyn UsageReader) = match who.agent {
+                Agent::Claude => (
+                    model::Provider::Claude,
+                    self.homes.statusline_state.as_ref()?,
+                    &ClaudeReader,
+                ),
+                Agent::Agy => (
+                    model::Provider::Agy,
+                    self.homes.statusline_state.as_ref()?,
+                    &agy,
+                ),
+                Agent::Codex => (model::Provider::Codex, self.homes.codex.as_ref()?, codex),
+                Agent::Grok => (
+                    model::Provider::Grok,
+                    self.homes.grok.as_ref().unwrap_or(&self.directory),
+                    grok,
+                ),
+                Agent::Kimi => (
+                    model::Provider::Kimi,
+                    self.homes.kimi.as_ref().unwrap_or(&self.directory),
+                    &KimiReader,
+                ),
+                _ => return None,
+            };
+            // Snapshot has no pane-specific home/profile. Only the injected daemon
+            // home is searched, with an exact native id; never infer by cwd or use
+            // another session when a different pane profile is inaccessible.
+            let identity = model::SessionIdentity {
+                provider,
+                native_session_id: native.clone(),
+                repository_identity: pane.cwd.clone().unwrap_or_default(),
+            };
+            // Repository discovery and earlier panes may take seconds. A
+            // newly written observation must be compared to this read's clock.
+            let now = SystemTime::now();
+            let request = model::ReadRequest {
+                identity: &identity,
+                home,
+                now,
+                max_age: Duration::from_millis(config.usage_max_age_ms),
+                timeout: budget.deadline.saturating_duration_since(Instant::now()),
+                shutdown: self.shutdown.as_deref(),
+            };
+            let missing_home = (who.agent == Agent::Grok && self.homes.grok.is_none())
+                || (who.agent == Agent::Kimi && self.homes.kimi.is_none());
+            let mut reading = if missing_home || (who.agent == Agent::Kimi && native.is_empty()) {
+                // Billing account attribution does not require a local session
+                // home. Do not search plugin state as a substitute for context.
+                model::UsageReading::missing(
+                    &request,
+                    if who.agent == Agent::Kimi {
+                        model::SourceKind::KimiSession
+                    } else {
+                        model::SourceKind::GrokSignals
+                    },
+                    model::MissingReason::NotFound,
+                )
+            } else if request.timeout.is_zero() {
+                // The shared reader budget is spent: skip only the reader I/O.
+                // The timeout below restores a valid cached observation.
+                model::UsageReading::missing(
+                    &request,
+                    source_kind(provider),
+                    model::MissingReason::Timeout,
+                )
+            } else {
+                // Calling the reader is the pane's attempt, even if it returns
+                // at once (for example BUSY).
+                reader_called = true;
+                let stage_start = Instant::now();
+                let result = reader.read_in_cycle(&request, budget.cycle);
+                let elapsed = stage_start.elapsed();
+                self.record_stage(|stages| stages.reader += elapsed);
+                result
+            };
+            if reading.identity != identity {
+                self.local_readings.remove(&pane.pane_id);
+                return None;
             }
+            // A shared cycle budget can expire before this pane gets a turn.
+            // Do not turn a transient read timeout into loss of proven identity.
+            // EntryLimit is not transient: the directory stays over the cap, so
+            // the previous context must be dropped instead of kept without expiry.
+            // Cache local observations only; account workers retain their own
+            // reset/auth policy and are overlaid afresh below.
+            if reading.context == model::UsageOutcome::Unavailable(model::MissingReason::Timeout)
+                && matches!(
+                    reading.weekly_remaining,
+                    model::UsageOutcome::Unavailable(_)
+                )
+                && let Some(previous) = self.local_readings.get(&pane.pane_id)
+                && previous.identity == identity
+                && previous.source_kind == reading.source_kind
+            {
+                reading = restore_local_after_timeout(previous, now, request.max_age);
+            }
+            if reading.binding.is_some() {
+                self.local_readings
+                    .insert(pane.pane_id.clone(), reading.clone());
+            } else {
+                self.local_readings.remove(&pane.pane_id);
+            }
+            if config.allow_network {
+                let weekly = match who.agent {
+                    // Herdr snapshots do not expose pane-specific CODEX_HOME or
+                    // profiles. Attribute the daemon home's quota only after its
+                    // rollout reader proves this exact native session belongs
+                    // there. Different homes remain unavailable; profiles sharing
+                    // a home cannot be distinguished, and auth changes require
+                    // restarting the daemon to discard the account cache.
+                    Agent::Codex
+                        if reading.binding
+                            == Some(model::UsageBinding::NativeSession(native.clone())) =>
+                    {
+                        inventory.codex_weekly
+                    }
+                    // Grok has one configured account, shared across all its
+                    // panes even when no local context/native id is available.
+                    Agent::Grok => inventory.grok_weekly,
+                    Agent::Kimi if config.weekly_enabled(Agent::Kimi) => inventory.kimi_weekly,
+                    _ => None,
+                };
+                if let Some(weekly) = weekly {
+                    reading.weekly_remaining =
+                        model::UsageOutcome::Available(100.0 - weekly.used_percent);
+                    reading.weekly_window = Some(model::WeeklyWindow::RollingSevenDays);
+                    reading.weekly_resets_at = weekly.resets_at;
+                    if matches!(who.agent, Agent::Grok | Agent::Kimi) {
+                        reading.binding = Some(model::UsageBinding::Pane(pane.pane_id.clone()));
+                    }
+                }
+            }
+            Some(tokens::Usage {
+                binding: reading.binding,
+                occupant: who.clone(),
+                context_pct: match reading.context {
+                    model::UsageOutcome::Available(value) => Some(value),
+                    _ => None,
+                },
+                weekly_remaining_pct: match reading.weekly_remaining {
+                    model::UsageOutcome::Available(value) if reading.weekly_window.is_some() => {
+                        Some(value)
+                    }
+                    _ => None,
+                },
+                weekly_reset_unix: reading
+                    .weekly_resets_at
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .and_then(|age| i64::try_from(age.as_secs()).ok()),
+            })
+        });
+        Ok((
+            PaneObservation {
+                pane_id: pane.pane_id.clone(),
+                workspace_id: pane.workspace_id.clone(),
+                stored_keys: pane.stored_keys.clone(),
+                occupant,
+                state: pane.state.clone(),
+                usage,
+            },
+            reader_called,
+        ))
+    }
+
+    fn plan_pane_report(
+        &self,
+        inventory: &RefreshInventory,
+        config: &Config,
+        headings: &Headings,
+        obs: PaneObservation,
+    ) -> io::Result<PlannedPaneReport> {
+        let first_pane = inventory.first_panes.contains(&obs.pane_id);
+        let mut desired = tokens::pane_tokens(
+            &tokens::PaneInput {
+                pane_id: obs.pane_id.clone(),
+                occupant: obs.occupant.clone(),
+                state: Some(obs.state),
+                usage: obs.usage,
+            },
+            inventory.mode,
+            false,
+            inventory.now_unix,
+        );
+        if let Some(heading) = headings.by_workspace.get(&obs.workspace_id)
+            && first_pane
+            && heading.resolved
+        {
+            desired.insert(
+                "lineup_group".into(),
+                heading.desired.get("lineup_repo").and_then(Clone::clone),
+            );
+            desired.insert(
+                "lineup_group_ship_text".into(),
+                heading
+                    .desired
+                    .get("lineup_ship_text")
+                    .and_then(Clone::clone),
+            );
+        }
+        if !first_pane
+            && config.non_first_pane_logo_indent != 0
+            && let Some(Some(logo)) = desired.get_mut("lineup_logo")
+        {
+            logo.insert_str(
+                0,
+                &"\u{2800}".repeat(usize::from(config.non_first_pane_logo_indent)),
+            );
+        }
+        let resource = self.resource(ResourceKind::Pane, &obs.pane_id);
+        Ok(PlannedPaneReport {
+            resource,
+            stored_keys: obs.stored_keys,
+            occupant: obs.occupant,
+            desired,
+        })
+    }
+
+    fn plan_workspace_report(
+        &self,
+        headings: &Headings,
+        workspace: &protocol::Workspace,
+    ) -> PlannedWorkspaceReport {
+        let desired = headings
+            .by_workspace
+            .get(&workspace.workspace_id)
+            .map(|heading| heading.desired.clone())
+            .unwrap_or_default();
+        let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
+        PlannedWorkspaceReport {
+            resource,
+            stored_keys: workspace.stored_keys.clone(),
+            desired,
+        }
+    }
+
+    fn refresh_with_readers_inner(
+        &mut self,
+        transport: &mut Transport,
+        config: &Config,
+        codex: &dyn UsageReader,
+        grok: &dyn UsageReader,
+    ) -> io::Result<()> {
+        let reader_timeout = Duration::from_millis(config.reader_timeout_ms);
+        let envelope = Instant::now()
+            + self.terms.snapshot
+            + self.terms.git
+            + reader_timeout
+            + self.terms.metadata;
+        let inventory = self.collect_inventory(transport, config, envelope)?;
+        let headings = self.resolve_headings(&inventory, envelope)?;
+
+        // A single reader budget for the cycle prevents N panes multiplying the
+        // reader wait. It starts after headings and never outlives `envelope`.
+        let cycle = model::ReadCycle::with_diagnostics(self.reader_diagnostics.clone());
+        let budget = ReaderBudget {
+            deadline: (Instant::now() + reader_timeout).min(envelope),
+            cycle: &cycle,
+        };
+
+        let snapshot = &inventory.snapshot;
+        let mut items = BTreeMap::new();
+        for pane in &snapshot.panes {
+            items.insert(
+                self.resource(ResourceKind::Pane, &pane.pane_id),
+                SendItem::Pane(pane),
+            );
         }
         for workspace in &snapshot.workspaces {
+            items.insert(
+                self.resource(ResourceKind::Workspace, &workspace.workspace_id),
+                SendItem::Workspace(workspace),
+            );
+        }
+        let arrivals =
+            snapshot
+                .panes
+                .iter()
+                .map(|pane| self.resource(ResourceKind::Pane, &pane.pane_id))
+                .chain(snapshot.workspaces.iter().map(|workspace| {
+                    self.resource(ResourceKind::Workspace, &workspace.workspace_id)
+                }))
+                .collect::<Vec<_>>();
+        let pass = self.send_queue.sync(arrivals);
+        let mut skip = RefreshSkip::default();
+        for resource in pass {
+            // `remove` makes the item map the visited set for this pass.
+            let Some(item) = items.remove(&resource) else {
+                continue;
+            };
             self.check_shutdown()?;
-            let desired = &headings[workspace.workspace_id.as_str()].1;
-            let resource = self.resource(ResourceKind::Workspace, &workspace.workspace_id);
-            if let Err(error) = self.report(
-                transport,
-                &resource,
-                &workspace.stored_keys,
-                None,
-                desired,
-                None,
-            ) {
-                if capacity_skip_count(&error).is_none() {
-                    return Err(error);
+            let outcome = match item {
+                SendItem::Pane(pane) => {
+                    let (observation, reader_called) =
+                        self.observe_pane(&inventory, config, pane, &budget, codex, grok)?;
+                    if reader_called {
+                        self.send_queue.rotate(&resource);
+                    }
+                    self.check_shutdown()?;
+                    let report =
+                        self.plan_pane_report(&inventory, config, &headings, observation)?;
+                    self.send_report(
+                        transport,
+                        &report.resource,
+                        &report.stored_keys,
+                        report.occupant.as_ref(),
+                        &report.desired,
+                        ReportMode::Refresh {
+                            envelope,
+                            rotate: !reader_called,
+                        },
+                    )?
                 }
-                skipped_resources = skipped_resources.saturating_add(1);
+                SendItem::Workspace(workspace) => {
+                    let report = self.plan_workspace_report(&headings, workspace);
+                    self.send_report(
+                        transport,
+                        &report.resource,
+                        &report.stored_keys,
+                        None,
+                        &report.desired,
+                        ReportMode::Refresh {
+                            envelope,
+                            rotate: true,
+                        },
+                    )?
+                }
+            };
+            // An error above ends the cycle: never continue I/O after an
+            // ambiguous response; the daemon reconnects and reconciles.
+            match outcome {
+                ReportOutcome::CapacitySkipped => {
+                    skip.capacity_skipped = skip.capacity_skipped.saturating_add(1);
+                }
+                ReportOutcome::DeadlineSkipped => {
+                    skip.deadline_skipped = skip.deadline_skipped.saturating_add(1);
+                }
+                ReportOutcome::NoFrame | ReportOutcome::Acknowledged => {}
             }
         }
-        if skipped_resources > 0 {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                CapacitySkip { skipped_resources },
-            ))
-        } else {
+
+        if skip == RefreshSkip::default() {
             Ok(())
+        } else {
+            Err(skip.into_error())
+        }
+    }
+}
+
+impl MetadataPublisher {
+    fn clear_report(
+        &mut self,
+        transport: &mut Transport,
+        resource: &ResourceId,
+        keys: &BTreeSet<String>,
+        desired: &tokens::Tokens,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        match self.send_report(
+            transport,
+            resource,
+            keys,
+            None,
+            desired,
+            ReportMode::Clear { deadline },
+        )? {
+            ReportOutcome::CapacitySkipped => Err(RefreshSkip {
+                capacity_skipped: 1,
+                deadline_skipped: 0,
+            }
+            .into_error()),
+            _ => Ok(()),
         }
     }
 }
 
 impl daemon::Publisher for MetadataPublisher {
+    fn reader_diagnostics(&self) -> Option<daemon::ReaderDiagnosticsHandle> {
+        Some(daemon::ReaderDiagnosticsHandle::new(
+            self.reader_diagnostics.clone(),
+        ))
+    }
     fn set_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
         self.shutdown = Some(shutdown);
     }
     fn refresh(&mut self, transport: &mut Transport, config: &Config) -> io::Result<()> {
-        config.validate()?;
-        self.start_weekly(config)?;
-        self.refresh_with_readers(transport, config, &CodexReader, &GrokReader)
+        #[cfg(test)]
+        return self.refresh_cycle_with_readers(transport, config, &CodexReader, &GrokReader);
+        #[cfg(not(test))]
+        {
+            // Reset first so validation and worker errors still report a sample.
+            self.reset_stages();
+            config.validate()?;
+            self.start_weekly(config)?;
+            self.refresh_with_readers(transport, config, &CodexReader, &GrokReader)
+        }
+    }
+    fn refresh_stages(&self) -> Option<daemon::RefreshStages> {
+        let stages = self
+            .stages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stages.as_ref().map(|stages| daemon::RefreshStages {
+            durations: daemon::RefreshStageDurations {
+                snapshot_us: duration_us(stages.snapshot),
+                git_us: duration_us(stages.git),
+                reader_us: duration_us(stages.reader),
+                persist_us: duration_us(stages.persist),
+                socket_us: duration_us(stages.socket),
+            },
+            counts: daemon::RefreshStageCounts {
+                reports: stages.reports,
+                checkpoints: stages.checkpoints,
+            },
+        })
     }
     fn shutdown(&mut self) {
         self.codex_control.stop();
@@ -1123,8 +2392,9 @@ impl daemon::Publisher for MetadataPublisher {
         self.kimi_weekly.take();
     }
     fn clear(&mut self, transport: &mut Transport) -> io::Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let snapshot = self.snapshot(transport)?;
+        // Independent of any refresh envelope; shutdown does not stop clear.
+        let deadline = Instant::now() + CLEAR_DEADLINE;
+        let snapshot = self.snapshot_before(transport, deadline)?;
         for pane in snapshot.panes {
             check_clear_deadline(deadline)?;
             let resource = self.resource(ResourceKind::Pane, &pane.pane_id);
@@ -1132,14 +2402,7 @@ impl daemon::Publisher for MetadataPublisher {
                 .iter()
                 .map(|key| ((*key).into(), None))
                 .collect();
-            self.report(
-                transport,
-                &resource,
-                &pane.stored_keys,
-                None,
-                &desired,
-                Some(deadline),
-            )?;
+            self.clear_report(transport, &resource, &pane.stored_keys, &desired, deadline)?;
         }
         for workspace in snapshot.workspaces {
             check_clear_deadline(deadline)?;
@@ -1148,18 +2411,19 @@ impl daemon::Publisher for MetadataPublisher {
                 .iter()
                 .map(|key| ((*key).into(), None))
                 .collect();
-            self.report(
+            self.clear_report(
                 transport,
                 &resource,
                 &workspace.stored_keys,
-                None,
                 &desired,
-                Some(deadline),
+                deadline,
             )?;
         }
         Ok(())
     }
     fn reconnected(&mut self) {
+        // `persistence_poisoned` survives: memory may hold a lower upper bound
+        // than disk after an uncertain write.
         self.planner = tokens::Publisher::restore_with_floors(
             self.planner.checkpoint(),
             self.planner.checkpoint_floors(),
@@ -1199,10 +2463,23 @@ fn check_clear_deadline(deadline: Instant) -> io::Result<()> {
     }
 }
 
-fn exchange(transport: &mut Transport, request: &Value) -> io::Result<Value> {
-    transport.send_line(&serde_json::to_vec(request)?)?;
-    serde_json::from_slice(&transport.receive_line()?)
+/// One request and response under the caller's absolute deadline. The
+/// transport also caps connect, write and read locally and reconnects only
+/// after a complete response, so an unanswered request is never replayed.
+fn exchange_before(
+    transport: &mut Transport,
+    request: &Value,
+    deadline: Instant,
+) -> io::Result<Value> {
+    transport.send_line_before(&serde_json::to_vec(request)?, deadline)?;
+    serde_json::from_slice(&transport.receive_line_before(deadline)?)
         .map_err(|_| io::Error::other("invalid Herdr JSON response"))
+}
+
+/// Far enough that only the transport's local caps apply.
+#[cfg(test)]
+fn unbounded_test_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(3600)
 }
 fn unix(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
@@ -1212,6 +2489,244 @@ fn unix(time: SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FAR_RESET: &str = "2099-01-01T00:00:00Z";
+
+    #[test]
+    fn grok_reader_switch_invalidates_worker_result_even_when_auth_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        let a = r#"{"key":"fake-a","user_id":"same"}"#;
+        let b = r#"{"key":"fake-b","user_id":"same"}"#;
+        std::fs::write(&auth, a).unwrap();
+        let source_a = crate::quota_grok::source_stamp(&auth).unwrap();
+        let state = std::sync::Mutex::new(GrokSnapshot::default());
+        let config = Config {
+            allow_network: true,
+            providers: vec!["grok".into()],
+            ..Config::default()
+        };
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let sample = model::WeeklySample {
+            used_percent: 25.0,
+            resets_at: Some(now + Duration::from_secs(600)),
+        };
+        {
+            let mut state = state.lock().unwrap();
+            state.observe(Some(source_a.clone()));
+            let generation = state.generation;
+            state.publish(generation, &source_a, Some(sample), Some(instant));
+        }
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            Some(sample)
+        );
+        let worker_generation = state.lock().unwrap().generation;
+        std::fs::write(&auth, b).unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        std::fs::write(&auth, a).unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        state
+            .lock()
+            .unwrap()
+            .publish(worker_generation, &source_a, Some(sample), Some(instant));
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+    }
+
+    #[test]
+    fn grok_unknown_source_and_expired_reset_are_never_displayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(&auth, r#"{"key":"fake-a","user_id":"user-a"}"#).unwrap();
+        let source = crate::quota_grok::source_stamp(&auth).unwrap();
+        let state = std::sync::Mutex::new(GrokSnapshot::default());
+        let config = Config {
+            allow_network: true,
+            providers: vec!["grok".into()],
+            ..Config::default()
+        };
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        {
+            let mut state = state.lock().unwrap();
+            state.observe(Some(source.clone()));
+            let generation = state.generation;
+            state.publish(
+                generation,
+                &source,
+                Some(model::WeeklySample {
+                    used_percent: 25.0,
+                    resets_at: Some(now - Duration::from_secs(1)),
+                }),
+                Some(instant),
+            );
+        }
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        std::fs::write(&auth, "invalid").unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        assert!(state.lock().unwrap().source.is_none());
+    }
+
+    #[test]
+    fn grok_worker_cannot_publish_after_concurrent_reader_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(&auth, r#"{"key":"fake-a","user_id":"user"}"#).unwrap();
+        let source_a = crate::quota_grok::source_stamp(&auth).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(GrokSnapshot::default()));
+        let config = Config {
+            allow_network: true,
+            providers: vec!["grok".into()],
+            ..Config::default()
+        };
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let sample = model::WeeklySample {
+            used_percent: 25.0,
+            resets_at: Some(now + Duration::from_secs(600)),
+        };
+        let (started, ready) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            let generation = {
+                let mut state = worker_state.lock().unwrap();
+                state.observe(Some(source_a.clone()));
+                state.generation
+            };
+            started.send(()).unwrap();
+            release.recv().unwrap();
+            worker_state.lock().unwrap().publish(
+                generation,
+                &source_a,
+                Some(sample),
+                Some(instant),
+            );
+        });
+        ready.recv().unwrap();
+        std::fs::write(&auth, r#"{"key":"fake-b","user_id":"user"}"#).unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            current_grok_weekly(&state, Some(&auth), &config, now, instant),
+            None
+        );
+    }
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct FixtureReply {
+        status: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ratio: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reset: Option<String>,
+    }
+
+    impl FixtureReply {
+        fn weekly(ratio: f64, reset: Option<&str>) -> Self {
+            Self {
+                status: 200,
+                ratio: Some(ratio),
+                reset: reset.map(str::to_owned),
+            }
+        }
+
+        fn status(status: u16) -> Self {
+            Self {
+                status,
+                ratio: None,
+                reset: None,
+            }
+        }
+    }
+
+    fn serve_kimi_fixture(
+        listener: std::net::TcpListener,
+        replies: &Path,
+        connections: &Path,
+        stop: &AtomicBool,
+    ) {
+        listener.set_nonblocking(true).unwrap();
+        let mut count = 0usize;
+        while !stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    count += 1;
+                    let temporary = connections.with_extension("tmp");
+                    std::fs::write(&temporary, count.to_string()).unwrap();
+                    std::fs::rename(&temporary, connections).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n")
+                        && request.len() < 8192
+                    {
+                        match std::io::Read::read(&mut stream, &mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(size) => request.extend_from_slice(&buffer[..size]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let token = request.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().strip_prefix("Bearer "))
+                            .flatten()
+                    });
+                    let script = std::fs::read(replies).ok().and_then(|bytes| {
+                        serde_json::from_slice::<BTreeMap<String, FixtureReply>>(&bytes).ok()
+                    });
+                    let reply = token.and_then(|token| script.as_ref()?.get(token).cloned());
+                    let (status, body) = match reply {
+                        Some(reply) if reply.status == 200 => {
+                            let ratio = reply.ratio.unwrap_or(0.0);
+                            let body = match reply.reset {
+                                Some(reset) => format!(
+                                    r#"{{"usages":{{"limit_7d":{{"used_ratio":{ratio},"reset_time":"{reset}"}}}}}}"#
+                                ),
+                                None => format!(
+                                    r#"{{"usages":{{"limit_7d":{{"used_ratio":{ratio}}}}}}}"#
+                                ),
+                            };
+                            (200, body)
+                        }
+                        Some(reply) => (reply.status, "no".into()),
+                        None => (401, "no".into()),
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
     use crate::{daemon::Publisher as _, model::*, socket::Transport};
     use serde_json::{Value, json};
     use std::{
@@ -1270,9 +2785,28 @@ mod tests {
         clock: Arc<std::sync::atomic::AtomicU64>,
         template: Arc<std::sync::Mutex<Value>>,
     ) -> std::thread::JoinHandle<()> {
+        sequence_server(listener, clock, template, Arc::default(), Arc::default())
+    }
+
+    /// One received metadata report: resource ID, seq, and whether it applied.
+    type ReportLog = Arc<std::sync::Mutex<Vec<(String, u64, bool)>>>;
+
+    // Like Herdr, a report whose seq is not newer than the last accepted seq
+    // for the same resource and source is answered `ok` but not applied. The
+    // accepted seq outlives the resource leaving the snapshot, so a reused ID
+    // must also move forward. A report whose seq equals `lose_response_for`
+    // is applied and logged, then its connection closes without a reply.
+    fn sequence_server(
+        listener: UnixListener,
+        clock: Arc<std::sync::atomic::AtomicU64>,
+        template: Arc<std::sync::Mutex<Value>>,
+        log: ReportLog,
+        lose_response_for: Arc<std::sync::atomic::AtomicU64>,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let mut resources = BTreeMap::<String, BTreeMap<String, (Value, u64)>>::new();
+            let mut accepted = BTreeMap::<(String, String), u64>::new();
             loop {
                 let request = receive(&mut stream);
                 let now = clock.load(Ordering::Acquire);
@@ -1307,14 +2841,30 @@ mod tests {
                             .as_str()
                             .or_else(|| params["workspace_id"].as_str())
                             .unwrap();
-                        let tokens = resources.entry(id.into()).or_default();
-                        let ttl = params["ttl_ms"].as_u64().unwrap();
-                        for (key, value) in params["tokens"].as_object().unwrap() {
-                            if value.is_null() {
-                                tokens.remove(key);
-                            } else {
-                                tokens.insert(key.clone(), (value.clone(), now + ttl));
+                        let seq = params["seq"].as_u64().unwrap();
+                        let source = params["source"].as_str().unwrap();
+                        let last = accepted.entry((id.into(), source.into())).or_default();
+                        let applied = seq > *last;
+                        log.lock().unwrap().push((id.into(), seq, applied));
+                        if applied {
+                            *last = seq;
+                            let tokens = resources.entry(id.into()).or_default();
+                            let ttl = params["ttl_ms"].as_u64().unwrap();
+                            for (key, value) in params["tokens"].as_object().unwrap() {
+                                if value.is_null() {
+                                    tokens.remove(key);
+                                } else {
+                                    tokens.insert(key.clone(), (value.clone(), now + ttl));
+                                }
                             }
+                        }
+                        if seq == lose_response_for.load(Ordering::Acquire) {
+                            stream
+                                .get_mut()
+                                .0
+                                .shutdown(std::net::Shutdown::Both)
+                                .unwrap();
+                            continue;
                         }
                         json!({"id":request["id"],"result":{"type":"ok"}})
                     }
@@ -1678,6 +3228,9 @@ mod tests {
             reader_timeout_ms: 100,
             ..Config::default()
         };
+        // This fixture is about timeout restore, not fairness: keep the
+        // exhausting Codex pane first, as in snapshot order.
+        publisher.send_queue = FairQueue::default();
         publisher
             .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
             .unwrap();
@@ -1687,6 +3240,9 @@ mod tests {
         let cached = publisher.local_readings.get_mut("w1:p2").unwrap();
         // Inject an elapsed reset into the prior observation without real waits.
         cached.weekly_resets_at = Some(SystemTime::now() - Duration::from_secs(1));
+        // This fixture is about timeout restore, not fairness: keep the
+        // exhausting Codex pane first, as in snapshot order.
+        publisher.send_queue = FairQueue::default();
         publisher
             .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
             .unwrap();
@@ -1699,6 +3255,9 @@ mod tests {
         cached.weekly_window = Some(WeeklyWindow::RollingSevenDays);
         cached.weekly_resets_at = None;
         cached.observed_at = Some(SystemTime::now() - Duration::from_secs(61));
+        // This fixture is about timeout restore, not fairness: keep the
+        // exhausting Codex pane first, as in snapshot order.
+        publisher.send_queue = FairQueue::default();
         publisher
             .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
             .unwrap();
@@ -1707,6 +3266,9 @@ mod tests {
             .unwrap();
         template.lock().unwrap()["result"]["snapshot"]["panes"][1]["agent_session"]["value"] =
             json!("other-session");
+        // This fixture is about timeout restore, not fairness: keep the
+        // exhausting Codex pane first, as in snapshot order.
+        publisher.send_queue = FairQueue::default();
         publisher
             .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
             .unwrap();
@@ -1844,6 +3406,13 @@ mod tests {
         }
     }
 
+    fn confirmed(repository: &ship_time::Repository, verified_at: Instant) -> HeadingRead {
+        HeadingRead::Confirmed {
+            repository: repository.clone(),
+            verified_at,
+        }
+    }
+
     #[test]
     fn heading_timeout_retains_only_the_same_workspace_and_occupant() {
         let dir = tempfile::tempdir().unwrap();
@@ -1861,31 +3430,19 @@ mod tests {
                 native_session: Some("native-one".into()),
             }),
         )];
+        let t0 = Instant::now();
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &occupant,
-                ship_time::RepositoryRead::Complete(Some(repo.clone()))
-            ),
+            publisher.heading_repository("w1", Some(cwd), &occupant, confirmed(&repo, t0), t0),
             Some(repo.clone())
         );
+        for read in [HeadingRead::Interrupted, HeadingRead::NotAttempted] {
+            assert_eq!(
+                publisher.heading_repository("w1", Some(cwd), &occupant, read, t0),
+                Some(repo.clone())
+            );
+        }
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &occupant,
-                ship_time::RepositoryRead::Interrupted
-            ),
-            Some(repo)
-        );
-        assert_eq!(
-            publisher.heading_repository(
-                "w2",
-                Some(cwd),
-                &occupant,
-                ship_time::RepositoryRead::Interrupted
-            ),
+            publisher.heading_repository("w2", Some(cwd), &occupant, HeadingRead::Interrupted, t0),
             None
         );
         let changed = vec![(
@@ -1896,14 +3453,81 @@ mod tests {
             }),
         )];
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &changed,
-                ship_time::RepositoryRead::Interrupted
-            ),
+            publisher.heading_repository("w1", Some(cwd), &changed, HeadingRead::Interrupted, t0),
             None
         );
+    }
+
+    // F14 and F18: the fallback is bounded by the original verification
+    // instant, even when the occupants never change.
+    #[test]
+    fn heading_fallback_expires_thirty_seconds_after_the_original_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().to_owned(), "fake".into(), Homes::default()).unwrap();
+        let cwd = Path::new("/synthetic/repo");
+        let repo = ship_time::Repository {
+            name: "repo".into(),
+            ship_unix: Some(123),
+        };
+        let t0 = Instant::now();
+        let at = |seconds: u64| t0 + Duration::from_secs(seconds);
+        publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, t0), t0);
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(29)),
+            Some(repo.clone()),
+            "fallback must hold just before 30 s"
+        );
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(30)),
+            None,
+            "fallback must end at 30 s"
+        );
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(31)),
+            None,
+            "an expired heading is not retained by occupant equality"
+        );
+
+        // A cache hit inherits its root's old verification and does not renew it.
+        let root_verified = t0.checked_sub(Duration::from_secs(25)).unwrap();
+        publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, root_verified), t0);
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::NotAttempted, at(4)),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::NotAttempted, at(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn heading_read_needs_a_verification_instant_to_be_confirmed() {
+        let repo = ship_time::Repository {
+            name: "repo".into(),
+            ship_unix: None,
+        };
+        let now = Instant::now();
+        let read = |read, verified_at| {
+            HeadingRead::from(ship_time::RepositoryObservation { read, verified_at })
+        };
+        assert!(matches!(
+            read(ship_time::RepositoryRead::Complete(Some(repo.clone())), Some(now)),
+            HeadingRead::Confirmed { verified_at, .. } if verified_at == now
+        ));
+        assert!(matches!(
+            read(ship_time::RepositoryRead::Complete(Some(repo)), None),
+            HeadingRead::Unknown
+        ));
+        assert!(matches!(
+            read(ship_time::RepositoryRead::Complete(None), None),
+            HeadingRead::Unknown
+        ));
+        assert!(matches!(
+            read(ship_time::RepositoryRead::Interrupted, None),
+            HeadingRead::Interrupted
+        ));
     }
 
     #[test]
@@ -1916,45 +3540,23 @@ mod tests {
             name: "repo".into(),
             ship_unix: Some(123),
         };
+        let now = Instant::now();
         for replacement in [Some(Path::new("/synthetic/other")), None] {
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &[],
-                ship_time::RepositoryRead::Complete(Some(repo.clone())),
-            );
+            publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, now), now);
             assert_eq!(
-                publisher.heading_repository(
-                    "w1",
-                    replacement,
-                    &[],
-                    ship_time::RepositoryRead::Interrupted
-                ),
+                publisher.heading_repository("w1", replacement, &[], HeadingRead::Interrupted, now),
                 None
             );
         }
-        publisher.heading_repository(
-            "w1",
-            Some(cwd),
-            &[],
-            ship_time::RepositoryRead::Complete(Some(repo)),
-        );
+        // F16: a completed read without a repository (including rejection)
+        // clears at once and starts no fallback.
+        publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, now), now);
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &[],
-                ship_time::RepositoryRead::Complete(None)
-            ),
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Unknown, now),
             None
         );
         assert_eq!(
-            publisher.heading_repository(
-                "w1",
-                Some(cwd),
-                &[],
-                ship_time::RepositoryRead::Interrupted
-            ),
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, now),
             None
         );
     }
@@ -1971,7 +3573,7 @@ mod tests {
         let refresh = Duration::from_millis(config.refresh_interval_ms);
         let next_query_done = now + settings.interval() + settings.timeout();
         assert!(
-            fresh_grok_weekly(
+            fresh_account_weekly(
                 sample,
                 Some(now),
                 next_query_done + refresh,
@@ -1981,7 +3583,7 @@ mod tests {
             .is_some()
         );
         assert!(
-            fresh_grok_weekly(
+            fresh_account_weekly(
                 sample,
                 Some(now),
                 next_query_done + refresh + Duration::from_millis(1),
@@ -1992,7 +3594,7 @@ mod tests {
         );
         let longer_age = settings.interval() + settings.timeout() + refresh + settings.interval();
         assert!(
-            fresh_grok_weekly(
+            fresh_account_weekly(
                 sample,
                 Some(now),
                 now + longer_age,
@@ -2002,7 +3604,7 @@ mod tests {
             .is_some()
         );
         assert!(
-            fresh_grok_weekly(
+            fresh_account_weekly(
                 sample,
                 None,
                 now,
@@ -2136,6 +3738,295 @@ mod tests {
     }
 
     #[test]
+    fn kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset() {
+        let Some(root) = std::env::var_os("LINEUP_FAKE_KIMI_WIRING_CHILD") else {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("kimi-home");
+            std::fs::create_dir_all(home.join("credentials")).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/usages", listener.local_addr().unwrap());
+            let replies = root.path().join("replies.json");
+            let connections = root.path().join("connections");
+            std::fs::write(&replies, b"{}").unwrap();
+            std::fs::write(&connections, b"0").unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server = {
+                let replies = replies.clone();
+                let connections = connections.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    serve_kimi_fixture(listener, &replies, &connections, &stop)
+                })
+            };
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "publish::tests::kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset",
+                ])
+                .env("LINEUP_FAKE_KIMI_WIRING_CHILD", root.path())
+                .env("HOME", root.path())
+                .env("KIMI_CODE_HOME", &home)
+                .env("LINEUP_TEST_KIMI_ENDPOINT", endpoint)
+                .env("LINEUP_TEST_KIMI_INTERVAL_MS", "100")
+                .env_remove("KIMI_CODE_BASE_URL")
+                .env_remove("GROK_HOME")
+                .env_remove("GROK_AUTH_FILE")
+                .env_remove("CODEX_HOME")
+                .env_remove("HERDR_SOCKET_PATH")
+                .env_remove("HERDR_PLUGIN_STATE_DIR")
+                .env_remove("HERDR_PLUGIN_CONFIG_DIR")
+                .env_remove("HERDR_PLUGIN_ROOT")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated Kimi wiring child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            stop.store(true, Ordering::Release);
+            server.join().unwrap();
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+            assert!(
+                status.success(),
+                "isolated Kimi wiring child failed: {stderr}"
+            );
+            return;
+        };
+        let root = PathBuf::from(root);
+        let home = PathBuf::from(std::env::var_os("KIMI_CODE_HOME").unwrap());
+        let auth = home.join("credentials/kimi-code.json");
+        let replies = root.join("replies.json");
+        let connections = root.join("connections");
+        for (index, (network, kimi_enabled, providers)) in [
+            (false, false, vec!["kimi".into()]),
+            (true, false, vec!["kimi".into()]),
+            (false, true, vec!["kimi".into()]),
+            (true, true, vec!["claude".into()]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = root.join(format!("opt-in-{index}"));
+            std::fs::create_dir(&directory).unwrap();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let mut publisher =
+                MetadataPublisher::new(directory, "fake".into(), Homes::from_env()).unwrap();
+            publisher.set_shutdown(shutdown.clone());
+            publisher
+                .start_weekly(&Config {
+                    allow_network: network,
+                    kimi_weekly_enabled: kimi_enabled,
+                    providers,
+                    ..Config::default()
+                })
+                .unwrap();
+            assert!(publisher.kimi_weekly.is_none());
+            shutdown.store(true, Ordering::Release);
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(std::fs::read_to_string(&connections).unwrap().trim(), "0");
+
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let mut script = BTreeMap::new();
+        let long_expiry = 4_102_444_800_u64;
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            providers: vec!["kimi".into()],
+            ..Config::default()
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut publisher =
+            MetadataPublisher::new(state.clone(), "fake".into(), Homes::from_env()).unwrap();
+        publisher.set_shutdown(shutdown.clone());
+        let observe = |publisher: &MetadataPublisher| {
+            current_kimi_weekly(
+                &publisher.kimi_source,
+                &publisher.kimi_epoch,
+                publisher.homes.kimi.as_deref(),
+                &enabled,
+                SystemTime::now(),
+                Instant::now(),
+            )
+        };
+        let wait_percent = |publisher: &MetadataPublisher, percent: f64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(sample) = observe(publisher)
+                    && (sample.used_percent - percent).abs() < 0.001
+                {
+                    return sample;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {percent}: {}",
+                    crate::quota_diagnostic::weekly_diagnostics(&state)
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let wait_cleared = |publisher: &MetadataPublisher, reset_at: Option<SystemTime>| {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                // Apply expiry/clear logic, then verify the actual source
+                // with a blocking lock so a try_lock failure is not mistaken
+                // for the source being cleared.
+                observe(publisher);
+                let actually_cleared = publisher.kimi_source.lock().unwrap().snapshot.is_none();
+                let reset_reached = reset_at.is_none_or(|reset| SystemTime::now() >= reset);
+                if actually_cleared && reset_reached {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for weekly to clear: {}",
+                    crate::quota_diagnostic::weekly_diagnostics(&state)
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let wait_diagnostic = |pattern: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let diagnostics = crate::quota_diagnostic::weekly_diagnostics(&state);
+                if diagnostics.contains(pattern) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for diagnostic {pattern}: {diagnostics}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let publish = |script: &BTreeMap<String, FixtureReply>| {
+            let bytes = serde_json::to_vec(script).unwrap();
+            let temporary = replies.with_extension("tmp");
+            std::fs::write(&temporary, bytes).unwrap();
+            std::fs::rename(temporary, &replies).unwrap();
+        };
+        let credential = |token: &str, expires_at: u64| {
+            std::fs::write(
+                &auth,
+                format!(r#"{{"access_token":"{token}","expires_at":{expires_at}}}"#),
+            )
+            .unwrap();
+        };
+
+        script.insert(
+            "phase-success".into(),
+            FixtureReply::weekly(0.25, Some(FAR_RESET)),
+        );
+        publish(&script);
+        credential("phase-success", long_expiry);
+        publisher.start_weekly(&enabled).unwrap();
+        let sample = wait_percent(&publisher, 25.0);
+        assert!(sample.resets_at.is_some());
+        wait_diagnostic("kimi=ok");
+        assert!(
+            publisher
+                .kimi_weekly
+                .as_ref()
+                .unwrap()
+                .sample(SystemTime::now())
+                .is_none()
+        );
+
+        script.insert(
+            "phase-rotated".into(),
+            FixtureReply::weekly(0.5, Some(FAR_RESET)),
+        );
+        publish(&script);
+        credential("phase-rotated", long_expiry);
+        assert_eq!(wait_percent(&publisher, 50.0).used_percent, 50.0);
+
+        script.insert("phase-rotated".into(), FixtureReply::status(500));
+        publish(&script);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let retained = observe(&publisher).is_some_and(|sample| sample.used_percent == 50.0);
+            let transient =
+                crate::quota_diagnostic::weekly_diagnostics(&state).contains("kimi=transient");
+            if retained && transient {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "transient failure did not retain reset sample"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        script.insert("phase-resetless".into(), FixtureReply::weekly(0.125, None));
+        publish(&script);
+        credential("phase-resetless", long_expiry);
+        let resetless = wait_percent(&publisher, 12.5);
+        assert!(resetless.resets_at.is_none());
+        script.insert("phase-resetless".into(), FixtureReply::status(500));
+        publish(&script);
+        wait_cleared(&publisher, None);
+        wait_diagnostic("kimi=transient");
+
+        let reset =
+            chrono::DateTime::<chrono::Utc>::from(SystemTime::now() + Duration::from_secs(4))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        script.insert(
+            "phase-reset".into(),
+            FixtureReply::weekly(0.75, Some(&reset)),
+        );
+        publish(&script);
+        credential("phase-reset", long_expiry);
+        let reset_at = wait_percent(&publisher, 75.0).resets_at.unwrap();
+        wait_cleared(&publisher, Some(reset_at));
+        assert!(SystemTime::now() >= reset_at);
+
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 4;
+        script.insert(
+            "phase-expiry".into(),
+            FixtureReply::weekly(0.375, Some(FAR_RESET)),
+        );
+        publish(&script);
+        credential("phase-expiry", expires_at);
+        let expiring = wait_percent(&publisher, 37.5);
+        assert!(
+            expiring
+                .resets_at
+                .is_some_and(|reset| reset > SystemTime::now())
+        );
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let cleared = observe(&publisher).is_none();
+            let expired =
+                crate::quota_diagnostic::weekly_diagnostics(&state).contains("kimi=auth_expired");
+            if cleared && expired {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "credential expiry did not clear weekly"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(SystemTime::now() >= UNIX_EPOCH + Duration::from_secs(expires_at));
+        shutdown.store(true, Ordering::Release);
+    }
+
+    #[test]
     fn kimi_poll_retains_only_future_reset_on_transient_failure() {
         use crate::quota_kimi::{Failure, Outcome, WeeklyUsage};
         let now = SystemTime::now();
@@ -2214,8 +4105,9 @@ mod tests {
             kimi_weekly_enabled: true,
             ..Config::default()
         };
-        let cache = std::sync::Mutex::new(Some(snapshot));
-        assert!(current_kimi_weekly(&cache, Some(home), &enabled, now, instant).is_some());
+        let cache = std::sync::Mutex::new(KimiShared::new(Some(snapshot)));
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_some());
         for config in [
             Config {
                 allow_network: false,
@@ -2230,21 +4122,24 @@ mod tests {
                 ..enabled.clone()
             },
         ] {
-            *cache.lock().unwrap() = Some(snapshot);
-            assert!(current_kimi_weekly(&cache, Some(home), &config, now, instant).is_none());
-            assert!(cache.lock().unwrap().is_none());
+            *cache.lock().unwrap() = KimiShared::new(Some(snapshot));
+            assert!(
+                current_kimi_weekly(&cache, &epoch, Some(home), &config, now, instant).is_none()
+            );
+            assert!(cache.lock().unwrap().snapshot.is_none());
         }
-        *cache.lock().unwrap() = Some(snapshot);
+        *cache.lock().unwrap() = KimiShared::new(Some(snapshot));
         std::fs::write(&auth_file, "fake-credential-two-longer").unwrap();
-        assert!(current_kimi_weekly(&cache, Some(home), &enabled, now, instant).is_none());
-        assert!(cache.lock().unwrap().is_none());
-        *cache.lock().unwrap() = Some(KimiSnapshot {
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+        *cache.lock().unwrap() = KimiShared::new(Some(KimiSnapshot {
             stamp: crate::quota_kimi::source_stamp(&auth_file).unwrap(),
             ..snapshot
-        });
+        }));
         assert!(
             current_kimi_weekly(
                 &cache,
+                &epoch,
                 Some(home),
                 &enabled,
                 now + Duration::from_secs(120),
@@ -2255,9 +4150,748 @@ mod tests {
     }
 
     #[test]
+    fn kimi_credential_stat_distinguishes_transient_failure_from_missing_and_account_switch() {
+        use crate::quota_kimi::SourceState;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let credentials = home.join("credentials");
+        std::fs::create_dir(&credentials).unwrap();
+        let auth_file = credentials.join("kimi-code.json");
+        std::fs::write(&auth_file, "fake-credential-account-a").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_file).unwrap();
+
+        let other_file = credentials.join("other.json");
+        std::fs::write(&other_file, "fake-credential-account-b").unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&other_file).unwrap();
+        std::fs::remove_file(&other_file).unwrap();
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let make_snapshot = |resets_in_secs: u64, auth_expires_in_secs: u64| KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 25.0,
+                resets_at: Some(now + Duration::from_secs(resets_in_secs)),
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(auth_expires_in_secs),
+            observed: instant,
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::new(Some(make_snapshot(300, 600))));
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Transient { credential: None }
+        });
+        assert_eq!(sample.unwrap().used_percent, 25.0);
+        assert!(cache.lock().unwrap().snapshot.is_some());
+
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_a)
+        });
+        assert_eq!(sample.unwrap().used_percent, 25.0);
+        assert!(cache.lock().unwrap().snapshot.is_some());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 60)));
+        let sample = current_kimi_weekly_with_state(
+            &cache,
+            &epoch,
+            &enabled,
+            now + Duration::from_secs(61),
+            instant,
+            || SourceState::Transient { credential: None },
+        );
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(60, 300)));
+        let sample = current_kimi_weekly_with_state(
+            &cache,
+            &epoch,
+            &enabled,
+            now + Duration::from_secs(61),
+            instant,
+            || SourceState::Transient { credential: None },
+        );
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 25.0,
+                resets_at: None,
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(600),
+            observed: instant,
+        }));
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_a)
+        });
+        assert_eq!(sample.unwrap().used_percent, 25.0);
+        assert!(cache.lock().unwrap().snapshot.is_some());
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Transient { credential: None }
+        });
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 600)));
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Missing
+        });
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 600)));
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_b)
+        });
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 600)));
+        let sample = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Transient {
+                credential: Some(stamp_b.credential),
+            }
+        });
+        assert!(sample.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        *cache.lock().unwrap() = KimiShared::new(Some(make_snapshot(300, 600)));
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_some());
+
+        let original_mode = std::fs::metadata(&credentials)
+            .unwrap()
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_some());
+        assert!(cache.lock().unwrap().snapshot.is_some());
+
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+        std::fs::remove_file(&auth_file).unwrap();
+        assert!(current_kimi_weekly(&cache, &epoch, Some(home), &enabled, now, instant).is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn kimi_worker_state_transitions_handle_in_flight_switch_and_transient_failures() {
+        use crate::quota_kimi::{Failure, Outcome, SourceState, WeeklyUsage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+        let transient_a = SourceState::Transient {
+            credential: Some(a.credential),
+        };
+        let transient_b = SourceState::Transient {
+            credential: Some(b.credential),
+        };
+        let transient_unknown = SourceState::Transient { credential: None };
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let reset = Some(now + Duration::from_secs(3600));
+        let weekly = |used_percent| {
+            Outcome::Weekly(WeeklyUsage {
+                used_percent,
+                resets_at: reset,
+            })
+        };
+
+        for (name, before, outcome, after, initial, expected, stamp) in [
+            (
+                "switch during successful poll",
+                SourceState::Present(a),
+                weekly(20.0),
+                SourceState::Present(b),
+                Some(10.0),
+                None,
+                Some(b),
+            ),
+            (
+                "switch before transient poll",
+                SourceState::Present(b),
+                Outcome::Unavailable(Failure::Transient),
+                transient_unknown,
+                Some(10.0),
+                None,
+                None,
+            ),
+            (
+                "missing before transient poll",
+                SourceState::Missing,
+                Outcome::Unavailable(Failure::Transient),
+                transient_unknown,
+                Some(10.0),
+                None,
+                None,
+            ),
+            (
+                "expired poll after transient stat",
+                SourceState::Present(a),
+                Outcome::Unavailable(Failure::AuthExpired),
+                transient_unknown,
+                Some(10.0),
+                None,
+                None,
+            ),
+            (
+                "same source transient",
+                SourceState::Present(a),
+                Outcome::Unavailable(Failure::Transient),
+                transient_a,
+                Some(30.0),
+                Some(30.0),
+                Some(a),
+            ),
+            (
+                "unknown reset transient",
+                SourceState::Present(a),
+                Outcome::Unavailable(Failure::Transient),
+                transient_a,
+                None,
+                None,
+                None,
+            ),
+            (
+                "auth I/O transient",
+                transient_a,
+                Outcome::Unavailable(Failure::AuthIo),
+                transient_a,
+                Some(35.0),
+                Some(35.0),
+                Some(a),
+            ),
+            (
+                "recover same source",
+                transient_a,
+                Outcome::Unavailable(Failure::Transient),
+                SourceState::Present(a),
+                Some(35.0),
+                Some(35.0),
+                Some(a),
+            ),
+            (
+                "recover different source",
+                transient_a,
+                Outcome::Unavailable(Failure::Transient),
+                SourceState::Present(b),
+                Some(35.0),
+                None,
+                Some(b),
+            ),
+            (
+                "changed credential during transient poll",
+                SourceState::Present(a),
+                Outcome::Unavailable(Failure::Transient),
+                transient_b,
+                Some(35.0),
+                None,
+                None,
+            ),
+            (
+                "new credential before successful poll",
+                transient_b,
+                weekly(50.0),
+                transient_b,
+                Some(35.0),
+                None,
+                None,
+            ),
+        ] {
+            let initial_sample = model::WeeklySample {
+                used_percent: initial.unwrap_or(40.0),
+                resets_at: initial.map(|_| reset).unwrap_or(None),
+            };
+            let cache = std::sync::Mutex::new(KimiShared::new(Some(KimiSnapshot {
+                sample: initial_sample,
+                stamp: a,
+                auth_expiry: now + Duration::from_secs(3600),
+                observed: instant,
+            })));
+            let epoch = std::sync::atomic::AtomicU64::new(0);
+            let mut previous = Some(initial_sample);
+            let mut previous_stamp = Some(a);
+            let mut last_success = Some(instant);
+            let result = step_kimi_worker(
+                before,
+                outcome,
+                after,
+                &mut previous,
+                &mut previous_stamp,
+                &mut last_success,
+                &cache,
+                &epoch,
+                0,
+                Some(now + Duration::from_secs(3600)),
+                now,
+                instant,
+            );
+            assert_eq!(result.map(|sample| sample.used_percent), expected, "{name}");
+            assert_eq!(previous.is_some(), expected.is_some(), "{name}");
+            assert_eq!(
+                cache.lock().unwrap().snapshot.is_some(),
+                expected.is_some(),
+                "{name}"
+            );
+            if let Some(stamp) = stamp {
+                assert_eq!(previous_stamp, Some(stamp), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_account_switch_invalidates_shared_cache_before_poll_completes() {
+        use crate::quota_kimi::SourceState;
+        use std::sync::Arc;
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let source = Arc::new(std::sync::Mutex::new(KimiShared::new(Some(KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 25.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(3600),
+            observed: instant,
+        }))));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let mut previous = Some(model::WeeklySample {
+            used_percent: 25.0,
+            resets_at: Some(now + Duration::from_secs(3600)),
+        });
+        let mut previous_stamp = Some(stamp_a);
+
+        let before = SourceState::Present(stamp_b);
+        prepare_kimi_worker(before, &mut previous, &mut previous_stamp, &source, &epoch);
+
+        let concurrent_read =
+            current_kimi_weekly_with_state(&source, &epoch, &enabled, now, instant, || {
+                SourceState::Transient { credential: None }
+            });
+        assert!(concurrent_read.is_none());
+        assert!(source.lock().unwrap().snapshot.is_none());
+        assert!(previous.is_none());
+    }
+
+    #[test]
+    fn kimi_reader_invalidation_during_poll_prevents_worker_from_repopulating_old_sample() {
+        use crate::quota_kimi::{Outcome, SourceState, WeeklyUsage};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::new(Some(KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 15.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(3600),
+            observed: instant,
+        })));
+        let epoch = AtomicU64::new(0);
+
+        let mut previous = Some(model::WeeklySample {
+            used_percent: 15.0,
+            resets_at: Some(now + Duration::from_secs(3600)),
+        });
+        let mut previous_stamp = Some(stamp_a);
+        let mut last_success = Some(instant);
+
+        let epoch_before = prepare_kimi_worker(
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &cache,
+            &epoch,
+        );
+        assert_eq!(epoch_before, 0);
+
+        let reader_result =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+        assert!(reader_result.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+        assert!(epoch.load(Ordering::SeqCst) > epoch_before);
+
+        let worker_sample = step_kimi_worker(
+            SourceState::Present(stamp_a),
+            Outcome::Weekly(WeeklyUsage {
+                used_percent: 20.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            }),
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &mut last_success,
+            &cache,
+            &epoch,
+            epoch_before,
+            Some(now + Duration::from_secs(3600)),
+            now,
+            instant,
+        );
+        assert!(worker_sample.is_none());
+        assert!(previous.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        let next_reader =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Transient { credential: None }
+            });
+        assert!(next_reader.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn kimi_reader_source_change_with_empty_cache_increments_epoch_and_avoids_starvation() {
+        use crate::quota_kimi::{Outcome, SourceState, WeeklyUsage};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::default());
+        let epoch = AtomicU64::new(0);
+
+        let mut previous = None;
+        let mut previous_stamp = None;
+        let mut last_success = None;
+
+        let epoch_before = prepare_kimi_worker(
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &cache,
+            &epoch,
+        );
+
+        for _ in 0..5 {
+            let r = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_a)
+            });
+            assert!(r.is_none());
+            assert_eq!(epoch.load(Ordering::SeqCst), epoch_before);
+        }
+
+        let r = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_b)
+        });
+        assert!(r.is_none());
+        let epoch_after_switch = epoch.load(Ordering::SeqCst);
+        assert!(epoch_after_switch > epoch_before);
+
+        for _ in 0..5 {
+            let r = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+            assert!(r.is_none());
+            assert_eq!(epoch.load(Ordering::SeqCst), epoch_after_switch);
+        }
+
+        let worker_sample = step_kimi_worker(
+            SourceState::Present(stamp_a),
+            Outcome::Weekly(WeeklyUsage {
+                used_percent: 20.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            }),
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &mut last_success,
+            &cache,
+            &epoch,
+            epoch_before,
+            Some(now + Duration::from_secs(3600)),
+            now,
+            instant,
+        );
+        assert!(worker_sample.is_none());
+        assert!(previous.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        let next_reader =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Transient { credential: None }
+            });
+        assert!(next_reader.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn kimi_reader_records_switch_before_worker_prepare_and_transient_failure_keeps_cache_empty() {
+        use crate::quota_kimi::{Failure, Outcome, SourceState};
+        use std::sync::atomic::AtomicU64;
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let auth_a = dir.path().join("a.json");
+        let auth_b = dir.path().join("b.json");
+        std::fs::write(&auth_a, "token-a").unwrap();
+        std::fs::write(&auth_b, "token-b").unwrap();
+        let stamp_a = crate::quota_kimi::source_stamp(&auth_a).unwrap();
+        let stamp_b = crate::quota_kimi::source_stamp(&auth_b).unwrap();
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::new(Some(KimiSnapshot {
+            sample: model::WeeklySample {
+                used_percent: 15.0,
+                resets_at: Some(now + Duration::from_secs(3600)),
+            },
+            stamp: stamp_a,
+            auth_expiry: now + Duration::from_secs(3600),
+            observed: instant,
+        })));
+        let epoch = AtomicU64::new(0);
+
+        let mut previous = Some(model::WeeklySample {
+            used_percent: 15.0,
+            resets_at: Some(now + Duration::from_secs(3600)),
+        });
+        let mut previous_stamp = Some(stamp_a);
+        let mut last_success = Some(instant);
+
+        let reader_result =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+        assert!(reader_result.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+        assert_eq!(cache.lock().unwrap().last_stamp, Some(stamp_b));
+        assert_eq!(
+            cache.lock().unwrap().last_state,
+            Some(SourceState::Present(stamp_b))
+        );
+
+        let epoch_before = prepare_kimi_worker(
+            SourceState::Present(stamp_b),
+            &mut previous,
+            &mut previous_stamp,
+            &cache,
+            &epoch,
+        );
+        assert!(
+            previous.is_none(),
+            "worker previous sample must be discarded on account switch"
+        );
+        assert_eq!(previous_stamp, Some(stamp_b));
+
+        let worker_sample = step_kimi_worker(
+            SourceState::Present(stamp_b),
+            Outcome::Unavailable(Failure::Transient),
+            SourceState::Present(stamp_b),
+            &mut previous,
+            &mut previous_stamp,
+            &mut last_success,
+            &cache,
+            &epoch,
+            epoch_before,
+            Some(now + Duration::from_secs(3600)),
+            now,
+            instant,
+        );
+
+        assert!(worker_sample.is_none());
+        assert!(previous.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        let next_reader =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+        assert!(next_reader.is_none());
+    }
+
+    #[test]
+    fn kimi_reader_selector_change_across_transient_failures_increments_epoch_and_avoids_starvation()
+     {
+        use crate::quota_kimi::{Outcome, SourceState, WeeklyUsage};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = SystemTime::now();
+        let instant = Instant::now();
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let credentials = home.join("credentials");
+        std::fs::create_dir_all(&credentials).unwrap();
+        let auth_file = credentials.join("kimi-code.json");
+        let config_file = home.join("config.toml");
+        std::fs::write(&auth_file, "same-token").unwrap();
+
+        let state_a = crate::quota_kimi::source_state(&auth_file);
+        let stamp_a = match state_a {
+            SourceState::Present(stamp) => stamp,
+            _ => panic!("expected Present for state_a"),
+        };
+        assert!(stamp_a.selector.is_none());
+
+        std::fs::write(&config_file, "selector = 1").unwrap();
+        let state_b = crate::quota_kimi::source_state(&auth_file);
+        let stamp_b = match state_b {
+            SourceState::Present(stamp) => stamp,
+            _ => panic!("expected Present for state_b"),
+        };
+        assert!(stamp_b.selector.is_some());
+        assert_eq!(stamp_a.credential, stamp_b.credential);
+        assert_ne!(stamp_a, stamp_b);
+
+        let state_transient = SourceState::Transient {
+            credential: Some(stamp_a.credential),
+        };
+
+        let enabled = Config {
+            allow_network: true,
+            kimi_weekly_enabled: true,
+            ..Config::default()
+        };
+
+        let cache = std::sync::Mutex::new(KimiShared::default());
+        let epoch = AtomicU64::new(0);
+
+        let mut previous = None;
+        let mut previous_stamp = None;
+        let mut last_success = None;
+
+        let epoch_before = prepare_kimi_worker(
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &cache,
+            &epoch,
+        );
+
+        let outcome = Outcome::Weekly(WeeklyUsage {
+            used_percent: 20.0,
+            resets_at: Some(now + Duration::from_secs(3600)),
+        });
+
+        let r1 = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            state_transient
+        });
+        assert!(r1.is_none());
+        assert_eq!(epoch.load(Ordering::SeqCst), epoch_before);
+
+        let r2 = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            SourceState::Present(stamp_b)
+        });
+        assert!(r2.is_none());
+        let epoch_after_switch = epoch.load(Ordering::SeqCst);
+        assert!(
+            epoch_after_switch > epoch_before,
+            "epoch must increment on selector change"
+        );
+
+        let r3 = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+            state_transient
+        });
+        assert!(r3.is_none());
+        assert_eq!(epoch.load(Ordering::SeqCst), epoch_after_switch);
+
+        for _ in 0..5 {
+            let r = current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                SourceState::Present(stamp_b)
+            });
+            assert!(r.is_none());
+            assert_eq!(epoch.load(Ordering::SeqCst), epoch_after_switch);
+        }
+
+        let worker_sample = step_kimi_worker(
+            SourceState::Present(stamp_a),
+            outcome,
+            SourceState::Present(stamp_a),
+            &mut previous,
+            &mut previous_stamp,
+            &mut last_success,
+            &cache,
+            &epoch,
+            epoch_before,
+            Some(now + Duration::from_secs(3600)),
+            now,
+            instant,
+        );
+        assert!(worker_sample.is_none());
+        assert!(previous.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+
+        let next_reader =
+            current_kimi_weekly_with_state(&cache, &epoch, &enabled, now, instant, || {
+                state_transient
+            });
+        assert!(next_reader.is_none());
+        assert!(cache.lock().unwrap().snapshot.is_none());
+    }
+
+    #[test]
     fn disabled_kimi_never_checks_credential_stamp() {
         let now = SystemTime::now();
-        let cache = std::sync::Mutex::new(None);
+        let cache = std::sync::Mutex::new(KimiShared::default());
+        let epoch = std::sync::atomic::AtomicU64::new(0);
         for config in [
             Config::default(),
             Config {
@@ -2272,34 +4906,30 @@ mod tests {
             },
         ] {
             assert!(
-                current_kimi_weekly_with_stamp(&cache, &config, now, Instant::now(), || panic!(
-                    "credential path was checked"
-                ))
+                current_kimi_weekly_with_stamp(
+                    &cache,
+                    &epoch,
+                    &config,
+                    now,
+                    Instant::now(),
+                    || panic!("credential path was checked")
+                )
                 .is_none()
             );
         }
     }
 
     #[test]
-    fn same_cwd_is_read_once_per_cycle_and_refreshed_next_cycle() {
-        let cwd = Path::new("/synthetic/repo");
-        let mut calls = 0;
-        for cycle in 0..2 {
-            let mut readings = BTreeMap::new();
-            for _ in 0..2 {
-                let reading = repository_read_once(&mut readings, cwd, |_| {
-                    calls += 1;
-                    ship_time::RepositoryRead::Complete(Some(ship_time::Repository {
-                        name: format!("cycle-{cycle}"),
-                        ship_unix: Some(cycle),
-                    }))
-                });
-                assert!(
-                    matches!(reading, ship_time::RepositoryRead::Complete(Some(repo)) if repo.name == format!("cycle-{cycle}"))
-                );
-            }
-            assert_eq!(calls, cycle + 1);
-        }
+    fn fair_queue_syncs_rotates_and_never_revisits_in_one_pass() {
+        let mut queue = FairQueue::default();
+        assert_eq!(queue.sync(["a", "b", "c"]), ["a", "b", "c"]);
+        queue.rotate(&"a");
+        assert_eq!(queue.sync(["a", "b", "c"]), ["b", "c", "a"]);
+        // F13: removed IDs leave, survivors keep order, new IDs go to the tail
+        // in snapshot order, and duplicates in one snapshot appear once.
+        assert_eq!(queue.sync(["d", "a", "c", "e", "d"]), ["c", "a", "d", "e"]);
+        queue.rotate(&"missing");
+        assert_eq!(queue.sync(["d", "a", "c", "e"]), ["c", "a", "d", "e"]);
     }
 
     #[test]
@@ -2379,7 +5009,25 @@ mod tests {
         publisher.codex_weekly = Some(workers.remove(0));
         publisher.grok_weekly = Some(workers.remove(0));
         publisher.kimi_weekly = Some(workers.remove(0));
-        *publisher.kimi_source.lock().unwrap() = Some(KimiSnapshot {
+        let grok_auth = dir.path().join("grok-auth.json");
+        std::fs::write(&grok_auth, r#"{"key":"fake-key","user_id":"fake-user"}"#).unwrap();
+        let grok_stamp = crate::quota_grok::source_stamp(&grok_auth).unwrap();
+        publisher.grok_auth_file = Some(grok_auth);
+        {
+            let mut source = publisher.grok_source.lock().unwrap();
+            source.observe(Some(grok_stamp.clone()));
+            let generation = source.generation;
+            source.publish(
+                generation,
+                &grok_stamp,
+                Some(model::WeeklySample {
+                    used_percent: 42.0,
+                    resets_at: Some(SystemTime::now() + Duration::from_secs(86400)),
+                }),
+                Some(Instant::now()),
+            );
+        }
+        *publisher.kimi_source.lock().unwrap() = KimiShared::new(Some(KimiSnapshot {
             sample: model::WeeklySample {
                 used_percent: 10.0,
                 resets_at: Some(SystemTime::now() + Duration::from_secs(86400)),
@@ -2388,7 +5036,7 @@ mod tests {
                 .unwrap(),
             auth_expiry: SystemTime::now() + Duration::from_secs(86400),
             observed: Instant::now(),
-        });
+        }));
         publisher.set_shutdown(shutdown.clone());
         struct AssociatedReader;
         impl UsageReader for AssociatedReader {
@@ -2582,7 +5230,9 @@ mod tests {
             cycles[2]["w1:p2"],
             json!({"lineup_group":null,"lineup_group_ship_text":null})
         );
-        assert_eq!(cycles[2]["w1"]["lineup_repo"], "—");
+        // An Unknown heading clears the workspace keys instead of showing `—`.
+        assert!(cycles[2]["w1"]["lineup_repo"].is_null());
+        assert!(cycles[2]["w1"]["lineup_ship_text"].is_null());
     }
 
     #[test]
@@ -2760,7 +5410,8 @@ mod tests {
         assert!(result.is_ok(), "real one-shot response failed: {result:?}");
         let report = report.unwrap();
         assert_eq!(report["method"], "workspace.report_metadata");
-        assert_eq!(report["params"]["tokens"]["lineup_repo"], "—");
+        // No repository is an Unknown heading: its stored keys are cleared.
+        assert!(report["params"]["tokens"]["lineup_repo"].is_null());
     }
 
     #[test]
@@ -2965,6 +5616,266 @@ mod tests {
         assert!(flag.load(Ordering::Acquire), "fixture did not reach reader");
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         assert_eq!(reports, 0, "shutdown must not publish a partial refresh");
+    }
+
+    #[test]
+    fn fast_pane_publishes_before_subsequent_slow_reader() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        struct StepReader {
+            rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl UsageReader for StepReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                if request.identity.native_session_id == "slow-native" {
+                    // Pane 2 waits until Pane 1 has already reached the server.
+                    let _ = self.rx.lock().unwrap().recv_timeout(Duration::from_secs(2));
+                }
+                TimeoutReader.read(request)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let socket = dir.path().join("order.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_millis(500));
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(stream.get_mut(), "{}", json!({"id":request["id"],"result":{
+                "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                "workspaces":[{"workspace_id":"w1"}],"panes":[
+                    {"pane_id":"w1:p1","workspace_id":"w1","agent":"codex",
+                     "agent_session":{"agent":"codex","kind":"id","value":"fast-native"},"agent_status":"idle"},
+                    {"pane_id":"w1:p2","workspace_id":"w1","agent":"codex",
+                     "agent_session":{"agent":"codex","kind":"id","value":"slow-native"},"agent_status":"idle"}
+                ]}
+            }})).unwrap();
+            let mut pane_order = Vec::new();
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap_or_default();
+                if method == "pane.report_metadata" {
+                    let target = request["params"]["pane_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    pane_order.push(target);
+                    // Signal to slow reader that first pane arrived at server.
+                    let _ = tx.send(());
+                }
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+            }
+            pane_order
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().join("state"),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("synthetic-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        let reader = StepReader {
+            rx: std::sync::Mutex::new(rx),
+        };
+        let result = publisher.refresh_with_readers(
+            &mut transport,
+            &Config::default(),
+            &reader,
+            &TimeoutReader,
+        );
+        drop(transport);
+        let pane_order = server.join().unwrap();
+        assert!(result.is_ok(), "refresh failed: {:?}", result);
+        assert_eq!(pane_order, vec!["w1:p1", "w1:p2"]);
+    }
+
+    #[test]
+    fn shutdown_during_subsequent_reader_preserves_earlier_pane_publication() {
+        struct StoppingOnSecondReader(Arc<AtomicBool>);
+        impl UsageReader for StoppingOnSecondReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                if request.identity.native_session_id == "stopping-native" {
+                    self.0.store(true, Ordering::Release);
+                }
+                TimeoutReader.read(request)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let socket = dir.path().join("subsequent-cancel.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_millis(500));
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(stream.get_mut(), "{}", json!({"id":request["id"],"result":{
+                "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                "workspaces":[{"workspace_id":"w1"}],"panes":[
+                    {"pane_id":"w1:p1","workspace_id":"w1","agent":"codex",
+                     "agent_session":{"agent":"codex","kind":"id","value":"fast-native"},"agent_status":"idle"},
+                    {"pane_id":"w1:p2","workspace_id":"w1","agent":"codex",
+                     "agent_session":{"agent":"codex","kind":"id","value":"stopping-native"},"agent_status":"idle"}
+                ]}
+            }})).unwrap();
+            let mut received_panes = Vec::new();
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                if request["method"].as_str() == Some("pane.report_metadata") {
+                    received_panes.push(request["params"]["pane_id"].as_str().unwrap().to_string());
+                }
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"result":{"type":"ok"}})
+                )
+                .unwrap();
+            }
+            received_panes
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = MetadataPublisher::new(
+            dir.path().join("state"),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.path().join("synthetic-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        publisher.set_shutdown(flag.clone());
+        let result = publisher.refresh_with_readers(
+            &mut transport,
+            &Config::default(),
+            &StoppingOnSecondReader(flag.clone()),
+            &TimeoutReader,
+        );
+        drop(transport);
+        let received_panes = server.join().unwrap();
+        assert!(
+            flag.load(Ordering::Acquire),
+            "fixture did not reach second reader"
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        // Earlier fast pane was already published and acknowledged before second reader shutdown.
+        assert_eq!(received_panes, vec!["w1:p1"]);
+    }
+
+    #[test]
+    fn slow_heading_does_not_consume_reader_timeout_budget() {
+        if let Some(root) = std::env::var_os("LINEUP_TEST_SLOW_HEADING") {
+            let root = PathBuf::from(root);
+            let recorded_timeout = Arc::new(std::sync::Mutex::new(None));
+            let recorded = recorded_timeout.clone();
+            struct RecordingReader(Arc<std::sync::Mutex<Option<Duration>>>);
+            impl UsageReader for RecordingReader {
+                fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                    *self.0.lock().unwrap() = Some(request.timeout);
+                    TimeoutReader.read(request)
+                }
+            }
+            let socket = root.join("slow-heading.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server_root = root.clone();
+            let server = std::thread::spawn(move || {
+                let mut stream = OneShotServer::new(listener, Duration::from_millis(1000));
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                writeln!(stream.get_mut(), "{}", json!({"id":request["id"],"result":{
+                    "type":"session_snapshot","snapshot":{"version":"0.9.3","protocol":22,
+                    "workspaces":[{"workspace_id":"w1","checkout_path":server_root.to_str().unwrap()}],
+                    "panes":[{
+                        "pane_id":"w1:p1","workspace_id":"w1","agent":"codex",
+                        "agent_session":{"agent":"codex","kind":"id","value":"synthetic-native"},"agent_status":"idle"
+                    }]}
+                }})).unwrap();
+                loop {
+                    line.clear();
+                    if stream.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    writeln!(
+                        stream.get_mut(),
+                        "{}",
+                        json!({"id":request["id"],"result":{"type":"ok"}})
+                    )
+                    .unwrap();
+                }
+            });
+            let mut transport = Transport::connect(&socket).unwrap();
+            let mut publisher = MetadataPublisher::new(
+                root.join("state"),
+                "fake".into(),
+                Homes {
+                    codex: Some(root.join("synthetic-home")),
+                    ..Homes::default()
+                },
+            )
+            .unwrap();
+            let config = Config {
+                reader_timeout_ms: 100,
+                ..Config::default()
+            };
+            let result = publisher.refresh_with_readers(
+                &mut transport,
+                &config,
+                &RecordingReader(recorded),
+                &TimeoutReader,
+            );
+            drop(transport);
+            server.join().unwrap();
+            assert!(result.is_ok(), "refresh failed: {:?}", result);
+            let captured = recorded_timeout.lock().unwrap().unwrap();
+            // Git mock slept for ~150ms. If reader deadline were computed before resolve_headings,
+            // the 100ms reader budget would have expired before the first reader even began.
+            assert!(
+                captured > Duration::from_millis(70),
+                "reader timeout was consumed by headings stage: {captured:?}"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        let script = bin.join("git");
+        crate::test_support::write_executable(&script, "#!/bin/sh\n/bin/sleep 0.15\nexit 1\n")
+            .unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "publish::tests::slow_heading_does_not_consume_reader_timeout_budget",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", &bin)
+            .env("LINEUP_TEST_SLOW_HEADING", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
@@ -3235,6 +6146,124 @@ mod tests {
         }}})
     }
 
+    // Run explicitly with --ignored --nocapture. This uses the existing fake
+    // socket and snapshot shape, and never connects to a Herdr session.
+    #[test]
+    #[ignore = "synthetic refresh latency measurement"]
+    fn measure_refresh_stages() {
+        let root = std::env::var_os("LINEUP_BENCH_ROOT").expect("set LINEUP_BENCH_ROOT");
+        let root = Path::new(&root);
+        let repeats: usize = std::env::var("LINEUP_BENCH_REPEATS")
+            .unwrap_or_else(|_| "3".into())
+            .parse()
+            .unwrap();
+        assert!(repeats >= 2);
+        println!(
+            "panes,run,total_us,pipeline_us,snapshot_us,git_us,reader_us,persist_us,socket_us,reports,checkpoint_rows,external_us"
+        );
+        for panes in [1, 8, 32, 128, 256] {
+            for run in 0..repeats {
+                let dir = tempfile::Builder::new()
+                    .prefix("herdr-lineup-refresh-")
+                    .disable_cleanup(root != Path::new("/tmp"))
+                    .tempdir_in(root)
+                    .unwrap();
+                let repo = dir.path().join("repo");
+                std::fs::create_dir(&repo).unwrap();
+                let git = |args: &[&str]| {
+                    let output = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&repo)
+                        .args(args)
+                        .env_remove("GIT_DIR")
+                        .env_remove("GIT_WORK_TREE")
+                        .env_remove("GIT_INDEX_FILE")
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "git fixture failed: {:?}", args);
+                };
+                git(&["init", "-q"]);
+                git(&[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "fixture",
+                ]);
+                git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+                let socket = dir.path().join("fake.sock");
+                let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let mut template = snapshot(&json!("template"), true);
+                template["result"]["snapshot"]["workspaces"][0]["checkout_path"] = json!(repo);
+                template["result"]["snapshot"]["panes"] = Value::Array(
+                    (0..panes)
+                        .map(|index| {
+                            json!({"pane_id":format!("w1:p{index}"), "workspace_id":"w1",
+                                "cwd":repo,"agent":"codex",
+                                "agent_session":{"agent":"codex","kind":"id",
+                                    "value":format!("synthetic-{index}")},
+                                "agent_status":"working","tokens":{}})
+                        })
+                        .collect(),
+                );
+                let server = token_server_with_template(
+                    UnixListener::bind(&socket).unwrap(),
+                    clock,
+                    Arc::new(std::sync::Mutex::new(template)),
+                );
+                let mut transport = Transport::connect(&socket).unwrap();
+                let mut publisher = MetadataPublisher::new(
+                    dir.path().into(),
+                    "fake".into(),
+                    Homes {
+                        codex: Some(dir.path().into()),
+                        ..Homes::default()
+                    },
+                )
+                .unwrap();
+                publisher.set_shutdown(Arc::new(AtomicBool::new(false)));
+                let external_start = Instant::now();
+                publisher
+                    .refresh_cycle_with_readers(
+                        &mut transport,
+                        &Config::default(),
+                        &SampleReader,
+                        &SampleReader,
+                    )
+                    .unwrap();
+                let external = external_start.elapsed();
+                let stages = publisher.stages.lock().unwrap().clone().unwrap();
+                let us = |duration: Duration| duration.as_micros();
+                println!(
+                    "{panes},{run},{},{},{},{},{},{},{},{},{},{}",
+                    us(stages.refresh),
+                    us(stages.pipeline),
+                    us(stages.snapshot),
+                    us(stages.git),
+                    us(stages.reader),
+                    us(stages.persist),
+                    us(stages.socket),
+                    stages.reports,
+                    stages.checkpoint_rows,
+                    us(external)
+                );
+                publisher.request(&mut transport, "test.finish").unwrap();
+                server.join().unwrap();
+                if root != Path::new("/tmp") {
+                    // Preserve disk fixtures: only /tmp-owned fixture directories
+                    // may be reclaimed automatically by this measurement.
+                    let path = dir.keep();
+                    eprintln!("retained_fixture={}", path.display());
+                }
+            }
+        }
+    }
+
     #[test]
     fn checkpoint_is_loaded_after_construction_before_first_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -3323,6 +6352,7 @@ mod tests {
         let mut restarted =
             MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
         restarted.load_checkpoint().unwrap();
+        restarted.reserve_window_for_endpoint(endpoint, 32).unwrap();
         let resource = ResourceId {
             endpoint_session: endpoint.into(),
             kind: ResourceKind::Pane,
@@ -3386,13 +6416,23 @@ mod tests {
         let reserved = std::fs::read(dir.path().join("sequences.json")).unwrap();
         let rows: Vec<CheckpointRow> = serde_json::from_slice(&reserved).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].seq, 1);
-        // Acceptance does not move the high-water mark, so rewriting the
-        // checkpoint after acknowledge stores the same bytes.
+        assert_eq!(rows[0].kind, "endpoint");
+        assert_eq!(rows[0].seq, MIN_RESERVATION_WINDOW);
+        // Acceptance does not move the high-water mark. Rewriting the checkpoint
+        // after acknowledge writes the confirmed resource rows alongside the reserved endpoint window.
         publisher.persist().unwrap();
-        assert_eq!(
-            std::fs::read(dir.path().join("sequences.json")).unwrap(),
-            reserved
+        let post_ack_rows: Vec<CheckpointRow> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
+                .unwrap();
+        assert!(
+            post_ack_rows
+                .iter()
+                .any(|r| r.kind == "endpoint" && r.seq == MIN_RESERVATION_WINDOW)
+        );
+        assert!(
+            post_ack_rows
+                .iter()
+                .any(|r| r.kind == "pane" && r.id == "w1:p1" && r.seq == 1)
         );
 
         let mut restarted =
@@ -3413,7 +6453,10 @@ mod tests {
         let rows: Vec<CheckpointRow> =
             serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
                 .unwrap();
-        assert_eq!(rows[0].seq, 2);
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == "endpoint" && r.seq == MIN_RESERVATION_WINDOW * 2)
+        );
         server.join().unwrap();
     }
 
@@ -3450,7 +6493,7 @@ mod tests {
         let rows: Vec<CheckpointRow> =
             serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
                 .unwrap();
-        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[0].seq, MIN_RESERVATION_WINDOW);
         let mut line = String::new();
         assert!(stream.read_line(&mut line).is_err());
         assert!(line.is_empty());
@@ -3497,7 +6540,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("sequences.json")).unwrap())
                 .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[0].seq, MIN_RESERVATION_WINDOW);
     }
 
     #[test]
@@ -3729,11 +6772,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let mut reports = Vec::new();
+            // The workspace has no repository: its Unknown heading publishes
+            // nulls once in cycle 1 and needs no clear frame afterwards.
             for cycle in 0..3 {
                 let request = receive(&mut stream);
                 let response = snapshot(&request["id"], true);
                 writeln!(stream.get_mut(), "{response}").unwrap();
-                for _ in 0..if cycle == 0 { 1 } else { 2 } {
+                for _ in 0..if cycle == 1 { 2 } else { 1 } {
                     let request = receive(&mut stream);
                     let response = if cycle == 0 {
                         json!({"id":request["id"],"error":{"code":"rejected","message":"synthetic rejection"}})
@@ -3754,10 +6799,14 @@ mod tests {
         publisher.refresh(&mut transport, &config).unwrap();
         publisher.clear(&mut transport).unwrap();
         let reports = server.join().unwrap();
+        assert_eq!(reports.len(), 4);
         assert_eq!(reports[0]["params"]["seq"], 1);
         assert_eq!(reports[1]["params"]["seq"], 2);
-        assert_eq!(reports[3]["params"]["seq"], 3);
-        for request in &reports[3..] {
+        assert_eq!(reports[3]["params"]["seq"], 4);
+        // Cycle 1 visits the workspace first because the rejected pane rotated;
+        // the workspace frame and the clear frame carry only nulls.
+        assert_eq!(reports[1]["method"], "workspace.report_metadata");
+        for request in [&reports[1], &reports[3]] {
             let tokens = request["params"]["tokens"].as_object().unwrap();
             assert!(tokens.values().all(Value::is_null));
             assert!(tokens.keys().all(|key| key.starts_with("lineup_")));
@@ -3785,7 +6834,7 @@ mod tests {
         )
         .unwrap();
         let result = publisher.refresh(&mut transport, &crate::config::Config::default());
-        assert_eq!(capacity_skip_count(result.as_ref().unwrap_err()), None);
+        assert_eq!(refresh_skip(result.as_ref().unwrap_err()), None);
         server.join().unwrap();
     }
 
@@ -3885,7 +6934,13 @@ mod tests {
         let mut publisher =
             MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
         let result = publisher.refresh(&mut transport, &crate::config::Config::default());
-        assert_eq!(capacity_skip_count(result.as_ref().unwrap_err()), Some(1));
+        assert_eq!(
+            refresh_skip(result.as_ref().unwrap_err()),
+            Some(RefreshSkip {
+                capacity_skipped: 1,
+                deadline_skipped: 0
+            })
+        );
         let mut health = crate::daemon::Health {
             plugin: crate::daemon::PLUGIN_ID.into(),
             socket_path: socket,
@@ -4059,13 +7114,18 @@ mod tests {
                     let rows: Vec<CheckpointRow> =
                         serde_json::from_slice(&std::fs::read(&server_checkpoint).unwrap())
                             .unwrap();
-                    assert!(rows.iter().any(|row| row.id
-                        == request["params"][if request["method"] == "pane.report_metadata" {
-                            "pane_id"
-                        } else {
-                            "workspace_id"
-                        }]
-                        && row.seq == request["params"]["seq"]));
+                    assert!(rows.iter().any(|row| {
+                        (row.kind == "endpoint"
+                            && row.seq >= request["params"]["seq"].as_u64().unwrap())
+                            || (row.id
+                                == request["params"][if request["method"] == "pane.report_metadata"
+                                {
+                                    "pane_id"
+                                } else {
+                                    "workspace_id"
+                                }]
+                                && row.seq >= request["params"]["seq"].as_u64().unwrap())
+                    }));
                     let response = json!({"id":request["id"], "result":{"type":"ok"}});
                     writeln!(stream.get_mut(), "{response}").unwrap();
                     remember_tokens(&mut stored, &request);
@@ -4115,8 +7175,8 @@ mod tests {
                 .values()
                 .all(Value::is_null)
         );
-        assert_eq!(reports[3]["params"]["seq"], 3);
-        assert_eq!(reports[4]["params"]["seq"], 2);
+        assert_eq!(reports[3]["params"]["seq"], MIN_RESERVATION_WINDOW + 1);
+        assert_eq!(reports[4]["params"]["seq"], MIN_RESERVATION_WINDOW + 2);
     }
 
     #[test]
@@ -4396,6 +7456,1656 @@ mod tests {
         assert_eq!(pane(&expired, 1)["lineup_context_text"], "08%");
         assert_eq!(pane(&expired, 1)["lineup_context_pct"], "7.5");
         publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn reservation_checked_overflow_fails_closed_before_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_millis(100));
+            let request = receive(&mut stream);
+            writeln!(stream.get_mut(), "{}", snapshot(&request["id"], true)).unwrap();
+            let mut line = String::new();
+            assert!(stream.read_line(&mut line).is_err());
+            assert!(line.is_empty());
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let identity = transport.identity();
+        let endpoint = format!("fake:{}:{}", identity.device, identity.inode);
+        publisher.load_checkpoint().unwrap();
+        publisher
+            .planner
+            .confirm_reservation(&endpoint, u64::MAX)
+            .unwrap();
+        publisher.planner.set_cursor_for_test(&endpoint, u64::MAX);
+
+        let result = publisher.refresh(&mut transport, &crate::config::Config::default());
+        assert!(result.is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_checkpoint_migration_in_metadata_publisher() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_rows = vec![
+            CheckpointRow {
+                endpoint: "ep1".into(),
+                kind: "pane".into(),
+                id: "w1:p1".into(),
+                seq: 15,
+            },
+            CheckpointRow {
+                endpoint: "ep1".into(),
+                kind: "pane".into(),
+                id: "w1:p2".into(),
+                seq: 28,
+            },
+        ];
+        std::fs::write(
+            dir.path().join("sequences.json"),
+            serde_json::to_vec(&legacy_rows).unwrap(),
+        )
+        .unwrap();
+
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        publisher.load_checkpoint().unwrap();
+        let (cursor, upper_bound) = publisher.planner.endpoint_window("ep1");
+        assert_eq!(cursor, 28);
+        assert_eq!(upper_bound, 28);
+        assert!(!publisher.planner.has_available_reservation("ep1"));
+
+        publisher.reserve_window_for_endpoint("ep1", 32).unwrap();
+        let (cursor, upper_bound) = publisher.planner.endpoint_window("ep1");
+        assert_eq!(cursor, 28);
+        assert_eq!(upper_bound, 28 + 32);
+        assert!(publisher.planner.has_available_reservation("ep1"));
+    }
+
+    #[test]
+    fn window_amortizes_persists_across_multiple_reports_within_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(2));
+            for _ in 0..5 {
+                let request = receive(&mut stream);
+                writeln!(
+                    stream.get_mut(),
+                    "{}",
+                    json!({"id": request["id"], "result": {"type": "ok"}})
+                )
+                .unwrap();
+            }
+        });
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().into(), "fake".into(), Homes::default()).unwrap();
+        let endpoint = "ep-batch";
+        for i in 1..=5 {
+            let resource = ResourceId {
+                endpoint_session: endpoint.into(),
+                kind: ResourceKind::Pane,
+                id: format!("w1:p{i}"),
+            };
+            let desired = BTreeMap::from([("lineup_agent".into(), Some("codex".into()))]);
+            publisher
+                .report(
+                    &mut transport,
+                    &resource,
+                    &BTreeSet::new(),
+                    None,
+                    &desired,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 1);
+        server.join().unwrap();
+    }
+
+    fn endpoint_upper_bound_on_disk(dir: &Path) -> Option<u64> {
+        let bytes = std::fs::read(dir.join("sequences.json")).ok()?;
+        let rows: Vec<CheckpointRow> = serde_json::from_slice(&bytes).unwrap();
+        rows.into_iter()
+            .find(|row| row.kind == "endpoint")
+            .map(|row| row.seq)
+    }
+
+    fn report_logo(
+        publisher: &mut MetadataPublisher,
+        transport: &mut Transport,
+        pane: &str,
+        logo: &str,
+    ) -> io::Result<()> {
+        let snapshot = publisher.snapshot(transport)?;
+        let keys = snapshot
+            .panes
+            .iter()
+            .find(|candidate| candidate.pane_id == pane)
+            .map(|candidate| candidate.stored_keys.clone())
+            .unwrap_or_default();
+        let resource = publisher.resource(ResourceKind::Pane, pane);
+        let desired = BTreeMap::from([("lineup_logo".into(), Some(logo.into()))]);
+        publisher.report(transport, &resource, &keys, None, &desired, None)
+    }
+
+    #[test]
+    fn stale_sequence_server_applies_reports_across_window_restart_and_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
+        let log = ReportLog::default();
+        let server = sequence_server(
+            UnixListener::bind(&socket).unwrap(),
+            clock,
+            template.clone(),
+            log.clone(),
+            Arc::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(state.clone(), "fake".into(), Homes::default()).unwrap();
+
+        // Cross the first window boundary: 40 reports need exactly two
+        // reservation writes and no other checkpoint write.
+        let reports = MIN_RESERVATION_WINDOW + 8;
+        for index in 0..reports {
+            report_logo(
+                &mut publisher,
+                &mut transport,
+                "w1:p1",
+                &format!("a{index}"),
+            )
+            .unwrap();
+        }
+        assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 2);
+        let first_upper_bound = endpoint_upper_bound_on_disk(&state).unwrap();
+        assert_eq!(first_upper_bound, MIN_RESERVATION_WINDOW * 2);
+
+        // Restart discards the unused part of the window: the first seq is
+        // above the old durable upper bound, not just above the last sent seq.
+        drop(publisher);
+        let mut publisher =
+            MetadataPublisher::new(state.clone(), "fake".into(), Homes::default()).unwrap();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "restart").unwrap();
+        assert!(log.lock().unwrap().last().unwrap().1 > first_upper_bound);
+
+        // The pane leaves the authoritative snapshot and its ID comes back.
+        let removed = std::mem::take(
+            template.lock().unwrap()["result"]["snapshot"]["panes"]
+                .as_array_mut()
+                .unwrap(),
+        );
+        let snapshot = publisher.snapshot(&mut transport).unwrap();
+        publisher.reconcile_missing(&snapshot).unwrap();
+        template.lock().unwrap()["result"]["snapshot"]["panes"] = Value::Array(removed);
+        report_logo(&mut publisher, &mut transport, "w1:p1", "reused").unwrap();
+
+        // A publisher that lost the checkpoint is answered `ok` but ignored.
+        let lost = dir.path().join("lost");
+        std::fs::create_dir(&lost).unwrap();
+        let mut forgetful = MetadataPublisher::new(lost, "fake".into(), Homes::default()).unwrap();
+        report_logo(&mut forgetful, &mut transport, "w1:p1", "stale").unwrap();
+
+        let (_, response) = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap();
+        publisher.request(&mut transport, "test.finish").unwrap();
+        server.join().unwrap();
+
+        let log = log.lock().unwrap();
+        let (stale, applied) = log.split_last().unwrap();
+        assert_eq!(applied.len() as u64, reports + 2);
+        assert!(applied.iter().all(|(_, _, applied)| *applied));
+        assert!(applied.windows(2).all(|pair| pair[0].1 < pair[1].1));
+        assert_eq!(stale, &("w1:p1".to_string(), 1, false));
+        assert_eq!(
+            response["result"]["snapshot"]["panes"][0]["tokens"]["lineup_logo"],
+            "reused"
+        );
+    }
+
+    #[test]
+    fn uncertain_checkpoint_write_poisons_publication_until_new_instance() {
+        for stage in [
+            PersistStage::FileSync,
+            PersistStage::Rename,
+            PersistStage::DirectorySync,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("fake.sock");
+            let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
+            let log = ReportLog::default();
+            let server = sequence_server(
+                UnixListener::bind(&socket).unwrap(),
+                clock,
+                template,
+                log.clone(),
+                Arc::default(),
+            );
+            let mut transport = Transport::connect(&socket).unwrap();
+            let state = dir.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            let mut publisher =
+                MetadataPublisher::new(state.clone(), "fake".into(), Homes::default()).unwrap();
+
+            let snapshot = publisher.snapshot(&mut transport).unwrap();
+            let endpoint = publisher.endpoint.clone().unwrap();
+            let resource = publisher.resource(ResourceKind::Pane, "w1:p1");
+            let desired = BTreeMap::from([("lineup_logo".into(), Some("Codex".into()))]);
+            publisher.reservation_window = MAX_RESERVATION_WINDOW;
+            *publisher.persist_fault.lock().unwrap() = Some(stage);
+            assert!(
+                publisher
+                    .report(
+                        &mut transport,
+                        &resource,
+                        &snapshot.panes[0].stored_keys,
+                        None,
+                        &desired,
+                        None,
+                    )
+                    .is_err()
+            );
+            // Only a rename that already happened leaves the new upper bound.
+            let expected_disk =
+                (stage == PersistStage::DirectorySync).then_some(MAX_RESERVATION_WINDOW);
+            assert_eq!(endpoint_upper_bound_on_disk(&state), expected_disk);
+
+            // With the fault gone, the poison alone must stop every path from
+            // writing a smaller upper bound or sending a frame.
+            *publisher.persist_fault.lock().unwrap() = None;
+            assert!(
+                publisher
+                    .report(
+                        &mut transport,
+                        &resource,
+                        &snapshot.panes[0].stored_keys,
+                        None,
+                        &desired,
+                        None,
+                    )
+                    .is_err()
+            );
+            assert!(
+                publisher
+                    .reserve_window_for_endpoint(&endpoint, MIN_RESERVATION_WINDOW)
+                    .is_err()
+            );
+            assert!(publisher.persist().is_err());
+            assert!(
+                publisher
+                    .refresh(&mut transport, &crate::config::Config::default())
+                    .is_err()
+            );
+            publisher.reconnected();
+            assert!(publisher.snapshot(&mut transport).is_err());
+            assert!(publisher.clear(&mut transport).is_err());
+            assert_eq!(publisher.checkpoint_persists.load(Ordering::Relaxed), 0);
+            assert_eq!(endpoint_upper_bound_on_disk(&state), expected_disk);
+            assert!(log.lock().unwrap().is_empty(), "{stage:?} sent a report");
+
+            // A new instance reloads whatever the disk holds and resumes
+            // above it.
+            drop(publisher);
+            let mut restarted =
+                MetadataPublisher::new(state.clone(), "fake".into(), Homes::default()).unwrap();
+            report_logo(&mut restarted, &mut transport, "w1:p1", "Codex").unwrap();
+            restarted.request(&mut transport, "test.finish").unwrap();
+            server.join().unwrap();
+            let log = log.lock().unwrap();
+            assert_eq!(log.len(), 1);
+            assert!(log[0].2);
+            assert_eq!(log[0].1, expected_disk.unwrap_or_default() + 1);
+        }
+    }
+
+    struct SequenceFixture {
+        dir: tempfile::TempDir,
+        socket: PathBuf,
+        state: PathBuf,
+        template: Arc<std::sync::Mutex<Value>>,
+        log: ReportLog,
+        lose_response_for: Arc<std::sync::atomic::AtomicU64>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl SequenceFixture {
+        fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("fake.sock");
+            let state = dir.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
+            let log = ReportLog::default();
+            let lose_response_for = Arc::<std::sync::atomic::AtomicU64>::default();
+            let server = sequence_server(
+                UnixListener::bind(&socket).unwrap(),
+                Arc::default(),
+                template.clone(),
+                log.clone(),
+                lose_response_for.clone(),
+            );
+            Self {
+                dir,
+                socket,
+                state,
+                template,
+                log,
+                lose_response_for,
+                server,
+            }
+        }
+
+        fn publisher(&self) -> MetadataPublisher {
+            MetadataPublisher::new(self.state.clone(), "fake".into(), Homes::default()).unwrap()
+        }
+
+        fn seqs(&self) -> Vec<(u64, bool)> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, seq, applied)| (*seq, *applied))
+                .collect()
+        }
+
+        /// Ends the server and returns its final pane tokens.
+        fn finish(self, publisher: &mut MetadataPublisher, transport: &mut Transport) -> Value {
+            let (_, response) = publisher.request(transport, "session.snapshot").unwrap();
+            publisher.request(transport, "test.finish").unwrap();
+            self.server.join().unwrap();
+            drop(self.dir);
+            response["result"]["snapshot"]["panes"][0]["tokens"].clone()
+        }
+    }
+
+    #[test]
+    fn response_lost_after_apply_is_never_replayed() {
+        let fixture = SequenceFixture::start();
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "a").unwrap();
+        // The server applies seq 2 and then drops the reply.
+        fixture.lose_response_for.store(2, Ordering::Release);
+        assert!(report_logo(&mut publisher, &mut transport, "w1:p1", "b").is_err());
+        assert_eq!(fixture.seqs(), [(1, true), (2, true)]);
+
+        // Reconnect: the unacknowledged seq 2 is not reused and the old
+        // patch is not resent; the current desired value goes out above it.
+        publisher.reconnected();
+        transport.reconnect_same_endpoint().unwrap();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "c").unwrap();
+        // Restart: the new instance continues above the durable bound.
+        drop(publisher);
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "d").unwrap();
+
+        // `reconnected` and restart both discard the rest of the window.
+        let window = MIN_RESERVATION_WINDOW;
+        assert_eq!(
+            fixture.seqs(),
+            [
+                (1, true),
+                (2, true),
+                (window + 1, true),
+                (2 * window + 1, true)
+            ]
+        );
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "d");
+    }
+
+    #[test]
+    fn process_exit_after_reservation_discards_unused_window() {
+        if let Some(socket) = std::env::var_os("LINEUP_SEQUENCE_EXIT_CHILD") {
+            let state = PathBuf::from(std::env::var_os("LINEUP_SEQUENCE_EXIT_STATE").unwrap());
+            let mut transport = Transport::connect(Path::new(&socket)).unwrap();
+            let mut publisher =
+                MetadataPublisher::new(state, "fake".into(), Homes::default()).unwrap();
+            report_logo(&mut publisher, &mut transport, "w1:p1", "child").unwrap();
+            // Exit with 31 reserved slots unused and without running Drop.
+            std::process::exit(0);
+        }
+        let fixture = SequenceFixture::start();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "publish::tests::process_exit_after_reservation_discards_unused_window",
+            ])
+            .env("LINEUP_SEQUENCE_EXIT_CHILD", &fixture.socket)
+            .env("LINEUP_SEQUENCE_EXIT_STATE", &fixture.state)
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "sequence child failed");
+        let child_upper_bound = endpoint_upper_bound_on_disk(&fixture.state).unwrap();
+        assert_eq!(child_upper_bound, MIN_RESERVATION_WINDOW);
+        assert_eq!(fixture.seqs(), [(1, true)]);
+
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "parent").unwrap();
+        assert_eq!(fixture.seqs(), [(1, true), (child_upper_bound + 1, true)]);
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "parent");
+    }
+
+    #[test]
+    fn clear_deadline_after_reservation_burns_the_unsent_seq() {
+        let fixture = SequenceFixture::start();
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        let snapshot = publisher.snapshot(&mut transport).unwrap();
+        let resource = publisher.resource(ResourceKind::Pane, "w1:p1");
+        let desired = BTreeMap::from([("lineup_logo".into(), Some("late".into()))]);
+        // A deadline that has passed by the time the reservation is durable:
+        // `report` reserves and allocates, then stops before the send.
+        let expired = Instant::now();
+        assert!(
+            publisher
+                .report(
+                    &mut transport,
+                    &resource,
+                    &snapshot.panes[0].stored_keys,
+                    None,
+                    &desired,
+                    Some(expired),
+                )
+                .is_err()
+        );
+        assert!(fixture.seqs().is_empty());
+        assert_eq!(
+            endpoint_upper_bound_on_disk(&fixture.state),
+            Some(MIN_RESERVATION_WINDOW)
+        );
+
+        report_logo(&mut publisher, &mut transport, "w1:p1", "next").unwrap();
+        drop(publisher);
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "restart").unwrap();
+        // Seq 1 was burned without a send; the restart skips the unused window.
+        assert_eq!(
+            fixture.seqs(),
+            [(2, true), (MIN_RESERVATION_WINDOW + 1, true)]
+        );
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "restart");
+    }
+
+    #[test]
+    fn failed_pruning_persist_poisons_refresh_clear_and_reconnect() {
+        let fixture = SequenceFixture::start();
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "a").unwrap();
+        let removed = std::mem::take(
+            fixture.template.lock().unwrap()["result"]["snapshot"]["panes"]
+                .as_array_mut()
+                .unwrap(),
+        );
+        let snapshot = publisher.snapshot(&mut transport).unwrap();
+        *publisher.persist_fault.lock().unwrap() = Some(PersistStage::DirectorySync);
+        assert!(publisher.reconcile_missing(&snapshot).is_err());
+        *publisher.persist_fault.lock().unwrap() = None;
+        fixture.template.lock().unwrap()["result"]["snapshot"]["panes"] = Value::Array(removed);
+
+        assert!(
+            publisher
+                .refresh(&mut transport, &crate::config::Config::default())
+                .is_err()
+        );
+        publisher.reconnected();
+        assert!(publisher.snapshot(&mut transport).is_err());
+        assert!(publisher.clear(&mut transport).is_err());
+        assert!(report_logo(&mut publisher, &mut transport, "w1:p1", "b").is_err());
+        assert_eq!(fixture.seqs(), [(1, true)]);
+
+        drop(publisher);
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "b").unwrap();
+        assert_eq!(
+            fixture.seqs(),
+            [(1, true), (MIN_RESERVATION_WINDOW + 1, true)]
+        );
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "b");
+    }
+
+    // Runtime wiring fixtures (plan F1 to F19). Time thresholds use shrunken
+    // cycle terms and hooks at exact boundaries instead of long real waits.
+
+    /// One received report: resource ID and sequence.
+    type BudgetLog = Arc<std::sync::Mutex<Vec<(String, u64)>>>;
+
+    #[derive(Default)]
+    struct BudgetServer {
+        /// Delay before answering each report.
+        report_delay: Duration,
+        /// Zero-based index of a report that is read but never answered.
+        stall_report: Option<usize>,
+        /// Written before answering the first report for this resource.
+        marker: Option<(String, PathBuf)>,
+        /// Milliseconds to wait before answering each snapshot.
+        snapshot_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    fn budget_server(
+        listener: UnixListener,
+        template: Arc<std::sync::Mutex<Value>>,
+        behavior: BudgetServer,
+        log: BudgetLog,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
+            let mut stored = BTreeMap::new();
+            let mut reports = 0usize;
+            loop {
+                let request = receive(&mut stream);
+                let response = match request["method"].as_str().unwrap() {
+                    "session.snapshot" => {
+                        std::thread::sleep(Duration::from_millis(
+                            behavior.snapshot_delay_ms.load(Ordering::Acquire),
+                        ));
+                        let mut response =
+                            with_stored_tokens(template.lock().unwrap().clone(), &stored);
+                        response["id"] = request["id"].clone();
+                        response
+                    }
+                    "test.finish" => {
+                        writeln!(
+                            stream.get_mut(),
+                            "{}",
+                            json!({"id":request["id"],"result":{"type":"ok"}})
+                        )
+                        .unwrap();
+                        break;
+                    }
+                    _ => {
+                        let params = &request["params"];
+                        let id = params["pane_id"]
+                            .as_str()
+                            .or_else(|| params["workspace_id"].as_str())
+                            .unwrap()
+                            .to_owned();
+                        log.lock()
+                            .unwrap()
+                            .push((id.clone(), params["seq"].as_u64().unwrap()));
+                        let index = reports;
+                        reports += 1;
+                        if behavior.stall_report == Some(index) {
+                            // Read, never answered: the next accept drops it.
+                            continue;
+                        }
+                        if let Some((target, path)) = &behavior.marker
+                            && *target == id
+                            && !path.exists()
+                        {
+                            std::fs::write(path, b"acknowledged").unwrap();
+                        }
+                        std::thread::sleep(behavior.report_delay);
+                        remember_tokens(&mut stored, &request);
+                        json!({"id":request["id"],"result":{"type":"ok"}})
+                    }
+                };
+                writeln!(stream.get_mut(), "{response}").unwrap();
+            }
+        })
+    }
+
+    fn budget_pane(pane: &str, workspace: &str, agent: Option<&str>, native: &str) -> Value {
+        let mut value = json!({"pane_id": pane, "workspace_id": workspace, "agent": agent,
+            "agent_status": "working", "tokens": {}});
+        if let Some(agent) = agent {
+            value["agent_session"] = json!({"agent": agent, "kind": "id", "value": native});
+        }
+        value
+    }
+
+    fn budget_workspace(workspace: &str, checkout: Option<&str>) -> Value {
+        let mut value = json!({"workspace_id": workspace, "tokens": {}});
+        if let Some(checkout) = checkout {
+            value["worktree"] = json!({"checkout_path": checkout});
+        }
+        value
+    }
+
+    fn budget_template(panes: Vec<Value>, workspaces: Vec<Value>) -> Arc<std::sync::Mutex<Value>> {
+        Arc::new(std::sync::Mutex::new(json!({"id": "template", "result": {
+            "type": "session_snapshot", "snapshot": {"version": "0.9.3", "protocol": 17,
+            "workspaces": workspaces, "panes": panes}}})))
+    }
+
+    fn budget_terms(snapshot_ms: u64, git_ms: u64, metadata_ms: u64) -> CycleTerms {
+        CycleTerms {
+            snapshot: Duration::from_millis(snapshot_ms),
+            git: Duration::from_millis(git_ms),
+            metadata: Duration::from_millis(metadata_ms),
+        }
+    }
+
+    fn budget_publisher(dir: &Path, terms: CycleTerms) -> MetadataPublisher {
+        let mut publisher = MetadataPublisher::new(
+            dir.into(),
+            "fake".into(),
+            Homes {
+                codex: Some(dir.join("codex-home")),
+                ..Homes::default()
+            },
+        )
+        .unwrap();
+        publisher.terms = terms;
+        publisher
+    }
+
+    fn short_readers() -> Config {
+        Config {
+            reader_timeout_ms: 100,
+            ..Config::default()
+        }
+    }
+
+    fn queue_ids(publisher: &MetadataPublisher) -> Vec<String> {
+        publisher
+            .send_queue
+            .order
+            .iter()
+            .map(|resource| resource.id.clone())
+            .collect()
+    }
+
+    fn finish(publisher: &mut MetadataPublisher, transport: &mut Transport) {
+        if transport.check_connection().is_err() {
+            transport.reconnect_same_endpoint().unwrap();
+        }
+        publisher.request(transport, "test.finish").unwrap();
+    }
+
+    // F1 and F7: admission refuses every frame after the first two of a
+    // cycle. The admission seam makes the counts exact: refused frames count
+    // once each, nothing reconnects, only sent items rotate, and every pane
+    // and the trailing workspaces are acknowledged in ceil(14 / 2) cycles.
+    // Panes have no reader, so only exchanges rotate; a long interval keeps
+    // renewal out of this fixture. Real deadlines are covered by F2 to F4.
+    #[test]
+    fn deadline_skip_counts_refused_frames_and_rotates_only_started_items() {
+        const ADMITTED_PER_CYCLE: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let panes = (0..12)
+            .map(|index| {
+                let workspace = if index < 6 { "w1" } else { "w2" };
+                budget_pane(
+                    &format!("{workspace}:p{index}"),
+                    workspace,
+                    Some("claude"),
+                    &format!("native-{index}"),
+                )
+            })
+            .collect();
+        let template = budget_template(
+            panes,
+            vec![budget_workspace("w1", None), budget_workspace("w2", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = admitted.clone();
+        publisher.hooks.admission = Some(Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst) < ADMITTED_PER_CYCLE
+        }));
+        let config = Config {
+            refresh_interval_ms: 3_600_000,
+            usage_max_age_ms: 3_600_000,
+            reader_timeout_ms: 100,
+            ..Config::default()
+        };
+        let resources = 14;
+        let mut acknowledged = BTreeSet::new();
+        let mut cycles = 0;
+        while acknowledged.len() < resources {
+            cycles += 1;
+            assert!(
+                cycles <= resources.div_ceil(ADMITTED_PER_CYCLE),
+                "a resource starved"
+            );
+            admitted.store(0, Ordering::SeqCst);
+            let before = queue_ids(&publisher);
+            let first_report = log.lock().unwrap().len();
+            let result = publisher.refresh_with_readers(
+                &mut transport,
+                &config,
+                &TimeoutReader,
+                &TimeoutReader,
+            );
+            let sent: Vec<String> = log.lock().unwrap()[first_report..]
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect();
+            let needed = resources - acknowledged.len();
+            assert_eq!(
+                sent.len(),
+                needed.min(ADMITTED_PER_CYCLE),
+                "cycle {cycles}: {result:?}"
+            );
+            assert!(
+                sent.iter().all(|id| !acknowledged.contains(id)),
+                "an acknowledged resource was sent again: {sent:?}"
+            );
+            match result {
+                Ok(()) => assert_eq!(sent.len(), needed),
+                Err(error) => {
+                    let skip = refresh_skip(&error).expect("a deadline skip, never an error");
+                    assert_eq!(skip.capacity_skipped, 0);
+                    assert_eq!(skip.deadline_skipped as usize, needed - sent.len());
+                }
+            }
+            if cycles > 1 {
+                let expected: Vec<String> = before
+                    .iter()
+                    .filter(|id| !sent.contains(id))
+                    .chain(before.iter().filter(|id| sent.contains(id)))
+                    .cloned()
+                    .collect();
+                assert_eq!(queue_ids(&publisher), expected, "cycle {cycles}");
+            }
+            acknowledged.extend(sent);
+        }
+        assert_eq!(cycles, resources.div_ceil(ADMITTED_PER_CYCLE));
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F2: an admitted report without a reply is an ambiguous error. Its
+    // sequence is burned and the request is never sent again.
+    #[test]
+    fn unanswered_admitted_report_is_an_error_and_never_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer {
+                stall_report: Some(0),
+                ..BudgetServer::default()
+            },
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(refresh_skip(&error), None, "{error}");
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::InvalidInput,
+            "the daemon must reconnect"
+        );
+        let stalled = log.lock().unwrap().clone();
+        assert_eq!(stalled.len(), 1);
+        transport.reconnect_same_endpoint().unwrap();
+        publisher.reconnected();
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let (stalled_id, stalled_seq) = stalled[0].clone();
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.iter().filter(|(_, seq)| *seq == stalled_seq).count(),
+            1,
+            "burned sequence reused: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .skip(1)
+                .filter(|(id, _)| *id == stalled_id)
+                .all(|(_, seq)| *seq > stalled_seq)
+        );
+    }
+
+    // F3: a slow persist after the reader leaves less than the admission
+    // threshold. Nothing is written, the pane stays rotated and is counted
+    // once, the durable upper bound holds, and the next cycle continues above it.
+    #[test]
+    fn refused_admission_after_reader_keeps_rotation_and_upper_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(0, 0, 100));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        publisher.hooks.before_admission = Some(Box::new(move || {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }));
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(
+            refresh_skip(&error),
+            Some(RefreshSkip {
+                capacity_skipped: 0,
+                deadline_skipped: 2
+            })
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a refused frame was written"
+        );
+        assert_eq!(queue_ids(&publisher), ["w1", "w1:p1"]);
+        let upper_bound = endpoint_upper_bound_on_disk(dir.path()).unwrap();
+        publisher.hooks.before_admission = None;
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        assert_eq!(endpoint_upper_bound_on_disk(dir.path()), Some(upper_bound));
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2);
+        // Sequences 1 and 2 were prepared for the refused frames and are burned.
+        assert!(log.iter().all(|(_, seq)| *seq > 2 && *seq <= upper_bound));
+    }
+
+    // F4: the envelope expires between admission and the exchange. That is an
+    // ambiguous error with a burned sequence, never a skip.
+    #[test]
+    fn envelope_expiring_after_admission_is_an_error_not_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(0, 0, 100));
+        publisher.hooks.before_exchange = Some(Box::new(|| {
+            std::thread::sleep(Duration::from_millis(250));
+        }));
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(refresh_skip(&error), None, "{error}");
+        publisher.hooks.before_exchange = None;
+        transport.reconnect_same_endpoint().unwrap();
+        publisher.reconnected();
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().all(|(_, seq)| *seq > 1),
+            "sequence 1 was sent after its deadline: {log:?}"
+        );
+    }
+
+    // F5: poison from a checkpoint fault is an error in every later cycle,
+    // even when the envelope would otherwise produce a deadline skip.
+    #[test]
+    fn poison_is_never_reported_as_a_deadline_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        *publisher.persist_fault.lock().unwrap() = Some(PersistStage::FileSync);
+        let first = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(refresh_skip(&first), None);
+        *publisher.persist_fault.lock().unwrap() = None;
+        // Admission could never pass with these terms; poison must still win.
+        publisher.terms = budget_terms(0, 0, 60_000);
+        let later = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(refresh_skip(&later), None);
+        assert!(later.to_string().contains("restart required"), "{later}");
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    // F6: shutdown during a budgeted cycle is an interruption, and clear then
+    // runs under its own deadline although the refresh terms admit nothing.
+    #[test]
+    fn shutdown_mid_cycle_interrupts_and_clear_keeps_its_own_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template.clone(),
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        publisher.set_shutdown(shutdown.clone());
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        let acknowledged = log.lock().unwrap().len();
+        template.lock().unwrap()["result"]["snapshot"]["panes"][0]["agent_status"] = json!("idle");
+        let flag = shutdown.clone();
+        publisher.hooks.before_admission = Some(Box::new(move || {
+            flag.store(true, Ordering::Release);
+        }));
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(refresh_skip(&error), None);
+        assert_eq!(log.lock().unwrap().len(), acknowledged);
+        publisher.hooks.before_admission = None;
+        publisher.terms = budget_terms(0, 0, 60_000);
+        publisher.clear(&mut transport).unwrap();
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let log = log.lock().unwrap();
+        assert!(
+            log[acknowledged..].iter().any(|(id, _)| id == "w1:p1"),
+            "clear sent nothing: {log:?}"
+        );
+    }
+
+    // F8: each pane is observed only after the previous pane was sent.
+    #[test]
+    fn next_pane_is_observed_after_the_previous_pane_was_acknowledged() {
+        struct MarkerReader {
+            marker: PathBuf,
+            seen: std::sync::Mutex<Option<bool>>,
+        }
+        impl UsageReader for MarkerReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                if request.identity.native_session_id == "native-2" {
+                    *self.seen.lock().unwrap() = Some(self.marker.exists());
+                }
+                UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let marker = dir.path().join("pane-1-acknowledged");
+        let template = budget_template(
+            vec![
+                budget_pane("w1:p1", "w1", Some("codex"), "native-1"),
+                budget_pane("w1:p2", "w1", Some("codex"), "native-2"),
+            ],
+            vec![budget_workspace("w1", None)],
+        );
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer {
+                marker: Some(("w1:p1".into(), marker.clone())),
+                ..BudgetServer::default()
+            },
+            BudgetLog::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        let reader = MarkerReader {
+            marker,
+            seen: std::sync::Mutex::new(None),
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &short_readers(), &reader, &TimeoutReader)
+            .unwrap();
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        assert_eq!(*reader.seen.lock().unwrap(), Some(true));
+    }
+
+    // F9: a pane whose reader ran but needs no frame rotates and is not
+    // counted; a refused pane is counted once; untouched items keep order.
+    #[test]
+    fn reader_attempt_without_frame_rotates_and_refused_frame_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![
+                budget_pane("w1:p1", "w1", Some("codex"), "native-1"),
+                budget_pane("w1:p2", "w1", Some("codex"), "native-2"),
+                budget_pane("w1:p3", "w1", None, ""),
+            ],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template.clone(),
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(300, 0, 100));
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        let sent = log.lock().unwrap().len();
+        publisher.send_queue = FairQueue::default();
+        template.lock().unwrap()["result"]["snapshot"]["panes"][1]["agent_status"] = json!("idle");
+        publisher.hooks.before_admission = Some(Box::new(|| {
+            std::thread::sleep(Duration::from_millis(450));
+        }));
+        let error = publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap_err();
+        assert_eq!(
+            refresh_skip(&error),
+            Some(RefreshSkip {
+                capacity_skipped: 0,
+                deadline_skipped: 1
+            })
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            sent,
+            "a refused frame was written"
+        );
+        // p1 read without a frame and p2 read then refused both rotated; p3
+        // and the workspace started no I/O and keep their order.
+        assert_eq!(queue_ids(&publisher), ["w1:p3", "w1", "w1:p1", "w1:p2"]);
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F9a: once one pane spends the reader deadline, later panes skip only
+    // reader I/O. A cached pane restores and renews, the workspace and a
+    // no-reader pane still send, and a pane needing no frame keeps its place.
+    #[test]
+    fn spent_reader_budget_skips_only_reader_io_while_admission_remains() {
+        struct BudgetReader {
+            exhaust: AtomicBool,
+            reads: std::sync::Mutex<Vec<String>>,
+        }
+        impl UsageReader for BudgetReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                let native = request.identity.native_session_id.clone();
+                self.reads.lock().unwrap().push(native.clone());
+                if native == "native-a" && self.exhaust.load(Ordering::Acquire) {
+                    std::thread::sleep(request.timeout + Duration::from_millis(5));
+                    return TimeoutReader.read(request);
+                }
+                UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let repo = dir.path().join("repo");
+        let template = budget_template(
+            vec![
+                budget_pane("w1:pa", "w1", Some("codex"), "native-a"),
+                budget_pane("w1:pb", "w1", Some("codex"), "native-b"),
+                budget_pane("w1:pc", "w1", Some("claude"), "native-c"),
+                budget_pane("w1:pd", "w1", None, ""),
+            ],
+            vec![budget_workspace("w1", Some(repo.to_str().unwrap()))],
+        );
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(300, 100, 100));
+        publisher.hooks.git = Some(Box::new(|_, _| ship_time::RepositoryObservation {
+            read: ship_time::RepositoryRead::Complete(Some(ship_time::Repository {
+                name: "repo".into(),
+                ship_unix: None,
+            })),
+            verified_at: Some(Instant::now()),
+        }));
+        let reader = BudgetReader {
+            exhaust: AtomicBool::new(false),
+            reads: std::sync::Mutex::default(),
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &short_readers(), &reader, &TimeoutReader)
+            .unwrap();
+        assert!(publisher.local_readings.contains_key("w1:pb"));
+        // Every live key is now one interval old and needs renewal.
+        publisher.started -= Duration::from_millis(5000);
+        publisher.send_queue = FairQueue::default();
+        reader.exhaust.store(true, Ordering::Release);
+        reader.reads.lock().unwrap().clear();
+        let first_report = log.lock().unwrap().len();
+        publisher
+            .refresh_with_readers(&mut transport, &short_readers(), &reader, &TimeoutReader)
+            .unwrap();
+        assert_eq!(*reader.reads.lock().unwrap(), ["native-a"]);
+        let sent: BTreeSet<String> = log.lock().unwrap()[first_report..]
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ["w1:pb", "w1:pc", "w1"] {
+            assert!(sent.contains(id), "{id} did not send: {sent:?}");
+        }
+        assert!(!sent.contains("w1:pd"));
+        assert_eq!(
+            queue_ids(&publisher),
+            ["w1:pd", "w1:pa", "w1:pb", "w1:pc", "w1"]
+        );
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F9b: a reader call that returns at once (BUSY) is still an attempt.
+    #[test]
+    fn immediate_busy_reader_result_counts_as_an_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            BudgetLog::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &TimeoutReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        publisher.send_queue = FairQueue::default();
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &TimeoutReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        assert_eq!(queue_ids(&publisher), ["w1", "w1:p1"]);
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F10: one reader cycle per refresh, shared by its panes and carrying the
+    // publisher-owned diagnostics; the next refresh starts with a fresh cycle.
+    #[test]
+    fn one_reader_cycle_per_refresh_shares_discovery_and_diagnostics() {
+        // Codex's process-global BUSY permit is intentionally shared by readers.
+        // Isolate this discovery assertion from other tests holding that permit.
+        const CHILD: &str = "HERDR_LINEUP_PUBLISH_CYCLE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "publish::tests::one_reader_cycle_per_refresh_shares_discovery_and_diagnostics",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        struct CycleProbe {
+            scans: std::sync::Mutex<Vec<(usize, usize, usize)>>,
+            diagnostics: std::sync::Mutex<Vec<Arc<model::ReaderDiagnostics>>>,
+        }
+        impl UsageReader for CycleProbe {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                CodexReader.read(request)
+            }
+            fn read_in_cycle(
+                &self,
+                request: &ReadRequest<'_>,
+                cycle: &model::ReadCycle,
+            ) -> UsageReading {
+                let before = cycle.discovery_scan_count();
+                let reading = CodexReader.read_in_cycle(request, cycle);
+                assert_eq!(
+                    reading.context,
+                    UsageOutcome::Unavailable(MissingReason::NotFound),
+                    "empty synthetic directory must complete discovery, not BUSY/timeout"
+                );
+                let address = std::ptr::from_ref(cycle) as usize;
+                self.scans
+                    .lock()
+                    .unwrap()
+                    .push((address, before, cycle.discovery_scan_count()));
+                self.diagnostics
+                    .lock()
+                    .unwrap()
+                    .push(cycle.diagnostics().expect("diagnostics attached").clone());
+                reading
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("codex-home/sessions")).unwrap();
+        let socket = dir.path().join("fake.sock");
+        // Codex associates a rollout only with a pane cwd.
+        let panes = ["1", "2"]
+            .map(|index| {
+                let mut pane = budget_pane(
+                    &format!("w1:p{index}"),
+                    "w1",
+                    Some("codex"),
+                    &format!("native-{index}"),
+                );
+                pane["cwd"] = json!("/synthetic/codex");
+                pane
+            })
+            .to_vec();
+        let template = budget_template(panes, vec![budget_workspace("w1", None)]);
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            BudgetLog::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        publisher.hooks.git = Some(Box::new(|_, _| ship_time::RepositoryObservation {
+            read: ship_time::RepositoryRead::Complete(None),
+            verified_at: None,
+        }));
+        let negative_cycle =
+            model::ReadCycle::with_diagnostics(publisher.reader_diagnostics.clone());
+        let identity = model::SessionIdentity {
+            provider: Provider::Codex,
+            native_session_id: "negative".into(),
+            repository_identity: "/synthetic/codex".into(),
+        };
+        let refused = CodexReader.read_in_cycle(
+            &ReadRequest {
+                identity: &identity,
+                home: &dir.path().join("codex-home"),
+                now: SystemTime::now(),
+                max_age: Duration::from_secs(60),
+                timeout: Duration::ZERO,
+                shutdown: None,
+            },
+            &negative_cycle,
+        );
+        assert_eq!(
+            refused.context,
+            UsageOutcome::Unavailable(MissingReason::Timeout)
+        );
+        assert_eq!(
+            negative_cycle.discovery_scan_count(),
+            0,
+            "a timeout need not have scanned"
+        );
+        assert_eq!(
+            publisher
+                .reader_diagnostics
+                .snapshot(Provider::Codex)
+                .unwrap()
+                .deadline_ends,
+            1
+        );
+        let probe = CycleProbe {
+            scans: std::sync::Mutex::default(),
+            diagnostics: std::sync::Mutex::default(),
+        };
+        for _ in 0..2 {
+            publisher.send_queue = FairQueue::default();
+            publisher
+                .refresh_with_readers(&mut transport, &short_readers(), &probe, &TimeoutReader)
+                .unwrap();
+        }
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        // Both panes of a refresh read through the same cycle. A new refresh
+        // starts from an empty cycle, so its first read scans exactly once.
+        // Reuse inside a refresh is the reader's choice: a still-running
+        // worker may rescan, as the reader tests allow.
+        let scans = probe.scans.lock().unwrap().clone();
+        assert_eq!(scans.len(), 4);
+        for refresh in scans.chunks(2) {
+            assert_eq!(refresh[0].0, refresh[1].0, "panes used different cycles");
+            assert_eq!(refresh[0].1, 0, "a refresh reused prior discovery");
+            assert_eq!(refresh[0].2, 1, "first completed read did not scan");
+            assert_eq!(refresh[1].1, 1, "second pane did not inherit discovery");
+            assert!((1..=2).contains(&refresh[1].2));
+        }
+        assert!(
+            probe
+                .diagnostics
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|diagnostics| Arc::ptr_eq(diagnostics, &publisher.reader_diagnostics))
+        );
+    }
+
+    fn git_observation(name: &str, ship_unix: Option<i64>) -> ship_time::RepositoryObservation {
+        ship_time::RepositoryObservation {
+            read: ship_time::RepositoryRead::Complete(Some(ship_time::Repository {
+                name: name.into(),
+                ship_unix,
+            })),
+            verified_at: Some(Instant::now()),
+        }
+    }
+
+    // F11, F15 and F17: a stalled repository uses the cycle's Git budget and
+    // rotates; the others keep their place and publish null, never `—`, until
+    // read. A confirmed repository without origin/main shows its name and `—`.
+    #[test]
+    fn git_queue_rotates_a_stalled_repository_and_unread_headings_are_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![
+                budget_pane("wa:p1", "wa", None, ""),
+                budget_pane("wb:p1", "wb", None, ""),
+                budget_pane("wc:p1", "wc", None, ""),
+            ],
+            vec![
+                budget_workspace("wa", Some("/synthetic/a")),
+                budget_workspace("wb", Some("/synthetic/b")),
+                budget_workspace("wc", Some("/synthetic/c")),
+            ],
+        );
+        let tokens = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let log = BudgetLog::default();
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(2000, 100, 100));
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = reads.clone();
+        publisher.hooks.git = Some(Box::new(move |cwd, deadline| {
+            let name = cwd.file_name().unwrap().to_str().unwrap().to_owned();
+            seen.lock().unwrap().push(name.clone());
+            match name.as_str() {
+                "a" => {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    ship_time::RepositoryObservation {
+                        read: ship_time::RepositoryRead::Interrupted,
+                        verified_at: None,
+                    }
+                }
+                "b" => git_observation("repo-b", Some(1_700_000_000)),
+                _ => git_observation("repo-c", None),
+            }
+        }));
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        assert_eq!(*reads.lock().unwrap(), ["a"]);
+        assert_eq!(publisher.git_queue.order, ["wb", "wc", "wa"]);
+        let first = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap()
+            .1;
+        tokens.lock().unwrap().insert(0, first);
+        reads.lock().unwrap().clear();
+        publisher
+            .refresh_with_readers(
+                &mut transport,
+                &short_readers(),
+                &SampleReader,
+                &TimeoutReader,
+            )
+            .unwrap();
+        assert_eq!(*reads.lock().unwrap(), ["b", "c", "a"]);
+        assert_eq!(publisher.git_queue.order, ["wb", "wc", "wa"]);
+        let second = publisher
+            .request(&mut transport, "session.snapshot")
+            .unwrap()
+            .1;
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        let workspace = |snapshot: &Value, index: usize| {
+            snapshot["result"]["snapshot"]["workspaces"][index]["tokens"].clone()
+        };
+        let first = tokens.lock().unwrap().remove(&0).unwrap();
+        for index in 0..3 {
+            let heading = workspace(&first, index);
+            assert!(heading.get("lineup_repo").is_none(), "{heading}");
+            assert!(heading.get("lineup_ship_text").is_none(), "{heading}");
+        }
+        assert_eq!(workspace(&second, 1)["lineup_repo"], "repo-b");
+        assert_eq!(workspace(&second, 2)["lineup_repo"], "repo-c");
+        assert_eq!(workspace(&second, 2)["lineup_ship_text"], "—");
+        assert!(workspace(&second, 2).get("lineup_ship_unix").is_none());
+        assert!(workspace(&second, 0).get("lineup_repo").is_none());
+    }
+
+    // F12: two workspaces share one stalled cwd: one Git read per cycle, only
+    // the workspace that started it rotates, and the pass ends.
+    #[test]
+    fn shared_stalled_cwd_is_read_once_and_rotates_only_its_starter() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![],
+            vec![
+                budget_workspace("w1", Some("/synthetic/shared")),
+                budget_workspace("w2", Some("/synthetic/shared")),
+            ],
+        );
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            BudgetLog::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(2000, 100, 100));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = reads.clone();
+        publisher.hooks.git = Some(Box::new(move |_, deadline| {
+            count.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            ship_time::RepositoryObservation {
+                read: ship_time::RepositoryRead::Interrupted,
+                verified_at: None,
+            }
+        }));
+        for cycle in 1..=2 {
+            publisher
+                .refresh_with_readers(
+                    &mut transport,
+                    &short_readers(),
+                    &SampleReader,
+                    &TimeoutReader,
+                )
+                .unwrap();
+            assert_eq!(reads.load(Ordering::SeqCst), cycle);
+        }
+        // w1 started cycle 1 and w2 started cycle 2.
+        assert_eq!(publisher.git_queue.order, ["w1", "w2"]);
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+    }
+
+    // F19: production stage samples count acknowledged reports and successful
+    // checkpoint writes per refresh, reset each attempt, and still record a
+    // failed snapshot's controlled delay.
+    #[test]
+    fn production_stages_count_reports_and_checkpoints_and_survive_errors() {
+        use crate::daemon::Publisher as _;
+        const SNAPSHOT_DELAY_MS: u64 = 50;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            vec![budget_pane("w1:p1", "w1", Some("codex"), "native-1")],
+            vec![budget_workspace("w1", None)],
+        );
+        let log = BudgetLog::default();
+        let snapshot_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template.clone(),
+            BudgetServer {
+                snapshot_delay_ms: snapshot_delay.clone(),
+                ..BudgetServer::default()
+            },
+            log.clone(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        assert!(publisher.refresh_stages().is_none(), "no attempt yet");
+        publisher.refresh(&mut transport, &short_readers()).unwrap();
+        let first = publisher.refresh_stages().unwrap();
+        assert_eq!(first.counts.reports, log.lock().unwrap().len() as u64);
+        assert_eq!(first.counts.reports, 2);
+        assert_eq!(first.counts.checkpoints, 1);
+        // The next attempt fails at the snapshot after a controlled delay.
+        let valid = template.lock().unwrap().clone();
+        template.lock().unwrap()["result"]["type"] = json!("not_a_snapshot");
+        snapshot_delay.store(SNAPSHOT_DELAY_MS, Ordering::Release);
+        assert!(publisher.refresh(&mut transport, &short_readers()).is_err());
+        let failed = publisher.refresh_stages().unwrap();
+        let delay_us = SNAPSHOT_DELAY_MS * 1000;
+        assert!(failed.durations.snapshot_us >= delay_us, "{failed:?}");
+        assert!(failed.durations.socket_us >= delay_us, "{failed:?}");
+        // Counts and later stages restart from zero for each attempt.
+        assert_eq!(failed.counts.reports, 0);
+        assert_eq!(failed.counts.checkpoints, 0);
+        assert_eq!(failed.durations.git_us, 0);
+        assert_eq!(failed.durations.reader_us, 0);
+        assert_eq!(failed.durations.persist_us, 0);
+        *template.lock().unwrap() = valid;
+        snapshot_delay.store(0, Ordering::Release);
+        finish(&mut publisher, &mut transport);
         server.join().unwrap();
     }
 }

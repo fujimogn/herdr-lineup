@@ -55,8 +55,179 @@ impl Options {
     }
 }
 
+/// Opaque memory-only access to advisory reader observations.
+/// Cloning this handle does not join workers or acquire provider locks.
+#[derive(Clone)]
+pub struct ReaderDiagnosticsHandle {
+    diagnostics: Arc<crate::model::ReaderDiagnostics>,
+    #[cfg(test)]
+    samples: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    sample_gate: Option<Arc<ControlTestGate>>,
+}
+
+impl std::fmt::Debug for ReaderDiagnosticsHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReaderDiagnosticsHandle(opaque)")
+    }
+}
+
+impl ReaderDiagnosticsHandle {
+    pub(crate) fn new(diagnostics: Arc<crate::model::ReaderDiagnostics>) -> Self {
+        Self {
+            diagnostics,
+            #[cfg(test)]
+            samples: Arc::default(),
+            #[cfg(test)]
+            sample_gate: None,
+        }
+    }
+
+    fn sample(&self) -> ReaderDiagnosticsData {
+        #[cfg(test)]
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(gate) = &self.sample_gate {
+            gate.wait();
+        }
+        let providers = self
+            .diagnostics
+            .snapshots()
+            .into_iter()
+            .map(|(provider, result)| {
+                use crate::model::{DiagnosticUnavailable, Provider};
+                let label = match provider {
+                    Provider::Claude => "claude",
+                    Provider::Agy => "agy",
+                    Provider::Codex => "codex",
+                    Provider::Grok => "grok",
+                    Provider::Hermes => "hermes",
+                    Provider::Kimi => "kimi",
+                };
+                let entry = match result {
+                    Ok(sample) => ReaderEntry::Available {
+                        sample: ReaderSample::from(sample),
+                    },
+                    Err(DiagnosticUnavailable::Contended) => ReaderEntry::Contended,
+                    Err(DiagnosticUnavailable::Poisoned) => ReaderEntry::Poisoned,
+                    Err(DiagnosticUnavailable::Incomplete) => ReaderEntry::Incomplete,
+                };
+                (label, entry)
+            })
+            .collect();
+        ReaderDiagnosticsData {
+            version: 1,
+            sampling: "live_best_effort",
+            providers,
+        }
+    }
+}
+
+pub(crate) const READER_LABELS: [&str; 6] = ["claude", "agy", "codex", "grok", "hermes", "kimi"];
+
+/// Non-sensitive wire DTO: never serialize a model object or arbitrary labels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReaderSample {
+    pub attempts: u64,
+    pub busy_rejections: u64,
+    pub deadline_ends: u64,
+    pub shutdown_ends: u64,
+    pub spawn_failures: u64,
+    pub worker_failures: u64,
+    pub completed: u64,
+    pub invalid: u64,
+    pub caller_wait_count: u64,
+    pub caller_wait_total_ns: u64,
+    pub caller_wait_max_ns: u64,
+    pub sampling_skips: u64,
+    pub worker_active: bool,
+    pub timed_out_worker_active: bool,
+    pub shutdown_worker_active: bool,
+}
+
+impl From<crate::model::ReaderSnapshot> for ReaderSample {
+    fn from(s: crate::model::ReaderSnapshot) -> Self {
+        Self {
+            attempts: s.attempts,
+            busy_rejections: s.busy_rejections,
+            deadline_ends: s.deadline_ends,
+            shutdown_ends: s.shutdown_ends,
+            spawn_failures: s.spawn_failures,
+            worker_failures: s.worker_failures,
+            completed: s.completed,
+            invalid: s.invalid,
+            caller_wait_count: s.caller_wait_count,
+            caller_wait_total_ns: s.caller_wait_total_ns,
+            caller_wait_max_ns: s.caller_wait_max_ns,
+            sampling_skips: s.sampling_skips,
+            worker_active: s.worker_active,
+            timed_out_worker_active: s.timed_out_worker_active,
+            shutdown_worker_active: s.shutdown_worker_active,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ReaderEntry {
+    Available { sample: ReaderSample },
+    Contended,
+    Poisoned,
+    Incomplete,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReaderDiagnosticsData {
+    version: u64,
+    sampling: &'static str,
+    pub providers: std::collections::BTreeMap<&'static str, ReaderEntry>,
+}
+
+fn reader_diagnostics_from_raw(raw: &serde_json::Value) -> Option<ReaderDiagnosticsData> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Envelope {
+        version: u64,
+        sampling: String,
+        providers: serde_json::Map<String, serde_json::Value>,
+    }
+    let envelope: Envelope = serde_json::from_value(raw.clone()).ok()?;
+    if envelope.version != 1 || envelope.sampling != "live_best_effort" {
+        return None;
+    }
+    let providers = READER_LABELS
+        .into_iter()
+        .map(|label| {
+            let entry = envelope
+                .providers
+                .get(label)
+                .and_then(|value| serde_json::from_value::<ReaderEntry>(value.clone()).ok())
+                .filter(|entry| match entry {
+                    ReaderEntry::Available { sample } => {
+                        sample.worker_active
+                            || !(sample.timed_out_worker_active || sample.shutdown_worker_active)
+                    }
+                    _ => true,
+                })
+                .unwrap_or(ReaderEntry::Unavailable);
+            (label, entry)
+        })
+        .collect();
+    Some(ReaderDiagnosticsData {
+        version: 1,
+        sampling: "live_best_effort",
+        providers,
+    })
+}
+
 /// Implementations must bound I/O and clear only plugin-owned metadata.
 pub trait Publisher {
+    /// Advisory reader state; unavailable for publishers without a registry.
+    fn reader_diagnostics(&self) -> Option<ReaderDiagnosticsHandle> {
+        None
+    }
     /// Observe shutdown between bounded reader calls and complete metadata frames.
     fn set_shutdown(&mut self, _shutdown: Arc<AtomicBool>) {}
     /// Stop owned background queries on every exit, without joining HTTP I/O.
@@ -66,6 +237,14 @@ pub trait Publisher {
     fn clear(&mut self, transport: &mut Transport) -> io::Result<()>;
     /// Drop any cached pane associations before authoritative reconciliation.
     fn reconnected(&mut self) {}
+    /// Timings and counts for the refresh that just finished.
+    ///
+    /// `None` means this publisher does not measure stages. Callers must treat
+    /// that as unavailable, not as a zero sample. Durations are microseconds.
+    /// Counts are report and checkpoint totals of that refresh only.
+    fn refresh_stages(&self) -> Option<RefreshStages> {
+        None
+    }
 }
 #[cfg(test)]
 struct NoopPublisher;
@@ -97,24 +276,551 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
-pub(crate) fn record_refresh(health: &mut Health, result: &io::Result<()>, elapsed_ms: u64) {
+/// Histogram bounds in milliseconds. Comparisons use microseconds so a
+/// sub-millisecond sample stays in `<1ms` without rounding `last_us`.
+const REFRESH_DURATION_UPPER_US: [u64; 8] = [
+    1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+];
+pub(crate) const REFRESH_DURATION_BUCKETS: usize = 9;
+pub(crate) const REFRESH_DURATION_BUCKET_LABELS: [&str; REFRESH_DURATION_BUCKETS] = [
+    "<1ms", "<5ms", "<10ms", "<50ms", "<100ms", "<500ms", "<1000ms", "<5000ms", ">=5000ms",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshStageDurations {
+    pub snapshot_us: u64,
+    pub git_us: u64,
+    pub reader_us: u64,
+    pub persist_us: u64,
+    pub socket_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshStageCounts {
+    pub reports: u64,
+    pub checkpoints: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshStages {
+    pub durations: RefreshStageDurations,
+    pub counts: RefreshStageCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RefreshDuration {
+    pub last_us: u64,
+    pub min_us: u64,
+    pub max_us: u64,
+    pub histogram: [u64; REFRESH_DURATION_BUCKETS],
+}
+
+/// One measured stage, in microseconds, using the same buckets as the total.
+///
+/// `count` is the number of completed attempts that supplied this stage.
+/// `sum_us` saturates. Absence of the parent aggregate is unmeasured, not zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StageDurationStats {
+    pub count: u64,
+    pub sum_us: u64,
+    pub duration: RefreshDuration,
+}
+
+/// Histograms for the five measured refresh stages.
+///
+/// `latest_measured` is false when the most recent completed attempt returned
+/// no stage sample. The histograms still describe earlier measured attempts.
+/// `reports` and `checkpoints` are saturating sums of those measured attempts,
+/// not extra stages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RefreshStageAggregate {
+    pub snapshot: StageDurationStats,
+    pub git: StageDurationStats,
+    pub reader: StageDurationStats,
+    pub persist: StageDurationStats,
+    pub socket: StageDurationStats,
+    pub latest_measured: bool,
+    pub reports: u64,
+    pub checkpoints: u64,
+}
+
+/// Memory-only totals for completed refresh attempts.
+///
+/// Absence of this object on the control wire means the peer did not measure
+/// attempts. Absence of `duration` means no monotonic sample exists yet.
+/// Absence of `stages` means no stage sample has been measured yet.
+/// None of those cases is a zero measurement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RefreshObservation {
+    pub attempt_count: u64,
+    pub success_count: u64,
+    pub error_count: u64,
+    pub capacity_skip_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<RefreshDuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stages: Option<RefreshStageAggregate>,
+}
+
+/// Memory-only totals for refresh attempts classified as deadline skips.
+///
+/// Sent as the optional `refresh_deadline_skips` control field beside
+/// `refresh_observation`, so `Health` and `RefreshObservation` keep their
+/// shape and an older peer still parses the frame. Absence means no deadline
+/// skip has happened or the peer does not report them, never a measured zero.
+/// These attempts are included in `refresh_observation.attempt_count` and its
+/// duration and stage histograms, but not in its success, error or capacity
+/// skip counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeadlineSkipObservation {
+    pub attempt_count: u64,
+    /// Resources the latest deadline-skip attempt skipped by its deadline.
+    pub last_deadline_skipped: u64,
+    /// Resources the same attempt skipped for capacity. Zero is measured.
+    pub last_capacity_skipped: u64,
+}
+
+// Channel gates exercise the real control worker's lock scope in normal tests.
+#[cfg(test)]
+#[derive(Debug)]
+struct ControlTestGate {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+#[cfg(test)]
+impl ControlTestGate {
+    fn wait(&self) {
+        self.entered.send(()).unwrap();
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ControlState {
+    health: Health,
+    observation: Option<RefreshObservation>,
+    deadline_skips: Option<DeadlineSkipObservation>,
+    reader_diagnostics: Option<ReaderDiagnosticsHandle>,
+    #[cfg(test)]
+    write_gate: Option<Arc<ControlTestGate>>,
+}
+
+impl From<Health> for ControlState {
+    fn from(health: Health) -> Self {
+        Self {
+            health,
+            observation: None,
+            deadline_skips: None,
+            reader_diagnostics: None,
+            #[cfg(test)]
+            write_gate: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ControlResponse<'a> {
+    #[serde(flatten)]
+    health: &'a Health,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_observation: Option<&'a RefreshObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_deadline_skips: Option<&'a DeadlineSkipObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reader_diagnostics: Option<&'a ReaderDiagnosticsData>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ControlView {
+    pub health: Health,
+    pub observation: Option<RefreshObservation>,
+    pub deadline_skips: Option<DeadlineSkipObservation>,
+    pub reader_diagnostics: Option<ReaderDiagnosticsData>,
+}
+
+struct MeasuredRefresh<'a> {
+    result: &'a io::Result<()>,
+    uptime_ms: u64,
+    duration_us: Option<u64>,
+    stages: Option<RefreshStages>,
+}
+
+#[derive(Clone, Copy)]
+enum RefreshOutcome {
+    Success,
+    Error,
+    CapacitySkip,
+    /// At least one resource was skipped by the cycle deadline. Capacity skips
+    /// in the same attempt keep their own count.
+    DeadlineSkip(crate::publish::RefreshSkip),
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Subtract the monotonic samples first, then convert. Truncating each side to
+/// milliseconds before subtraction collapses a 10.9 ms to 11.1 ms attempt to 1 ms.
+fn attempt_duration_us(started: Duration, finished: Duration) -> Option<u64> {
+    finished.checked_sub(started).map(duration_micros)
+}
+
+fn refresh_outcome(result: &io::Result<()>) -> RefreshOutcome {
     match result {
-        Ok(()) => {
+        Ok(()) => RefreshOutcome::Success,
+        // Shutdown, poison and ambiguous exchanges return their own errors and
+        // never carry a skip payload.
+        Err(error) => match crate::publish::refresh_skip(error) {
+            Some(skip) if skip.deadline_skipped > 0 => RefreshOutcome::DeadlineSkip(skip),
+            Some(_) => RefreshOutcome::CapacitySkip,
+            None => RefreshOutcome::Error,
+        },
+    }
+}
+
+pub(crate) fn duration_bucket(duration_us: u64) -> usize {
+    REFRESH_DURATION_UPPER_US
+        .iter()
+        .position(|upper| duration_us < *upper)
+        .unwrap_or(REFRESH_DURATION_BUCKETS - 1)
+}
+
+fn observe_duration(stats: &mut RefreshDuration, duration_us: u64) {
+    stats.last_us = duration_us;
+    stats.min_us = stats.min_us.min(duration_us);
+    stats.max_us = stats.max_us.max(duration_us);
+    let index = duration_bucket(duration_us);
+    stats.histogram[index] = stats.histogram[index].saturating_add(1);
+}
+
+fn new_stage_stats(duration_us: u64) -> StageDurationStats {
+    let mut duration = RefreshDuration {
+        last_us: duration_us,
+        min_us: duration_us,
+        max_us: duration_us,
+        histogram: [0; REFRESH_DURATION_BUCKETS],
+    };
+    observe_duration(&mut duration, duration_us);
+    StageDurationStats {
+        count: 1,
+        sum_us: duration_us,
+        duration,
+    }
+}
+
+fn observe_stage(stats: &mut StageDurationStats, duration_us: u64) {
+    stats.count = stats.count.saturating_add(1);
+    stats.sum_us = stats.sum_us.saturating_add(duration_us);
+    observe_duration(&mut stats.duration, duration_us);
+}
+
+fn stage_aggregate_from_sample(sample: RefreshStages) -> RefreshStageAggregate {
+    RefreshStageAggregate {
+        snapshot: new_stage_stats(sample.durations.snapshot_us),
+        git: new_stage_stats(sample.durations.git_us),
+        reader: new_stage_stats(sample.durations.reader_us),
+        persist: new_stage_stats(sample.durations.persist_us),
+        socket: new_stage_stats(sample.durations.socket_us),
+        latest_measured: true,
+        reports: sample.counts.reports,
+        checkpoints: sample.counts.checkpoints,
+    }
+}
+
+fn observe_stages(aggregate: &mut RefreshStageAggregate, sample: RefreshStages) {
+    observe_stage(&mut aggregate.snapshot, sample.durations.snapshot_us);
+    observe_stage(&mut aggregate.git, sample.durations.git_us);
+    observe_stage(&mut aggregate.reader, sample.durations.reader_us);
+    observe_stage(&mut aggregate.persist, sample.durations.persist_us);
+    observe_stage(&mut aggregate.socket, sample.durations.socket_us);
+    aggregate.latest_measured = true;
+    aggregate.reports = aggregate.reports.saturating_add(sample.counts.reports);
+    aggregate.checkpoints = aggregate
+        .checkpoints
+        .saturating_add(sample.counts.checkpoints);
+}
+
+pub(crate) fn record_refresh(health: &mut Health, result: &io::Result<()>, elapsed_ms: u64) {
+    match refresh_outcome(result) {
+        RefreshOutcome::Success => {
             health.last_refresh_ms = Some(elapsed_ms);
             health.refresh_failed = false;
             health.capacity_skipped_resources = 0;
         }
-        Err(error) => {
-            if let Some(count) = crate::publish::capacity_skip_count(error) {
-                health.last_refresh_ms = Some(elapsed_ms);
-                health.refresh_failed = false;
-                health.capacity_skipped_resources = count;
-            } else {
-                health.refresh_failed = true;
-                health.capacity_skipped_resources = 0;
+        RefreshOutcome::CapacitySkip => {
+            let count = result
+                .as_ref()
+                .err()
+                .and_then(crate::publish::refresh_skip)
+                .map_or(0, |skip| skip.capacity_skipped);
+            health.last_refresh_ms = Some(elapsed_ms);
+            health.refresh_failed = false;
+            health.capacity_skipped_resources = count;
+        }
+        RefreshOutcome::DeadlineSkip(skip) => {
+            health.last_refresh_ms = Some(elapsed_ms);
+            health.refresh_failed = false;
+            health.capacity_skipped_resources = skip.capacity_skipped;
+        }
+        RefreshOutcome::Error => {
+            health.refresh_failed = true;
+            health.capacity_skipped_resources = 0;
+        }
+    }
+}
+
+fn note_refresh_attempt(
+    health: &mut Health,
+    observation: &mut Option<RefreshObservation>,
+    measured: MeasuredRefresh<'_>,
+) {
+    record_refresh(health, measured.result, measured.uptime_ms);
+    let mut current = observation.take().unwrap_or(RefreshObservation {
+        attempt_count: 0,
+        success_count: 0,
+        error_count: 0,
+        capacity_skip_count: 0,
+        duration: None,
+        stages: None,
+    });
+    current.attempt_count = current.attempt_count.saturating_add(1);
+    match refresh_outcome(measured.result) {
+        RefreshOutcome::Success => {
+            current.success_count = current.success_count.saturating_add(1);
+        }
+        RefreshOutcome::Error => {
+            current.error_count = current.error_count.saturating_add(1);
+        }
+        RefreshOutcome::CapacitySkip => {
+            current.capacity_skip_count = current.capacity_skip_count.saturating_add(1);
+        }
+        // Counted only in the attempt total here; see `note_deadline_skip`.
+        RefreshOutcome::DeadlineSkip(_) => {}
+    }
+    if let Some(duration_us) = measured.duration_us {
+        let mut stats = current.duration.take().unwrap_or(RefreshDuration {
+            last_us: duration_us,
+            min_us: duration_us,
+            max_us: duration_us,
+            histogram: [0; REFRESH_DURATION_BUCKETS],
+        });
+        observe_duration(&mut stats, duration_us);
+        current.duration = Some(stats);
+    }
+    match measured.stages {
+        Some(sample) => match current.stages.as_mut() {
+            Some(aggregate) => observe_stages(aggregate, sample),
+            None => current.stages = Some(stage_aggregate_from_sample(sample)),
+        },
+        None => {
+            if let Some(aggregate) = current.stages.as_mut() {
+                aggregate.latest_measured = false;
             }
         }
     }
+    *observation = Some(current);
+}
+
+fn note_deadline_skip(
+    deadline_skips: &mut Option<DeadlineSkipObservation>,
+    result: &io::Result<()>,
+) {
+    if let RefreshOutcome::DeadlineSkip(skip) = refresh_outcome(result) {
+        let attempt_count = deadline_skips
+            .as_ref()
+            .map_or(0, |previous| previous.attempt_count)
+            .saturating_add(1);
+        *deadline_skips = Some(DeadlineSkipObservation {
+            attempt_count,
+            last_deadline_skipped: skip.deadline_skipped,
+            last_capacity_skipped: skip.capacity_skipped,
+        });
+    }
+}
+
+fn stage_parts(aggregate: &RefreshStageAggregate) -> [&StageDurationStats; 5] {
+    [
+        &aggregate.snapshot,
+        &aggregate.git,
+        &aggregate.reader,
+        &aggregate.persist,
+        &aggregate.socket,
+    ]
+}
+
+fn histogram_total(histogram: &[u64; REFRESH_DURATION_BUCKETS]) -> Option<u64> {
+    histogram
+        .iter()
+        .try_fold(0u64, |total, bucket| total.checked_add(*bucket))
+}
+
+/// Occupied buckets must overlap `[min_us, max_us]`, and the buckets that
+/// contain last, min, and max must hold a real observation. A saturated
+/// `u64::MAX` count does not make an impossible bucket legal.
+fn buckets_match_extrema(duration: &RefreshDuration) -> bool {
+    let min_bucket = duration_bucket(duration.min_us);
+    let max_bucket = duration_bucket(duration.max_us);
+    let last_bucket = duration_bucket(duration.last_us);
+    if duration.histogram[min_bucket] == 0
+        || duration.histogram[max_bucket] == 0
+        || duration.histogram[last_bucket] == 0
+    {
+        return false;
+    }
+    duration
+        .histogram
+        .iter()
+        .enumerate()
+        .all(|(index, count)| *count == 0 || (min_bucket..=max_bucket).contains(&index))
+}
+
+fn stage_duration_consistent(stats: &StageDurationStats) -> bool {
+    let duration = &stats.duration;
+    if stats.count == 0 {
+        return stats.sum_us == 0
+            && duration.last_us == 0
+            && duration.min_us == 0
+            && duration.max_us == 0
+            && duration.histogram.iter().all(|count| *count == 0);
+    }
+    if duration.min_us > duration.max_us
+        || duration.last_us < duration.min_us
+        || duration.last_us > duration.max_us
+        || !buckets_match_extrema(duration)
+    {
+        return false;
+    }
+    if stats.count == 1 && stats.sum_us != duration.last_us {
+        return false;
+    }
+    if let Some(lower) = duration.min_us.checked_mul(stats.count)
+        && stats.sum_us != u64::MAX
+        && stats.sum_us < lower
+    {
+        return false;
+    }
+    if let Some(upper) = duration.max_us.checked_mul(stats.count)
+        && stats.sum_us > upper
+    {
+        return false;
+    }
+    match histogram_total(&duration.histogram) {
+        Some(total) if total == stats.count => true,
+        // `u64::MAX - 1` samples in one bucket and two in the next overflow the
+        // stored total without any single bucket reaching `u64::MAX`. The
+        // attempt count is saturated. Extrema checks above still reject an
+        // occupied bucket outside min/max.
+        None if stats.count == u64::MAX => true,
+        _ => false,
+    }
+}
+
+fn stage_aggregate_consistent(aggregate: &RefreshStageAggregate) -> bool {
+    let parts = stage_parts(aggregate);
+    if !parts.iter().all(|stage| stage_duration_consistent(stage)) {
+        return false;
+    }
+    let count = parts[0].count;
+    count > 0 && parts.iter().all(|stage| stage.count == count)
+}
+
+fn stage_aggregate_from_value(value: &serde_json::Value) -> Option<RefreshStageAggregate> {
+    let aggregate: RefreshStageAggregate = serde_json::from_value(value.clone()).ok()?;
+    stage_aggregate_consistent(&aggregate).then_some(aggregate)
+}
+
+/// A missing, legacy, unknown, or contradictory `stages` object is unavailable.
+/// It does not erase a valid total, and it is not stored as a zero histogram.
+fn observation_from_raw(raw: &serde_json::Value) -> Option<RefreshObservation> {
+    let mut object = raw.as_object()?.clone();
+    let stages_value = object.remove("stages");
+    let mut observation: RefreshObservation =
+        serde_json::from_value(serde_json::Value::Object(object)).ok()?;
+    observation.stages = match stages_value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => stage_aggregate_from_value(&value),
+    };
+    Some(observation)
+}
+
+fn control_frame(state: &ControlState) -> io::Result<Vec<u8>> {
+    // Exactly one live sample per response, reused throughout size fallback.
+    let readers = state
+        .reader_diagnostics
+        .as_ref()
+        .map(ReaderDiagnosticsHandle::sample);
+    let mut response = ControlResponse {
+        health: &state.health,
+        refresh_observation: state.observation.as_ref(),
+        refresh_deadline_skips: state.deadline_skips.as_ref(),
+        reader_diagnostics: readers.as_ref(),
+    };
+    for step in 0..3 {
+        let bytes = serde_json::to_vec(&response)
+            .map_err(|_| io::Error::other("invalid daemon control snapshot"))?;
+        // write_frame appends one newline, and read_frame counts that byte.
+        if bytes.len() < 8192 {
+            return Ok(bytes);
+        }
+        match step {
+            0 => response.reader_diagnostics = None,
+            1 => {
+                response.refresh_observation = None;
+                response.refresh_deadline_skips = None;
+            }
+            _ => break,
+        }
+    }
+    Err(io::Error::other(
+        "daemon control health exceeds frame limit",
+    ))
+}
+
+pub(crate) fn control_view_from_frame(frame: &[u8]) -> io::Result<ControlView> {
+    let value: serde_json::Value = serde_json::from_slice(frame)
+        .map_err(|_| io::Error::other("invalid daemon control identity"))?;
+    let health: Health = serde_json::from_value(value.clone())
+        .map_err(|_| io::Error::other("invalid daemon control identity"))?;
+    let observation = match value.get("refresh_observation") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(raw) => observation_from_raw(raw),
+    };
+    let deadline_skips = value
+        .get("refresh_deadline_skips")
+        .and_then(|raw| serde_json::from_value(raw.clone()).ok());
+    let reader_diagnostics = value
+        .get("reader_diagnostics")
+        .and_then(reader_diagnostics_from_raw);
+    Ok(ControlView {
+        health,
+        observation,
+        deadline_skips,
+        reader_diagnostics,
+    })
+}
+
+/// Typed seam for doctor: the optional deadline skip field of a control
+/// frame. Absent, null or invalid reads as unavailable, never as zero.
+#[cfg(test)]
+pub(crate) fn deadline_skips_from_frame(frame: &[u8]) -> Option<DeadlineSkipObservation> {
+    let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
+    serde_json::from_value(value.get("refresh_deadline_skips")?.clone()).ok()
 }
 
 pub fn ensure(options: &Options) -> io::Result<()> {
@@ -290,7 +996,7 @@ fn run_locked(
     let mut random = [0u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
     let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let mut health = Health {
+    let mut state = ControlState::from(Health {
         plugin: PLUGIN_ID.into(),
         socket_path: options.socket.clone(),
         socket_key: paths.key.clone(),
@@ -300,9 +1006,10 @@ fn run_locked(
         last_refresh_ms: None,
         refresh_failed: false,
         capacity_skipped_resources: 0,
-    };
-    fs::write(&paths.pid, format!("{}\n", health.pid))?;
-    let control = ControlWorker::start(listener, health.clone());
+    });
+    state.reader_diagnostics = publisher.reader_diagnostics();
+    fs::write(&paths.pid, format!("{}\n", state.health.pid))?;
+    let control = ControlWorker::start(listener, state.clone());
     publisher.set_shutdown(control.shutdown.clone());
     let started = Instant::now();
     let mut refresh_at = Instant::now();
@@ -352,7 +1059,7 @@ fn run_locked(
                         _ => socket_missing_since = None,
                     }
                     reconnect = true;
-                    *control.health.lock().unwrap() = health.clone();
+                    *control.state.lock().unwrap() = state.clone();
                     std::thread::sleep(RECONNECT_RETRY);
                     continue;
                 }
@@ -364,12 +1071,29 @@ fn run_locked(
                 }
             }
             if Instant::now() >= refresh_at {
+                let attempt_started = started.elapsed();
                 let result = publisher.refresh(&mut transport, &config);
-                let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                record_refresh(&mut health, &result, elapsed_ms);
+                let finished = started.elapsed();
+                note_refresh_attempt(
+                    &mut state.health,
+                    &mut state.observation,
+                    MeasuredRefresh {
+                        result: &result,
+                        uptime_ms: duration_millis(finished),
+                        duration_us: attempt_duration_us(attempt_started, finished),
+                        stages: publisher.refresh_stages(),
+                    },
+                );
+                note_deadline_skip(&mut state.deadline_skips, &result);
                 if let Err(error) = result {
-                    if health.capacity_skipped_resources > 0 {
-                        let _ = log_event(&paths, "refresh_skipped", "metadata_capacity");
+                    if let Some(skip) = crate::publish::refresh_skip(&error) {
+                        // Neither skip reconnects; the frame was never written.
+                        if skip.deadline_skipped > 0 {
+                            let _ = log_event(&paths, "refresh_skipped", "cycle_deadline");
+                        }
+                        if skip.capacity_skipped > 0 {
+                            let _ = log_event(&paths, "refresh_skipped", "metadata_capacity");
+                        }
                     } else if error.kind() == io::ErrorKind::Interrupted
                         && control.shutdown.load(Ordering::Acquire)
                     {
@@ -386,7 +1110,7 @@ fn run_locked(
                 }
                 refresh_at = Instant::now() + Duration::from_millis(config.refresh_interval_ms);
             }
-            *control.health.lock().unwrap() = health.clone();
+            *control.state.lock().unwrap() = state.clone();
             if control.shutdown.load(Ordering::Acquire) {
                 continue;
             }
@@ -406,17 +1130,17 @@ fn control_worker_exited_unexpectedly(
 /// Own the control listener independently of publication. Drop joins the worker
 /// before runtime paths are removed and session ownership is released.
 struct ControlWorker {
-    health: Arc<Mutex<Health>>,
+    state: Arc<Mutex<ControlState>>,
     shutdown: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<io::Result<()>>>,
 }
 impl ControlWorker {
-    fn start(listener: UnixListener, health: Health) -> Self {
-        let health = Arc::new(Mutex::new(health));
+    fn start(listener: UnixListener, state: ControlState) -> Self {
+        let state = Arc::new(Mutex::new(state));
         let shutdown = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
-        let worker_health = health.clone();
+        let worker_state = state.clone();
         let worker_shutdown = shutdown.clone();
         let worker_done = done.clone();
         let worker = std::thread::spawn(move || {
@@ -444,8 +1168,8 @@ impl ControlWorker {
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        // Never hold the health mutex during I/O or a refresh.
-                        let snapshot = worker_health.lock().unwrap().clone();
+                        // Never hold the snapshot mutex during I/O or a refresh.
+                        let snapshot = worker_state.lock().unwrap().clone();
                         if serve_control(stream, &snapshot)? {
                             worker_shutdown.store(true, Ordering::Release);
                             return Ok(());
@@ -458,7 +1182,7 @@ impl ControlWorker {
             Ok(())
         });
         Self {
-            health,
+            state,
             shutdown,
             done,
             worker: Some(worker),
@@ -538,14 +1262,14 @@ impl std::fmt::Display for ReplacedEndpoint {
     }
 }
 impl std::error::Error for ReplacedEndpoint {}
-fn read_identity(
+fn read_control(
     stream: &mut BufReader<UnixStream>,
     paths: &RuntimePaths,
     socket: &std::path::Path,
-) -> io::Result<Health> {
+) -> io::Result<ControlView> {
     write_frame(stream.get_mut(), b"health")?;
-    let health: Health = serde_json::from_slice(&read_frame(stream, 8192)?)
-        .map_err(|_| io::Error::other("invalid daemon control identity"))?;
+    let view = control_view_from_frame(&read_frame(stream, 8192)?)?;
+    let health = &view.health;
     if health.plugin != PLUGIN_ID
         || health.socket_key != paths.key
         || health.socket_path != socket
@@ -562,13 +1286,26 @@ fn read_identity(
     {
         return Err(io::Error::other(ReplacedEndpoint));
     }
-    Ok(health)
+    Ok(view)
 }
-pub fn probe(paths: &RuntimePaths, socket: &std::path::Path) -> io::Result<Option<Health>> {
+fn read_identity(
+    stream: &mut BufReader<UnixStream>,
+    paths: &RuntimePaths,
+    socket: &std::path::Path,
+) -> io::Result<Health> {
+    read_control(stream, paths, socket).map(|view| view.health)
+}
+pub(crate) fn probe_view(
+    paths: &RuntimePaths,
+    socket: &std::path::Path,
+) -> io::Result<Option<ControlView>> {
     let Some(mut stream) = control_stream(paths)? else {
         return Ok(None);
     };
-    read_identity(&mut stream, paths, socket).map(Some)
+    read_control(&mut stream, paths, socket).map(Some)
+}
+pub fn probe(paths: &RuntimePaths, socket: &std::path::Path) -> io::Result<Option<Health>> {
+    probe_view(paths, socket).map(|view| view.map(|view| view.health))
 }
 fn transient_control_error(error: &io::Error) -> bool {
     matches!(
@@ -677,11 +1414,12 @@ fn verify_peer_pid(stream: &UnixStream, expected: u32) -> io::Result<()> {
     }
     Ok(())
 }
-fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
+fn serve_control(stream: UnixStream, snapshot: &ControlState) -> io::Result<bool> {
     // Accept inherits O_NONBLOCK. read_frame and write_frame keep non-blocking
     // I/O and one poll deadline. Do not apply that deadline with setsockopt:
     // on macOS it returns EINVAL after the peer has closed, and that error
-    // would exit the control worker.
+    // would exit the control worker. The snapshot is already detached from
+    // the control mutex.
     let mut reader = BufReader::new(stream);
     // Broken or slow clients cannot terminate the daemon.
     let Ok(frame) = read_frame(&mut reader, 8192) else {
@@ -690,9 +1428,13 @@ fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
     if frame != b"health" {
         return Ok(false);
     }
-    let Ok(bytes) = serde_json::to_vec(health) else {
+    let Ok(bytes) = control_frame(snapshot) else {
         return Ok(false);
     };
+    #[cfg(test)]
+    if let Some(gate) = &snapshot.write_gate {
+        gate.wait();
+    }
     if write_frame(reader.get_mut(), &bytes).is_err() {
         return Ok(false);
     }
@@ -702,6 +1444,7 @@ fn serve_control(stream: UnixStream, health: &Health) -> io::Result<bool> {
     let Ok(request) = serde_json::from_slice::<serde_json::Value>(&frame) else {
         return Ok(false);
     };
+    let health = &snapshot.health;
     if request.get("stop").and_then(|v| v.as_str()) != Some(&health.nonce)
         || request.get("plugin").and_then(|v| v.as_str()) != Some(PLUGIN_ID)
         || request.get("socket_key").and_then(|v| v.as_str()) != Some(&health.socket_key)
@@ -981,6 +1724,53 @@ mod tests {
                 .unwrap();
                 return;
             }
+            if std::env::var_os("LINEUP_TEST_READER_DIAGNOSTICS").is_some() {
+                struct ReaderPublisher(Arc<crate::model::ReaderDiagnostics>);
+                impl Publisher for ReaderPublisher {
+                    fn reader_diagnostics(&self) -> Option<ReaderDiagnosticsHandle> {
+                        Some(ReaderDiagnosticsHandle::new(self.0.clone()))
+                    }
+                    fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                        self.0.test_seed(
+                            crate::model::Provider::Codex,
+                            crate::model::ReaderSnapshot {
+                                attempts: 42,
+                                ..Default::default()
+                            },
+                        );
+                        Ok(())
+                    }
+                    fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let diagnostics = Arc::new(crate::model::ReaderDiagnostics::default());
+                run_foreground(&options, true, &mut ReaderPublisher(diagnostics)).unwrap();
+                return;
+            }
+            if std::env::var_os("LINEUP_TEST_REFRESH_DEADLINE_SKIP").is_some() {
+                struct DeadlineSkip(PathBuf);
+                impl Publisher for DeadlineSkip {
+                    fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                        fs::write(self.0.join("refresh-entered"), "")?;
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            crate::publish::RefreshSkip {
+                                capacity_skipped: 1,
+                                deadline_skipped: 2,
+                            },
+                        ))
+                    }
+                    fn reconnected(&mut self) {
+                        let _ = fs::write(self.0.join("reconnected"), "");
+                    }
+                    fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                run_foreground(&options, true, &mut DeadlineSkip(options.state.clone())).unwrap();
+                return;
+            }
             if std::env::var_os("LINEUP_TEST_REFRESH_INTERRUPTED").is_some() {
                 struct InterruptedRefresh(Arc<AtomicBool>, PathBuf);
                 impl Publisher for InterruptedRefresh {
@@ -1109,6 +1899,65 @@ mod tests {
             pid.is_some()
         });
         pid.unwrap()
+    }
+
+    #[test]
+    fn deadline_skip_is_healthy_logged_and_reported_beside_the_observation() {
+        let (_dir, options, done, server) = fixture();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_REFRESH_DEADLINE_SKIP", "1");
+        ensure_command(&options, command).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| options.state.join("refresh-entered").exists());
+        let mut frame = Vec::new();
+        wait_until(|| {
+            let Ok(mut stream) = UnixStream::connect(&paths.control) else {
+                return false;
+            };
+            if write_frame(&mut stream, b"health").is_err() {
+                return false;
+            }
+            frame = read_frame(&mut BufReader::new(stream), 8192).unwrap_or_default();
+            deadline_skips_from_frame(&frame).is_some()
+        });
+        stop(&options).unwrap();
+        let log = fs::read_to_string(&paths.log).unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(
+            deadline_skips_from_frame(&frame),
+            Some(DeadlineSkipObservation {
+                attempt_count: 1,
+                last_deadline_skipped: 2,
+                last_capacity_skipped: 1,
+            })
+        );
+        let view = control_view_from_frame(&frame).unwrap();
+        assert!(!view.health.refresh_failed);
+        assert_eq!(view.health.capacity_skipped_resources, 1);
+        let observation = view.observation.unwrap();
+        assert_eq!(observation.attempt_count, 1);
+        assert_eq!(
+            (
+                observation.success_count,
+                observation.error_count,
+                observation.capacity_skip_count
+            ),
+            (0, 0, 0)
+        );
+        assert!(
+            log.contains("event=refresh_skipped reason=cycle_deadline"),
+            "{log}"
+        );
+        assert!(
+            log.contains("event=refresh_skipped reason=metadata_capacity"),
+            "{log}"
+        );
+        assert!(!log.contains("event=refresh_failed"), "{log}");
+        assert!(
+            !options.state.join("reconnected").exists(),
+            "a deadline skip must not reconnect"
+        );
     }
 
     #[test]
@@ -1267,6 +2116,14 @@ mod tests {
         let mut command = child_command();
         command.env("LINEUP_TEST_RECORD_START", "1");
         let restarted = ensure_command(&options, command);
+        assert!(
+            stopped.is_ok(),
+            "stop failed before restart probe: {stopped:?}"
+        );
+        assert!(
+            restarted.is_ok(),
+            "ensure failed before restart probe: {restarted:?}"
+        );
         let new = probe(&paths, &options.socket).unwrap().unwrap();
         // Reap only the child owned by this fixture, even on a regression.
         let old_exited_at_start = old.try_wait().unwrap().is_some();
@@ -1338,7 +2195,7 @@ mod tests {
         };
         let fake = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            assert!(!serve_control(stream, &health).unwrap());
+            assert!(!serve_control(stream, &ControlState::from(health)).unwrap());
         });
         let stopped = stop(&options);
         fake.join().unwrap();
@@ -1547,6 +2404,14 @@ mod tests {
         let stopped = stop(&options);
         let cleared = options.state.join("clear-called").exists();
         let restarted = ensure_command(&options, child_command());
+        assert!(
+            stopped.is_ok(),
+            "stop failed before restart probe: {stopped:?}"
+        );
+        assert!(
+            restarted.is_ok(),
+            "ensure failed before restart probe: {restarted:?}"
+        );
         let new = probe(&paths, &options.socket).unwrap().unwrap();
         // Clean up even when the regression assertion fails.
         stop(&options).unwrap();
@@ -1954,10 +2819,10 @@ mod tests {
         // reproduce that state on Linux and queue health before starting I/O.
         server.set_nonblocking(true).unwrap();
         client.write_all(b"health\n").unwrap();
-        let server_health = health.clone();
+        let server_state = ControlState::from(health.clone());
         let (completed_tx, completed_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result = serve_control(server, &server_health).unwrap();
+            let result = serve_control(server, &server_state).unwrap();
             completed_tx.send(result).unwrap();
         });
         let mut client = BufReader::new(client);
@@ -2052,8 +2917,9 @@ mod tests {
             &mut health,
             &Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                crate::publish::CapacitySkip {
-                    skipped_resources: 2,
+                crate::publish::RefreshSkip {
+                    capacity_skipped: 2,
+                    deadline_skipped: 0,
                 },
             )),
             12,
@@ -2087,7 +2953,7 @@ mod tests {
         server.set_nonblocking(true).unwrap();
         drop(client);
         let started = Instant::now();
-        assert!(!serve_control(server, &sample_health()).unwrap());
+        assert!(!serve_control(server, &ControlState::from(sample_health())).unwrap());
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
@@ -2112,6 +2978,1475 @@ mod tests {
         assert!(started.elapsed() < STOP_DEADLINE);
         assert!(probe(&paths, &options.socket).unwrap().is_none());
         assert!(SessionLock::acquire(&paths).unwrap().is_some());
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    fn note(
+        health: &mut Health,
+        observation: &mut Option<RefreshObservation>,
+        result: &io::Result<()>,
+        uptime_ms: u64,
+        duration_us: Option<u64>,
+        stages: Option<RefreshStages>,
+    ) {
+        note_refresh_attempt(
+            health,
+            observation,
+            MeasuredRefresh {
+                result,
+                uptime_ms,
+                duration_us,
+                stages,
+            },
+        );
+    }
+
+    #[test]
+    fn injected_clock_separates_uptime_from_attempt_duration() {
+        let uptime_ms = 10_012u64;
+        let mut health = sample_health();
+        health.last_refresh_ms = None;
+        let mut observation = None;
+        note(
+            &mut health,
+            &mut observation,
+            &Ok(()),
+            uptime_ms,
+            Some(12_400),
+            None,
+        );
+        assert_eq!(health.last_refresh_ms, Some(10_012));
+        assert!(!health.refresh_failed);
+        let duration = observation.unwrap().duration.unwrap();
+        assert_eq!(duration.last_us, 12_400);
+        assert_eq!(duration.min_us, 12_400);
+        assert_eq!(duration.max_us, 12_400);
+        assert_ne!(duration.last_us, health.last_refresh_ms.unwrap());
+        assert_eq!(duration_bucket(duration.last_us), 3);
+    }
+
+    #[test]
+    fn sub_millisecond_crossing_is_not_the_truncated_uptime_delta() {
+        let started = Duration::from_micros(10_900);
+        let finished = Duration::from_micros(11_100);
+        let duration_us = attempt_duration_us(started, finished);
+        assert_eq!(duration_us, Some(200));
+        assert_eq!(duration_millis(finished) - duration_millis(started), 1);
+        let mut health = sample_health();
+        health.last_refresh_ms = None;
+        let mut observation = None;
+        note(
+            &mut health,
+            &mut observation,
+            &Ok(()),
+            duration_millis(finished),
+            duration_us,
+            None,
+        );
+        assert_eq!(health.last_refresh_ms, Some(11));
+        let stats = observation.unwrap().duration.unwrap();
+        assert_eq!(stats.last_us, 200);
+        assert_eq!(stats.min_us, 200);
+        assert_eq!(stats.max_us, 200);
+        assert_eq!(stats.histogram[0], 1);
+        assert_eq!(stats.histogram.iter().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn refresh_outcomes_and_monotonic_failures_do_not_invent_durations() {
+        let mut health = sample_health();
+        health.last_refresh_ms = Some(100);
+        let mut observation = None;
+        note(
+            &mut health,
+            &mut observation,
+            &Err(io::Error::other("transport")),
+            130,
+            Some(6_500),
+            None,
+        );
+        assert!(health.refresh_failed);
+        assert_eq!(health.last_refresh_ms, Some(100));
+        assert_eq!(health.capacity_skipped_resources, 0);
+        let observed = observation.clone().unwrap();
+        assert_eq!(observed.error_count, 1);
+        assert_eq!(observed.success_count, 0);
+        assert_eq!(observed.capacity_skip_count, 0);
+        assert_eq!(observed.duration.unwrap().last_us, 6_500);
+
+        note(
+            &mut health,
+            &mut observation,
+            &Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                crate::publish::RefreshSkip {
+                    capacity_skipped: 2,
+                    deadline_skipped: 0,
+                },
+            )),
+            140,
+            None,
+            None,
+        );
+        assert!(!health.refresh_failed);
+        assert_eq!(health.last_refresh_ms, Some(140));
+        assert_eq!(health.capacity_skipped_resources, 2);
+        let skipped = observation.clone().unwrap();
+        assert_eq!(skipped.capacity_skip_count, 1);
+        assert_eq!(skipped.attempt_count, 2);
+        assert_eq!(skipped.duration.unwrap().last_us, 6_500);
+
+        note(
+            &mut health,
+            &mut observation,
+            &Ok(()),
+            150,
+            Some(3_000),
+            None,
+        );
+        let measured = observation.unwrap();
+        assert_eq!(measured.success_count, 1);
+        assert_eq!(measured.error_count, 1);
+        assert_eq!(measured.capacity_skip_count, 1);
+        let duration = measured.duration.unwrap();
+        assert_eq!(duration.last_us, 3_000);
+        assert_eq!(duration.min_us, 3_000);
+        assert_eq!(duration.max_us, 6_500);
+        assert_eq!(health.last_refresh_ms, Some(150));
+    }
+
+    #[test]
+    fn duration_histogram_bounds_and_counters_saturate() {
+        let samples = [
+            (0, 0),
+            (999, 0),
+            (1_000, 1),
+            (4_999, 1),
+            (5_000, 2),
+            (9_999, 2),
+            (10_000, 3),
+            (49_999, 3),
+            (50_000, 4),
+            (99_999, 4),
+            (100_000, 5),
+            (499_999, 5),
+            (500_000, 6),
+            (999_999, 6),
+            (1_000_000, 7),
+            (4_999_999, 7),
+            (5_000_000, 8),
+            (u64::MAX, 8),
+        ];
+        for (duration_us, bucket) in samples {
+            assert_eq!(duration_bucket(duration_us), bucket, "{duration_us}");
+        }
+        let mut health = sample_health();
+        let mut observation = Some(RefreshObservation {
+            attempt_count: u64::MAX,
+            success_count: u64::MAX,
+            error_count: u64::MAX,
+            capacity_skip_count: u64::MAX,
+            duration: Some(RefreshDuration {
+                last_us: 1,
+                min_us: 1,
+                max_us: 1,
+                histogram: [u64::MAX; REFRESH_DURATION_BUCKETS],
+            }),
+            stages: None,
+        });
+        note(
+            &mut health,
+            &mut observation,
+            &Ok(()),
+            8,
+            Some(5_000_000),
+            None,
+        );
+        let observed = observation.unwrap();
+        assert_eq!(observed.attempt_count, u64::MAX);
+        assert_eq!(observed.success_count, u64::MAX);
+        assert_eq!(observed.duration.unwrap().histogram[8], u64::MAX);
+    }
+
+    #[test]
+    fn legacy_and_malformed_diagnostics_stay_unavailable() {
+        let health = sample_health();
+        let legacy = serde_json::to_vec(&health).unwrap();
+        let view = control_view_from_frame(&legacy).unwrap();
+        assert!(view.observation.is_none());
+        assert_eq!(view.health.last_refresh_ms, health.last_refresh_ms);
+
+        let mut value = serde_json::to_value(&health).unwrap();
+        value["refresh_observation"] = serde_json::json!({
+            "attempt_count": 4,
+            "success_count": 4,
+            "error_count": 0,
+            "capacity_skip_count": 0,
+            "duration": {"last_ms": 1, "min_ms": 1, "max_ms": 1, "histogram": [0, 0, 0, 0, 0, 0, 0, 0, 0]}
+        });
+        let wrong_unit = control_view_from_frame(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(wrong_unit.observation.is_none());
+        assert_eq!(wrong_unit.health.pid, health.pid);
+        value["refresh_observation"]["duration"] =
+            serde_json::json!({"last_us": 1, "min_us": 1, "max_us": 1, "histogram": [1]});
+        let malformed = control_view_from_frame(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(malformed.observation.is_none());
+        assert_eq!(malformed.health.pid, health.pid);
+
+        value["refresh_observation"]["extra"] = serde_json::json!(1);
+        value["refresh_observation"]["duration"]["histogram"] =
+            serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let unknown = control_view_from_frame(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(unknown.observation.is_none());
+    }
+
+    #[test]
+    fn one_attempt_publishes_health_and_metrics_together() {
+        let mut state = ControlState::from(sample_health());
+        state.health.last_refresh_ms = None;
+        note(
+            &mut state.health,
+            &mut state.observation,
+            &Ok(()),
+            20,
+            Some(10_400),
+            Some(RefreshStages {
+                durations: RefreshStageDurations {
+                    snapshot_us: 1,
+                    git_us: 0,
+                    reader_us: 2,
+                    persist_us: 3,
+                    socket_us: 4,
+                },
+                counts: RefreshStageCounts {
+                    reports: 2,
+                    checkpoints: 1,
+                },
+            }),
+        );
+        let first = state.clone();
+        note(
+            &mut state.health,
+            &mut state.observation,
+            &Err(io::Error::other("transport")),
+            99,
+            Some(7_000),
+            None,
+        );
+        let first_view = control_view_from_frame(&control_frame(&first).unwrap()).unwrap();
+        assert_eq!(first_view.health.last_refresh_ms, Some(20));
+        assert!(!first_view.health.refresh_failed);
+        let first_observation = first_view.observation.unwrap();
+        assert_eq!(first_observation.duration.unwrap().last_us, 10_400);
+        let first_stages = first_observation.stages.unwrap();
+        assert!(first_stages.latest_measured);
+        assert_eq!(first_stages.git.duration.last_us, 0);
+        assert_eq!(first_stages.git.count, 1);
+        assert_eq!(first_stages.git.duration.histogram[0], 1);
+        assert_eq!(first_stages.reports, 2);
+        assert_eq!(first_stages.checkpoints, 1);
+        assert_eq!(first_observation.success_count, 1);
+
+        let current = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
+        assert!(current.health.refresh_failed);
+        assert_eq!(current.health.last_refresh_ms, Some(20));
+        let current_observation = current.observation.unwrap();
+        let kept_stages = current_observation.stages.unwrap();
+        assert!(!kept_stages.latest_measured);
+        assert_eq!(kept_stages.git.count, 1);
+        assert_eq!(kept_stages.git.duration.histogram.iter().sum::<u64>(), 1);
+        assert_eq!(kept_stages.reports, 2);
+        assert_eq!(current_observation.error_count, 1);
+        assert_eq!(current_observation.duration.unwrap().last_us, 7_000);
+        let legacy: Health = serde_json::from_slice(&control_frame(&state).unwrap()).unwrap();
+        assert_eq!(legacy.last_refresh_ms, Some(20));
+        assert!(legacy.refresh_failed);
+    }
+
+    #[test]
+    fn default_stages_are_not_zero_measurements() {
+        assert!(NoopPublisher.refresh_stages().is_none());
+        struct Staged;
+        impl Publisher for Staged {
+            fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                Ok(())
+            }
+            fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                Ok(())
+            }
+            fn refresh_stages(&self) -> Option<RefreshStages> {
+                Some(RefreshStages {
+                    durations: RefreshStageDurations {
+                        snapshot_us: 0,
+                        git_us: 0,
+                        reader_us: 0,
+                        persist_us: 0,
+                        socket_us: 0,
+                    },
+                    counts: RefreshStageCounts {
+                        reports: 0,
+                        checkpoints: 0,
+                    },
+                })
+            }
+        }
+        let measured = Staged.refresh_stages().unwrap();
+        assert_eq!(measured.durations.git_us, 0);
+        assert_eq!(measured.counts.checkpoints, 0);
+        let mut health = sample_health();
+        let mut observation = None;
+        note(&mut health, &mut observation, &Ok(()), 4, Some(0), None);
+        assert!(observation.unwrap().stages.is_none());
+    }
+
+    fn stages_us(
+        snapshot: u64,
+        git: u64,
+        reader: u64,
+        persist: u64,
+        socket: u64,
+        reports: u64,
+        checkpoints: u64,
+    ) -> RefreshStages {
+        RefreshStages {
+            durations: RefreshStageDurations {
+                snapshot_us: snapshot,
+                git_us: git,
+                reader_us: reader,
+                persist_us: persist,
+                socket_us: socket,
+            },
+            counts: RefreshStageCounts {
+                reports,
+                checkpoints,
+            },
+        }
+    }
+
+    #[test]
+    fn stage_histograms_keep_measured_attempts_and_ignore_missing_ones() {
+        let mut health = sample_health();
+        health.last_refresh_ms = None;
+        let mut observation = None;
+        note(
+            &mut health,
+            &mut observation,
+            &Ok(()),
+            40,
+            Some(12_400),
+            Some(stages_us(999, 1_000, 5_000, 50_000, 5_000_000, 2, 1)),
+        );
+        note(
+            &mut health,
+            &mut observation,
+            &Err(io::Error::other("transport")),
+            80,
+            Some(200),
+            Some(stages_us(0, 4_999, 9_999, 99_999, u64::MAX, u64::MAX, 3)),
+        );
+        assert!(health.refresh_failed);
+        assert_eq!(health.last_refresh_ms, Some(40));
+        note(&mut health, &mut observation, &Ok(()), 90, None, None);
+        assert!(!health.refresh_failed);
+        assert_eq!(health.last_refresh_ms, Some(90));
+        let unmeasured = observation.clone().unwrap();
+        let unmeasured_stages = unmeasured.stages.unwrap();
+        assert!(!unmeasured_stages.latest_measured);
+        assert_eq!(unmeasured_stages.snapshot.count, 2);
+        assert_eq!(unmeasured_stages.reports, u64::MAX);
+        assert_eq!(
+            unmeasured.duration.unwrap().histogram.iter().sum::<u64>(),
+            2
+        );
+        note(
+            &mut health,
+            &mut observation,
+            &Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                crate::publish::RefreshSkip {
+                    capacity_skipped: 1,
+                    deadline_skipped: 0,
+                },
+            )),
+            100,
+            Some(3_000),
+            Some(stages_us(10, 10, 10, 10, 10, 1, 0)),
+        );
+
+        let observed = observation.unwrap();
+        assert_eq!(observed.success_count, 2);
+        assert_eq!(observed.error_count, 1);
+        assert_eq!(observed.capacity_skip_count, 1);
+        assert_eq!(health.last_refresh_ms, Some(100));
+        assert!(!health.refresh_failed);
+        let total = observed.duration.unwrap();
+        assert_eq!(total.last_us, 3_000);
+        assert_eq!(total.min_us, 200);
+        assert_eq!(total.max_us, 12_400);
+        assert_eq!(total.histogram[0], 1);
+        assert_eq!(total.histogram[1], 1);
+        assert_eq!(total.histogram[3], 1);
+        assert_eq!(total.histogram.iter().sum::<u64>(), 3);
+
+        let stages = observed.stages.unwrap();
+        assert!(stages.latest_measured);
+        assert_eq!(stages.reports, u64::MAX);
+        assert_eq!(stages.checkpoints, 4);
+        assert_eq!(stages.snapshot.count, 3);
+        assert_eq!(stages.snapshot.duration.last_us, 10);
+        assert_eq!(stages.snapshot.duration.min_us, 0);
+        assert_eq!(stages.snapshot.duration.max_us, 999);
+        assert_eq!(stages.snapshot.sum_us, 1_009);
+        assert_eq!(stages.snapshot.duration.histogram[0], 3);
+        assert_eq!(stages.git.duration.histogram[0], 1);
+        assert_eq!(stages.git.duration.histogram[1], 2);
+        assert_eq!(stages.git.sum_us, 6_009);
+        assert_eq!(stages.reader.duration.histogram[0], 1);
+        assert_eq!(stages.reader.duration.histogram[2], 2);
+        assert_eq!(stages.persist.duration.histogram[0], 1);
+        assert_eq!(stages.persist.duration.histogram[4], 2);
+        assert_eq!(stages.socket.duration.histogram[0], 1);
+        assert_eq!(stages.socket.duration.histogram[8], 2);
+        assert_eq!(stages.socket.sum_us, u64::MAX);
+        assert_eq!(duration_bucket(999), 0);
+        assert_eq!(duration_bucket(1_000), 1);
+    }
+
+    #[test]
+    fn stage_histograms_saturate_without_zeroing_history() {
+        let saturated = StageDurationStats {
+            count: u64::MAX,
+            sum_us: u64::MAX,
+            duration: RefreshDuration {
+                last_us: 5,
+                min_us: 5,
+                max_us: 5,
+                histogram: [u64::MAX; REFRESH_DURATION_BUCKETS],
+            },
+        };
+        let mut health = sample_health();
+        let mut observation = Some(RefreshObservation {
+            attempt_count: 4,
+            success_count: 4,
+            error_count: 0,
+            capacity_skip_count: 0,
+            duration: None,
+            stages: Some(RefreshStageAggregate {
+                snapshot: saturated.clone(),
+                git: saturated.clone(),
+                reader: saturated.clone(),
+                persist: saturated.clone(),
+                socket: saturated,
+                latest_measured: true,
+                reports: u64::MAX,
+                checkpoints: u64::MAX,
+            }),
+        });
+        note(
+            &mut health,
+            &mut observation,
+            &Err(io::Error::other("transport")),
+            11,
+            None,
+            Some(stages_us(0, 1, 2, 3, 4, 9, 8)),
+        );
+        let stages = observation.unwrap().stages.unwrap();
+        assert!(stages.latest_measured);
+        assert_eq!(stages.snapshot.count, u64::MAX);
+        assert_eq!(stages.snapshot.sum_us, u64::MAX);
+        assert_eq!(stages.snapshot.duration.histogram[0], u64::MAX);
+        assert_eq!(stages.snapshot.duration.last_us, 0);
+        assert_eq!(stages.snapshot.duration.min_us, 0);
+        assert_eq!(stages.snapshot.duration.max_us, 5);
+        assert_eq!(stages.reports, u64::MAX);
+        assert_eq!(stages.checkpoints, u64::MAX);
+        assert!(health.refresh_failed);
+        assert_eq!(health.last_refresh_ms, sample_health().last_refresh_ms);
+    }
+
+    #[test]
+    fn stage_wire_rejects_legacy_malformed_and_contradictions() {
+        let mut base = serde_json::to_value(sample_health()).unwrap();
+        base["refresh_observation"] = serde_json::json!({
+            "attempt_count": 1,
+            "success_count": 1,
+            "error_count": 0,
+            "capacity_skip_count": 0,
+            "duration": {
+                "last_us": 0,
+                "min_us": 0,
+                "max_us": 0,
+                "histogram": [1, 0, 0, 0, 0, 0, 0, 0, 0]
+            }
+        });
+        let missing = control_view_from_frame(&serde_json::to_vec(&base).unwrap()).unwrap();
+        let missing_observation = missing.observation.unwrap();
+        assert!(missing_observation.stages.is_none());
+        assert_eq!(missing_observation.duration.unwrap().last_us, 0);
+
+        let mut legacy = base.clone();
+        legacy["refresh_observation"]["stages"] = serde_json::json!({
+            "durations": {
+                "snapshot_us": 1,
+                "git_us": 1,
+                "reader_us": 1,
+                "persist_us": 1,
+                "socket_us": 1
+            },
+            "counts": {"reports": 1, "checkpoints": 1}
+        });
+        let legacy_view = control_view_from_frame(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(legacy_view.observation.unwrap().stages.is_none());
+        assert_eq!(legacy_view.health.nonce, sample_health().nonce);
+
+        let mut health = sample_health();
+        let mut observation = None;
+        note(
+            &mut health,
+            &mut observation,
+            &Ok(()),
+            5,
+            Some(0),
+            Some(stages_us(0, 0, 0, 0, 0, 0, 0)),
+        );
+        let state = ControlState {
+            health,
+            observation,
+            deadline_skips: None,
+            reader_diagnostics: None,
+            #[cfg(test)]
+            write_gate: None,
+        };
+        let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
+        let measured = roundtrip.observation.unwrap().stages.unwrap();
+        assert_eq!(measured.snapshot.count, 1);
+        assert_eq!(measured.snapshot.duration.last_us, 0);
+        assert_eq!(measured.snapshot.duration.histogram[0], 1);
+        assert!(measured.latest_measured);
+
+        let mut valid = serde_json::to_value(&state.health).unwrap();
+        valid["refresh_observation"] =
+            serde_json::to_value(state.observation.as_ref().unwrap()).unwrap();
+        let mut short = valid.clone();
+        short["refresh_observation"]["stages"]["snapshot"]["duration"]["histogram"] =
+            serde_json::json!([1]);
+        let short_view = control_view_from_frame(&serde_json::to_vec(&short).unwrap()).unwrap();
+        let short_observation = short_view.observation.unwrap();
+        assert!(short_observation.stages.is_none());
+        assert_eq!(short_observation.duration.unwrap().last_us, 0);
+
+        let mut unknown = valid.clone();
+        unknown["refresh_observation"]["stages"]["extra"] = serde_json::json!(1);
+        assert!(
+            control_view_from_frame(&serde_json::to_vec(&unknown).unwrap())
+                .unwrap()
+                .observation
+                .unwrap()
+                .stages
+                .is_none()
+        );
+
+        let mut contradictory = valid.clone();
+        contradictory["refresh_observation"]["stages"]["git"]["duration"]["min_us"] =
+            serde_json::json!(8);
+        contradictory["refresh_observation"]["stages"]["git"]["duration"]["max_us"] =
+            serde_json::json!(1);
+        assert!(
+            control_view_from_frame(&serde_json::to_vec(&contradictory).unwrap())
+                .unwrap()
+                .observation
+                .unwrap()
+                .stages
+                .is_none()
+        );
+
+        let mut histogram_mismatch = valid.clone();
+        histogram_mismatch["refresh_observation"]["stages"]["reader"]["duration"]["histogram"] =
+            serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            control_view_from_frame(&serde_json::to_vec(&histogram_mismatch).unwrap())
+                .unwrap()
+                .observation
+                .unwrap()
+                .stages
+                .is_none()
+        );
+        let mut sum_below_max = valid.clone();
+        sum_below_max["refresh_observation"]["stages"]["persist"]["sum_us"] = serde_json::json!(0);
+        sum_below_max["refresh_observation"]["stages"]["persist"]["duration"] = serde_json::json!({
+            "last_us": 30,
+            "min_us": 30,
+            "max_us": 30,
+            "histogram": [1, 0, 0, 0, 0, 0, 0, 0, 0]
+        });
+        assert!(
+            control_view_from_frame(&serde_json::to_vec(&sum_below_max).unwrap())
+                .unwrap()
+                .observation
+                .unwrap()
+                .stages
+                .is_none()
+        );
+
+        let mut unequal = valid;
+        unequal["refresh_observation"]["stages"]["socket"]["count"] = serde_json::json!(2);
+        let unequal_view = control_view_from_frame(&serde_json::to_vec(&unequal).unwrap()).unwrap();
+        assert_eq!(unequal_view.health.endpoint, sample_health().endpoint);
+        assert!(unequal_view.observation.unwrap().stages.is_none());
+    }
+
+    fn stage_distribution(
+        count: u64,
+        sum_us: u64,
+        last_us: u64,
+        min_us: u64,
+        max_us: u64,
+        histogram: [u64; REFRESH_DURATION_BUCKETS],
+    ) -> serde_json::Value {
+        let stage = serde_json::json!({
+            "count": count,
+            "sum_us": sum_us,
+            "duration": {
+                "last_us": last_us,
+                "min_us": min_us,
+                "max_us": max_us,
+                "histogram": histogram,
+            }
+        });
+        let mut health = serde_json::to_value(sample_health()).unwrap();
+        health["refresh_observation"] = serde_json::json!({
+            "attempt_count": count,
+            "success_count": count,
+            "error_count": 0,
+            "capacity_skip_count": 0,
+            "duration": {
+                "last_us": 0,
+                "min_us": 0,
+                "max_us": 0,
+                "histogram": [1, 0, 0, 0, 0, 0, 0, 0, 0]
+            },
+            "stages": {
+                "snapshot": stage.clone(),
+                "git": stage.clone(),
+                "reader": stage.clone(),
+                "persist": stage.clone(),
+                "socket": stage,
+                "latest_measured": true,
+                "reports": 0,
+                "checkpoints": 0
+            }
+        });
+        health
+    }
+
+    fn assert_stages_unavailable(frame: &serde_json::Value) {
+        let view = control_view_from_frame(&serde_json::to_vec(frame).unwrap()).unwrap();
+        assert!(view.observation.as_ref().unwrap().stages.is_none());
+        assert_eq!(view.health.nonce, sample_health().nonce);
+        assert_eq!(view.health.endpoint, sample_health().endpoint);
+        assert_eq!(
+            view.observation
+                .as_ref()
+                .unwrap()
+                .duration
+                .as_ref()
+                .unwrap()
+                .last_us,
+            0
+        );
+    }
+
+    #[test]
+    fn stage_histogram_buckets_must_cover_min_max_and_last() {
+        let zeros = [0; REFRESH_DURATION_BUCKETS];
+        let mut outside = zeros;
+        outside[8] = 1;
+        // count 1, sum 0, last = min = max = 0, but the only observation is `>=5000ms`.
+        assert_stages_unavailable(&stage_distribution(1, 0, 0, 0, 0, outside));
+
+        let mut above_max = zeros;
+        above_max[0] = 1;
+        above_max[1] = 1;
+        assert_stages_unavailable(&stage_distribution(2, 1_000, 500, 0, 999, above_max));
+
+        let mut missing_last = zeros;
+        missing_last[0] = 1;
+        missing_last[2] = 1;
+        assert_stages_unavailable(&stage_distribution(
+            2,
+            10_000,
+            1_000,
+            0,
+            10_000,
+            missing_last,
+        ));
+
+        let mut missing_min = zeros;
+        missing_min[1] = 1;
+        missing_min[2] = 1;
+        assert_stages_unavailable(&stage_distribution(
+            2,
+            11_000,
+            10_000,
+            0,
+            10_000,
+            missing_min,
+        ));
+
+        let mut saturated_outside = zeros;
+        saturated_outside[8] = u64::MAX;
+        assert_stages_unavailable(&stage_distribution(
+            u64::MAX,
+            u64::MAX,
+            0,
+            0,
+            0,
+            saturated_outside,
+        ));
+
+        let mut saturated_small_count = zeros;
+        saturated_small_count[0] = u64::MAX;
+        assert_stages_unavailable(&stage_distribution(2, 0, 0, 0, 0, saturated_small_count));
+
+        let mut crossing = zeros;
+        crossing[0] = 1;
+        crossing[1] = 1;
+        let accepted = control_view_from_frame(
+            &serde_json::to_vec(&stage_distribution(2, 1_999, 1_000, 999, 1_000, crossing))
+                .unwrap(),
+        )
+        .unwrap();
+        let stages = accepted.observation.unwrap().stages.unwrap();
+        assert_eq!(stages.snapshot.duration.histogram[0], 1);
+        assert_eq!(stages.snapshot.duration.histogram[1], 1);
+        assert_eq!(stages.snapshot.duration.max_us, 1_000);
+        assert_eq!(
+            accepted.health.last_refresh_ms,
+            sample_health().last_refresh_ms
+        );
+
+        let mut saturated = zeros;
+        saturated[0] = u64::MAX;
+        saturated[1] = 1;
+        let saturated_view = control_view_from_frame(
+            &serde_json::to_vec(&stage_distribution(
+                u64::MAX,
+                u64::MAX,
+                1_000,
+                0,
+                1_000,
+                saturated,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(saturated_view.observation.unwrap().stages.is_some());
+        assert_eq!(saturated_view.health.pid, sample_health().pid);
+
+        // `u64::MAX - 1` zeros and two 1000 us samples saturate the count
+        // without saturating either bucket. The histogram sum does not fit.
+        let mut spread = zeros;
+        spread[0] = u64::MAX - 1;
+        spread[1] = 2;
+        let parsed = control_view_from_frame(
+            &serde_json::to_vec(&stage_distribution(
+                u64::MAX,
+                2_000,
+                1_000,
+                0,
+                1_000,
+                spread,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .observation
+                .as_ref()
+                .unwrap()
+                .duration
+                .as_ref()
+                .unwrap()
+                .last_us,
+            0
+        );
+        let state = ControlState {
+            health: parsed.health.clone(),
+            observation: parsed.observation.clone(),
+            deadline_skips: None,
+            reader_diagnostics: None,
+            #[cfg(test)]
+            write_gate: None,
+        };
+        let roundtrip = control_view_from_frame(&control_frame(&state).unwrap()).unwrap();
+        assert_eq!(roundtrip.health.nonce, parsed.health.nonce);
+        assert_eq!(roundtrip.health.endpoint, parsed.health.endpoint);
+        let stages = roundtrip.observation.unwrap().stages.unwrap();
+        assert_eq!(stages.snapshot.count, u64::MAX);
+        assert_eq!(stages.snapshot.sum_us, 2_000);
+        assert_eq!(stages.snapshot.duration.last_us, 1_000);
+        assert_eq!(stages.snapshot.duration.min_us, 0);
+        assert_eq!(stages.snapshot.duration.max_us, 1_000);
+        assert_eq!(stages.snapshot.duration.histogram[0], u64::MAX - 1);
+        assert_eq!(stages.snapshot.duration.histogram[1], 2);
+        assert!(
+            stages.snapshot.duration.histogram[2..]
+                .iter()
+                .all(|count| *count == 0)
+        );
+        assert!(!stages.snapshot.duration.histogram.contains(&u64::MAX));
+        assert_eq!(stages.socket.duration.histogram[1], 2);
+
+        assert_stages_unavailable(&stage_distribution(
+            u64::MAX - 1,
+            2_000,
+            1_000,
+            0,
+            1_000,
+            spread,
+        ));
+        let mut spread_outside = spread;
+        spread_outside[8] = 1;
+        assert_stages_unavailable(&stage_distribution(
+            u64::MAX,
+            2_000,
+            1_000,
+            0,
+            1_000,
+            spread_outside,
+        ));
+    }
+
+    #[test]
+    fn serve_control_uses_a_snapshot_without_the_state_mutex() {
+        let state = Arc::new(Mutex::new(ControlState::from(sample_health())));
+        {
+            let mut guard = state.lock().unwrap();
+            let mut health = guard.health.clone();
+            let mut observation = guard.observation.clone();
+            note(
+                &mut health,
+                &mut observation,
+                &Ok(()),
+                30,
+                Some(5_400),
+                Some(stages_us(1, 2, 3, 4, 5, 1, 1)),
+            );
+            guard.health = health;
+            guard.observation = observation;
+        }
+        let snapshot = state.lock().unwrap().clone();
+        {
+            let mut guard = state.lock().unwrap();
+            guard.health.last_refresh_ms = Some(999);
+            guard
+                .observation
+                .as_mut()
+                .unwrap()
+                .duration
+                .as_mut()
+                .unwrap()
+                .last_us = 999;
+            guard
+                .observation
+                .as_mut()
+                .unwrap()
+                .stages
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .duration
+                .last_us = 999;
+        }
+        let held = state.lock().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.write_all(b"health\n").unwrap();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || serve_control(server, &snapshot));
+        let mut client = BufReader::new(client);
+        let view = control_view_from_frame(&read_frame(&mut client, 8192).unwrap()).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(view.health.last_refresh_ms, Some(30));
+        let observed = view.observation.unwrap();
+        assert_eq!(observed.duration.unwrap().last_us, 5_400);
+        assert_eq!(observed.stages.unwrap().snapshot.duration.last_us, 1);
+        drop(client);
+        drop(held);
+        assert!(!worker.join().unwrap().unwrap());
+    }
+
+    fn skip(capacity_skipped: u64, deadline_skipped: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            crate::publish::RefreshSkip {
+                capacity_skipped,
+                deadline_skipped,
+            },
+        ))
+    }
+
+    #[test]
+    fn mixed_skip_keeps_both_counts_and_errors_never_become_skips() {
+        let mut state = ControlState::from(sample_health());
+        let attempt = |state: &mut ControlState, result: &io::Result<()>| {
+            note(
+                &mut state.health,
+                &mut state.observation,
+                result,
+                1,
+                Some(10),
+                Some(stages_us(1, 1, 1, 1, 1, 0, 0)),
+            );
+            note_deadline_skip(&mut state.deadline_skips, result);
+        };
+        attempt(&mut state, &skip(3, 2));
+        assert!(!state.health.refresh_failed);
+        assert_eq!(state.health.capacity_skipped_resources, 3);
+        assert_eq!(
+            state.deadline_skips,
+            Some(DeadlineSkipObservation {
+                attempt_count: 1,
+                last_deadline_skipped: 2,
+                last_capacity_skipped: 3,
+            })
+        );
+        // A capacity-only skip keeps its own classification and leaves the
+        // deadline totals as they were.
+        attempt(&mut state, &skip(1, 0));
+        assert_eq!(state.deadline_skips.as_ref().unwrap().attempt_count, 1);
+        for error in [
+            io::Error::new(io::ErrorKind::Interrupted, "shutdown"),
+            io::Error::other("sequence checkpoint persistence is uncertain; restart required"),
+            io::Error::new(io::ErrorKind::TimedOut, "ambiguous exchange"),
+        ] {
+            attempt(&mut state, &Err(error));
+            assert!(state.health.refresh_failed);
+        }
+        attempt(&mut state, &skip(0, 4));
+        let observation = state.observation.as_ref().unwrap();
+        // Deadline skips are in the attempt total, duration and stage samples,
+        // and in none of the other outcome counts.
+        assert_eq!(observation.attempt_count, 6);
+        assert_eq!(observation.success_count, 0);
+        assert_eq!(observation.error_count, 3);
+        assert_eq!(observation.capacity_skip_count, 1);
+        assert_eq!(
+            observation
+                .duration
+                .as_ref()
+                .unwrap()
+                .histogram
+                .iter()
+                .sum::<u64>(),
+            6
+        );
+        assert_eq!(observation.stages.as_ref().unwrap().snapshot.count, 6);
+        assert_eq!(
+            state.deadline_skips,
+            Some(DeadlineSkipObservation {
+                attempt_count: 2,
+                last_deadline_skipped: 4,
+                last_capacity_skipped: 0,
+            })
+        );
+        assert!(!state.health.refresh_failed);
+        assert_eq!(state.health.capacity_skipped_resources, 0);
+    }
+
+    #[test]
+    fn deadline_skip_field_is_optional_and_does_not_break_existing_readers() {
+        let mut state = ControlState::from(sample_health());
+        let fresh = control_frame(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fresh).unwrap();
+        assert!(
+            value.get("refresh_deadline_skips").is_none(),
+            "absent until the first skip"
+        );
+        assert_eq!(deadline_skips_from_frame(&fresh), None);
+        note(
+            &mut state.health,
+            &mut state.observation,
+            &skip(0, 1),
+            1,
+            Some(10),
+            None,
+        );
+        note_deadline_skip(&mut state.deadline_skips, &skip(0, 1));
+        let frame = control_frame(&state).unwrap();
+        // The existing reader and the bare `Health` shape still parse the frame.
+        let view = control_view_from_frame(&frame).unwrap();
+        assert_eq!(view.observation.unwrap().attempt_count, 1);
+        let legacy: Health = serde_json::from_slice(&frame).unwrap();
+        assert!(!legacy.refresh_failed);
+        assert_eq!(
+            deadline_skips_from_frame(&frame)
+                .unwrap()
+                .last_deadline_skipped,
+            1
+        );
+        let mut value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({"attempt_count": 1}),
+            serde_json::json!({"attempt_count": 1, "last_deadline_skipped": 1,
+                "last_capacity_skipped": 0, "unknown": 1}),
+        ] {
+            value["refresh_deadline_skips"] = invalid;
+            let frame = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                deadline_skips_from_frame(&frame),
+                None,
+                "unavailable, not zero"
+            );
+            assert!(
+                control_view_from_frame(&frame)
+                    .unwrap()
+                    .observation
+                    .is_some()
+            );
+        }
+    }
+    #[test]
+    fn reader_frame_rejects_oversized_health_without_truncating_identity() {
+        let mut state = ControlState::from(sample_health());
+        state.health.socket_path = PathBuf::from("/".to_owned() + &"x".repeat(8192));
+        assert!(
+            control_frame(&state).is_err(),
+            "health alone must fit including newline"
+        );
+    }
+    fn reader_test_state() -> (ControlState, Arc<crate::model::ReaderDiagnostics>) {
+        let diagnostics = Arc::new(crate::model::ReaderDiagnostics::default());
+        let mut state = ControlState::from(sample_health());
+        state.reader_diagnostics = Some(ReaderDiagnosticsHandle::new(diagnostics.clone()));
+        (state, diagnostics)
+    }
+
+    fn reader_entry(view: &ControlView, label: &str) -> ReaderSample {
+        match &view.reader_diagnostics.as_ref().unwrap().providers[label] {
+            ReaderEntry::Available { sample } => sample.clone(),
+            other => panic!("expected available, got {other:?}"),
+        }
+    }
+
+    fn reader_view(state: &ControlState) -> ControlView {
+        control_view_from_frame(&control_frame(state).unwrap()).unwrap()
+    }
+
+    // Removing per-slot try_lock or flattening unavailable into zero breaks this.
+    #[test]
+    fn reader_control_reports_real_contention_poison_and_incomplete_independently() {
+        use crate::model::Provider;
+        let (state, diagnostics) = reader_test_state();
+        diagnostics.test_with_slot(Provider::Codex, || {
+            let view = reader_view(&state);
+            assert!(matches!(
+                view.reader_diagnostics.unwrap().providers["codex"],
+                ReaderEntry::Contended
+            ));
+        });
+        let clone = diagnostics.clone();
+        assert!(
+            std::thread::spawn(
+                move || clone.test_with_slot(Provider::Grok, || panic!("synthetic poison"))
+            )
+            .join()
+            .is_err()
+        );
+        diagnostics.test_unknown(Provider::Kimi);
+        let view = reader_view(&state);
+        let readers = view.reader_diagnostics.as_ref().unwrap();
+        assert!(matches!(readers.providers["grok"], ReaderEntry::Poisoned));
+        assert!(matches!(readers.providers["kimi"], ReaderEntry::Incomplete));
+        assert_eq!(reader_entry(&view, "codex").attempts, 0);
+        assert!(!reader_entry(&view, "codex").worker_active);
+        assert_eq!(view.health.nonce, state.health.nonce);
+    }
+
+    // Sampling a frozen refresh snapshot would keep active=true after release.
+    #[test]
+    fn reader_control_live_worker_release_is_visible_without_another_refresh() {
+        use crate::model::{
+            self, Provider, ReadRequest, SessionIdentity, SourceKind, UsageReading,
+        };
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let (state, diagnostics) = reader_test_state();
+        let identity = SessionIdentity {
+            provider: Provider::Codex,
+            native_session_id: "synthetic".into(),
+            repository_identity: "synthetic".into(),
+        };
+        let request = ReadRequest {
+            identity: &identity,
+            home: std::path::Path::new("/unused"),
+            now: std::time::SystemTime::now(),
+            max_age: Duration::from_secs(60),
+            timeout: Duration::from_millis(20),
+            shutdown: None,
+        };
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, running) = std::sync::mpsc::channel();
+        let result = model::bounded_read_observed(
+            &request,
+            SourceKind::CodexRollout,
+            &BUSY,
+            &diagnostics,
+            move |r| {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+                UsageReading::sample(r, SourceKind::CodexRollout, 7.0, r.now)
+            },
+        );
+        running.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            result.context,
+            model::UsageOutcome::Unavailable(model::MissingReason::Timeout)
+        );
+        let before = reader_view(&state);
+        let sample = reader_entry(&before, "codex");
+        assert!(sample.worker_active && sample.timed_out_worker_active);
+        assert_eq!(sample.deadline_ends, 1);
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while BUSY.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert!(!BUSY.load(Ordering::Acquire));
+        let after = reader_view(&state);
+        let sample = reader_entry(&after, "codex");
+        assert!(!sample.worker_active && !sample.timed_out_worker_active);
+        assert_eq!(sample.attempts, 1);
+        assert_eq!(after.health.last_refresh_ms, before.health.last_refresh_ms);
+        assert_eq!(after.health.nonce, before.health.nonce);
+    }
+
+    #[test]
+    fn reader_wire_skew_does_not_erase_health_or_valid_siblings() {
+        let (mut state, _) = reader_test_state();
+        note(
+            &mut state.health,
+            &mut state.observation,
+            &Ok(()),
+            9,
+            Some(10),
+            None,
+        );
+        state.deadline_skips = Some(DeadlineSkipObservation {
+            attempt_count: 3,
+            last_deadline_skipped: 4,
+            last_capacity_skipped: 2,
+        });
+        let base: serde_json::Value =
+            serde_json::from_slice(&control_frame(&state).unwrap()).unwrap();
+        let decode = |value: &serde_json::Value| {
+            control_view_from_frame(&serde_json::to_vec(value).unwrap()).unwrap()
+        };
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"version":2,"sampling":"live_best_effort","providers":{}}),
+            serde_json::json!({"version":1,"sampling":"frozen","providers":{}}),
+            serde_json::json!({"version":1,"sampling":"live_best_effort","providers":{},"path":"do-not-display"}),
+        ] {
+            let mut value = base.clone();
+            value["reader_diagnostics"] = bad;
+            let view = decode(&value);
+            assert!(view.reader_diagnostics.is_none());
+            assert_eq!(view.observation.unwrap().attempt_count, 1);
+            assert_eq!(view.deadline_skips.unwrap().last_capacity_skipped, 2);
+            assert_eq!(view.health.nonce, state.health.nonce);
+        }
+        let mut bad_samples = Vec::new();
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("4"),
+            serde_json::json!(true),
+            serde_json::from_str("18446744073709551616").unwrap(),
+        ] {
+            let mut value = base.clone();
+            value["reader_diagnostics"]["providers"]["codex"]["sample"]["attempts"] = bad;
+            bad_samples.push(value);
+        }
+        for field in ["attempts", "worker_active"] {
+            let mut value = base.clone();
+            value["reader_diagnostics"]["providers"]["codex"]["sample"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            bad_samples.push(value);
+        }
+        for (field, value) in [
+            ("extra", serde_json::json!("nonce-path-usage-secret")),
+            ("worker_active", serde_json::json!(0)),
+            ("timed_out_worker_active", serde_json::json!(true)),
+        ] {
+            let mut bad = base.clone();
+            bad["reader_diagnostics"]["providers"]["codex"]["sample"][field] = value;
+            bad_samples.push(bad);
+        }
+        let mut missing = base.clone();
+        missing["reader_diagnostics"]["providers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("codex");
+        bad_samples.push(missing);
+        let mut unknown = base.clone();
+        unknown["reader_diagnostics"]["providers"]["codex"] =
+            serde_json::json!({"status":"nonce-path-usage-secret"});
+        bad_samples.push(unknown);
+        for mut value in bad_samples {
+            value["reader_diagnostics"]["providers"]["arbitrary-secret-label"] =
+                serde_json::json!({"status":"available"});
+            let view = decode(&value);
+            let readers = view.reader_diagnostics.as_ref().unwrap();
+            assert_eq!(readers.providers.len(), 6);
+            assert!(matches!(
+                readers.providers["codex"],
+                ReaderEntry::Unavailable
+            ));
+            assert_eq!(reader_entry(&view, "agy").attempts, 0);
+            assert_eq!(view.health.nonce, state.health.nonce);
+        }
+        let mut invalid_health = base;
+        invalid_health["pid"] = serde_json::json!("invalid");
+        assert!(control_view_from_frame(&serde_json::to_vec(&invalid_health).unwrap()).is_err());
+    }
+
+    fn maximum_reader_state() -> ControlState {
+        use crate::model::{Provider, ReaderSnapshot};
+        let (mut state, diagnostics) = reader_test_state();
+        let maximum = ReaderSnapshot {
+            attempts: u64::MAX,
+            busy_rejections: u64::MAX,
+            deadline_ends: u64::MAX,
+            shutdown_ends: u64::MAX,
+            spawn_failures: u64::MAX,
+            worker_failures: u64::MAX,
+            completed: u64::MAX,
+            invalid: u64::MAX,
+            caller_wait_count: u64::MAX,
+            caller_wait_total_ns: u64::MAX,
+            caller_wait_max_ns: u64::MAX,
+            sampling_skips: u64::MAX,
+            ..ReaderSnapshot::default()
+        };
+        for provider in [
+            Provider::Claude,
+            Provider::Agy,
+            Provider::Codex,
+            Provider::Grok,
+            Provider::Hermes,
+            Provider::Kimi,
+        ] {
+            diagnostics.test_seed(provider, maximum);
+        }
+        let duration = RefreshDuration {
+            last_us: u64::MAX,
+            min_us: 0,
+            max_us: u64::MAX,
+            histogram: [u64::MAX; REFRESH_DURATION_BUCKETS],
+        };
+        let stage = StageDurationStats {
+            count: u64::MAX,
+            sum_us: u64::MAX,
+            duration: duration.clone(),
+        };
+        state.observation = Some(RefreshObservation {
+            attempt_count: u64::MAX,
+            success_count: u64::MAX,
+            error_count: u64::MAX,
+            capacity_skip_count: u64::MAX,
+            duration: Some(duration),
+            stages: Some(RefreshStageAggregate {
+                snapshot: stage.clone(),
+                git: stage.clone(),
+                reader: stage.clone(),
+                persist: stage.clone(),
+                socket: stage,
+                latest_measured: true,
+                reports: u64::MAX,
+                checkpoints: u64::MAX,
+            }),
+        });
+        state.deadline_skips = Some(DeadlineSkipObservation {
+            attempt_count: u64::MAX,
+            last_deadline_skipped: u64::MAX,
+            last_capacity_skipped: u64::MAX,
+        });
+        state
+    }
+
+    // Wrong budget, partial provider removal or resampling on fallback fails here.
+    #[test]
+    fn reader_maximum_frame_and_fallback_sample_once_preserving_health() {
+        let mut state = maximum_reader_state();
+        let handle = state.reader_diagnostics.as_ref().unwrap().clone();
+        let normal = control_frame(&state).unwrap();
+        assert!(normal.len() < 8192);
+        eprintln!(
+            "reader maximum combined frame including newline: {} bytes",
+            normal.len() + 1
+        );
+        let parsed = control_view_from_frame(&normal).unwrap();
+        assert_eq!(
+            reader_entry(&parsed, "codex").caller_wait_total_ns,
+            u64::MAX
+        );
+        assert_eq!(
+            parsed.observation.unwrap().stages.unwrap().reader.count,
+            u64::MAX
+        );
+        assert_eq!(
+            parsed.deadline_skips.unwrap().last_capacity_skipped,
+            u64::MAX
+        );
+        assert_eq!(handle.samples.load(Ordering::Relaxed), 1);
+        state.health.socket_path = PathBuf::from("/".to_owned() + &"\"".repeat(1200));
+        let fallback = control_frame(&state).unwrap();
+        let parsed = control_view_from_frame(&fallback).unwrap();
+        assert!(parsed.reader_diagnostics.is_none());
+        assert!(parsed.observation.is_some());
+        assert!(parsed.deadline_skips.is_some());
+        assert_eq!(parsed.health.socket_path, state.health.socket_path);
+        assert_eq!(handle.samples.load(Ordering::Relaxed), 2);
+        state.health.socket_path = PathBuf::from("/".to_owned() + &"\"".repeat(3200));
+        let fallback = control_frame(&state).unwrap();
+        let parsed = control_view_from_frame(&fallback).unwrap();
+        assert!(
+            parsed.reader_diagnostics.is_none()
+                && parsed.observation.is_none()
+                && parsed.deadline_skips.is_none()
+        );
+        assert_eq!(parsed.health.nonce, state.health.nonce);
+        assert_eq!(parsed.health.endpoint, state.health.endpoint);
+        assert_eq!(parsed.health.socket_path, state.health.socket_path);
+        assert_eq!(handle.samples.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn reader_frame_exact_newline_boundary_and_oversized_health_failure() {
+        let (mut state, _) = reader_test_state();
+        // With Health alone at exactly 8192 bytes, both extension tiers disappear.
+        let original = serde_json::to_vec(&state.health).unwrap().len();
+        let padding = 8191 - original;
+        state.health.socket_key.push_str(&"x".repeat(padding));
+        let frame = control_frame(&state).unwrap();
+        assert_eq!(frame.len() + 1, 8192);
+        assert!(
+            control_view_from_frame(&frame)
+                .unwrap()
+                .reader_diagnostics
+                .is_none()
+        );
+        let mut line = frame.clone();
+        line.push(b'\n');
+        let read_line = |line: Vec<u8>| {
+            let (mut sender, receiver) = UnixStream::pair().unwrap();
+            sender.write_all(&line).unwrap();
+            drop(sender);
+            read_frame(&mut BufReader::new(receiver), 8192)
+        };
+        assert_eq!(read_line(line).unwrap(), frame);
+        let mut over = frame.clone();
+        over.push(b' ');
+        over.push(b'\n');
+        assert!(read_line(over).is_err());
+        state.health.socket_key.push('x');
+        assert!(control_frame(&state).is_err());
+        assert_eq!(
+            state
+                .reader_diagnostics
+                .as_ref()
+                .unwrap()
+                .samples
+                .load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn reader_sampling_and_slow_client_do_not_hold_control_mutex() {
+        fn gate() -> (
+            Arc<ControlTestGate>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (entered, arrival) = std::sync::mpsc::sync_channel(1);
+            let (release, released) = std::sync::mpsc::channel();
+            (
+                Arc::new(ControlTestGate {
+                    entered,
+                    release: Mutex::new(released),
+                }),
+                arrival,
+                release,
+            )
+        }
+        let (mut state, diagnostics) = reader_test_state();
+        let (sampling, sample_arrived, sample_release) = gate();
+        let (writing, write_arrived, write_release) = gate();
+        state.reader_diagnostics.as_mut().unwrap().sample_gate = Some(sampling);
+        state.write_gate = Some(writing);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let control = ControlWorker::start(listener, state);
+        let mut client = UnixStream::connect(path).unwrap();
+        client.write_all(b"health\n").unwrap();
+        sample_arrived.recv_timeout(Duration::from_secs(2)).unwrap();
+        // This is the actual ControlWorker state, while its sampler is gated.
+        let sample_unlocked = control.state.try_lock().is_ok();
+        sample_release.send(()).unwrap();
+        write_arrived.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Deliberately stall the actual write site; no claim of kernel backpressure.
+        let write_unlocked = control.state.try_lock().is_ok();
+        write_release.send(()).unwrap();
+        let mut client = BufReader::new(client);
+        let view = control_view_from_frame(&read_frame(&mut client, 8192).unwrap()).unwrap();
+        assert_eq!(reader_entry(&view, "claude").attempts, 0);
+        assert_eq!(
+            diagnostics
+                .snapshot(crate::model::Provider::Claude)
+                .unwrap()
+                .attempts,
+            0
+        );
+        drop(client);
+        drop(control);
+        assert!(
+            sample_unlocked,
+            "ControlWorker held state mutex during live sampling"
+        );
+        assert!(
+            write_unlocked,
+            "ControlWorker held state mutex at a stalled control write"
+        );
+        assert!(NoopPublisher.reader_diagnostics().is_none());
+    }
+
+    #[test]
+    fn reader_handle_survives_actual_daemon_completed_state_publication() {
+        let (_dir, options, done, server) = fixture();
+        let mut command = child_command();
+        command.env("LINEUP_TEST_READER_DIAGNOSTICS", "1");
+        ensure_command(&options, command).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let mut observed = None;
+        wait_until(|| {
+            observed = probe_view(&paths, &options.socket).unwrap();
+            observed
+                .as_ref()
+                .is_some_and(|view| view.health.last_refresh_ms.is_some())
+        });
+        let view = observed.unwrap();
+        assert_eq!(reader_entry(&view, "codex").attempts, 42);
+        assert!(view.observation.is_some());
+        stop(&options).unwrap();
         done.store(true, Ordering::Relaxed);
         server.join().unwrap();
     }

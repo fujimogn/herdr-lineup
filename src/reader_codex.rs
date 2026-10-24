@@ -1,10 +1,10 @@
 //! Codex UI context percentage from exact-session rollout token_count observations.
 use crate::model::*;
+use crate::reader_cache::FingerprintCache;
 use serde::Deserialize;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{MapAccess, Visitor};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -13,28 +13,29 @@ use std::time::SystemTime;
 const CACHE_ENTRIES: usize = 128;
 type Observation = Result<(f64, SystemTime), MissingReason>;
 
-struct CachedRollout {
-    fingerprint: Fingerprint,
-    observation: Observation,
-}
 // Only paths, exact session IDs and derived observations are retained in memory.
-// Discovery still runs on cache hits to reject duplicate and symlinked sources.
-static CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), CachedRollout>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+// Discovery is freshly scanned or cycle-validated before observation cache hits.
+static CACHE: LazyLock<Mutex<FingerprintCache<(PathBuf, String), Observation>>> =
+    LazyLock::new(|| Mutex::new(FingerprintCache::new(CACHE_ENTRIES)));
 
 pub struct CodexReader;
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 impl UsageReader for CodexReader {
     fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+        self.read_in_cycle(request, &ReadCycle::new())
+    }
+
+    fn read_in_cycle(&self, request: &ReadRequest<'_>, cycle: &ReadCycle) -> UsageReading {
         let source = SourceKind::CodexRollout;
         if !associated(request, Provider::Codex)
             || !safe_component(&request.identity.native_session_id)
         {
             return UsageReading::missing(request, source, MissingReason::Unassociated);
         }
-        bounded_read(request, source, &BUSY, move |request| {
+        let worker_cycle = cycle.clone();
+        let job = move |request: &ReadRequest<'_>| {
             let started = std::time::Instant::now();
-            match read_session(request) {
+            match read_session_in_cycle(request, &worker_cycle) {
                 Ok((percent, time)) => {
                     let evaluated = ReadRequest {
                         now: request.now_after(started),
@@ -44,7 +45,11 @@ impl UsageReader for CodexReader {
                 }
                 Err(reason) => UsageReading::missing(request, source, reason),
             }
-        })
+        };
+        match cycle.diagnostics() {
+            Some(diagnostics) => bounded_read_observed(request, source, &BUSY, diagnostics, job),
+            None => bounded_read(request, source, &BUSY, job),
+        }
     }
 }
 fn rollout(path: &Path) -> bool {
@@ -52,10 +57,12 @@ fn rollout(path: &Path) -> bool {
         s.starts_with("rollout-") && (s.ends_with(".jsonl") || s.ends_with(".jsonl.zst"))
     })
 }
+#[cfg(test)]
 fn read_session(request: &ReadRequest<'_>) -> Result<(f64, std::time::SystemTime), MissingReason> {
     read_session_with_hook(request, |_| {})
 }
 
+#[cfg(test)]
 fn read_session_with_hook(
     request: &ReadRequest<'_>,
     after_read: impl FnOnce(&Path),
@@ -63,11 +70,25 @@ fn read_session_with_hook(
     read_session_with_hooks(request, after_read, |_| {})
 }
 
+#[cfg(test)]
 fn read_session_with_hooks(
     request: &ReadRequest<'_>,
     after_read: impl FnOnce(&Path),
     after_path_stat: impl FnOnce(&Path),
 ) -> Result<(f64, std::time::SystemTime), MissingReason> {
+    read_session_with_cycle_hooks(request, &ReadCycle::new(), after_read, after_path_stat)
+}
+
+fn read_session_in_cycle(request: &ReadRequest<'_>, cycle: &ReadCycle) -> Observation {
+    read_session_with_cycle_hooks(request, cycle, |_| {}, |_| {})
+}
+
+fn read_session_with_cycle_hooks(
+    request: &ReadRequest<'_>,
+    cycle: &ReadCycle,
+    after_read: impl FnOnce(&Path),
+    after_path_stat: impl FnOnce(&Path),
+) -> Observation {
     let mut budget = Budget::new(request);
     // Discovery reads names only. Other sessions and credential files are never opened.
     let id = &request.identity.native_session_id;
@@ -80,8 +101,11 @@ fn read_session_with_hooks(
                 .and_then(|s| s.to_str())
                 .is_some_and(|name| name.ends_with(&jsonl_suffix) || name.ends_with(&zst_suffix))
     };
-    let mut paths = budget.files(&request.home.join("sessions"), 3, matching_rollout)?;
-    paths.extend(budget.files(&request.home.join("archived_sessions"), 3, matching_rollout)?);
+    let paths: Vec<_> = cycle
+        .files(&mut budget, request.home, DiscoveryKind::Codex)?
+        .into_iter()
+        .filter(|path| matching_rollout(path))
+        .collect();
     if paths.len() > 1 {
         return Err(MissingReason::Unassociated);
     }
@@ -92,11 +116,10 @@ fn read_session_with_hooks(
     if let Some(cached) = CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .get(&key)
-        && cached.fingerprint == fingerprint
+        .get(&key, fingerprint)
     {
         budget.check()?;
-        return cached.observation;
+        return cached;
     }
     let result = if path.extension().is_some_and(|e| e == "zst") {
         // Keep the existing 16 MiB decompressed limit (SourceError on overflow).
@@ -127,17 +150,10 @@ fn read_session_with_hooks(
         result,
         Err(MissingReason::Timeout | MissingReason::SourceError | MissingReason::PermissionDenied)
     ) {
-        let mut cache = CACHE.lock().map_err(|_| MissingReason::SourceError)?;
-        if cache.len() >= CACHE_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(
-            key,
-            CachedRollout {
-                fingerprint,
-                observation: result,
-            },
-        );
+        CACHE
+            .lock()
+            .map_err(|_| MissingReason::SourceError)?
+            .insert(key, fingerprint, result);
     }
     result
 }
@@ -330,6 +346,111 @@ fn parse_records(text: &str, id: &str, budget: &Budget, mut bound: bool) -> Obse
 }
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+    #[test]
+    fn diagnostic_routing_isolated() {
+        const CHILD: &str = "HERDR_LINEUP_CODEX_ROUTING_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("codex") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reader_codex::tests::diagnostic_routing_isolated",
+                    "--nocapture",
+                ])
+                .env(CHILD, "codex")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostics = std::sync::Arc::new(ReaderDiagnostics::default());
+        let cycle = ReadCycle::with_diagnostics(diagnostics.clone());
+        let plain = ReadCycle::new();
+        let mut first = identity(Provider::Codex);
+        first.repository_identity = "/synthetic/repo".into();
+        let mut second = first.clone();
+        second.native_session_id = "session-2".into();
+        let base = request(&first, dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        for id in [&first, &second] {
+            let text = format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-10-12T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"total_tokens\":26000}},\"model_context_window\":212000}}}}}}\n",
+                id.native_session_id
+            );
+            std::fs::write(
+                dir.path()
+                    .join(format!("sessions/rollout-{}.jsonl", id.native_session_id)),
+                text,
+            )
+            .unwrap();
+        }
+        // Separate pane identities share this refresh's discovery owner.
+        for id in [&first, &second] {
+            let r = request(id, dir.path());
+            assert_routing_sample(CodexReader.read_in_cycle(&r, &cycle).context);
+            wait_for_routing_worker();
+        }
+        assert!((1..=2).contains(&cycle.discovery_scan_count()));
+        let snapshot = diagnostics.snapshot(Provider::Codex).unwrap();
+        assert_eq!((snapshot.attempts, snapshot.completed), (2, 2));
+        assert_eq!(snapshot.busy_rejections, 0);
+        assert!(!snapshot.worker_active);
+        for id in [&first, &second] {
+            assert_routing_sample(
+                CodexReader
+                    .read_in_cycle(&request(id, dir.path()), &plain)
+                    .context,
+            );
+            wait_for_routing_worker();
+        }
+        assert!((1..=2).contains(&plain.discovery_scan_count()));
+        assert_routing_sample(CodexReader.read(&base).context);
+        wait_for_routing_worker();
+        assert_eq!(diagnostics.snapshot(Provider::Codex).unwrap().attempts, 2);
+
+        // Rejection before bounded_read starts has no diagnostic attempt.
+        let mut unassociated = first.clone();
+        unassociated.provider = Provider::Hermes;
+        assert_eq!(
+            CodexReader
+                .read_in_cycle(&request(&unassociated, dir.path()), &cycle)
+                .context,
+            UsageOutcome::Unavailable(MissingReason::Unassociated)
+        );
+        assert_eq!(diagnostics.snapshot(Provider::Codex).unwrap().attempts, 2);
+        // Invalid timeout is detected inside bounded_read, so it is counted.
+        let invalid = ReadRequest {
+            timeout: Duration::MAX,
+            ..base
+        };
+        assert_eq!(
+            CodexReader.read_in_cycle(&invalid, &cycle).context,
+            UsageOutcome::Unavailable(MissingReason::Invalid)
+        );
+        let snapshot = diagnostics.snapshot(Provider::Codex).unwrap();
+        assert_eq!(
+            (snapshot.attempts, snapshot.completed, snapshot.invalid),
+            (3, 2, 1)
+        );
+        assert_eq!(snapshot.sampling_skips, 0);
+    }
+
+    fn assert_routing_sample(outcome: UsageOutcome) {
+        let UsageOutcome::Available(percent) = outcome else {
+            panic!("expected available context: {outcome:?}");
+        };
+        assert!((percent - 7.0).abs() < 1e-9);
+    }
+
+    fn wait_for_routing_worker() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while BUSY.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn typed_tail_ignores_valid_non_objects_and_rejects_completed_corruption() {
         let dir = tempfile::tempdir().unwrap();
@@ -782,6 +903,37 @@ mod tests {
             text,
         )
         .unwrap();
+    }
+    #[test]
+    fn cycle_adapter_detects_archival_duplicate_and_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(Provider::Codex);
+        let r = request(&id, dir.path());
+        let cycle = ReadCycle::new();
+        fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
+        let original = dir
+            .path()
+            .join("sessions/2026/10/12/rollout-test-session-1.jsonl");
+        let first = read_session_in_cycle(&r, &cycle).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        fs::create_dir(dir.path().join("archived_sessions")).unwrap();
+        let archived = dir
+            .path()
+            .join("archived_sessions/rollout-test-session-1.jsonl");
+        fs::rename(&original, &archived).unwrap();
+        assert_eq!(read_session_in_cycle(&r, &cycle).unwrap(), first);
+        fs::copy(&archived, &original).unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Unassociated)
+        );
+        // Moving a candidate away invalidates the old listing and observation.
+        fs::rename(&original, original.with_extension("ignored")).unwrap();
+        fs::write(&archived, b"broken\n").unwrap();
+        assert_eq!(
+            read_session_in_cycle(&r, &cycle),
+            Err(MissingReason::Invalid)
+        );
     }
     #[test]
     fn active_append_split_utf8_does_not_hide_completed_observation() {
