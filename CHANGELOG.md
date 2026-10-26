@@ -4,6 +4,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Maintenance: **Dependencies** update the locked `cc` crate from 1.9.0 to 1.10.0 within the existing Cargo requirements.
+
 ## 0.3.1 (2026-10-24)
 
 Lineup adds publisher runtime budgets and reader diagnostics, strengthens local reads and font recovery, and updates release tooling and locked dependencies.
