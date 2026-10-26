@@ -1,0 +1,84 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":timezone(Asia/Tokyo)",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "baseBranchPatterns": [
+    "develop"
+  ],
+  "enabledManagers": [
+    "cargo",
+    "github-actions",
+    "rust-toolchain"
+  ],
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "automerge": false,
+  "labels": [
+    "renovate"
+  ],
+  "prConcurrentLimit": 5,
+  "dependencyDashboard": true,
+  "lockFileMaintenance": {
+    "enabled": false
+  },
+  "packageRules": [
+    {
+      "description": "互換更新を週次の少数 PR にまとめる",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pinDigest"
+      ],
+      "groupName": "週次の互換依存更新"
+    },
+    {
+      "description": "Cargo の major/minor 互換範囲を保ち、解決版は lock で更新する",
+      "matchManagers": [
+        "cargo"
+      ],
+      "rangeStrategy": "update-lockfile"
+    },
+    {
+      "description": "major は個別 PR とし Dashboard の承認後に作成する",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": null,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "0.x の minor は major 相当として個別承認する",
+      "matchCurrentVersion": "/^0\\./",
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": null,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Rust toolchain は完全固定を保ち、すべての更新を個別承認する",
+      "matchManagers": [
+        "rust-toolchain"
+      ],
+      "groupName": null,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "develop-meta が配る workflow の action pin は配布元で更新する",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchFileNames": [
+        ".github/workflows/develop-tools.yml",
+        ".github/workflows/ci-develop.yml",
+        ".github/workflows/platform-check.yml"
+      ],
+      "enabled": false
+    }
+  ]
+}
