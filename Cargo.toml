@@ -13,13 +13,13 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde"] }
 toml_edit = "0.25"
 tempfile = { version = "3", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 # Disable dependency wire logging: HTTP TRACE output can contain credentials.
 log = { version = "0.4", features = ["max_level_off"] }
