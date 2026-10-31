@@ -4,6 +4,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Maintenance: **Dependencies** update seven locked crates within the existing Cargo requirements, including rustix 1.1.6 and log 0.4.35, and refresh the binary dependency license notices.
+
 - Maintenance: **Dependencies** update the locked `cc` crate from 1.9.0 to 1.10.0 within the existing Cargo requirements.
 
 ## 0.3.1 (2026-10-24)

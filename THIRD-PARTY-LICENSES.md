@@ -39,13 +39,13 @@ and vendored C terms.
 | `itoa@1.0.18` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `libc@0.2.191` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `linux-raw-sys@0.12.1` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `MIT` | linux |
-| `log@0.4.34` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `log@0.4.35` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `memchr@2.8.3` | `Unlicense OR MIT` | `MIT` | linux, macos |
 | `num-traits@0.2.19` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `once_cell@1.21.4` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `percent-encoding@2.3.2` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `ring@0.17.14` | `Apache-2.0 AND ISC` | `Apache-2.0 AND ISC` | linux, macos |
-| `rustix@1.1.5` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `MIT` | linux, macos |
+| `rustix@1.1.6` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `rustls@0.23.46` | `Apache-2.0 OR ISC OR MIT` | `MIT` | linux, macos |
 | `rustls-pki-types@1.15.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `rustls-webpki@0.103.16` | `ISC` | `ISC` | linux, macos |
@@ -152,7 +152,7 @@ THE SOFTWARE.
 Source crates and license files:
 
 - bitflags@2.13.2 `LICENSE-MIT`
-- log@0.4.34 `LICENSE-MIT`
+- log@0.4.35 `LICENSE-MIT`
 - num-traits@0.2.19 `LICENSE-MIT`
 
 ````text
@@ -402,7 +402,7 @@ Source crates and license files:
 - itoa@1.0.18 `LICENSE-MIT`
 - linux-raw-sys@0.12.1 `LICENSE-MIT`
 - once_cell@1.21.4 `LICENSE-MIT`
-- rustix@1.1.5 `LICENSE-MIT`
+- rustix@1.1.6 `LICENSE-MIT`
 - serde@1.0.229 `LICENSE-MIT`
 - serde_core@1.0.229 `LICENSE-MIT`
 - serde_json@1.0.154 `LICENSE-MIT`
@@ -1151,7 +1151,7 @@ limitations under the License.
 
 Source crates and license files:
 
-- rustix@1.1.5 `COPYRIGHT`
+- rustix@1.1.6 `COPYRIGHT`
 
 ````text
 Short version for non-lawyers:
