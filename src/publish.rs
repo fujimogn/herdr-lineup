@@ -7997,7 +7997,9 @@ mod tests {
         .unwrap();
         let config = Config::load(&config_dir).unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
-        let (changed_tx, changed_rx) = std::sync::mpsc::sync_channel(0);
+        // A late file writer must not block joining the scope if the reader
+        // already timed out while retaining its receiver outside the scope.
+        let (changed_tx, changed_rx) = std::sync::mpsc::sync_channel(1);
         let reader = GatedReader {
             entered: entered_tx,
             changed: std::sync::Mutex::new(changed_rx),

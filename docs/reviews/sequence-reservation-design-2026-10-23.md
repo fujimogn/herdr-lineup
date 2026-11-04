@@ -244,7 +244,7 @@ The remaining rows stay **Open**:
 | Kernel crash or power loss | Returned I/O faults and normal process exit do not emulate kernel failure, loss of volatile storage caches, or real filesystem recovery after power loss. |
 | Concurrent ensure / second allocator (remainder) | Publisher ownership is serialized by the tested lock protocol. Full daemon ensure spawn, descriptor inheritance, and control readiness races are not exercised by this publisher fixture; constructing a publisher alone does not acquire a session lock. |
 | Competing same-source writer protection | The negative control confirms that an uncooperative writer can make a reserved report a no-op. No arbitration, detection, or exclusion of such a writer is implemented by these tests. |
-| Config changes (remainder) | The daemon has no live-reload contract. The fixture verifies an in-flight refresh with the loaded config and a later refresh with an explicitly loaded replacement, not automatic daemon reload or every config option. |
+| Config changes (remainder) | The daemon has no live-reload contract. The fixture verifies an in-flight refresh with the loaded config and a later refresh on the same publisher with an explicitly loaded replacement, not automatic daemon reload or every config option. Clearing after a daemon restart with a new publisher instance is not verified by this fixture. |
 | Old-binary rollback | No rollback binary/version was selected or executed. Emulating an older checkpoint parser would not establish actual binary compatibility; retain the checkpoint and the existing compatibility warning. |
 | macOS disks | No macOS disk run was available. Linux fixture results are not macOS storage measurements or durability evidence. |
 
