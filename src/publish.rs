@@ -2815,6 +2815,24 @@ mod tests {
         log: ReportLog,
         lose_response_for: Arc<std::sync::atomic::AtomicU64>,
     ) -> std::thread::JoinHandle<()> {
+        sequence_server_recording(
+            listener,
+            clock,
+            template,
+            log,
+            lose_response_for,
+            Arc::default(),
+        )
+    }
+
+    fn sequence_server_recording(
+        listener: UnixListener,
+        clock: Arc<std::sync::atomic::AtomicU64>,
+        template: Arc<std::sync::Mutex<Value>>,
+        log: ReportLog,
+        lose_response_for: Arc<std::sync::atomic::AtomicU64>,
+        reports: Arc<std::sync::Mutex<Vec<Value>>>,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let mut resources = BTreeMap::<String, BTreeMap<String, (Value, u64)>>::new();
@@ -2858,6 +2876,7 @@ mod tests {
                         let last = accepted.entry((id.into(), source.into())).or_default();
                         let applied = seq > *last;
                         log.lock().unwrap().push((id.into(), seq, applied));
+                        reports.lock().unwrap().push(request.clone());
                         if applied {
                             *last = seq;
                             let tokens = resources.entry(id.into()).or_default();
@@ -7822,6 +7841,7 @@ mod tests {
         template: Arc<std::sync::Mutex<Value>>,
         log: ReportLog,
         lose_response_for: Arc<std::sync::atomic::AtomicU64>,
+        reports: Arc<std::sync::Mutex<Vec<Value>>>,
         server: std::thread::JoinHandle<()>,
     }
 
@@ -7834,12 +7854,14 @@ mod tests {
             let template = Arc::new(std::sync::Mutex::new(snapshot(&json!("template"), true)));
             let log = ReportLog::default();
             let lose_response_for = Arc::<std::sync::atomic::AtomicU64>::default();
-            let server = sequence_server(
+            let reports = Arc::default();
+            let server = sequence_server_recording(
                 UnixListener::bind(&socket).unwrap(),
                 Arc::default(),
                 template.clone(),
                 log.clone(),
                 lose_response_for.clone(),
+                Arc::clone(&reports),
             );
             Self {
                 dir,
@@ -7848,6 +7870,7 @@ mod tests {
                 template,
                 log,
                 lose_response_for,
+                reports,
                 server,
             }
         }
@@ -7873,6 +7896,168 @@ mod tests {
             drop(self.dir);
             response["result"]["snapshot"]["panes"][0]["tokens"].clone()
         }
+    }
+
+    #[test]
+    fn session_lock_serializes_sequence_window_owners() {
+        use crate::lock::{RuntimePaths, SessionLock};
+
+        let fixture = SequenceFixture::start();
+        let paths = RuntimePaths::new(&fixture.state, &fixture.socket).unwrap();
+        let gate = std::sync::Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let acquire = || {
+                gate.wait();
+                SessionLock::acquire(&paths).unwrap()
+            };
+            let first = scope.spawn(acquire);
+            let second = scope.spawn(acquire);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1
+        );
+        let owner = first.or(second).unwrap();
+        assert!(SessionLock::acquire(&paths).unwrap().is_none());
+        // Only the session owner constructs and runs a publisher. This does not
+        // exercise ensure's child spawn, inherited fd, or readiness protocol.
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher =
+            MetadataPublisher::new(paths.root.clone(), "fake".into(), Homes::default()).unwrap();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "first").unwrap();
+        assert_eq!(endpoint_upper_bound_on_disk(&paths.root), Some(32));
+        drop(publisher);
+        drop(owner);
+
+        let _next_owner = SessionLock::acquire(&paths).unwrap().unwrap();
+        let mut publisher =
+            MetadataPublisher::new(paths.root.clone(), "fake".into(), Homes::default()).unwrap();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "next").unwrap();
+        assert_eq!(fixture.seqs(), [(1, true), (33, true)]);
+        assert_eq!(endpoint_upper_bound_on_disk(&paths.root), Some(64));
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "next");
+    }
+
+    #[test]
+    fn competing_same_source_writer_can_make_reserved_reports_noops() {
+        let fixture = SequenceFixture::start();
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        report_logo(&mut publisher, &mut transport, "w1:p1", "first").unwrap();
+        assert_eq!(endpoint_upper_bound_on_disk(&fixture.state), Some(32));
+
+        // A writer outside our lock protocol can claim the same source. Its
+        // higher seq invalidates the remaining local window for this resource.
+        let mut competitor = Transport::connect(&fixture.socket).unwrap();
+        exchange_before(
+            &mut competitor,
+            &json!({"id":"competitor", "method":"pane.report_metadata", "params":{
+                "pane_id":"w1:p1", "source":"herdr-lineup", "seq":100,
+                "ttl_ms":15000, "tokens":{"lineup_logo":"competitor"}
+            }}),
+            unbounded_test_deadline(),
+        )
+        .unwrap();
+        // An ok response is not proof of application: seq 2 is a stale no-op.
+        report_logo(&mut publisher, &mut transport, "w1:p1", "local").unwrap();
+        assert_eq!(fixture.seqs(), [(1, true), (100, true), (2, false)]);
+        assert_eq!(endpoint_upper_bound_on_disk(&fixture.state), Some(32));
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert_eq!(tokens["lineup_logo"], "competitor");
+    }
+
+    #[test]
+    fn config_file_change_during_refresh_preserves_inflight_sequence_and_next_config_clears() {
+        struct GatedReader {
+            entered: std::sync::mpsc::SyncSender<()>,
+            changed: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl UsageReader for GatedReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                self.entered.send(()).unwrap();
+                self.changed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now)
+            }
+        }
+
+        let fixture = SequenceFixture::start();
+        let config_dir = fixture.dir.path().join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "providers = ['codex']\nrefresh_interval_ms = 5000\n",
+        )
+        .unwrap();
+        let config = Config::load(&config_dir).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (changed_tx, changed_rx) = std::sync::mpsc::sync_channel(0);
+        let reader = GatedReader {
+            entered: entered_tx,
+            changed: std::sync::Mutex::new(changed_rx),
+        };
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut publisher = fixture.publisher();
+        publisher.homes.codex = Some(fixture.dir.path().into());
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                std::fs::write(
+                    &config_path,
+                    "providers = []\nrefresh_interval_ms = 1000\nreader_timeout_ms = 1000\n",
+                )
+                .unwrap();
+                changed_tx.send(()).unwrap();
+            });
+            publisher
+                .refresh_with_readers(&mut transport, &config, &reader, &TimeoutReader)
+                .unwrap();
+            writer.join().unwrap();
+        });
+        let first = fixture.reports.lock().unwrap().clone();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|r| r["params"]["ttl_ms"] == 15000));
+        let pane = first
+            .iter()
+            .find(|r| r["method"] == "pane.report_metadata")
+            .unwrap();
+        assert_eq!(pane["params"]["tokens"]["lineup_context_pct"], "42");
+        assert_eq!(pane["params"]["tokens"]["lineup_agent"], "codex");
+
+        // The daemon does not live-reload config. This next refresh explicitly
+        // supplies a newly loaded config; it must clear the disabled provider.
+        let next = Config::load(&config_dir).unwrap();
+        publisher
+            .refresh_with_readers(&mut transport, &next, &TimeoutReader, &TimeoutReader)
+            .unwrap();
+        let reports = fixture.reports.lock().unwrap().clone();
+        let clears: Vec<_> = reports
+            .iter()
+            .skip(first.len())
+            .filter(|r| r["method"] == "pane.report_metadata")
+            .collect();
+        assert_eq!(clears.len(), 1, "disabling a provider must send a clear");
+        let clear = clears[0];
+        assert_eq!(clear["params"]["ttl_ms"], 3000);
+        assert_eq!(
+            clear["params"]["tokens"].get("lineup_agent"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            clear["params"]["tokens"].get("lineup_context_pct"),
+            Some(&Value::Null)
+        );
+        assert_eq!(fixture.seqs(), [(1, true), (2, true), (3, true)]);
+        assert_eq!(endpoint_upper_bound_on_disk(&fixture.state), Some(32));
+        let tokens = fixture.finish(&mut publisher, &mut transport);
+        assert!(tokens.get("lineup_agent").is_none());
+        assert!(tokens.get("lineup_context_pct").is_none());
     }
 
     #[test]

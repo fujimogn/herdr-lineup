@@ -217,14 +217,36 @@ process; a real power loss or kernel crash was not simulated.
 | Overflow | `checked_overflow_fails_closed_in_reservation_and_allocation`, `reservation_checked_overflow_fails_closed_before_send`. |
 | Legacy checkpoint without endpoint rows | `legacy_checkpoint_without_endpoint_rows_migrates_safely`, `legacy_checkpoint_migration_in_metadata_publisher`. |
 | Empty patch and capacity skip | `empty_patch_and_capacity_skip_preserve_reservation_cursor`. |
+| Publisher ownership serialization and handover (partial concurrent-ensure row) | `session_lock_serializes_sequence_window_owners`: two barrier-released acquisitions of the real session lock produce exactly one owner. Only the owner runs a publisher; after release, a new owner reloads the checkpoint, sends seq 33 after seq 1 / durable bound 32, and the latest patch applies. This does not exercise daemon ensure's spawn, descriptor inheritance, or readiness races. |
+| Competing same-source writer (negative control, not exclusion) | `competing_same_source_writer_can_make_reserved_reports_noops`: an independent transport sends seq 100 using `herdr-lineup` for the same pane after the publisher reserves 1..32. The publisher's seq 2 receives `ok` but is not applied; the competitor's token remains. This verifies the ownership limitation, not an implementation of competing-writer protection. |
+| Config file changes during refresh (partial) | `config_file_change_during_refresh_preserves_inflight_sequence_and_next_config_clears`: a channel-gated reader permits the file change only after reader entry. The in-flight refresh completes using the already loaded config (Codex context 42%, TTL 15,000 ms). A subsequent explicit `Config::load` disables providers and changes refresh to 1,000 ms; the pane sends explicit null clears at seq 3 / TTL 3,000 ms, and its agent/context keys disappear. Seqs 1, 2, 3 all apply within one durable window. The daemon has no live-reload contract. |
 
 The process-exit row uses a normal `exit`, not `SIGKILL` or power loss. The
 deadline row passes an already expired deadline instead of racing a timer.
 
-Not verified: kernel crash or power loss, concurrent ensure or a second
-allocator, a same-source competing writer, config change during refresh, and
-rollback to an older binary. macOS disks were not available and are
-unmeasured; the Linux results are not extrapolated to them.
+### Follow-up verification boundary (2026-11-04)
+
+The three additional fixtures above run on Linux with synthetic sockets and
+temporary plugin state/config only. Production behavior is unchanged. Each
+fixture was also run against a deliberately broken version and failed an
+assertion; each mutation was then removed:
+
+| Fixture | Temporary mutation detected |
+| --- | --- |
+| Publisher ownership and handover | Ignore endpoint floors when restoring the checkpoint in `MetadataPublisher::load_checkpoint`; the successor reuses seq 1 instead of sending seq 33. |
+| Competing same-source writer | Change the test server's acceptance rule from `seq > last` to `seq != last`; stale seq 2 applies. This mutation checks the negative-control oracle, not production writer exclusion. |
+| Config change and explicit reload | Remove null-valued desired tokens when the pane has no enabled occupant in `plan_pane_report`; the disabled provider's clear keys are omitted and old tokens remain. |
+
+The remaining rows stay **Open**:
+
+| Remaining row | Why this repository run does not verify it |
+| --- | --- |
+| Kernel crash or power loss | Returned I/O faults and normal process exit do not emulate kernel failure, loss of volatile storage caches, or real filesystem recovery after power loss. |
+| Concurrent ensure / second allocator (remainder) | Publisher ownership is serialized by the tested lock protocol. Full daemon ensure spawn, descriptor inheritance, and control readiness races are not exercised by this publisher fixture; constructing a publisher alone does not acquire a session lock. |
+| Competing same-source writer protection | The negative control confirms that an uncooperative writer can make a reserved report a no-op. No arbitration, detection, or exclusion of such a writer is implemented by these tests. |
+| Config changes (remainder) | The daemon has no live-reload contract. The fixture verifies an in-flight refresh with the loaded config and a later refresh with an explicitly loaded replacement, not automatic daemon reload or every config option. |
+| Old-binary rollback | No rollback binary/version was selected or executed. Emulating an older checkpoint parser would not establish actual binary compatibility; retain the checkpoint and the existing compatibility warning. |
+| macOS disks | No macOS disk run was available. Linux fixture results are not macOS storage measurements or durability evidence. |
 
 ### Measurement
 
