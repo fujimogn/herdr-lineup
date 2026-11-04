@@ -56,14 +56,14 @@ and vendored C terms.
 | `strsim@0.11.1` | `MIT` | `MIT` | linux, macos |
 | `subtle@2.6.1` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
 | `tempfile@3.27.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `toml@1.1.8+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `toml@1.2.0+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `toml_datetime@1.1.2+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `toml_edit@0.25.17+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `toml_edit@0.25.18+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `toml_parser@1.1.5+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `toml_writer@1.1.3+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `toml_writer@1.2.0+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `untrusted@0.9.0` | `ISC` | `ISC` | linux, macos |
-| `ureq@3.5.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `ureq-proto@0.6.5` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `ureq@3.5.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `ureq-proto@0.7.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `utf8-zero@0.8.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `utf8parse@0.2.2` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `webpki-roots@1.0.11` | `CDLA-Permissive-2.0` | `CDLA-Permissive-2.0` | linux, macos |
@@ -89,11 +89,11 @@ Source crates and license files:
 - colorchoice@1.0.5 `LICENSE-MIT`
 - is_terminal_polyfill@1.70.2 `LICENSE-MIT`
 - serde_spanned@1.1.2 `LICENSE-MIT`
-- toml@1.1.8+spec-1.1.0 `LICENSE-MIT`
+- toml@1.2.0+spec-1.1.0 `LICENSE-MIT`
 - toml_datetime@1.1.2+spec-1.1.0 `LICENSE-MIT`
-- toml_edit@0.25.17+spec-1.1.0 `LICENSE-MIT`
+- toml_edit@0.25.18+spec-1.1.0 `LICENSE-MIT`
 - toml_parser@1.1.5+spec-1.1.0 `LICENSE-MIT`
-- toml_writer@1.1.3+spec-1.1.0 `LICENSE-MIT`
+- toml_writer@1.2.0+spec-1.1.0 `LICENSE-MIT`
 
 ````text
 Copyright (c) Individual contributors
@@ -1411,7 +1411,7 @@ Source crates and license files:
 
 Source crates and license files:
 
-- ureq-proto@0.6.5 `LICENSE-MIT.txt`
+- ureq-proto@0.7.1 `LICENSE-MIT.txt`
 
 ````text
 Copyright 2022 Martin Algesten
@@ -1427,7 +1427,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Source crates and license files:
 
-- ureq@3.5.0 `LICENSE-MIT`
+- ureq@3.5.1 `LICENSE-MIT`
 
 ````text
 MIT License
