@@ -16,11 +16,26 @@ selected v0.3.1 to carry the owner-authorized release batch.
   [separate wired-head observation record](docs/reviews/git-heading-latency-wired-2026-11-04.md).
 - [x] Real-disk reader discovery with independent pane/candidate counts
   (L4, N4): [ext4 observations and missing-context limits](docs/reviews/reader-discovery-real-disk-2026-11-04.md).
-- [ ] Stuck-worker frequency using the connected diagnostics (L5). Bounded
-  channel fixtures are not OS-stall or live-frequency measurements.
-- [ ] Remaining sequence-window failure rows: kernel crash/power loss,
-  concurrent ensure or second allocator, competing same-source writer,
-  config change during refresh, old-binary rollback, macOS disks (L1/N2).
+- [x] Short live observation using the connected reader diagnostics (L5):
+  121 samples over ten minutes; BUSY and retained-worker gauges stayed zero,
+  with sampling and provenance limits in
+  [stuck-worker-frequency-2026-11-04.md](docs/reviews/stuck-worker-frequency-2026-11-04.md).
+- [ ] Long-term OS-stall frequency (L5) remains unmeasured. A ten-minute
+  sample does not establish an event rate or whether isolation is needed.
+- [ ] Remaining sequence-window failure rows (L1/N2). Publisher ownership
+  serialization and handover, a same-source writer no-op negative control,
+  and the in-flight loaded config with an explicitly reloaded provider clear
+  are verified by fixtures. Kernel crash/power loss, full daemon ensure
+  spawn/inheritance/readiness, competing-writer protection, automatic reload
+  or a restarted publisher clearing state, old-binary rollback, and macOS
+  disks remain open.
+- [ ] Check `publish::tests::envelope_expiring_after_admission_is_an_error_not_a_skip`
+  for timing dependence. On 2026-11-04 it failed once in five single-test runs
+  on a shared host with a load average near 80 (see the L5 record); a quiet-host
+  reproduction was not taken.
+- [ ] `docs/reviews/refresh-stage-latency-2026-10-23.md` and
+  `docs/plans/review-followups-plan.md` still describe N1 as open after the
+  [N1 record](docs/reviews/stage-timing-comparison-2026-11-04.md).
 - [ ] Font check-then-rename and check-then-unlink races (H1, M1). Closing
   them needs an owner-approved design; partial-state recovery stays manual.
 
