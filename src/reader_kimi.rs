@@ -97,12 +97,11 @@ fn read_session_in_cycle(
             // directory is this native id: that is the path shape of a
             // duplicate, so uniqueness is unproven. A different session
             // directory cannot be this id and does not hide a unique match.
-            Err(MissingReason::PermissionDenied) => {
+            Err(_) => {
                 if session_directory_could_match(&path, &request.identity.native_session_id) {
                     unproven_duplicate = true;
                 }
             }
-            Err(_) => {}
         }
     }
     if unproven_duplicate || matched.len() > 1 {
@@ -1075,6 +1074,55 @@ mod tests {
             UsageOutcome::Available(7.5),
             "a hexadecimal integer is the input window"
         );
+    }
+
+    #[test]
+    fn kimi_state_uniqueness_baseline_keeps_context() {
+        assert_eq!(
+            context_with_oversized_state(None),
+            UsageOutcome::Available(7.5)
+        );
+    }
+
+    #[test]
+    fn kimi_state_uniqueness_same_id_oversized_hides_context() {
+        // The provider-readers Kimi contract treats an unreadable same-ID
+        // state as a possible duplicate, even when the failure is a size cap.
+        assert_eq!(
+            context_with_oversized_state(Some("session-1")),
+            UsageOutcome::Unavailable(MissingReason::Unassociated)
+        );
+    }
+
+    #[test]
+    fn kimi_state_uniqueness_unrelated_id_oversized_keeps_context() {
+        // The same contract says an unreadable unrelated directory must not
+        // hide the readable match.
+        assert_eq!(
+            context_with_oversized_state(Some("session-x")),
+            UsageOutcome::Available(7.5)
+        );
+    }
+
+    fn context_with_oversized_state(session: Option<&str>) -> UsageOutcome {
+        let dir = tempfile::Builder::new()
+            .prefix("herdr-lineup-kimi-")
+            .tempdir()
+            .unwrap();
+        let bound = identity(Provider::Kimi);
+        let now = fresh_ms(&request(&bound, dir.path()));
+        install(dir.path(), "session-1", "/synthetic/repo", 75, now, "");
+        if let Some(session) = session {
+            let other = dir.path().join("sessions/wd_oversized").join(session);
+            fs::create_dir_all(&other).unwrap();
+            // Sparse input crosses the 16 MiB read limit without allocating
+            // its contents or depending on chmod behavior for root users.
+            File::create(other.join("state.json"))
+                .unwrap()
+                .set_len(16 * 1024 * 1024 + 1)
+                .unwrap();
+        }
+        read_at(dir.path(), "session-1", "/synthetic/repo")
     }
 
     #[test]
