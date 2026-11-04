@@ -890,6 +890,8 @@ struct TestHooks {
     before_exchange: Option<Box<dyn FnMut() + Send>>,
     /// Replaces the refresh admission decision so fixtures need no timing.
     admission: Option<Box<dyn FnMut() -> bool + Send>>,
+    /// Cooperative reader time, independent of socket and worker deadlines.
+    reader_clock: Option<Arc<std::sync::Mutex<Instant>>>,
 }
 
 /// Checkpoint write steps where tests inject a failure.
@@ -1017,6 +1019,16 @@ impl MetadataPublisher {
             #[cfg(test)]
             hooks: TestHooks::default(),
         })
+    }
+
+    /// Production uses monotonic wall time. Tests may advance only the shared
+    /// reader budget, leaving transport, admission and worker clocks intact.
+    fn reader_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.hooks.reader_clock {
+            return *clock.lock().unwrap();
+        }
+        Instant::now()
     }
 
     /// Update the current refresh's stage sample, if a refresh started.
@@ -2010,7 +2022,7 @@ impl MetadataPublisher {
                 home,
                 now,
                 max_age: Duration::from_millis(config.usage_max_age_ms),
-                timeout: budget.deadline.saturating_duration_since(Instant::now()),
+                timeout: budget.deadline.saturating_duration_since(self.reader_now()),
                 shutdown: self.shutdown.as_deref(),
             };
             let missing_home = (who.agent == Agent::Grok && self.homes.grok.is_none())
@@ -2225,7 +2237,7 @@ impl MetadataPublisher {
         // reader wait. It starts after headings and never outlives `envelope`.
         let cycle = model::ReadCycle::with_diagnostics(self.reader_diagnostics.clone());
         let budget = ReaderBudget {
-            deadline: (Instant::now() + reader_timeout).min(envelope),
+            deadline: (self.reader_now() + reader_timeout).min(envelope),
             cycle: &cycle,
         };
 
@@ -3197,10 +3209,11 @@ mod tests {
             serde_json::to_vec(&record).unwrap(),
         )
         .unwrap();
-        struct ExhaustBudget;
+        let clock = freeze_reader_clock(&mut publisher);
+        struct ExhaustBudget(Arc<std::sync::Mutex<Instant>>);
         impl UsageReader for ExhaustBudget {
             fn read(&self, r: &ReadRequest<'_>) -> UsageReading {
-                std::thread::sleep(r.timeout + Duration::from_millis(1));
+                spend_reader_budget(&self.0, r.timeout);
                 TimeoutReader.read(r)
             }
         }
@@ -3232,7 +3245,12 @@ mod tests {
         // exhausting Codex pane first, as in snapshot order.
         publisher.send_queue = FairQueue::default();
         publisher
-            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .refresh_with_readers(
+                &mut transport,
+                &config,
+                &ExhaustBudget(clock.clone()),
+                &TimeoutReader,
+            )
             .unwrap();
         let (_, retained) = publisher
             .request(&mut transport, "session.snapshot")
@@ -3244,7 +3262,12 @@ mod tests {
         // exhausting Codex pane first, as in snapshot order.
         publisher.send_queue = FairQueue::default();
         publisher
-            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .refresh_with_readers(
+                &mut transport,
+                &config,
+                &ExhaustBudget(clock.clone()),
+                &TimeoutReader,
+            )
             .unwrap();
         let (_, expired) = publisher
             .request(&mut transport, "session.snapshot")
@@ -3259,7 +3282,12 @@ mod tests {
         // exhausting Codex pane first, as in snapshot order.
         publisher.send_queue = FairQueue::default();
         publisher
-            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .refresh_with_readers(
+                &mut transport,
+                &config,
+                &ExhaustBudget(clock.clone()),
+                &TimeoutReader,
+            )
             .unwrap();
         let (_, stale) = publisher
             .request(&mut transport, "session.snapshot")
@@ -3270,7 +3298,12 @@ mod tests {
         // exhausting Codex pane first, as in snapshot order.
         publisher.send_queue = FairQueue::default();
         publisher
-            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .refresh_with_readers(
+                &mut transport,
+                &config,
+                &ExhaustBudget(clock.clone()),
+                &TimeoutReader,
+            )
             .unwrap();
         let (_, rebound) = publisher
             .request(&mut transport, "session.snapshot")
@@ -7427,15 +7460,21 @@ mod tests {
             usage_max_age_ms: 1000,
             ..Config::default()
         };
-        struct ExhaustBudget;
+        let clock = freeze_reader_clock(&mut publisher);
+        struct ExhaustBudget(Arc<std::sync::Mutex<Instant>>);
         impl UsageReader for ExhaustBudget {
             fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
-                std::thread::sleep(request.timeout + Duration::from_millis(1));
+                spend_reader_budget(&self.0, request.timeout);
                 TimeoutReader.read(request)
             }
         }
         publisher
-            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .refresh_with_readers(
+                &mut transport,
+                &config,
+                &ExhaustBudget(clock.clone()),
+                &TimeoutReader,
+            )
             .unwrap();
         let (_, fresh) = publisher
             .request(&mut transport, "session.snapshot")
@@ -7447,7 +7486,12 @@ mod tests {
             reading.observed_at = Some(stale_at);
         }
         publisher
-            .refresh_with_readers(&mut transport, &config, &ExhaustBudget, &TimeoutReader)
+            .refresh_with_readers(
+                &mut transport,
+                &config,
+                &ExhaustBudget(clock.clone()),
+                &TimeoutReader,
+            )
             .unwrap();
         let (_, expired) = publisher
             .request(&mut transport, "session.snapshot")
@@ -8094,6 +8138,16 @@ mod tests {
         }
     }
 
+    fn freeze_reader_clock(publisher: &mut MetadataPublisher) -> Arc<std::sync::Mutex<Instant>> {
+        let clock = Arc::new(std::sync::Mutex::new(Instant::now()));
+        publisher.hooks.reader_clock = Some(clock.clone());
+        clock
+    }
+
+    fn spend_reader_budget(clock: &std::sync::Mutex<Instant>, remaining: Duration) {
+        *clock.lock().unwrap() += remaining;
+    }
+
     fn budget_publisher(dir: &Path, terms: CycleTerms) -> MetadataPublisher {
         let mut publisher = MetadataPublisher::new(
             dir.into(),
@@ -8105,6 +8159,7 @@ mod tests {
         )
         .unwrap();
         publisher.terms = terms;
+        freeze_reader_clock(&mut publisher);
         publisher
     }
 
@@ -8639,6 +8694,7 @@ mod tests {
     fn spent_reader_budget_skips_only_reader_io_while_admission_remains() {
         struct BudgetReader {
             exhaust: AtomicBool,
+            clock: Arc<std::sync::Mutex<Instant>>,
             reads: std::sync::Mutex<Vec<String>>,
         }
         impl UsageReader for BudgetReader {
@@ -8646,7 +8702,7 @@ mod tests {
                 let native = request.identity.native_session_id.clone();
                 self.reads.lock().unwrap().push(native.clone());
                 if native == "native-a" && self.exhaust.load(Ordering::Acquire) {
-                    std::thread::sleep(request.timeout + Duration::from_millis(5));
+                    spend_reader_budget(&self.clock, request.timeout);
                     return TimeoutReader.read(request);
                 }
                 UsageReading::sample(request, SourceKind::CodexRollout, 42.0, request.now)
@@ -8672,7 +8728,7 @@ mod tests {
             log.clone(),
         );
         let mut transport = Transport::connect(&socket).unwrap();
-        let mut publisher = budget_publisher(dir.path(), budget_terms(300, 100, 100));
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
         publisher.hooks.git = Some(Box::new(|_, _| ship_time::RepositoryObservation {
             read: ship_time::RepositoryRead::Complete(Some(ship_time::Repository {
                 name: "repo".into(),
@@ -8682,6 +8738,7 @@ mod tests {
         }));
         let reader = BudgetReader {
             exhaust: AtomicBool::new(false),
+            clock: publisher.hooks.reader_clock.as_ref().unwrap().clone(),
             reads: std::sync::Mutex::default(),
         };
         publisher
@@ -8712,6 +8769,81 @@ mod tests {
         );
         finish(&mut publisher, &mut transport);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn reader_budget_starts_after_headings_and_expires_at_exact_boundary() {
+        struct AdvancingReader {
+            clock: Arc<std::sync::Mutex<Instant>>,
+            timeouts: std::sync::Mutex<Vec<Duration>>,
+        }
+        impl UsageReader for AdvancingReader {
+            fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
+                let mut timeouts = self.timeouts.lock().unwrap();
+                timeouts.push(request.timeout);
+                // Leave exactly 1 ms for pane 2, then exactly zero for pane 3.
+                spend_reader_budget(
+                    &self.clock,
+                    if timeouts.len() == 1 {
+                        Duration::from_millis(99)
+                    } else {
+                        Duration::from_millis(1)
+                    },
+                );
+                SampleReader.read(request)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let template = budget_template(
+            (1..=3)
+                .map(|n| {
+                    budget_pane(
+                        &format!("w1:p{n}"),
+                        "w1",
+                        Some("codex"),
+                        &format!("native-{n}"),
+                    )
+                })
+                .collect(),
+            vec![budget_workspace("w1", Some("/synthetic/repo"))],
+        );
+        let server = budget_server(
+            UnixListener::bind(&socket).unwrap(),
+            template,
+            BudgetServer::default(),
+            BudgetLog::default(),
+        );
+        let mut transport = Transport::connect(&socket).unwrap();
+        let mut publisher = budget_publisher(dir.path(), CycleTerms::default());
+        let clock = publisher.hooks.reader_clock.as_ref().unwrap().clone();
+        // A different epoch catches mixing the injected and real clocks at
+        // either deadline construction or remaining-time calculation.
+        *clock.lock().unwrap() -= Duration::from_secs(3600);
+        let git_clock = clock.clone();
+        publisher.hooks.git = Some(Box::new(move |_, _| {
+            spend_reader_budget(&git_clock, Duration::from_secs(1));
+            ship_time::RepositoryObservation {
+                read: ship_time::RepositoryRead::Complete(None),
+                verified_at: None,
+            }
+        }));
+        let reader = AdvancingReader {
+            clock,
+            timeouts: std::sync::Mutex::default(),
+        };
+        publisher
+            .refresh_with_readers(&mut transport, &short_readers(), &reader, &TimeoutReader)
+            .unwrap();
+        finish(&mut publisher, &mut transport);
+        server.join().unwrap();
+        assert_eq!(
+            *reader.timeouts.lock().unwrap(),
+            [Duration::from_millis(100), Duration::from_millis(1)]
+        );
+        assert!(publisher.local_readings.contains_key("w1:p1"));
+        assert!(publisher.local_readings.contains_key("w1:p2"));
+        assert!(!publisher.local_readings.contains_key("w1:p3"));
     }
 
     // F9b: a reader call that returns at once (BUSY) is still an attempt.
@@ -8876,7 +9008,7 @@ mod tests {
         for _ in 0..2 {
             publisher.send_queue = FairQueue::default();
             publisher
-                .refresh_with_readers(&mut transport, &short_readers(), &probe, &TimeoutReader)
+                .refresh_with_readers(&mut transport, &Config::default(), &probe, &TimeoutReader)
                 .unwrap();
         }
         finish(&mut publisher, &mut transport);
