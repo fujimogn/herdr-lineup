@@ -387,7 +387,31 @@ Managed evidence root: `/home/fujimogn/.cache/dev-task-temp/runs/4ee0a98a4a62c62
 | `release.log` | `6af795cac580b85a0d569f4ea28394820d327abaeb7294f6a39d56c531ad4eae` |
 | `help.log` | `b63d634987a86e1f90edb2bd16b2e2bd4763a279b43efbef32cccbc26b187eb6` |
 
-The successful managed run and the initial failed run are retained; final apparent sizes are reported with dust in the Formation candidate report. No managed payload is reclaimed by this lane.
+Both managed runs are retained; final apparent sizes are reported with dust in the Formation candidate report. No managed payload is reclaimed by this lane.
+
+### Supervisor outcome is separate from check results
+
+After the controller closed its directory descriptors and exited with code 0,
+dev-task-temp classified run 4ee0a98a4a62c627b247712672dc193c as **failed**,
+not complete. Its exit status was 1, with the following reasons:
+
+```text
+descendant PID 1982717 terminated by signal 9
+descendant PID 1981090 exited with code 101
+descendant PID 1981077 terminated by signal 15
+descendant PID 1980959 exited with code 101
+descendant PID 1981009 exited with code 101
+descendant PID 1982637 exited with code 101
+```
+
+The five top-level validation commands still returned 0 as recorded above.
+The full suite includes fault/shutdown child-process tests; that is a possible
+explanation for the supervisor classification, not a verified mapping of each
+listed PID to a particular test. This record does not claim successful managed
+run completion or eligibility for reclaim. Raw data and private-service cleanup
+evidence were captured before controller exit. No protection was bypassed and
+no payload was reclaimed. This final supervisor outcome was separately reported
+to the commander (Formation revision 209).
 
 ## Limits and suggested follow-up wording
 
