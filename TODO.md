@@ -15,7 +15,8 @@ selected v0.3.1 to carry the owner-authorized release batch.
 - [ ] Controlled old/new stage timing comparison, with binaries alternated
   on one host and filesystem (N1). Historical and new-candidate synthetic
   observations are separate records, not a speed-up or SLO.
-- [ ] Wired-head Git heading latency and child-count matrix (L2, N3).
+- [x] Wired-head Git heading latency and child-count matrix (L2, N3):
+  [separate wired-head observation record](docs/reviews/git-heading-latency-wired-2026-11-04.md).
 - [ ] Real-disk reader discovery with independent pane/candidate counts
   (L4, N4); the historical matrix is tmpfs-only.
 - [ ] Stuck-worker frequency using the connected diagnostics (L5). Bounded
