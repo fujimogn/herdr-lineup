@@ -12,9 +12,6 @@ selected v0.3.1 to carry the owner-authorized release batch.
 
 ## Open
 
-- [ ] Controlled old/new stage timing comparison, with binaries alternated
-  on one host and filesystem (N1). Historical and new-candidate synthetic
-  observations are separate records, not a speed-up or SLO.
 - [x] Wired-head Git heading latency and child-count matrix (L2, N3):
   [separate wired-head observation record](docs/reviews/git-heading-latency-wired-2026-11-04.md).
 - [x] Real-disk reader discovery with independent pane/candidate counts
@@ -55,6 +52,12 @@ Start only when the named condition is met; these are not obligations.
   occupant generation, apply only to the same generation, and invalidate
   displayed metadata on replacement. Current pane-bound Agy behavior stays.
   See `docs/reviews/agy-occupant-generation.md` for the planned host contract.
+
+## Completed measurements after v0.3.1
+
+- [x] N1 old/new synthetic stage timing with binaries alternated on one host
+  and filesystem; [procedure, raw rows, and limits](docs/reviews/stage-timing-comparison-2026-11-04.md).
+  Historical and new observations remain separate; no speed-up or SLO is established.
 
 ## Implemented in the v0.3.1 release contents
 
