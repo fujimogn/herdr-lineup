@@ -4,7 +4,9 @@ use crate::{
     config::Config,
     doctor,
     lock::{LifecycleLock, ProcessExit, RuntimePaths, SessionLock, StartupLockContention},
-    socket::{EndpointIdentity, Transport, read_frame, write_frame},
+    socket::{
+        EndpointIdentity, Transport, read_frame, read_frame_before, write_frame, write_frame_before,
+    },
 };
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -1237,7 +1239,17 @@ impl Drop for RuntimeCleanup {
     }
 }
 fn control_stream(paths: &RuntimePaths) -> io::Result<Option<BufReader<UnixStream>>> {
-    match crate::socket::connect_stream(&paths.control) {
+    control_stream_with_deadline(paths, None)
+}
+fn control_stream_with_deadline(
+    paths: &RuntimePaths,
+    deadline: Option<Instant>,
+) -> io::Result<Option<BufReader<UnixStream>>> {
+    let connected = match deadline {
+        Some(deadline) => crate::socket::connect_stream_before(&paths.control, deadline),
+        None => crate::socket::connect_stream(&paths.control),
+    };
+    match connected {
         Ok(stream) => {
             // Frame deadlines are poll-based inside read_frame and write_frame.
             // setsockopt timeouts return EINVAL on macOS after the peer closes.
@@ -1267,8 +1279,25 @@ fn read_control(
     paths: &RuntimePaths,
     socket: &std::path::Path,
 ) -> io::Result<ControlView> {
-    write_frame(stream.get_mut(), b"health")?;
-    let view = control_view_from_frame(&read_frame(stream, 8192)?)?;
+    read_control_with_deadline(stream, paths, socket, None)
+}
+fn read_control_with_deadline(
+    stream: &mut BufReader<UnixStream>,
+    paths: &RuntimePaths,
+    socket: &std::path::Path,
+    deadline: Option<Instant>,
+) -> io::Result<ControlView> {
+    let frame = match deadline {
+        Some(deadline) => {
+            write_frame_before(stream.get_mut(), b"health", deadline)?;
+            read_frame_before(stream, 8192, deadline)?
+        }
+        None => {
+            write_frame(stream.get_mut(), b"health")?;
+            read_frame(stream, 8192)?
+        }
+    };
+    let view = control_view_from_frame(&frame)?;
     let health = &view.health;
     if health.plugin != PLUGIN_ID
         || health.socket_key != paths.key
@@ -1288,6 +1317,7 @@ fn read_control(
     }
     Ok(view)
 }
+#[cfg(test)]
 fn read_identity(
     stream: &mut BufReader<UnixStream>,
     paths: &RuntimePaths,
@@ -1336,11 +1366,11 @@ pub fn stop(options: &Options) -> io::Result<()> {
     stop_with_lock(options, || {})
 }
 fn stop_with_lock(options: &Options, after_lock: impl FnOnce()) -> io::Result<()> {
-    let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let deadline = Instant::now() + STOP_DEADLINE;
+    let paths = RuntimePaths::new(&options.state, &options.socket)?;
     let _lifecycle = LifecycleLock::acquire(&paths, deadline)?;
     after_lock();
-    let Some(mut stream) = control_stream(&paths)? else {
+    let Some(mut stream) = control_stream_with_deadline(&paths, Some(deadline))? else {
         return if SessionLock::is_held(&paths)? {
             Err(io::Error::other(
                 "session lock is live but control is unavailable; no signal sent",
@@ -1349,26 +1379,30 @@ fn stop_with_lock(options: &Options, after_lock: impl FnOnce()) -> io::Result<()
             Ok(())
         };
     };
-    let identity = read_identity(&mut stream, &paths, &options.socket)?;
+    let identity =
+        read_control_with_deadline(&mut stream, &paths, &options.socket, Some(deadline))?.health;
     verify_peer_pid(stream.get_ref(), identity.pid)?;
     let process = ProcessExit::observe(identity.pid)?;
     let request = serde_json::json!({"stop":identity.nonce,"plugin":PLUGIN_ID,"socket_key":paths.key,"endpoint":identity.endpoint});
-    write_frame(stream.get_mut(), &serde_json::to_vec(&request)?)?;
-    if read_frame(&mut stream, 8192)? != b"stopping" {
+    // The bounded writer checks expiry again immediately before writing bytes.
+    write_frame_before(stream.get_mut(), &serde_json::to_vec(&request)?, deadline)?;
+    if read_frame_before(&mut stream, 8192, deadline)? != b"stopping" {
         return Err(io::Error::other("daemon refused shutdown identity"));
     }
     loop {
         // Termination includes destruction after flock release. A new ensure
         // may already own the lock, so do not wait on that unrelated owner.
-        if process.exited()? {
-            return Ok(());
-        }
         if Instant::now() >= deadline {
             return Err(io::Error::other(
                 "daemon did not stop within five seconds; no signal sent",
             ));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        if process.exited()? {
+            return Ok(());
+        }
+        std::thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 fn verify_peer_pid(stream: &UnixStream, expected: u32) -> io::Result<()> {
@@ -2140,6 +2174,118 @@ mod tests {
         let starts = fs::read_to_string(options.state.join("starts")).unwrap();
         assert_eq!(starts.lines().count(), 1, "ensure spawned more than once");
         assert_eq!(starts.trim(), new.pid.to_string());
+    }
+
+    // The synthetic control peer is this test process, never a Herdr server.
+    fn stop_deadline_fixture(
+        expire_after_lock: bool,
+        slow_health: bool,
+    ) -> (Duration, bool, io::Error) {
+        let (_dir, options, done, server) = fixture();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let _session = SessionLock::acquire(&paths).unwrap().unwrap();
+        let listener = UnixListener::bind(&paths.control).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let health = Health {
+            plugin: PLUGIN_ID.into(),
+            socket_path: options.socket.clone(),
+            socket_key: paths.key.clone(),
+            endpoint: EndpointIdentity::read(&options.socket).unwrap(),
+            nonce: "a".repeat(64),
+            pid: std::process::id(),
+            last_refresh_ms: None,
+            refresh_failed: false,
+            capacity_skipped_resources: 0,
+        };
+        let finished = Arc::new(AtomicBool::new(false));
+        let peer_finished = finished.clone();
+        let peer = std::thread::spawn(move || {
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if peer_finished.load(Ordering::Acquire) {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            let mut reader = BufReader::new(stream);
+            if read_frame(&mut reader, 8192).ok().as_deref() != Some(b"health") {
+                return false;
+            }
+            if slow_health {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            if write_frame(reader.get_mut(), &serde_json::to_vec(&health).unwrap()).is_err() {
+                return false;
+            }
+            let request = read_frame(&mut reader, 8192).ok();
+            let sent_stop = request
+                .and_then(|frame| serde_json::from_slice::<serde_json::Value>(&frame).ok())
+                .is_some_and(|request| request["stop"] == health.nonce);
+            if sent_stop {
+                std::thread::sleep(Duration::from_millis(400));
+                let _ = write_frame(reader.get_mut(), b"stopping");
+            }
+            sent_stop
+        });
+        let lifecycle = (!expire_after_lock)
+            .then(|| LifecycleLock::acquire(&paths, Instant::now() + STOP_DEADLINE).unwrap());
+        let started = Instant::now();
+        let release = std::thread::spawn(move || {
+            if let Some(lifecycle) = lifecycle {
+                std::thread::sleep(STOP_DEADLINE - Duration::from_millis(200));
+                drop(lifecycle);
+            }
+        });
+        let result = stop_with_lock(&options, || {
+            if expire_after_lock {
+                // Force expiry before connect, without a race at the boundary.
+                std::thread::sleep(STOP_DEADLINE + Duration::from_millis(25));
+            }
+        });
+        let elapsed = started.elapsed();
+        finished.store(true, Ordering::Release);
+        let sent_stop = peer.join().unwrap();
+        release.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        (elapsed, sent_stop, result.unwrap_err())
+    }
+
+    #[test]
+    fn stop_deadline_spans_lifecycle_contention_and_slow_health() {
+        let (elapsed, sent_stop, _) = stop_deadline_fixture(false, true);
+        assert!(
+            !sent_stop,
+            "shutdown request was sent after the shared deadline"
+        );
+        // Allow 150 ms for OS scheduling overhead, never a fresh 500 ms frame budget.
+        assert!(
+            elapsed < STOP_DEADLINE + Duration::from_millis(150),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn stop_deadline_spans_lifecycle_contention_and_slow_ack() {
+        let (elapsed, sent_stop, _) = stop_deadline_fixture(false, false);
+        assert!(sent_stop, "fixture did not reach the stop ACK wait");
+        // Allow 150 ms for OS scheduling overhead, never a fresh 500 ms frame budget.
+        assert!(
+            elapsed < STOP_DEADLINE + Duration::from_millis(150),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn stop_deadline_expired_after_lock_never_sends_shutdown() {
+        let (_, sent_stop, error) = stop_deadline_fixture(true, false);
+        assert!(!sent_stop, "expired stop sent a shutdown request");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
