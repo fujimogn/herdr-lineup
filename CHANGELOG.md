@@ -4,6 +4,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+## 0.3.2 (2026-11-04)
+
 Lineup tightens shutdown and Kimi session association, observes repository headings concurrently, and reduces periodic sidebar work.
 
 - Fix: **Stop** shares one five-second absolute deadline across the lifecycle lock, control handshake, and process-exit wait, and sends no shutdown request after that deadline.
