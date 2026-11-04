@@ -24,7 +24,7 @@ Start with `dev-task-temp run --root /home/fujimogn/.cache/herdr-lineup-reader-n
 
 To avoid Unix socket address length limits, the parent opens `$DEV_TASK_TEMP_DIR/t` and exports `/proc/<parent-pid>/fd/<fd>` as TMPDIR while it waits for Cargo. This is a short path into the same ext4 run. The mock socket similarly uses `/proc/self/fd/<fd>/s`, resolving into each coordinate's run-owned state directory. All processes remain inside the supervisor command tree. The bytes argument is a capacity request, not an enforced runtime quota; total apparent bytes were checked separately.
 
-Insert the complete harness below immediately before the final brace of the existing `publish::tests` module. Apply the two exact logging insertions shown below in this disposable copy. Then execute:
+Insert the complete harness below immediately before the final brace of the existing `publish::tests` module. Apply the two exact logging insertions shown below to `src/publish.rs` (observe_pane) and `src/model.rs` (ReadCycle::files_with_hooks) in this disposable copy. Then execute:
 
 ```sh
 cargo test --release --locked --lib publish::tests::real_disk_reader_matrix_n4 -- --ignored --exact --nocapture --test-threads=1
@@ -3326,7 +3326,7 @@ Final `dust -s -o b -d 0` apparent sizes (bytes):
 | runs/7e8d28bec07d3f99f101b31fc8f9a661 | 766976745 |
 | Entire /home/fujimogn/.cache/herdr-lineup-reader-n4 | 2887716291 |
 
-No run was reclaimed. All remain below the 5,000,000,000-byte aggregate limit. Complete means command-tree completion, not reclaim eligibility: list reports protected runs, including `Too many open files (os error 24)` and `unsupported payload entry type`. Synthetic Unix sockets remain in the diagnostic fixtures. These tool observations are recorded without attempting cleanup or changing the lifecycle. Commander owns any subsequent recovery/reclaim decision.
+No run was reclaimed. All remain below the 5,000,000,000-byte aggregate limit. Complete means command-tree completion, not reclaim eligibility: the captured final list reports protected runs with `protected lifecycle state` and `unsupported payload entry type`. Synthetic Unix sockets remain in the diagnostic fixtures. These tool observations are recorded without attempting cleanup or changing the lifecycle. Commander owns any subsequent recovery/reclaim decision.
 
 Final `dev-task-temp list --root /home/fujimogn/.cache/herdr-lineup-reader-n4 --json` output (exit 2):
 
