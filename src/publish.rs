@@ -8746,7 +8746,7 @@ mod tests {
             .unwrap();
         assert!(publisher.local_readings.contains_key("w1:pb"));
         // Every live key is now one interval old and needs renewal.
-        publisher.started -= Duration::from_millis(5000);
+        publisher.started -= Duration::from_millis(Config::default().refresh_interval_ms);
         publisher.send_queue = FairQueue::default();
         reader.exhaust.store(true, Ordering::Release);
         reader.reads.lock().unwrap().clear();

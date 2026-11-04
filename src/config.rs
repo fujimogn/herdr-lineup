@@ -22,7 +22,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            refresh_interval_ms: 5000,
+            refresh_interval_ms: 10000,
             reader_timeout_ms: 2000,
             usage_max_age_ms: 60000,
             logo_mode: "auto".into(),
@@ -118,7 +118,7 @@ mod tests {
     fn absent_config_uses_defaults_without_creating_a_file() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(dir.path()).unwrap();
-        assert_eq!(config.refresh_interval_ms, 5000);
+        assert_eq!(config.refresh_interval_ms, 10000);
         assert_eq!(
             config.providers,
             ["claude", "codex", "grok", "agy", "kimi", "hermes"]

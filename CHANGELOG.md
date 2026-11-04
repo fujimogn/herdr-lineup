@@ -6,6 +6,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 - Maintenance: **Dependencies** refresh six locked crates within the existing Cargo requirements: cc 1.11.0, toml 1.2.0, toml_edit 0.25.18, toml_writer 1.2.0, ureq 3.5.1, and its ureq-proto 0.7.1 dependency. Regenerate the binary dependency license notices.
 
+- Maintenance: **Sidebar refresh** increases the default interval from 5 s to 10 s and the corresponding token TTL from 15 s to 30 s, reducing periodic local reads and metadata renewals at the cost of slower sidebar updates. Explicit user settings and account-query client intervals are unchanged.
+
 - Maintenance: **Dependencies** update seven locked crates within the existing Cargo requirements, including rustix 1.1.6 and log 0.4.35, and refresh the binary dependency license notices.
 
 - Maintenance: **Dependencies** update the locked `cc` crate from 1.9.0 to 1.10.0 within the existing Cargo requirements.

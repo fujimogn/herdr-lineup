@@ -59,9 +59,9 @@ text is `—` followed by two U+2800 cells; missing weekly text is an unpadded
 tokens, never full snapshots. Lifecycle and doctor diagnostics can print paths
 inside the private temporary session.
 
-A second snapshot is taken after sixteen seconds, longer than the default
-15,000 ms TTL. It must still contain the expected tokens; this retained
-display is the primary renewal evidence, and it checks the default 5,000 ms
+A second snapshot is taken after thirty-one seconds, longer than the default
+30,000 ms TTL. It must still contain the expected tokens; this retained
+display is the primary renewal evidence, and it checks the default 10,000 ms
 refresh without changing settings. Herdr snapshots expose token values, not
 the publisher's per-source sequence.
 

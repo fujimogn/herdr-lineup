@@ -108,7 +108,7 @@ outside these bounds SHALL fail validation before spawning or publishing.
 
 | Key | Default | Contract |
 | --- | --- | --- |
-| `refresh_interval_ms` | `5000` | Integer 1000–3600000; TTL is exactly three times this value |
+| `refresh_interval_ms` | `10000` | Integer 1000–3600000; TTL is exactly three times this value |
 | `reader_timeout_ms` | `2000` | Integer 100–30000, and no greater than refresh interval |
 | `usage_max_age_ms` | `60000` | Integer at least refresh interval and at most 86400000 |
 | `logo_mode` | `"auto"` | `auto`, `font`, or `text`; conservative auto fallback |

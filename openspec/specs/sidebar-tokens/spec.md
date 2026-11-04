@@ -257,7 +257,7 @@ socket endpoint SHALL be removed once the current endpoint identity is verified;
 its metadata cannot be updated through the replaced endpoint. Empty patches and resources skipped due to
 capacity limits SHALL not allocate or consume sequences.
 
-The default refresh interval SHALL be 5,000 ms and TTL 15,000 ms. Startup and
+The default refresh interval SHALL be 10,000 ms and TTL 30,000 ms. Startup and
 workspace focus SHALL invoke `ensure`; the publisher SHALL NOT subscribe to
 pane or workspace change events. Each periodic refresh SHALL obtain an
 authoritative session snapshot, invalidate cached usage when pane identity or
@@ -290,7 +290,7 @@ more than fourteen keys, including clears. It SHALL publish no undocumented v1 k
 
 #### Scenario: Daemon disappears
 - **WHEN** the default daemon stops publishing without clearing tokens
-- **THEN** each live token expires no later than 15 seconds after its last accepted
+- **THEN** each live token expires no later than 30 seconds after its last accepted
   update, and a restart republishes current values with newer sequences
 
 #### Scenario: No changes while alive
