@@ -176,6 +176,10 @@ an interruption, nor expiry of that heading at 30 s.
 
 ## Limits and interpretation
 
+- In `normal/distinct/32`, null headings occurred only at measured iterations
+  27–30, with 2/5/2/2 null workspaces respectively. Their timing is near the
+  30 s cache/fallback age, but this harness does not instrument the cause
+  and does not establish expiry as the explanation.
 - This is one Linux host and local ext4 filesystem, small synthetic repos,
   an unoptimized test build, and instrumentation overhead. No macOS, remote
   filesystem, large ref namespace, real session load or release binary was measured.
