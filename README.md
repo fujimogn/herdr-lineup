@@ -913,10 +913,14 @@ non-blocking I/O and `poll` against one monotonic deadline. On macOS,
 is not applied with `setsockopt`.
 The local candidate uses a cooperative refresh envelope of
 `2 s + 1 s + reader_timeout_ms + 2 s` (7 s by default). Git headings share a
-one-second cycle budget and use an attempt-based fair queue. The persistent
+one-second cycle budget, observe up to four distinct working directories
+concurrently, and use an attempt-based fair queue. The persistent
 Git cache stores only worktree root/name; a hit still runs three children,
 and interrupted reads can use a confirmed heading for at most 30 s without
-renewing that age on a cache hit. No speed improvement has been measured.
+renewing that age on a cache hit. A
+[limited synthetic comparison](https://github.com/fujimogn/herdr-lineup/blob/main/docs/reviews/git-cache-design.md#95-limited-synthetic-observation-2026-11-04)
+records lower median heading time for 15 distinct working directories on Linux;
+it does not establish general performance, macOS, or rendered latency.
 One discovery cycle is shared across panes in each refresh, with the existing
 combined 4,096-entry Codex cap and cumulative fallback accounting.
 

@@ -1,25 +1,14 @@
 # TODO
 
-Open work after the 2026-10-23 reviews. Finding IDs, implementation source
-`0220da64f8545f89b6daca211553f486b271057f`, fixtures and limits are mapped in
-`docs/reviews/review-followup-coverage.md`. Working rules are in
-`docs/plans/review-followups-plan.md`. The implemented items below are included
-in the v0.3.1 release contents.
-Publication and artifacts are recorded by the [v0.3.1 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.1);
-this preparation record does not establish publication. The immutable v0.3.0
-tag is a failed macOS fixture attempt without a GitHub Release; maintainers
-selected v0.3.1 to carry the owner-authorized release batch.
+Work for the next release. Historical finding IDs, implementation snapshots,
+fixtures, and limits are mapped in
+[review follow-up coverage](docs/reviews/review-followup-coverage.md).
+Working rules are in [the follow-up plan](docs/plans/review-followups-plan.md).
+Completed work below does not establish publication; release versions are
+chosen during release preparation.
 
 ## Open
 
-- [x] Wired-head Git heading latency and child-count matrix (L2, N3):
-  [separate wired-head observation record](docs/reviews/git-heading-latency-wired-2026-11-04.md).
-- [x] Real-disk reader discovery with independent pane/candidate counts
-  (L4, N4): [ext4 observations and missing-context limits](docs/reviews/reader-discovery-real-disk-2026-11-04.md).
-- [x] Short live observation using the connected reader diagnostics (L5):
-  121 samples over ten minutes; BUSY and retained-worker gauges stayed zero,
-  with sampling and provenance limits in
-  [stuck-worker-frequency-2026-11-04.md](docs/reviews/stuck-worker-frequency-2026-11-04.md).
 - [ ] Long-term OS-stall frequency (L5) remains unmeasured. A ten-minute
   sample does not establish an event rate or whether isolation is needed.
 - [ ] Remaining sequence-window failure rows (L1/N2). Publisher ownership
@@ -29,17 +18,48 @@ selected v0.3.1 to carry the owner-authorized release batch.
   spawn/inheritance/readiness, competing-writer protection, automatic reload
   or a restarted publisher clearing state, old-binary rollback, and macOS
   disks remain open.
-- [ ] Check `publish::tests::envelope_expiring_after_admission_is_an_error_not_a_skip`
-  for timing dependence. On 2026-11-04 it failed once in five single-test runs
-  on a shared host with a load average near 80 (see the L5 record); a quiet-host
-  reproduction was not taken.
-- [ ] `docs/reviews/refresh-stage-latency-2026-10-23.md` and
-  `docs/plans/review-followups-plan.md` still describe N1 as open after the
-  [N1 record](docs/reviews/stage-timing-comparison-2026-11-04.md).
+- [ ] Investigate timing dependence in
+  `publish::tests::fast_pane_publishes_before_subsequent_slow_reader`:
+  the unchanged base failed 1 of 10 default-parallel full-suite runs on
+  2026-11-04 (commander-supplied observation; not yet investigated).
+- [ ] Scope Git cache invalidation generations per common directory, with a
+  global epoch for `Rejected`. At `d75e988`, a repository without `origin/main`
+  can suppress another repository's cache update in the same parallel batch;
+  displayed values and child counts are unchanged (`RepositoryCache::apply`
+  in `src/ship_time.rs`).
+- [ ] Refine nonblocking stop boundaries after `51be817`: the wait-loop order
+  can report timeout for a daemon that exits in the final 20 ms, and fixed
+  `LifecycleLock` sleeps can delay observation by about 20 ms (`src/daemon.rs`).
+- [ ] Handle thread-spawn `EAGAIN` without failing the entire heading stage
+  with `io::Error` (`resolve_headings_in_budget` in `src/publish.rs`, `d75e988`).
+  Preserve the guarantee that all started observations are joined.
 - [ ] Font check-then-rename and check-then-unlink races (H1, M1). Closing
   them needs an owner-approved design; partial-state recovery stays manual.
 
-## Implemented follow-ups
+## Completed for the next release
+
+- [x] Wired-head Git heading latency and child-count matrix (L2, N3):
+  [separate wired-head observation record](docs/reviews/git-heading-latency-wired-2026-11-04.md).
+- [x] Real-disk reader discovery with independent pane/candidate counts
+  (L4, N4): [ext4 observations and missing-context limits](docs/reviews/reader-discovery-real-disk-2026-11-04.md).
+- [x] Short live observation using the connected reader diagnostics (L5):
+  121 samples over ten minutes; BUSY and retained-worker gauges stayed zero,
+  with sampling and provenance limits in
+  [stuck-worker-frequency-2026-11-04.md](docs/reviews/stuck-worker-frequency-2026-11-04.md).
+- [x] Make `envelope_expiring_after_admission_is_an_error_not_a_skip`
+  deterministic (`b924a54`): 20/20 runs passed under load; the old fixture
+  failed 17/20 (commander-supplied comparison). Production deadlines are unchanged.
+- [x] Close stale N1 references in the historical stage record and follow-up
+  plan using the [alternating comparison](docs/reviews/stage-timing-comparison-2026-11-04.md).
+- [x] Record the [Codex reader performance trial](docs/reviews/codex-reader-perf-trial-2026-11-04.md):
+  median improvement 4.5%, below the 10% criterion. The owner declined the
+  append-only assumption and relaxed read guarantees; no runtime change landed.
+- [x] Record the [isolated latency investigation](docs/reviews/latency-investigation-2026-11-04.md);
+  rendered latency, macOS, and stable tails remain unmeasured.
+- [x] Record the [source review](docs/reviews/code-review-2026-11-04.md) and
+  resolve CR-01 (`a9b4b84`) and CR-02 (`51be817`).
+- [x] Split bounded reader execution and diagnostics out of `model.rs` into
+  private modules without changing behavior (`0a37245`).
 
 - [x] **Fix timing-dependent `publish::tests` failures.** Publisher fixtures
   inject the shared reader-budget clock and explicitly advance it for timeout

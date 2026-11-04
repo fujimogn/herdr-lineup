@@ -4,17 +4,15 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
-- Maintenance: **Tests** add synthetic sequence-window fixtures for publisher ownership handover, same-source competing-writer no-ops, and explicit config reload clearing, and document the remaining verification limits.
+Lineup tightens shutdown and Kimi session association, observes repository headings concurrently, and reduces periodic sidebar work.
 
-- Maintenance: **Tests** make publisher reader-budget fixtures deterministic without changing production deadlines.
-
-- Maintenance: **Dependencies** refresh six locked crates within the existing Cargo requirements: cc 1.11.0, toml 1.2.0, toml_edit 0.25.18, toml_writer 1.2.0, ureq 3.5.1, and its ureq-proto 0.7.1 dependency. Regenerate the binary dependency license notices.
-
+- Fix: **Stop** shares one five-second absolute deadline across the lifecycle lock, control handshake, and process-exit wait, and sends no shutdown request after that deadline.
+- Fix: **Kimi context** makes association unavailable when a same-ID state candidate cannot be read, while preserving a readable match when unreadable candidates have unrelated IDs.
+- Maintenance: **Git heading** observes up to four distinct working directories concurrently within the shared deadline, preserving native safety checks, fair attempt order, and the original fallback age. Each observation still runs three Git children.
 - Maintenance: **Sidebar refresh** increases the default interval from 5 s to 10 s and the corresponding token TTL from 15 s to 30 s, reducing periodic local reads and metadata renewals at the cost of slower sidebar updates. Explicit user settings and account-query client intervals are unchanged.
-
-- Maintenance: **Dependencies** update seven locked crates within the existing Cargo requirements, including rustix 1.1.6 and log 0.4.35, and refresh the binary dependency license notices.
-
-- Maintenance: **Dependencies** update the locked `cc` crate from 1.9.0 to 1.10.0 within the existing Cargo requirements.
+- Maintenance: **Dependencies** refresh locked crates within the existing Cargo requirements, including cc 1.11.0, rustix 1.1.6, log 0.4.35, toml 1.2.0, toml_edit 0.25.18, toml_writer 1.2.0, ureq 3.5.1, and ureq-proto 0.7.1, and regenerate the binary dependency license notices.
+- Maintenance: **Internal** moves bounded reader execution and diagnostics into private modules without changing behavior.
+- Maintenance: **Tests** makes reader-budget and post-admission deadline fixtures deterministic without changing production deadlines, and adds synthetic sequence-window ownership handover, competing-writer no-op, and explicit config reload fixtures with documented verification limits.
 
 ## 0.3.1 (2026-10-24)
 

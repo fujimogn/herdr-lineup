@@ -225,17 +225,18 @@ The following 20 isolated fixture scenarios specify verification requirements in
 ## 9. Production Implementation Status
 
 The current implementation source is
-`0220da64f8545f89b6daca211553f486b271057f`. The downstream cache implements
+`d75e988dd214cb1ad039f3016d5e0da88cace1b0`. The downstream cache implements
 the narrowed contract below, following `reviews/git-cache-code-sol61-high.md`.
 Production `MetadataPublisher::read_heading` now uses its owned cache;
 `resolve_headings_in_budget` shares same-cwd observations within the refresh,
-rotates workspace attempts under the 1 s cycle Git budget, and
+observes up to four distinct cwds concurrently, rotates workspace attempts
+under the shared 1 s cycle Git budget, and
 `heading_repository` bounds confirmed fallback to 30 s without renewal on hits.
 Unknown headings clear all three workspace keys; confirmed missing
 `origin/main` keeps the repository name and shows `—` for ship time.
 The runtime contract and fixtures are in `../plans/publisher-runtime-wiring.md`
 and `review-followup-coverage.md` L2. Git cache hits still run three children;
-no wired-head speed improvement has been measured. Earlier design sections
+the earlier wired-head measurement is linked in coverage L2. Earlier design sections
 are historical wherever the narrowed implementation below differs.
 
 ### 9.1 Narrowed Cache Scope (Supersedes §1, §3, §4 Where They Differ)
@@ -250,7 +251,24 @@ are historical wherever the narrowed implementation below differs.
 ### 9.2 API
 
 - `RepositoryCache::observe(cwd, shutdown, deadline) -> RepositoryObservation`. The effective deadline is `min(now + 1 s, deadline)` for the caller's absolute deadline. The deadline is cooperative, not a strict wall-clock bound: Git children are polled against it and are killed and reaped once it is observed, but a reap or a synchronous `stat` or config read blocked in the kernel can outlast it.
-- Cache hits update only `last_access`.
+- `RepositoryCache::observe_shared(cache: &Mutex<&mut Self>, cwd, shutdown, deadline)`
+  permits concurrent queries. The mutex protects cache metadata, never Git I/O
+  or reaping. Scoped callers join all started observations before returning.
+- Each query captures the invalidation generation before I/O. `Rejected`
+  clears all entries; `Discard(common)` removes that entry. Both advance the
+  currently cache-wide generation. Older queries cannot restore invalidated
+  entries, and a full verification cannot replace a newer verification with
+  an older one. Per-common-directory generations remain an open refinement
+  in [TODO](../../TODO.md).
+- A `Hit` returns its own independently validated snapshot, even if another
+  parallel query rejects or discards the cache meanwhile. It does not reload
+  another query's replacement entry or restore the invalidated entry.
+  `last_access` is updated only if the captured generation is still current
+  and the entry remains present; `verified_at` retains its original age.
+- Same-cwd observations are shared within the cycle; distinct cwds use at most
+  four workers. Fair attempt order, the shared deadline, native validation,
+  kill/reap, and finite fallback are preserved. Thread-spawn failure currently
+  returns an I/O error after joining already-started workers.
 
 ### 9.3 Refinements Made During Implementation
 
@@ -266,3 +284,25 @@ are historical wherever the narrowed implementation below differs.
 ### 9.4 Fixture Coverage
 
 `src/ship_time.rs` tests cover common-directory refusal hidden behind a permitted workspace (isolated global configuration and a test-only Git environment seam using `GIT_TEST_ASSUME_DIFFERENT_OWNER`, which production sanitizing drops; no user configuration or ownership is changed), and the API side of F-01 to F-12 and F-19 with full-query (`worktree list`) counts and verification instants. For F-13 the API tests cover fresh `verified_at` on uncached successes. Publication now has `heading_fallback_expires_thirty_seconds_after_the_original_verification`; this uses synthetic instants, not a measured 40 s / 45 s production run. P adds `git_queue_rotates_a_stalled_repository_and_unread_headings_are_null` and `shared_stalled_cwd_is_read_once_and_rotates_only_its_starter` for queue/deadline behavior. The historical F-13 to F-18 table is a design checklist, not evidence that every exact scenario was run. Further fixtures cover configuration change and include, refusal clearing all entries, unsupported repository format, re-initialization at the same path (ABA), loose, packed, unreadable, and alternate-target object loss after a warm entry, a ref to a missing object, inaccessible dependencies, a dependency change after the fingerprint during both a hit and a full read, interruption by the caller deadline and after a completed full query, main root rename, and LRU eviction. Each guard was mutated once to confirm that at least one test fails; the `files` format check and the `reftable/` stat fail only when both are removed, and the main root stat cannot be isolated by a fixture.
+
+### 9.5 Limited synthetic observation (2026-11-04)
+
+Commander-supplied results from `lane_gitperf` (`asg_git_heading_perf`) compare
+sequential and concurrent observation using the
+[existing wired-head harness appendix](git-heading-latency-wired-2026-11-04.md#appendix-a-reproduction-driver-complete).
+The fixture was restricted to normal/distinct mode, 15 workspaces and 15 cwds.
+Old and new runs alternated, with three warmup cycles and 50 measured cycles
+per version.
+
+| Version | p50 (ms) | p95 (ms) | Git children per cycle | Null headings |
+| --- | ---: | ---: | ---: | --- |
+| Sequential | 1002.636 | 1010.404 | 13–45 | 0–8 per cycle; 21 total across 7 cycles |
+| Concurrent (up to four cwds) | 459.316 | 948.784 | 39–45 | 0 |
+
+Display values agreed wherever both versions resolved a heading across all
+53 cycles, including warmup. This is a limited synthetic observation:
+synthetic repositories, Linux/ext4, an unoptimized test build, wrapper-based
+child counting, and uncontrolled host load. It does not establish a general
+speed-up, stable tail, macOS result, or rendered sidebar latency. Raw CSV is
+not committed; the supplied pre-edit baseline CSV SHA-256 is
+`26ae53c3fd222b25666ae29d84e03653da4645fdfc467991501f03b9bb54de45`.
