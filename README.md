@@ -217,7 +217,7 @@ defaults. Unknown keys fail validation.
 
 | Key | Default | Bounds |
 | --- | --- | --- |
-| `refresh_interval_ms` | `5000` | Integer 1000–3600000. Sidebar TTL is three times this value. |
+| `refresh_interval_ms` | `10000` | Integer 1000–3600000. Sidebar TTL is three times this value. |
 | `reader_timeout_ms` | `2000` | Integer 100–30000, and no greater than `refresh_interval_ms`. |
 | `usage_max_age_ms` | `60000` | Integer at least `refresh_interval_ms` and at most 86400000. |
 | `providers` | `claude`, `codex`, `grok`, `agy`, `kimi`, `hermes` | Unique ids from that list. An empty list publishes no agent rows. Repository headings stay independent. |
@@ -927,7 +927,11 @@ replayed. Sequence windows are durable before send; an uncertain checkpoint
 write stops publication until a new daemon instance reloads it. The envelope
 cannot interrupt synchronous filesystem work, fsync or process reaping, and
 is not an SLO or a strict wall-clock bound. Deferred renewals may expire and
-disappear in degraded cycles. The default refresh interval stays 5 s.
+disappear in degraded cycles. The default refresh interval is 10 s, with a
+30 s sidebar TTL. The daemon waits this interval after each refresh completes;
+the cooperative envelope remains 7 s by default. The longer interval reduces
+periodic local reads and metadata renewals, but sidebar changes can take longer
+to appear. Codex and Grok account-query client intervals remain independent.
 See the [Herdr plugin documentation](https://herdr.dev/docs/plugins/)
 and [SECURITY.md](https://github.com/fujimogn/herdr-lineup/blob/main/SECURITY.md).
 

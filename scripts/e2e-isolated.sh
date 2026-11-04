@@ -446,10 +446,10 @@ PYVIEW
     echo 'PASS: workspace heading and synthetic pane display tokens received'
     echo 'SKIP: real agent pane; isolated HOME has no provider authentication; synthetic occupant only'
     sequence_tool record "$temp/state" "$workspace" "$pane" > "$temp/seq-first.json"
-    # The default TTL is 15 seconds; unchanged keys renew by 10 seconds.
-    # Tokens in a snapshot taken 16 seconds later prove renewal; the checkpoint
+    # The default TTL is 30 seconds; unchanged keys renew on each admitted refresh.
+    # Tokens in a snapshot taken 31 seconds later prove renewal; the checkpoint
     # need only keep a valid, non-decreasing endpoint floor.
-    sleep 16
+    sleep 31
     herdr_cmd api snapshot > "$temp/renewed.json"
     if ! token_check present "$temp/renewed.json" "$workspace" "$pane" "$ship_unix"; then
         token_check explain "$temp/renewed.json" "$workspace" "$pane" "$ship_unix" >&2 || true

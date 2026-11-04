@@ -296,7 +296,7 @@ mod tests {
                 None,
                 &tokens,
                 0,
-                5000,
+                crate::config::Config::default().refresh_interval_ms,
             )
             .unwrap()
             .unwrap()
@@ -316,7 +316,7 @@ mod tests {
             metadata_request("report-1", &report).unwrap(),
             json!({
                 "id":"report-1","method":"pane.report_metadata","params":{
-                    "pane_id":"w1:p1","source":"herdr-lineup","ttl_ms":15000,"seq":1,
+                    "pane_id":"w1:p1","source":"herdr-lineup","ttl_ms":30000,"seq":1,
                     "tokens":{"lineup_context_pct":null,"lineup_context_text":"—","lineup_state_idle":null}
                 }
             })
