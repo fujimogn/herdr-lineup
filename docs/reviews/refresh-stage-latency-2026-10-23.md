@@ -225,5 +225,8 @@ within report processing. Never sum the columns. Host load and cache state
 were uncontrolled; the old and new binaries were not alternated. These
 observations establish neither a speed multiplier nor a stable tail estimate,
 SLO, strict 7 s wall-clock guarantee, macOS result, live Herdr result or
-event-to-visible latency. The controlled comparison and other outstanding
-measurements remain in `../../TODO.md` N1/N3/N4/L5/N5.
+event-to-visible latency. N1's controlled old/new comparison is now recorded in
+[the alternating comparison](stage-timing-comparison-2026-11-04.md); the
+historical numbers above are unchanged. Later N3/N4 and bounded L5 observations
+are linked from [TODO](../../TODO.md). Long-term stalls and N5 remain open or
+conditional there.

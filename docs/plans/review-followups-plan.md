@@ -17,7 +17,7 @@ Repository files and commit subjects are English. Conversation with the
 commander is Japanese. Support Linux and macOS. Keep source and endpoint
 identity. Do not touch a live Herdr session, user settings, secrets, or
 network APIs. Do not push, ACK, or ship from a member lane. Keep
-`refresh_interval_ms` at 5000. Independent review is GPT-6.1 Sol high,
+the current default `refresh_interval_ms` at 10000 (updated by `6f8f369`). Independent review is GPT-6.1 Sol high,
 read-only, with native subagent fork none. Members do not review each other.
 Questions go to the commander through a Formation report. A path outside the
 assignment is a `BLOCKED` touching request before any edit. Do not `cargo clean`
@@ -57,10 +57,11 @@ The general procedure below applies to subsequent candidates.
 
 `TODO.md` lists the open items. Take them in this order of dependency:
 
-1. The commander's final synthetic observations are recorded separately from
-   historical results. Controlled timing comparison, Git/reader real-disk
-   matrices and stuck-worker frequency remain the measurement work in
-   `TODO.md`.
+1. N1 is complete as a measurement record: the
+   [alternating old/new comparison](../reviews/stage-timing-comparison-2026-11-04.md)
+   is separate from historical results. Git/reader matrices and a bounded
+   ten-minute worker observation are also recorded in `TODO.md`; long-term
+   OS-stall frequency remains open. These records do not establish an SLO.
 2. Conditional proposals (L6 period/event changes and N5 event-to-visible,
    L7 child timeouts/direct exec, L8 reuse, L5 isolation) start only when their
    written condition is met. They are not obligations. The L3 cooperative
