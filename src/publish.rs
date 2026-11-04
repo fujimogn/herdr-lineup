@@ -87,6 +87,8 @@ impl Default for CycleTerms {
 
 /// A heading not confirmed by Git for this long is no longer published.
 const HEADING_FALLBACK: Duration = Duration::from_secs(30);
+/// Each observation owns at most one Git child at a time.
+const MAX_CONCURRENT_GIT_OBSERVATIONS: usize = 4;
 /// Clear runs at shutdown under its own deadline, never a refresh envelope.
 const CLEAR_DEADLINE: Duration = Duration::from_secs(3);
 
@@ -1106,6 +1108,7 @@ impl MetadataPublisher {
         }
     }
 
+    #[cfg(test)]
     fn read_heading(&mut self, cwd: &Path, deadline: Instant) -> HeadingRead {
         #[cfg(test)]
         if let Some(hook) = self.hooks.git.as_mut() {
@@ -1882,29 +1885,106 @@ impl MetadataPublisher {
         // `reads` doubles as the visited set: no workspace is read twice.
         let mut reads: BTreeMap<String, HeadingRead> = BTreeMap::new();
         let mut by_cwd: BTreeMap<PathBuf, HeadingRead> = BTreeMap::new();
-        for id in pass {
-            if reads.contains_key(&id) {
-                continue;
+        #[cfg(test)]
+        let serial_hook = self.hooks.git.is_some();
+        #[cfg(not(test))]
+        let serial_hook = false;
+        #[cfg(test)]
+        if serial_hook {
+            for id in pass.iter().cloned() {
+                if reads.contains_key(&id) {
+                    continue;
+                }
+                let Some(workspace) = workspaces.get(id.as_str()) else {
+                    continue;
+                };
+                self.check_shutdown()?;
+                let read = match workspace_cwd(workspace) {
+                    None => HeadingRead::Unknown,
+                    Some(cwd) => match by_cwd.get(&cwd) {
+                        // A shared result starts no Git I/O, so it does not rotate.
+                        Some(shared) => shared.clone(),
+                        None if Instant::now() >= git_deadline => HeadingRead::NotAttempted,
+                        None => {
+                            self.git_queue.rotate(&id);
+                            let read = self.read_heading(&cwd, git_deadline);
+                            by_cwd.insert(cwd, read.clone());
+                            read
+                        }
+                    },
+                };
+                reads.insert(id, read);
             }
-            let Some(workspace) = workspaces.get(id.as_str()) else {
-                continue;
-            };
-            self.check_shutdown()?;
-            let read = match workspace_cwd(workspace) {
-                None => HeadingRead::Unknown,
-                Some(cwd) => match by_cwd.get(&cwd) {
-                    // A shared result starts no Git I/O, so it does not rotate.
-                    Some(shared) => shared.clone(),
-                    None if Instant::now() >= git_deadline => HeadingRead::NotAttempted,
-                    None => {
-                        self.git_queue.rotate(&id);
-                        let read = self.read_heading(&cwd, git_deadline);
-                        by_cwd.insert(cwd, read.clone());
-                        read
+        }
+        if !serial_hook {
+            let mut pending = pass.into_iter().peekable();
+            while pending.peek().is_some() {
+                self.check_shutdown()?;
+                let mut batch = Vec::new();
+                let mut scheduled = BTreeSet::new();
+                for id in pending.by_ref() {
+                    let Some(workspace) = workspaces.get(id.as_str()) else {
+                        continue;
+                    };
+                    let Some(cwd) = workspace_cwd(workspace) else {
+                        reads.insert(id, HeadingRead::Unknown);
+                        continue;
+                    };
+                    if let Some(shared) = by_cwd.get(&cwd) {
+                        reads.insert(id, shared.clone());
+                    } else if scheduled.contains(&cwd) {
+                        // Its starter in this batch supplies the shared result.
+                    } else if Instant::now() >= git_deadline {
+                        reads.insert(id, HeadingRead::NotAttempted);
+                    } else {
+                        scheduled.insert(cwd.clone());
+                        batch.push((id, cwd));
+                        if batch.len() == MAX_CONCURRENT_GIT_OBSERVATIONS {
+                            break;
+                        }
                     }
-                },
-            };
-            reads.insert(id, read);
+                }
+                let cache = std::sync::Mutex::new(&mut self.repositories);
+                let queue = &mut self.git_queue;
+                let shutdown = self.shutdown.as_deref();
+                let results = std::thread::scope(|scope| -> io::Result<Vec<_>> {
+                    let mut running = Vec::new();
+                    for (id, cwd) in batch {
+                        if Instant::now() >= git_deadline
+                            || shutdown.is_some_and(|flag| flag.load(Ordering::Acquire))
+                        {
+                            continue;
+                        }
+                        let cache = &cache;
+                        let path = cwd.clone();
+                        let handle =
+                            std::thread::Builder::new().spawn_scoped(scope, move || {
+                                ship_time::RepositoryCache::observe_shared(
+                                    cache,
+                                    &path,
+                                    shutdown,
+                                    git_deadline,
+                                )
+                            })?;
+                        // Rotate only admitted starters, never shared results.
+                        queue.rotate(&id);
+                        running.push((cwd, handle));
+                    }
+                    running
+                        .into_iter()
+                        .map(|(cwd, handle)| {
+                            handle
+                                .join()
+                                .map(|observation| (cwd, HeadingRead::from(observation)))
+                                .map_err(|_| io::Error::other("Git observation thread panicked"))
+                        })
+                        .collect()
+                })?;
+                for (cwd, read) in results {
+                    by_cwd.insert(cwd, read);
+                }
+                self.check_shutdown()?;
+            }
         }
 
         let local_now = chrono::Local::now();
@@ -1920,6 +2000,7 @@ impl MetadataPublisher {
                 .collect::<Vec<_>>();
             let read = reads
                 .remove(&workspace.workspace_id)
+                .or_else(|| cwd.as_ref().and_then(|cwd| by_cwd.get(cwd).cloned()))
                 .unwrap_or(HeadingRead::NotAttempted);
             let repository = self.heading_repository(
                 &workspace.workspace_id,
@@ -9250,6 +9331,161 @@ mod tests {
             })),
             verified_at: Some(Instant::now()),
         }
+    }
+
+    #[test]
+    fn native_git_batches_share_deadline_cwd_and_reap_before_returning() {
+        const CHILD: &str = "LINEUP_TEST_GIT_BATCHES";
+        let Some(root) = std::env::var_os(CHILD) else {
+            for mode in ["deadline", "shutdown"] {
+                let dir = tempfile::tempdir().unwrap();
+                let bin = dir.path().join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                crate::test_support::write_executable(
+                    &bin.join("git"),
+                    "#!/bin/sh\necho $$ >> \"$2/pids\"\nexec /bin/sleep 30\n",
+                )
+                .unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "publish::tests::native_git_batches_share_deadline_cwd_and_reap_before_returning",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HOME", dir.path())
+                .env("PATH", bin)
+                .env(CHILD, dir.path())
+                .env("LINEUP_TEST_GIT_BATCH_MODE", mode)
+                .status()
+                .unwrap();
+                assert!(status.success());
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        let paths: Vec<_> = (0..6).map(|i| root.join(format!("repo-{i}"))).collect();
+        for path in &paths {
+            std::fs::create_dir(path).unwrap();
+        }
+        // The first two workspaces share cwd, including while its read runs.
+        let indices = [0, 0, 1, 2, 3, 4, 5];
+        let snapshot = protocol::Snapshot {
+            version: "0.9.3".into(),
+            protocol: 17,
+            panes: vec![],
+            workspaces: indices
+                .iter()
+                .enumerate()
+                .map(|(i, index)| protocol::Workspace {
+                    workspace_id: format!("w{i}"),
+                    checkout_path: paths[*index].to_str().map(String::from),
+                    stored_keys: BTreeSet::new(),
+                })
+                .collect(),
+        };
+        let inventory = RefreshInventory {
+            snapshot,
+            now_unix: 0,
+            mode: tokens::LogoMode::Text,
+            first_panes: BTreeSet::new(),
+            codex_weekly: None,
+            grok_weekly: None,
+            kimi_weekly: None,
+        };
+        let mut publisher = budget_publisher(&root, budget_terms(1000, 1000, 1000));
+        if std::env::var("LINEUP_TEST_GIT_BATCH_MODE").unwrap() == "shutdown" {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            publisher.shutdown = Some(shutdown.clone());
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let limit = Instant::now() + Duration::from_secs(5);
+                    while paths.iter().filter(|p| p.join("pids").exists()).count() < 4 {
+                        assert!(Instant::now() < limit, "four Git children never started");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    shutdown.store(true, Ordering::Release);
+                });
+                let started = Instant::now();
+                let error = publisher
+                    .resolve_headings_in_budget(
+                        &inventory,
+                        started + Duration::from_secs(7),
+                        started,
+                    )
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            });
+            let pids: Vec<i32> = paths
+                .iter()
+                .flat_map(|path| {
+                    std::fs::read_to_string(path.join("pids"))
+                        .unwrap_or_default()
+                        .lines()
+                        .map(|pid| pid.parse().unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(pids.len(), 4, "shutdown admitted another batch");
+            for pid in pids {
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+            }
+            return;
+        }
+        for cycle in 0..2 {
+            let started = Instant::now();
+            let result = publisher
+                .resolve_headings_in_budget(&inventory, started + Duration::from_secs(7), started)
+                .unwrap();
+            assert!(
+                result
+                    .by_workspace
+                    .values()
+                    .all(|heading| !heading.resolved)
+            );
+            let pids: Vec<i32> = paths
+                .iter()
+                .flat_map(|path| {
+                    std::fs::read_to_string(path.join("pids"))
+                        .unwrap_or_default()
+                        .lines()
+                        .map(|pid| pid.parse().unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                pids.len(),
+                (cycle + 1) * 4,
+                "one shared deadline must admit four distinct cwd"
+            );
+            for pid in pids {
+                assert_eq!(
+                    unsafe { libc::kill(pid, 0) },
+                    -1,
+                    "Git leader survived return"
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+            }
+            if cycle == 0 {
+                assert_eq!(
+                    publisher.git_queue.order,
+                    ["w1", "w5", "w6", "w0", "w2", "w3", "w4"]
+                );
+                assert!(!paths[4].join("pids").exists());
+                assert!(!paths[5].join("pids").exists());
+            }
+        }
+        assert!(
+            paths.iter().all(|path| path.join("pids").exists()),
+            "unattempted cwd must advance next cycle"
+        );
     }
 
     // F11, F15 and F17: a stalled repository uses the cycle's Git budget and
