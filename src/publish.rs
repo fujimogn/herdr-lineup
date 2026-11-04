@@ -8625,19 +8625,37 @@ mod tests {
         );
         let mut transport = Transport::connect(&socket).unwrap();
         let mut publisher = budget_publisher(dir.path(), budget_terms(0, 0, 100));
-        publisher.hooks.before_exchange = Some(Box::new(|| {
-            std::thread::sleep(Duration::from_millis(250));
+        let snapshot = publisher.snapshot(&mut transport).unwrap();
+        let resource = publisher.resource(ResourceKind::Pane, "w1:p1");
+        let desired = BTreeMap::from([("lineup_logo".into(), Some("Codex".into()))]);
+        let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_admission = admitted.clone();
+        publisher.hooks.admission = Some(Box::new(move || {
+            observed_admission.store(true, Ordering::SeqCst);
+            true
         }));
+        // Enter at send_report so scheduling before admission cannot turn this
+        // into a skip. Inject admission and an already expired exchange deadline
+        // to model the post-admission boundary without a real-time sleep.
         let error = publisher
-            .refresh_with_readers(
+            .send_report(
                 &mut transport,
-                &short_readers(),
-                &SampleReader,
-                &TimeoutReader,
+                &resource,
+                &snapshot.panes[0].stored_keys,
+                None,
+                &desired,
+                ReportMode::Refresh {
+                    envelope: Instant::now(),
+                    rotate: false,
+                },
             )
             .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
         assert_eq!(refresh_skip(&error), None, "{error}");
-        publisher.hooks.before_exchange = None;
+        assert!(admitted.load(Ordering::SeqCst), "admission was not reached");
+        assert!(log.lock().unwrap().is_empty(), "an expired frame was sent");
+        publisher.hooks.admission = None;
+        publisher.terms = budget_terms(60_000, 0, 60_000);
         transport.reconnect_same_endpoint().unwrap();
         publisher.reconnected();
         publisher
@@ -8651,6 +8669,7 @@ mod tests {
         finish(&mut publisher, &mut transport);
         server.join().unwrap();
         let log = log.lock().unwrap();
+        assert!(!log.is_empty(), "recovery did not publish any frames");
         assert!(
             log.iter().all(|(_, seq)| *seq > 1),
             "sequence 1 was sent after its deadline: {log:?}"
