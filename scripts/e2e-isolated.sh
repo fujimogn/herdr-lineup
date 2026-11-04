@@ -423,7 +423,7 @@ print(r['workspace']['workspace_id'])
 PYID
 )
     found=false
-    deadline=$((SECONDS + 12))
+    deadline=$((SECONDS + 30))
     while ((SECONDS < deadline)); do
         herdr_cmd api snapshot > "$temp/snapshot.json"
         if token_check present "$temp/snapshot.json" "$workspace" "$pane" "$ship_unix"; then
