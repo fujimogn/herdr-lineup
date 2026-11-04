@@ -12,7 +12,6 @@ selected v0.3.1 to carry the owner-authorized release batch.
 
 ## Open
 
-- [ ] **Fix timing-dependent `publish::tests` failures.** On 2026-11-01 the develop CI failed on `b8c0c91` and `dece162`, which changed no Rust code, in different tests under `publish::tests`, and a rerun passed. Next: reproduce under load and inject the reader budget clock into the tests. Done when the suite stays green under load.
 - [ ] Controlled old/new stage timing comparison, with binaries alternated
   on one host and filesystem (N1). Historical and new-candidate synthetic
   observations are separate records, not a speed-up or SLO.
@@ -26,6 +25,15 @@ selected v0.3.1 to carry the owner-authorized release batch.
   config change during refresh, old-binary rollback, macOS disks (L1/N2).
 - [ ] Font check-then-rename and check-then-unlink races (H1, M1). Closing
   them needs an owner-approved design; partial-state recovery stays manual.
+
+## Implemented follow-ups
+
+- [x] **Fix timing-dependent `publish::tests` failures.** Publisher fixtures
+  inject the shared reader-budget clock and explicitly advance it for timeout
+  restoration. Boundary coverage checks that the budget starts after headings
+  and skips reader I/O at exactly zero remaining time. Discovery uses the normal
+  worker budget, and the reader-only fixture uses the normal cycle envelope.
+  Production deadline checks retain real monotonic time.
 
 ## Conditional
 
