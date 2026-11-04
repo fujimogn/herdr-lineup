@@ -20,6 +20,7 @@ pub mod reader_codex;
 pub mod reader_grok;
 pub mod reader_hermes;
 pub mod reader_kimi;
+mod reader_runtime;
 pub mod ship_time;
 pub mod socket;
 pub mod statusline;
