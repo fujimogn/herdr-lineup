@@ -130,7 +130,7 @@ each cell. They describe this experiment only. Stage values overlap and must
 not be summed. No ratio or causal improvement is inferred.
 
 | FS | Binary | Panes | Total | Pipeline | Snapshot | Git | Reader | Persist | Socket | External |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | tmpfs | old | 1 | 41256 | 41056 | 1338 | 29394.5 | 10 | 300 | 5424.5 | 41275.5 |
 | tmpfs | old | 8 | 64053 | 63938.5 | 2311 | 34222.5 | 70.5 | 2444 | 24776 | 64070 |
 | tmpfs | old | 32 | 127091 | 126923.5 | 6406 | 29846 | 241 | 10236 | 74549.5 | 127115.5 |
@@ -327,8 +327,9 @@ the Git column includes heading and repository work. Never sum stage columns
 to reconstruct total time. `external_us` surrounds the fixture refresh call;
 its gap from `total_us` does not estimate instrumentation overhead.
 
-Alternating binaries controls host identity, filesystem, fixture parameters,
-build profile, and temporal ordering. It does not control background load,
+Both binaries use the same host, filesystem and fixture parameters with
+the same build profile. Alternation fixes the execution order only; it does
+not neutralize time-dependent effects. It does not control background load,
 cache state, storage scheduling, or the differences between the two source
 trees and their instrumentation. Fresh fixture directories do not imply cold
 kernel caches. No uninstrumented control or stable tail estimate is provided.

@@ -90,5 +90,5 @@ Start only when the named condition is met; these are not obligations.
   the residual races remain open above.
 - [x] N1 wired synthetic cold-refresh observations: tmpfs and ext4, five pane
   counts, n=3 each. The new results are separated from historical baselines
-  in `docs/reviews/refresh-stage-latency-2026-10-23.md`; controlled timing
-  comparison remains open above.
+  in `docs/reviews/refresh-stage-latency-2026-10-23.md`; the later alternating
+  old/new comparison is recorded under Completed measurements after v0.3.1 above.
