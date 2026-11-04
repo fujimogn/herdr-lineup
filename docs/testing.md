@@ -50,7 +50,7 @@ calls no provider API. A real authenticated agent pane is explicitly `SKIP`
 because the isolated HOME has no provider authentication; the synthetic check
 is separate evidence of publication and missing-value presentation.
 
-Within twelve seconds, snapshots from
+Within thirty seconds, snapshots from
 `herdr --session <unique name> api snapshot` must show the expected repository
 name, the exact local `origin/main` commit timestamp, its local date/time label,
 and the synthetic pane's logo, state, context, and weekly text. Missing context

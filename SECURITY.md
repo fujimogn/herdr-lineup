@@ -97,7 +97,7 @@ The foreground rereads the selected auth file once per refresh, with the
 existing 64 KiB file bound and nonblocking open. A synthetic 48-byte auth file
 measured 1,000 source reads in 3.58 ms on the development host (debug test
 build, 2026-10-23); this is a local cost measurement, not a service latency
-claim. At the default five-second refresh interval, it adds one bounded local
+claim. At the default ten-second refresh interval, it adds one bounded local
 read and parse per cycle.
 
 The daemon saves only fixed query-result categories in private per-session
