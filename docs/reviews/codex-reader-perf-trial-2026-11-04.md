@@ -419,7 +419,7 @@ all measurement-wrapper changes as well as the production-copy phase markers.
 +    crate::perf_mark("cache_insert");
      result
  }
- 
+
 @@ -166,7 +172,9 @@
          }
          Ok(())
@@ -429,7 +429,7 @@ all measurement-wrapper changes as well as the production-copy phase markers.
 +    crate::perf_mark("parse");
 +    result
  }
- 
+
  #[derive(Deserialize)]
 @@ -1152,7 +1160,9 @@
      assert!((result.0 - 7.0).abs() < 1e-9);
@@ -469,7 +469,7 @@ all measurement-wrapper changes as well as the production-copy phase markers.
 +    crate::perf_mark("decode");
 +    text
  }
- 
+
  pub(crate) fn timestamp(value: &serde_json::Value) -> Option<SystemTime> {
 ```
 
