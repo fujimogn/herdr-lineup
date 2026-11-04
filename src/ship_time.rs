@@ -6,7 +6,10 @@ use std::{
     os::{fd::AsRawFd, unix::process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -160,10 +163,11 @@ struct CachedRepository {
 #[derive(Default)]
 pub(crate) struct RepositoryCache {
     entries: HashMap<PathBuf, CachedRepository>,
+    invalidation_generation: u64,
     #[cfg(test)]
     full_queries: usize,
     #[cfg(test)]
-    after_git_queries: Option<Box<dyn FnMut()>>,
+    after_git_queries: Option<Box<dyn FnMut() + Send>>,
 }
 
 enum Outcome {
@@ -174,6 +178,7 @@ enum Outcome {
     /// The cached root with a ship time confirmed by Git in this observation.
     Hit {
         common: PathBuf,
+        entry: Box<CachedRepository>,
         ship_unix: Option<i64>,
     },
     Verified {
@@ -195,12 +200,22 @@ impl RepositoryCache {
         shutdown: Option<&AtomicBool>,
         deadline: Instant,
     ) -> RepositoryObservation {
-        let now = Instant::now();
-        self.observe_at(cwd, shutdown, deadline.min(now + QUERY_LIMIT), now)
+        Self::observe_shared(&Mutex::new(self), cwd, shutdown, deadline)
     }
 
-    /// `now` stamps verification and ages entries; cancellation always uses
-    /// the real clock against `deadline`.
+    /// The mutex protects only cache metadata, never a Git child or its reap.
+    /// Scoped callers join all observations before releasing the owned cache.
+    pub(crate) fn observe_shared(
+        cache: &Mutex<&mut Self>,
+        cwd: &Path,
+        shutdown: Option<&AtomicBool>,
+        deadline: Instant,
+    ) -> RepositoryObservation {
+        let now = Instant::now();
+        Self::observe_shared_at(cache, cwd, shutdown, deadline.min(now + QUERY_LIMIT), now)
+    }
+
+    #[cfg(test)]
     fn observe_at(
         &mut self,
         cwd: &Path,
@@ -208,7 +223,18 @@ impl RepositoryCache {
         deadline: Instant,
         now: Instant,
     ) -> RepositoryObservation {
-        let outcome = self.query(cwd, shutdown, deadline, now);
+        Self::observe_shared_at(&Mutex::new(self), cwd, shutdown, deadline, now)
+    }
+
+    fn observe_shared_at(
+        cache: &Mutex<&mut Self>,
+        cwd: &Path,
+        shutdown: Option<&AtomicBool>,
+        deadline: Instant,
+        now: Instant,
+    ) -> RepositoryObservation {
+        let generation = cache.lock().unwrap().invalidation_generation;
+        let outcome = Self::query(cache, cwd, shutdown, deadline, now);
         if Instant::now() >= deadline || shutdown.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             // An interrupted read proves nothing; leave every entry as it was.
             return RepositoryObservation {
@@ -216,6 +242,14 @@ impl RepositoryCache {
                 verified_at: None,
             };
         }
+        cache.lock().unwrap().apply(outcome, generation, now)
+    }
+
+    fn invalidate(&mut self) {
+        self.invalidation_generation = self.invalidation_generation.wrapping_add(1);
+    }
+
+    fn apply(&mut self, outcome: Outcome, generation: u64, now: Instant) -> RepositoryObservation {
         let unverified = RepositoryObservation {
             read: RepositoryRead::Complete(None),
             verified_at: None,
@@ -225,22 +259,29 @@ impl RepositoryCache {
                 // The refused cwd may belong to any cached repository, and
                 // only 64 entries exist: verify everything again from Git.
                 self.entries.clear();
+                self.invalidate();
                 unverified
             }
             Outcome::Discard(common) => {
                 self.entries.remove(&common);
+                self.invalidate();
                 unverified
             }
-            Outcome::Hit { common, ship_unix } => {
-                let Some(entry) = self.entries.get_mut(&common) else {
-                    return unverified;
-                };
-                entry.last_access = now;
-                // The combined data is only as fresh as its older part, the
-                // cached root, so a hit never extends the entry's age.
+            Outcome::Hit {
+                common,
+                entry,
+                ship_unix,
+            } => {
+                if generation == self.invalidation_generation
+                    && let Some(current) = self.entries.get_mut(&common)
+                {
+                    current.last_access = current.last_access.max(now);
+                }
+                // Return this query's independently validated snapshot, not an
+                // entry another observation may have replaced or invalidated.
                 RepositoryObservation {
                     read: RepositoryRead::Complete(Some(Repository {
-                        name: entry.name.clone(),
+                        name: entry.name,
                         ship_unix,
                     })),
                     verified_at: Some(entry.verified_at),
@@ -252,9 +293,22 @@ impl RepositoryCache {
                 store,
             } => {
                 match store {
-                    Some(entry) => self.insert(common, *entry),
+                    Some(entry) => {
+                        // A rejection/discard during I/O forbids old queries
+                        // from restoring the invalidated cache. A later full
+                        // verification must also never be aged backwards.
+                        if generation == self.invalidation_generation
+                            && !self
+                                .entries
+                                .get(&common)
+                                .is_some_and(|current| current.verified_at > now)
+                        {
+                            self.insert(common, *entry);
+                        }
+                    }
                     None => {
                         self.entries.remove(&common);
+                        self.invalidate();
                     }
                 }
                 RepositoryObservation {
@@ -280,7 +334,7 @@ impl RepositoryCache {
     }
 
     fn query(
-        &mut self,
+        cache: &Mutex<&mut Self>,
         cwd: &Path,
         shutdown: Option<&AtomicBool>,
         deadline: Instant,
@@ -360,12 +414,18 @@ impl RepositoryCache {
             && !symbolic
             && !linked_ref
             && ship_unix.is_some();
-        let cached = self.entries.get(&common).filter(|entry| {
-            cacheable
-                && entry.fingerprint == before
-                && now.saturating_duration_since(entry.verified_at) < VERIFIED_TTL
-        });
-        let (root, name) = match cached.map(|entry| entry.root.clone()) {
+        let cached = cache
+            .lock()
+            .unwrap()
+            .entries
+            .get(&common)
+            .filter(|entry| {
+                cacheable
+                    && entry.fingerprint == before
+                    && now.saturating_duration_since(entry.verified_at) < VERIFIED_TTL
+            })
+            .cloned();
+        let (root, name) = match cached.as_ref().map(|entry| entry.root.clone()) {
             Some(root) => {
                 // safe.directory is decided per path: a permitted workspace
                 // does not permit the common directory that worktree list
@@ -384,7 +444,7 @@ impl RepositoryCache {
             None => {
                 #[cfg(test)]
                 {
-                    self.full_queries += 1;
+                    cache.lock().unwrap().full_queries += 1;
                 }
                 // The first worktree is the main working repository, even when
                 // cwd is a linked worktree. Query its common directory, not the
@@ -404,7 +464,7 @@ impl RepositoryCache {
             }
         };
         #[cfg(test)]
-        if let Some(hook) = self.after_git_queries.as_mut() {
+        if let Some(hook) = cache.lock().unwrap().after_git_queries.as_mut() {
             hook();
         }
         // Data read while a dependency changed may mix two states; never
@@ -419,12 +479,12 @@ impl RepositoryCache {
             return Outcome::Discard(common);
         }
         let Some(name) = name else {
-            if self
-                .entries
-                .get(&common)
-                .is_some_and(|entry| entry.root_fingerprint == root_fingerprint)
-            {
-                return Outcome::Hit { common, ship_unix };
+            if let Some(entry) = cached.filter(|entry| entry.root_fingerprint == root_fingerprint) {
+                return Outcome::Hit {
+                    common,
+                    entry: Box::new(entry),
+                    ship_unix,
+                };
             }
             return Outcome::Discard(common);
         };
@@ -2038,5 +2098,74 @@ mod tests {
                 Self::Interrupted => panic!("unexpected interruption"),
             }
         }
+    }
+    #[test]
+    fn concurrent_cache_invalidation_cannot_be_undone_by_old_queries() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let now = Instant::now();
+        let generation = cache.invalidation_generation;
+        let queried = RepositoryCache::query(
+            &Mutex::new(&mut cache),
+            &fixture.repo,
+            None,
+            Instant::now() + QUERY_LIMIT,
+            now,
+        );
+        cache.apply(Outcome::Rejected, generation, now);
+        // This full query independently checked Git, but its cache write is old.
+        assert_eq!(ship(&cache.apply(queried, generation, now)), Some(DAY_ONE));
+        assert!(
+            cache.entries.is_empty(),
+            "an old full query restored a rejected cache"
+        );
+
+        observe(&mut cache, &fixture.repo, now);
+        let generation = cache.invalidation_generation;
+        let hit = RepositoryCache::query(
+            &Mutex::new(&mut cache),
+            &fixture.repo,
+            None,
+            Instant::now() + QUERY_LIMIT,
+            now + Duration::from_secs(1),
+        );
+        assert!(matches!(&hit, Outcome::Hit { .. }));
+        cache.apply(Outcome::Discard(fixture.common()), generation, now);
+        let observed = cache.apply(hit, generation, now + Duration::from_secs(1));
+        assert_eq!(
+            observed.verified_at,
+            Some(now),
+            "a concurrent hit renewed verification"
+        );
+        assert!(
+            cache.entries.is_empty(),
+            "an old hit restored a discarded cache"
+        );
+    }
+
+    #[test]
+    fn full_queries_finishing_out_of_order_do_not_age_the_cache_backwards() {
+        let fixture = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let now = Instant::now();
+        let generation = cache.invalidation_generation;
+        let old = RepositoryCache::query(
+            &Mutex::new(&mut cache),
+            &fixture.repo,
+            None,
+            Instant::now() + QUERY_LIMIT,
+            now,
+        );
+        let newer = now + Duration::from_secs(1);
+        let new = RepositoryCache::query(
+            &Mutex::new(&mut cache),
+            &fixture.repo,
+            None,
+            Instant::now() + QUERY_LIMIT,
+            newer,
+        );
+        cache.apply(new, generation, newer);
+        cache.apply(old, generation, now);
+        assert_eq!(cache.entries[&fixture.common()].verified_at, newer);
     }
 }
