@@ -1,9 +1,9 @@
 {
-  "version": "0.6.11",
+  "version": "0.6.12",
   "integrationBranch": "develop",
   "sha256": {
-    "x86_64-unknown-linux-gnu": "ac440b2cb710f5d17272bd06e520d6ce5a9c399b8c7b9cb345cacf973c79be79",
-    "aarch64-apple-darwin": "a414dd03901a3641361a2f09d745fa74361d26787ad2d9344d03e3c8c861639a"
+    "x86_64-unknown-linux-gnu": "07cb12d2bfbc960dac85d526b6e95361774a5a3b457c856f355223fb4c06337a",
+    "aarch64-apple-darwin": "a59c8d31032d5a6a28c3871cbe864accc1fd735cf107197b1d8d6f6d18fb15a2"
   },
   "platforms": ["linux", "macos"],
   "platformCheck": {
