@@ -760,8 +760,8 @@ credentials, paths, response bodies and error text are never recorded.
 Temporary failures retain the last success until its known reset; authentication
 failures clear it. Before the first successful query, after reset, and for Grok
 MONTHLY allowances, weekly stays `—`. Case-insensitive `WEEKLY` and
-`BILLING_PERIOD_TYPE_WEEKLY` supply weekly usage; `NON_WEEKLY`, `BIWEEKLY`,
-and `WEEK` do not. `MONTHLY` periods remain unavailable for 7d. Without a reset, Grok's remaining percentage
+`BILLING_PERIOD_TYPE_WEEKLY`, and `USAGE_PERIOD_TYPE_WEEKLY` supply weekly usage;
+`NON_WEEKLY`, `BIWEEKLY`, and `WEEK` do not. `MONTHLY` periods remain unavailable for 7d. Without a reset, Grok's remaining percentage
 is shown without a countdown and expires after the greater of `usage_max_age_ms`
 and Grok's five-minute query interval plus its query timeout and one sidebar
 refresh interval from the last successful query. Codex quota without a reset

@@ -303,9 +303,11 @@ struct Period {
 }
 
 fn confirmed_weekly(kind: &str) -> bool {
-    // Bare WEEKLY and the proto enum only. NON_WEEKLY, BIWEEKLY, and WEEK
-    // contain related letters but are not confirmed weekly periods.
-    matches!(kind, "WEEKLY" | "BILLING_PERIOD_TYPE_WEEKLY")
+    // Accept only confirmed weekly enum names; related labels are not weekly.
+    matches!(
+        kind,
+        "WEEKLY" | "BILLING_PERIOD_TYPE_WEEKLY" | "USAGE_PERIOD_TYPE_WEEKLY"
+    )
 }
 
 fn parse_billing(bytes: &[u8]) -> Result<Outcome, Failure> {
@@ -501,11 +503,26 @@ mod tests {
     }
 
     #[test]
+    fn usage_period_type_weekly_is_supported() {
+        let body = br#"{"config":{"creditUsagePercent":35,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2099-01-01T00:00:00Z"}}}"#;
+        assert!(matches!(
+            parse_billing(body),
+            Ok(Outcome::Weekly(WeeklyUsage {
+                used_percent: 35.0,
+                resets_at: Some(_),
+            }))
+        ));
+    }
+
+    #[test]
     fn unconfirmed_week_labels_are_not_weekly() {
         for kind in [
             "NON_WEEKLY",
             "BIWEEKLY",
             "WEEK",
+            "USAGE_PERIOD_TYPE_NON_WEEKLY",
+            "USAGE_PERIOD_TYPE_BIWEEKLY",
+            "USAGE_PERIOD_TYPE_WEEK",
             "non_weekly",
             "biweekly",
             "Week",
