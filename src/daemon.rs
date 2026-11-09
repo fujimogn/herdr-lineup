@@ -1527,6 +1527,7 @@ mod tests {
         let flag = done.clone();
         let workspace = options.state.clone();
         let handle = std::thread::spawn(move || {
+            let mut accepted = std::collections::BTreeMap::<(String, String), u64>::new();
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -1544,7 +1545,43 @@ mod tests {
                         {
                             continue;
                         }
-                        let result = if workspace.join("snapshot-workspace").exists()
+                        let result = if workspace.join("sequence-fixture").exists()
+                            && request["method"] == "session.snapshot"
+                        {
+                            serde_json::json!({"type":"session_snapshot", "snapshot":{
+                                "version":"0.9.3", "protocol":17,
+                                "panes":[{"pane_id":"w1:p1", "workspace_id":"w1",
+                                    "agent":"codex", "agent_session":{"agent":"codex",
+                                        "kind":"id", "value":"synthetic-session"},
+                                    "agent_status":"working", "tokens":{}}],
+                                "workspaces":[{"workspace_id":"w1", "tokens":{}}]
+                            }})
+                        } else if workspace.join("sequence-fixture").exists()
+                            && (request["method"] == "pane.report_metadata"
+                                || request["method"] == "workspace.report_metadata")
+                        {
+                            let params = &request["params"];
+                            let resource = params["pane_id"]
+                                .as_str()
+                                .or_else(|| params["workspace_id"].as_str())
+                                .unwrap();
+                            let seq = params["seq"].as_u64().unwrap();
+                            let source = params["source"].as_str().unwrap();
+                            let last = accepted
+                                .entry((resource.into(), source.into()))
+                                .or_default();
+                            let applied = seq > *last;
+                            if applied {
+                                *last = seq;
+                            }
+                            let mut log = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(workspace.join("sequence-log"))
+                                .unwrap();
+                            writeln!(log, "{resource} {seq} {applied}").unwrap();
+                            serde_json::json!({"type":"ok"})
+                        } else if workspace.join("snapshot-workspace").exists()
                             && request["method"] == "session.snapshot"
                         {
                             serde_json::json!({"type":"session_snapshot", "snapshot":{
@@ -1658,6 +1695,19 @@ mod tests {
                     .open(options.state.join("starts"))
                     .unwrap();
                 writeln!(record, "{}", std::process::id()).unwrap();
+            }
+            if std::env::var_os("LINEUP_TEST_SEQUENCE_PUBLISHER").is_some() {
+                fs::write(options.state.join("sequence-child-spawned"), "").unwrap();
+                wait_until(|| options.state.join("sequence-allow-ready").exists());
+                let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+                let mut publisher = crate::publish::MetadataPublisher::new(
+                    paths.root,
+                    paths.key,
+                    crate::publish::Homes::from_env(),
+                )
+                .unwrap();
+                run_foreground(&options, true, &mut publisher).unwrap();
+                return;
             }
             if std::env::var_os("LINEUP_TEST_FAIL_STARTUP").is_some() {
                 let error = io::Error::new(io::ErrorKind::WouldBlock, "synthetic socket failure");
@@ -2137,6 +2187,104 @@ mod tests {
             "parallel ensures spawned multiple successors"
         );
         assert_eq!(starts.trim(), successor.pid.to_string());
+    }
+
+    #[test]
+    fn concurrent_ensure_inherits_lock_and_restarts_above_reserved_window() {
+        struct StopOnDrop(Option<Options>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                if let Some(options) = self.0.take() {
+                    let _ = fs::write(options.state.join("sequence-allow-ready"), "");
+                    let _ = stop(&options);
+                }
+            }
+        }
+        let (_dir, options, done, server) = fixture();
+        let mut cleanup = StopOnDrop(Some(options.clone()));
+        fs::create_dir(&options.state).unwrap();
+        fs::write(options.state.join("sequence-fixture"), "").unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let options = options.clone();
+                std::thread::spawn(move || {
+                    let mut command = child_command();
+                    command.env("LINEUP_TEST_SEQUENCE_PUBLISHER", "1");
+                    command.env("LINEUP_TEST_RECORD_START", "1");
+                    ensure_command(&options, command)
+                })
+            })
+            .collect();
+        wait_until(|| options.state.join("sequence-child-spawned").exists());
+        assert!(probe(&paths, &options.socket).unwrap().is_none());
+        fs::write(options.state.join("sequence-allow-ready"), "").unwrap();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        wait_until(|| {
+            fs::read_to_string(options.state.join("sequence-log"))
+                .is_ok_and(|log| log.lines().any(|line| line.starts_with("w1:p1 ")))
+        });
+        let first = probe(&paths, &options.socket).unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(options.state.join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "concurrent ensures spawned more than one publisher"
+        );
+        stop(&options).unwrap();
+        let prior_lines = fs::read_to_string(options.state.join("sequence-log"))
+            .unwrap()
+            .lines()
+            .count();
+
+        let mut command = child_command();
+        command.env("LINEUP_TEST_SEQUENCE_PUBLISHER", "1");
+        command.env("LINEUP_TEST_RECORD_START", "1");
+        ensure_command(&options, command).unwrap();
+        let successor = probe(&paths, &options.socket).unwrap().unwrap();
+        assert_ne!(successor.pid, first.pid);
+        wait_until(|| {
+            fs::read_to_string(options.state.join("sequence-log")).is_ok_and(|log| {
+                log.lines().skip(prior_lines).any(|line| {
+                    let mut fields = line.split_whitespace();
+                    fields.next() == Some("w1:p1")
+                        && fields
+                            .next()
+                            .and_then(|seq| seq.parse::<u64>().ok())
+                            .is_some_and(|seq| seq > 32)
+                        && fields.next() == Some("true")
+                })
+            })
+        });
+        let log = fs::read_to_string(options.state.join("sequence-log")).unwrap();
+        let successor_reports: Vec<_> = log.lines().skip(prior_lines).collect();
+        assert!(
+            successor_reports.iter().any(|line| {
+                let mut fields = line.split_whitespace();
+                fields.next() == Some("w1:p1")
+                    && fields
+                        .next()
+                        .and_then(|seq| seq.parse::<u64>().ok())
+                        .is_some_and(|seq| seq > 32)
+                    && fields.next() == Some("true")
+            }),
+            "successor did not publish above the durable window: {log}"
+        );
+        stop(&options).unwrap();
+        cleanup.0 = None;
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(
+            fs::read_to_string(options.state.join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
     }
 
     #[test]

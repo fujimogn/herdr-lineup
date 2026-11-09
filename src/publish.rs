@@ -8228,6 +8228,50 @@ mod tests {
     }
 
     #[test]
+    fn restarted_publisher_loads_checkpoint_and_clears_disabled_provider() {
+        let fixture = SequenceFixture::start();
+        let config_dir = fixture.dir.path().join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), "providers = ['codex']\n").unwrap();
+        let enabled = Config::load(&config_dir).unwrap();
+        let mut transport = Transport::connect(&fixture.socket).unwrap();
+        let mut first = fixture.publisher();
+        first.homes.codex = Some(fixture.dir.path().into());
+        first
+            .refresh_with_readers(&mut transport, &enabled, &SampleReader, &TimeoutReader)
+            .unwrap();
+        assert_eq!(endpoint_upper_bound_on_disk(&fixture.state), Some(32));
+        assert_eq!(fixture.seqs(), [(1, true), (2, true)]);
+        drop(first);
+
+        std::fs::write(config_dir.join("config.toml"), "providers = []\n").unwrap();
+        let disabled = Config::load(&config_dir).unwrap();
+        let mut restarted = fixture.publisher();
+        restarted
+            .refresh_with_readers(&mut transport, &disabled, &TimeoutReader, &TimeoutReader)
+            .unwrap();
+        let reports = fixture.reports.lock().unwrap().clone();
+        let pane_clear = reports
+            .iter()
+            .skip(2)
+            .find(|report| report["method"] == "pane.report_metadata")
+            .expect("restart must clear the disabled provider");
+        assert_eq!(pane_clear["params"]["seq"], 33);
+        assert_eq!(pane_clear["params"]["tokens"]["lineup_agent"], Value::Null);
+        assert_eq!(
+            pane_clear["params"]["tokens"]["lineup_context_pct"],
+            Value::Null
+        );
+        assert_eq!(
+            fixture.seqs(),
+            [(1, true), (2, true), (33, true), (34, true)]
+        );
+        let tokens = fixture.finish(&mut restarted, &mut transport);
+        assert!(tokens.get("lineup_agent").is_none());
+        assert!(tokens.get("lineup_context_pct").is_none());
+    }
+
+    #[test]
     fn response_lost_after_apply_is_never_replayed() {
         let fixture = SequenceFixture::start();
         let mut transport = Transport::connect(&fixture.socket).unwrap();
