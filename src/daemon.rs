@@ -2188,7 +2188,6 @@ mod tests {
         assert_eq!(starts.trim(), new.pid.to_string());
     }
 
-    // The synthetic control peer is this test process, never a Herdr server.
     #[test]
     fn stop_observes_exit_at_deadline_after_final_poll() {
         let start = Instant::now();
@@ -2211,6 +2210,7 @@ mod tests {
         );
     }
 
+    // The synthetic control peer is this test process, never a Herdr server.
     fn stop_deadline_fixture(
         expire_after_lock: bool,
         slow_health: bool,
