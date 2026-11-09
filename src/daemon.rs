@@ -1697,8 +1697,13 @@ mod tests {
                 writeln!(record, "{}", std::process::id()).unwrap();
             }
             if std::env::var_os("LINEUP_TEST_SEQUENCE_PUBLISHER").is_some() {
-                fs::write(options.state.join("sequence-child-spawned"), "").unwrap();
-                wait_until(|| options.state.join("sequence-allow-ready").exists());
+                if std::env::var_os("LINEUP_TEST_SEQUENCE_GATE").is_some() {
+                    let mut gate =
+                        UnixStream::connect(options.state.join("sequence-ready-gate.sock"))
+                            .unwrap();
+                    gate.set_read_timeout(Some(START_DEADLINE)).unwrap();
+                    gate.read_exact(&mut [0]).unwrap();
+                }
                 let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
                 let mut publisher = crate::publish::MetadataPublisher::new(
                     paths.root,
@@ -2195,7 +2200,6 @@ mod tests {
         impl Drop for StopOnDrop {
             fn drop(&mut self) {
                 if let Some(options) = self.0.take() {
-                    let _ = fs::write(options.state.join("sequence-allow-ready"), "");
                     let _ = stop(&options);
                 }
             }
@@ -2204,21 +2208,32 @@ mod tests {
         let mut cleanup = StopOnDrop(Some(options.clone()));
         fs::create_dir(&options.state).unwrap();
         fs::write(options.state.join("sequence-fixture"), "").unwrap();
+        let gate = UnixListener::bind(options.state.join("sequence-ready-gate.sock")).unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::sync_channel(1);
+        let gate_waiter = std::thread::spawn(move || {
+            gate_tx.send(gate.accept().unwrap().0).unwrap();
+        });
         let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let callers = Arc::new(std::sync::Barrier::new(5));
         let workers: Vec<_> = (0..4)
             .map(|_| {
                 let options = options.clone();
+                let callers = Arc::clone(&callers);
                 std::thread::spawn(move || {
+                    callers.wait();
                     let mut command = child_command();
                     command.env("LINEUP_TEST_SEQUENCE_PUBLISHER", "1");
+                    command.env("LINEUP_TEST_SEQUENCE_GATE", "1");
                     command.env("LINEUP_TEST_RECORD_START", "1");
                     ensure_command(&options, command)
                 })
             })
             .collect();
-        wait_until(|| options.state.join("sequence-child-spawned").exists());
+        callers.wait();
+        let mut gate_stream = gate_rx.recv_timeout(START_DEADLINE).unwrap();
+        gate_waiter.join().unwrap();
         assert!(probe(&paths, &options.socket).unwrap().is_none());
-        fs::write(options.state.join("sequence-allow-ready"), "").unwrap();
+        gate_stream.write_all(&[1]).unwrap();
         for worker in workers {
             worker.join().unwrap().unwrap();
         }
