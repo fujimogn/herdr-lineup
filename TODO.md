@@ -16,7 +16,9 @@ Work waiting for the next release is in the `Unreleased` section of
 - [ ] Remaining sequence-window failure rows (L1/N2). Fixtures now cover
   publisher ownership and handover, detached ensure with lock inheritance and
   readiness, and a new publisher clearing a disabled provider. Kernel
-  crash/power loss, old-binary rollback, and macOS disks remain unverified.
+  crash/power loss, old-binary rollback, macOS disks, the `foreground` wrapper
+  setup, scheduler interleavings, and a detached daemon restart after a config
+  change remain unverified.
   Competing-writer protection and automatic config reload are not implemented,
   so there is no behavior to verify; see the
   [sequence reservation record](docs/reviews/sequence-reservation-design-2026-10-23.md).
@@ -42,8 +44,8 @@ Start only when the named condition is met; these are not obligations.
 - Reader process isolation (L5): measured stuck-worker frequency and a
   resource/privacy/restart contract.
 - Multi-resource metadata reports: a Herdr API that accepts several resources
-  in one request. The Herdr 0.9.5 API schema has none, so this cannot be done
-  in Lineup alone; see the
+  in one request. The Herdr 0.9.5 API schema checked on 2026-11-09 has none,
+  so this cannot be done in Lineup alone; see the
   [refresh path survey](docs/reviews/performance-survey-refresh-path-2026-11-09.md).
 - Socket and admission tail attribution: a concrete decision that depends on
   where deadline skips come from.
@@ -66,7 +68,7 @@ Completed work is listed in [CHANGELOG.md](CHANGELOG.md) and each
 findings are mapped in
 [review follow-up coverage](docs/reviews/review-followup-coverage.md).
 
-Observation records from v0.3.2 keep their own procedures and limits. The N1
+Observation records keep their own procedures and limits. The N1
 comparison establishes no speed-up or SLO, and the isolated latency
 investigation leaves rendered latency, macOS, and stable tails unmeasured:
 
