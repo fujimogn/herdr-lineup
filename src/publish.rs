@@ -3985,8 +3985,12 @@ mod tests {
                 }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("isolated Kimi wiring child timed out");
+                    let status = child.wait().unwrap();
+                    let stdout = stdout_reader.join().unwrap();
+                    let stderr = stderr_reader.join().unwrap();
+                    panic!(
+                        "isolated Kimi wiring child timed out (status: {status}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(20));
             };

@@ -36,7 +36,7 @@ and vendored C terms.
 | `iana-time-zone@0.1.65` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `indexmap@2.14.2` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `is_terminal_polyfill@1.70.2` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `itoa@1.0.18` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `itoa@1.0.19` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `libc@0.2.191` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `linux-raw-sys@0.12.1` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `MIT` | linux |
 | `log@0.4.35` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
@@ -52,13 +52,13 @@ and vendored C terms.
 | `serde@1.0.229` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `serde_core@1.0.229` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `serde_json@1.0.154` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `serde_spanned@1.1.2` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `serde_spanned@1.1.3` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `strsim@0.11.1` | `MIT` | `MIT` | linux, macos |
 | `subtle@2.6.1` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
 | `tempfile@3.27.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `toml@1.2.0+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `toml_datetime@1.1.2+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `toml_edit@0.25.18+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `toml@1.2.1+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `toml_datetime@1.1.3+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `toml_edit@0.25.19+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `toml_parser@1.1.5+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `toml_writer@1.2.0+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `untrusted@0.9.0` | `ISC` | `ISC` | linux, macos |
@@ -67,7 +67,7 @@ and vendored C terms.
 | `utf8-zero@0.8.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `utf8parse@0.2.2` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `webpki-roots@1.0.11` | `CDLA-Permissive-2.0` | `CDLA-Permissive-2.0` | linux, macos |
-| `winnow@1.0.4` | `MIT` | `MIT` | linux, macos |
+| `winnow@1.0.5` | `MIT` | `MIT` | linux, macos |
 | `zeroize@1.9.1` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `zmij@1.0.23` | `MIT` | `MIT` | linux, macos |
 | `zstd@0.14.3` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
@@ -88,10 +88,10 @@ Source crates and license files:
 - clap_lex@1.1.1 `LICENSE-MIT`
 - colorchoice@1.0.5 `LICENSE-MIT`
 - is_terminal_polyfill@1.70.2 `LICENSE-MIT`
-- serde_spanned@1.1.2 `LICENSE-MIT`
-- toml@1.2.0+spec-1.1.0 `LICENSE-MIT`
-- toml_datetime@1.1.2+spec-1.1.0 `LICENSE-MIT`
-- toml_edit@0.25.18+spec-1.1.0 `LICENSE-MIT`
+- serde_spanned@1.1.3 `LICENSE-MIT`
+- toml@1.2.1+spec-1.1.0 `LICENSE-MIT`
+- toml_datetime@1.1.3+spec-1.1.0 `LICENSE-MIT`
+- toml_edit@0.25.19+spec-1.1.0 `LICENSE-MIT`
 - toml_parser@1.1.5+spec-1.1.0 `LICENSE-MIT`
 - toml_writer@1.2.0+spec-1.1.0 `LICENSE-MIT`
 
@@ -399,7 +399,7 @@ DEALINGS IN THE SOFTWARE.
 Source crates and license files:
 
 - fastrand@2.5.0 `LICENSE-MIT`
-- itoa@1.0.18 `LICENSE-MIT`
+- itoa@1.0.19 `LICENSE-MIT`
 - linux-raw-sys@0.12.1 `LICENSE-MIT`
 - once_cell@1.21.4 `LICENSE-MIT`
 - rustix@1.1.6 `LICENSE-MIT`
@@ -1561,7 +1561,7 @@ insights.
 
 Source crates and license files:
 
-- winnow@1.0.4 `LICENSE-MIT`
+- winnow@1.0.5 `LICENSE-MIT`
 
 ````text
 Permission is hereby granted, free of charge, to any person obtaining
