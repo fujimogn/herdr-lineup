@@ -6,6 +6,8 @@ fixtures, and limits are mapped in
 Working rules are in [the follow-up plan](docs/plans/review-followups-plan.md).
 Publication and artifacts are recorded by the
 [v0.3.2 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.2).
+Work waiting for the next release is in the `Unreleased` section of
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Open
 
@@ -23,43 +25,11 @@ Publication and artifacts are recorded by the
   the isolated child failed with empty stderr in the v0.3.2 platform check
   (run 41847126534, first attempt) and passed on the job rerun. Its stdout is
   piped but not reported, so the cause is unknown; Linux passed.
+- [ ] Assert that `publish::tests::fast_pane_publishes_before_subsequent_slow_reader`
+  reaches the slow reader, so a changed session ID or a skipped reader cannot
+  pass on pane order alone (non-blocking review finding).
 - [ ] Font check-then-rename and check-then-unlink races (H1, M1). Closing
   them needs an owner-approved design; partial-state recovery stays manual.
-
-## Implemented in the v0.3.2 release contents
-
-- [x] N1 old/new synthetic stage timing with binaries alternated on one host
-  and filesystem; [procedure, raw rows, and limits](docs/reviews/stage-timing-comparison-2026-11-04.md).
-  Historical and new observations remain separate; no speed-up or SLO is established.
-- [x] Wired-head Git heading latency and child-count matrix (L2, N3):
-  [separate wired-head observation record](docs/reviews/git-heading-latency-wired-2026-11-04.md).
-- [x] Real-disk reader discovery with independent pane/candidate counts
-  (L4, N4): [ext4 observations and missing-context limits](docs/reviews/reader-discovery-real-disk-2026-11-04.md).
-- [x] Short live observation using the connected reader diagnostics (L5):
-  121 samples over ten minutes; BUSY and retained-worker gauges stayed zero,
-  with sampling and provenance limits in
-  [stuck-worker-frequency-2026-11-04.md](docs/reviews/stuck-worker-frequency-2026-11-04.md).
-- [x] Make `envelope_expiring_after_admission_is_an_error_not_a_skip`
-  deterministic (`45b4626`): 20/20 runs passed under load; the old fixture
-  failed 17/20 (commander-supplied comparison). Production deadlines are unchanged.
-- [x] Close stale N1 references in the historical stage record and follow-up
-  plan using the [alternating comparison](docs/reviews/stage-timing-comparison-2026-11-04.md).
-- [x] Record the [Codex reader performance trial](docs/reviews/codex-reader-perf-trial-2026-11-04.md):
-  median improvement 4.5%, below the 10% criterion. The owner declined the
-  append-only assumption and relaxed read guarantees; no runtime change landed.
-- [x] Record the [isolated latency investigation](docs/reviews/latency-investigation-2026-11-04.md);
-  rendered latency, macOS, and stable tails remain unmeasured.
-- [x] Record the [source review](docs/reviews/code-review-2026-11-04.md) and
-  resolve CR-01 (`0b78c10`) and CR-02 (`7caf4f1`).
-- [x] Split bounded reader execution and diagnostics out of `model.rs` into
-  private modules without changing behavior (`97c9e24`).
-
-- [x] **Fix timing-dependent `publish::tests` failures.** Publisher fixtures
-  inject the shared reader-budget clock and explicitly advance it for timeout
-  restoration. Boundary coverage checks that the budget starts after headings
-  and skips reader I/O at exactly zero remaining time. Discovery uses the normal
-  worker budget, and the reader-only fixture uses the normal cycle envelope.
-  Production deadline checks retain real monotonic time.
 
 ## Conditional
 
@@ -81,9 +51,23 @@ Start only when the named condition is met; these are not obligations.
   displayed metadata on replacement. Current pane-bound Agy behavior stays.
   See `docs/reviews/agy-occupant-generation.md` for the planned host contract.
 
-## Implemented in the v0.3.1 release contents
+## Shipped
 
-- [x] The 2026-10-23 review follow-ups shipped in v0.3.1 are listed in its
-  [GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.1)
-  and mapped in [review follow-up coverage](docs/reviews/review-followup-coverage.md).
-  The H1/M1 font races remain open above.
+Completed work is listed in [CHANGELOG.md](CHANGELOG.md) and each
+[GitHub Release](https://github.com/fujimogn/herdr-lineup/releases), and review
+findings are mapped in
+[review follow-up coverage](docs/reviews/review-followup-coverage.md).
+
+Observation records from v0.3.2 keep their own procedures and limits. The N1
+comparison establishes no speed-up or SLO, and the isolated latency
+investigation leaves rendered latency, macOS, and stable tails unmeasured:
+
+- [Alternating stage timing (N1)](docs/reviews/stage-timing-comparison-2026-11-04.md)
+- [Wired-head Git heading latency (L2, N3)](docs/reviews/git-heading-latency-wired-2026-11-04.md)
+- [Real-disk reader discovery (L4, N4)](docs/reviews/reader-discovery-real-disk-2026-11-04.md)
+- [Short live reader-diagnostics sample (L5)](docs/reviews/stuck-worker-frequency-2026-11-04.md)
+- [Isolated latency investigation](docs/reviews/latency-investigation-2026-11-04.md)
+- [Codex reader performance trial](docs/reviews/codex-reader-perf-trial-2026-11-04.md):
+  below the 10% criterion; the owner declined the append-only assumption and
+  relaxed read guarantees, so no runtime change landed.
+- [Source review](docs/reviews/code-review-2026-11-04.md)

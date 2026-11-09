@@ -254,12 +254,11 @@ are historical wherever the narrowed implementation below differs.
 - `RepositoryCache::observe_shared(cache: &Mutex<&mut Self>, cwd, shutdown, deadline)`
   permits concurrent queries. The mutex protects cache metadata, never Git I/O
   or reaping. Scoped callers join all started observations before returning.
-- Each query captures the invalidation generation before I/O. `Rejected`
-  clears all entries; `Discard(common)` removes that entry. Both advance the
-  currently cache-wide generation. Older queries cannot restore invalidated
-  entries, and a full verification cannot replace a newer verification with
-  an older one. Per-common-directory generations remain an open refinement
-  in [TODO](../../TODO.md).
+- Each query captures a monotonic generation before I/O. `Rejected` clears
+  all entries and invalidates every older query; `Discard(common)` removes
+  that entry and invalidates older queries for that common directory only.
+  Older queries cannot restore invalidated entries, and a full verification
+  cannot replace a newer verification with an older one.
 - A `Hit` returns its own independently validated snapshot, even if another
   parallel query rejects or discards the cache meanwhile. It does not reload
   another query's replacement entry or restore the invalidated entry.

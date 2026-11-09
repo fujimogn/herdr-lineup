@@ -8,6 +8,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 - Fix: **Git heading cache** scopes invalidation per repository, so a repository without `origin/main` no longer suppresses another repository's cache update in the same parallel batch. A rejected working directory still invalidates all repositories.
 - Fix: **Stop** no longer reports a timeout when the daemon exits during the final wait, and lifecycle lock retries sleep no longer than the time left on the shared deadline.
 - Maintenance: **Tests** makes the fast-pane publication ordering test deterministic.
+- Maintenance: **Repository history** was rewritten on 2026-11-09 to translate commit messages into English. Commit hashes from 2026-10-19 onward and the `v0.2.0` through `v0.3.2` tags changed, while the file contents of every commit and the published release assets did not. Existing clones must fetch and reset to the new history.
 
 ## 0.3.2 (2026-11-04)
 

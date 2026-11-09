@@ -2,7 +2,7 @@
 
 - This is a single Rust crate for a Herdr plugin on macOS and Linux.
 - Read `README.md`, `herdr-plugin.toml`, and any relevant specifications before changing behavior.
-- Use the toolchain pinned in `rust-toolchain.toml`. Keep documentation and comments in English.
+- Use the toolchain pinned in `rust-toolchain.toml`. Keep documentation, comments, and commit messages in English.
 - Preserve the distinction between implemented behavior and **Planned** features.
 - Before handing off changes, run `cargo fmt --all --check`,
   `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`,

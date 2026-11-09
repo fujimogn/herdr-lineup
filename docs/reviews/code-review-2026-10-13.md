@@ -594,7 +594,7 @@ Ordered by severity. High, then Medium, then Low–Medium, then Low. Ballot orde
 
 - File:line: no single line. The ballot names hostile Git config, a rollout over 16 MiB, the 4,096-entry boundary, `control.sock` path length, a control client that closes immediately, SIGTERM, and checkpoint growth.
 - Kind: test gap
-- Severity: Low (the ballot's heading is "テストの抜け" and does not assign another severity)
+- Severity: Low (the ballot's heading, "test gaps", does not assign another severity)
 - Agreement: 1/2 by @claude
 - Content: Those cases are not covered. macOS in CI is unit tests only. End-to-end runs on Linux only and outside CI.
 - Evidence: The test suite as read for the ballot.

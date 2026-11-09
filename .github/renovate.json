@@ -27,24 +27,24 @@
   },
   "packageRules": [
     {
-      "description": "互換更新を週次の少数 PR にまとめる",
+      "description": "Group compatible updates into a few weekly PRs",
       "matchUpdateTypes": [
         "minor",
         "patch",
         "digest",
         "pinDigest"
       ],
-      "groupName": "週次の互換依存更新"
+      "groupName": "weekly compatible dependency updates"
     },
     {
-      "description": "Cargo の major/minor 互換範囲を保ち、解決版は lock で更新する",
+      "description": "Keep Cargo requirement ranges and update resolved versions in the lockfile",
       "matchManagers": [
         "cargo"
       ],
       "rangeStrategy": "update-lockfile"
     },
     {
-      "description": "major は個別 PR とし Dashboard の承認後に作成する",
+      "description": "Open each major update as its own PR after Dashboard approval",
       "matchUpdateTypes": [
         "major"
       ],
@@ -52,7 +52,7 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "0.x の minor は major 相当として個別承認する",
+      "description": "Treat 0.x minor updates as major and approve each one",
       "matchCurrentVersion": "/^0\\./",
       "matchUpdateTypes": [
         "minor"
@@ -61,7 +61,7 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "Rust toolchain は完全固定を保ち、すべての更新を個別承認する",
+      "description": "Keep the Rust toolchain fully pinned and approve every update",
       "matchManagers": [
         "rust-toolchain"
       ],
@@ -69,7 +69,7 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "develop-meta が配る workflow の action pin は配布元で更新する",
+      "description": "Update action pins in distributed workflows at their source",
       "matchManagers": [
         "github-actions"
       ],
