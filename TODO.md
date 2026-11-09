@@ -18,21 +18,6 @@ Publication and artifacts are recorded by the
   spawn/inheritance/readiness, competing-writer protection, automatic reload
   or a restarted publisher clearing state, old-binary rollback, and macOS
   disks remain open.
-- [ ] Investigate timing dependence in
-  `publish::tests::fast_pane_publishes_before_subsequent_slow_reader`:
-  the unchanged base failed 1 of 10 default-parallel full-suite runs on
-  2026-11-04 (commander-supplied observation; not yet investigated).
-- [ ] Scope Git cache invalidation generations per common directory, with a
-  global epoch for `Rejected`. At `d75e988`, a repository without `origin/main`
-  can suppress another repository's cache update in the same parallel batch;
-  displayed values and child counts are unchanged (`RepositoryCache::apply`
-  in `src/ship_time.rs`).
-- [ ] Refine nonblocking stop boundaries after `51be817`: the wait-loop order
-  can report timeout for a daemon that exits in the final 20 ms, and fixed
-  `LifecycleLock` sleeps can delay observation by about 20 ms (`src/daemon.rs`).
-- [ ] Handle thread-spawn `EAGAIN` without failing the entire heading stage
-  with `io::Error` (`resolve_headings_in_budget` in `src/publish.rs`, `d75e988`).
-  Preserve the guarantee that all started observations are joined.
 - [ ] Investigate the macOS-only failure of
   `publish::tests::kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset`:
   the isolated child failed with empty stderr in the v0.3.2 platform check

@@ -4,6 +4,11 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Fix: **Git heading** keeps publishing when Git observation threads temporarily cannot be created: repositories that could not start are left unattempted for that cycle, and every started observation is still joined.
+- Fix: **Git heading cache** scopes invalidation per repository, so a repository without `origin/main` no longer suppresses another repository's cache update in the same parallel batch. A rejected working directory still invalidates all repositories.
+- Fix: **Stop** no longer reports a timeout when the daemon exits during the final wait, and lifecycle lock retries sleep no longer than the time left on the shared deadline.
+- Maintenance: **Tests** makes the fast-pane publication ordering test deterministic.
+
 ## 0.3.2 (2026-11-04)
 
 Lineup tightens shutdown and Kimi session association, observes repository headings concurrently, and reduces periodic sidebar work.
