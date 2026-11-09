@@ -3966,6 +3966,18 @@ mod tests {
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let stdout_reader = std::thread::spawn(move || {
+                let mut output = String::new();
+                std::io::Read::read_to_string(&mut stdout, &mut output).unwrap();
+                output
+            });
+            let mut stderr = child.stderr.take().unwrap();
+            let stderr_reader = std::thread::spawn(move || {
+                let mut output = String::new();
+                std::io::Read::read_to_string(&mut stderr, &mut output).unwrap();
+                output
+            });
             let deadline = Instant::now() + Duration::from_secs(60);
             let status = loop {
                 if let Some(status) = child.try_wait().unwrap() {
@@ -3980,11 +3992,11 @@ mod tests {
             };
             stop.store(true, Ordering::Release);
             server.join().unwrap();
-            let mut stderr = String::new();
-            std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+            let stdout = stdout_reader.join().unwrap();
+            let stderr = stderr_reader.join().unwrap();
             assert!(
                 status.success(),
-                "isolated Kimi wiring child failed: {stderr}"
+                "isolated Kimi wiring child failed (status: {status}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
             );
             return;
         };
@@ -5807,12 +5819,17 @@ mod tests {
     #[test]
     fn fast_pane_publishes_before_subsequent_slow_reader() {
         let fast_report_seen = Arc::new(AtomicBool::new(false));
-        struct StepReader(Arc<AtomicBool>);
+        let slow_reader_seen = Arc::new(AtomicBool::new(false));
+        struct StepReader {
+            fast_report_seen: Arc<AtomicBool>,
+            slow_reader_seen: Arc<AtomicBool>,
+        }
         impl UsageReader for StepReader {
             fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
                 if request.identity.native_session_id == "slow-native" {
+                    self.slow_reader_seen.store(true, Ordering::Release);
                     assert!(
-                        self.0.load(Ordering::Acquire),
+                        self.fast_report_seen.load(Ordering::Acquire),
                         "fast pane must reach the server before the slow reader starts"
                     );
                 }
@@ -5878,7 +5895,10 @@ mod tests {
             },
         )
         .unwrap();
-        let reader = StepReader(fast_report_seen);
+        let reader = StepReader {
+            fast_report_seen,
+            slow_reader_seen: slow_reader_seen.clone(),
+        };
         let result = publisher.refresh_with_readers(
             &mut transport,
             &Config::default(),
@@ -5887,6 +5907,10 @@ mod tests {
         );
         drop(transport);
         let pane_order = server.join().unwrap();
+        assert!(
+            slow_reader_seen.load(Ordering::Acquire),
+            "fixture did not reach second reader"
+        );
         assert!(result.is_ok(), "refresh failed: {:?}", result);
         assert_eq!(pane_order, vec!["w1:p1", "w1:p2"]);
     }
