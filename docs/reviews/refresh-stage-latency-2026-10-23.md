@@ -3,10 +3,10 @@
 ## Historical baseline: scope and reproduction
 
 The original measurement candidate, `4afc9d42b9bab850576ffb3bd42d44accf2d21c2`,
-was based directly on `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`.
+was based directly on `60214d2ba9a8e7760f909c74247c563b88a28ee5`.
 Its test instrumentation and this report were subsequently carried forward
 onto the local consolidation candidate
-`a6cddcca01873c9f30f0632b20d1b28108562129`. The results below remain the
+`d4a7e738c9fd0939047588d4b66cfa62e8a6790d`. The results below remain the
 original measurements on the earlier base, not measurements of the consolidated
 code. Local integration does not establish independent review or shipment;
 shipment remains on hold.
@@ -108,7 +108,7 @@ real reader work in an isolated, authorized fixture.
 ## Local carry-forward verification
 
 On 2026-10-23, the instrumentation was applied to local consolidation base
-`a6cddcca01873c9f30f0632b20d1b28108562129`. Formatting, Clippy with warnings
+`d4a7e738c9fd0939047588d4b66cfa62e8a6790d`. Formatting, Clippy with warnings
 denied, locked tests (320 passed, 6 ignored, plus one integration test), the
 locked release build, and release binary `--help` passed. Encoding and diff
 checks passed as well.
@@ -176,10 +176,10 @@ fixture.
 ## Wired candidate synthetic observations (2026-10-24)
 
 These are new observations, separate from both historical runs above.
-The measured candidate was `9d2b4a23eca9d0e46839d54a0a84d9920c749c7f`;
+The measured candidate was `e4214a717a0fbd4820a7efb395d3298689a12cf0`;
 its Rust source was byte-identical to
-`6be18304d6e39a0eb6d88164a866b449d9396946`. The later source snapshot
-`0220da64f8545f89b6daca211553f486b271057f` changes comments only; it was
+`183c7901aa7cdbf12116543c3e083e20e597b694`. The later source snapshot
+`8a0c87805c5139aae3f7bb9f974b31da8c447932` changes comments only; it was
 not the measured binary. Commander-owned evidence outside the repository:
 `reviews/final-refresh-measurements-2026-10-24.md` and `.json` (raw rows,
 medians and log SHA256s); raw artifacts are in

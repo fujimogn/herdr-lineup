@@ -9,8 +9,8 @@ event-to-visible latency.
 
 - Old: `4afc9d42b9bab850576ffb3bd42d44accf2d21c2`, the original measurement
   candidate explicitly identified by the historical record, based on
-  `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`.
-- New: `bd62eb512d7708346591e8df84f05bec0bd5e645`, the assignment's local
+  `60214d2ba9a8e7760f909c74247c563b88a28ee5`.
+- New: `d006263fe356a0e52ec368ec12aa93f6d54f6693`, the assignment's local
   `origin/develop` and implementation checkout at the start of this run.
 - Both use their own unchanged `publish::tests::measure_refresh_stages`,
   pinned Rust 1.99.1, locked dependencies, and debug test builds. The source

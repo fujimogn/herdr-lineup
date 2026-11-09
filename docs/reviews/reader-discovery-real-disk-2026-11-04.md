@@ -4,7 +4,7 @@ This separate L4/N4 observation record changes no runtime behavior and establish
 
 ## Source and environment
 
-- Fixed measured source SHA: `fb19abf637618dba11e99cd28ea4c0e2ebe0e340` (assigned origin/develop head).
+- Fixed measured source SHA: `a60b26ca334e3e591ab35e699fb63f729c58f0b6` (assigned origin/develop head).
 - Host: `dev`, `Linux-7.3.1-1-cachyos-x86_64-with-glibc2.44`; CPU `AMD Ryzen 9 9955HX 16-Core Processor`.
 - Toolchain: `rustc 1.99.1 (58cf8f9c3 2026-10-13)`.
 - Managed root: `/home/fujimogn/.cache/herdr-lineup-reader-n4`; task ID `asg-reader-discovery-n4`.

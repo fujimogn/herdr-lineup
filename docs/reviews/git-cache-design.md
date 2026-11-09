@@ -3,11 +3,11 @@
 | Field | Details |
 |---|---|
 | Date | 2026-10-24 |
-| Historical design target | `96829df` (`96829df7e6fc51af327b448f5b8b3596f0a96d3f`) |
+| Historical design target | `426856b` (`426856bb55c5f1dfa44cf702d83a5b936cb4c896`) |
 | Touched components | `src/ship_time.rs`, `src/publish.rs`, `docs/reviews/git-cache-design.md` |
 | Author | agy (`lane_git_reader`) |
 | Review History | Sol-6.1 high v1–v5 NO-GO -> v6 NO-GO -> v7 (Final Simple Guard: Unconditional Non-Cache on Replacement Directory Presence) |
-| Status | Contract v7, narrowed and implemented as an API in `src/ship_time.rs` on the local integration line (`223de0a`, `8e8639e`, `d95e5b5`); production publication is wired in the current local candidate and nothing is shipped. §9 supersedes earlier sections where they differ. |
+| Status | Contract v7, narrowed and implemented as an API in `src/ship_time.rs` on the local integration line (`1b61ad5`, `f93b696`, `e2bf6ee`); production publication is wired in the current local candidate and nothing is shipped. §9 supersedes earlier sections where they differ. |
 
 ---
 
@@ -209,7 +209,7 @@ The following 20 isolated fixture scenarios specify verification requirements in
 
 ## 8. Historical baseline vs. implemented contract
 
-| Capability | Baseline Code (`96829df`) | Implemented contract (see §9) |
+| Capability | Baseline Code (`426856b`) | Implemented contract (see §9) |
 |---|---|---|
 | `cwd` Identity & Security | Native Git in all 3 processes | Native Git preserved in mandatory `rev-parse` |
 | Subprocess Execution | 3 processes unconditionally per `cwd` | 3 processes per `cwd` on a downstream hit: `worktree list` is replaced by a common-directory `rev-parse`; no process-count reduction is claimed (§9) |
@@ -225,7 +225,7 @@ The following 20 isolated fixture scenarios specify verification requirements in
 ## 9. Production Implementation Status
 
 The current implementation source is
-`d75e988dd214cb1ad039f3016d5e0da88cace1b0`. The downstream cache implements
+`afa0d3b4880f33cea52501ab49d9948391c85bdf`. The downstream cache implements
 the narrowed contract below, following `reviews/git-cache-code-sol61-high.md`.
 Production `MetadataPublisher::read_heading` now uses its owned cache;
 `resolve_headings_in_budget` shares same-cwd observations within the refresh,

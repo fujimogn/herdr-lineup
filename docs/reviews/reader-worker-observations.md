@@ -1,9 +1,9 @@
 # Bounded reader worker observations
 
 Status: implemented in the local unshipped candidate. Implementation source:
-`0220da64f8545f89b6daca211553f486b271057f`. The original observation API was
-based on `4f7044ad3f9066798bf55aff00bd6f17094022e2` and integrated as
-`98a57de`; production wiring followed in P/D and the worker-producer tasks.
+`8a0c87805c5139aae3f7bb9f974b31da8c447932`. The original observation API was
+based on `3ea9ac37f718a158b654e9692969dacfeb900f09` and integrated as
+`dae4e36`; production wiring followed in P/D and the worker-producer tasks.
 This addresses L5 observation, not cancellation or process isolation.
 
 ## API, production wiring and ownership

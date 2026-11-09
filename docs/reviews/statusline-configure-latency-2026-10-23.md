@@ -2,7 +2,7 @@
 
 ## Scope and source
 
-This is a record-only measurement of `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0` on Linux 7.2.10 x86_64. It reads the README, `src/statusline.rs`, `src/configure.rs`, CLI dispatch in `src/lib.rs`, and the plugin manifest at that commit. The fixture ran the release binary from a dedicated linked worktree. It did not invoke a real Herdr binary, server, or session, access user configuration, use the network, or change plugin behavior. `/tmp` was tmpfs on this host; all fixture homes, configuration, state, command scripts, and event logs were inside one temporary directory that the harness removed after the run. These numbers are not a macOS, disk-backed, or live Herdr measurement.
+This is a record-only measurement of `60214d2ba9a8e7760f909c74247c563b88a28ee5` on Linux 7.2.10 x86_64. It reads the README, `src/statusline.rs`, `src/configure.rs`, CLI dispatch in `src/lib.rs`, and the plugin manifest at that commit. The fixture ran the release binary from a dedicated linked worktree. It did not invoke a real Herdr binary, server, or session, access user configuration, use the network, or change plugin behavior. `/tmp` was tmpfs on this host; all fixture homes, configuration, state, command scripts, and event logs were inside one temporary directory that the harness removed after the run. These numbers are not a macOS, disk-backed, or live Herdr measurement.
 
 ## Synchronous contract and boundaries
 

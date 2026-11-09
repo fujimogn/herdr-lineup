@@ -1,13 +1,13 @@
 # Source review — 2026-11-04
 
-CR-01 resolved by `a9b4b84`: unreadable same-ID state candidates close association; unrelated unreadable candidates preserve a readable match.
-CR-02 resolved by `51be817`: lifecycle lock, control handshake, and process-exit wait share one five-second absolute deadline; no shutdown request is sent after expiry.
+CR-01 resolved by `0b78c10`: unreadable same-ID state candidates close association; unrelated unreadable candidates preserve a readable match.
+CR-02 resolved by `7caf4f1`: lifecycle lock, control handshake, and process-exit wait share one five-second absolute deadline; no shutdown request is sent after expiry.
 
 The findings and reproductions below describe the historical reviewed source.
 
 ## Fixed scope and result
 
-Reviewed source: `80e11d1604a2c4bb56d0fc008c157b3b4b179d0d` (`origin/develop` when this lane started).
+Reviewed source: `d60618bdd92414041583578f1f27c2d324bac3df` (`origin/develop` when this lane started).
 Formation assignment: `asg_code_review`, lane `lane_review`.
 This is a record-only candidate. It neither fixes the findings nor accepts,
 integrates, pushes, or deploys code. Line numbers below refer to that source SHA.

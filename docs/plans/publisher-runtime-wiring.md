@@ -3,7 +3,7 @@
 **Status:** P runtime wiring, D control/doctor diagnostics, and all local reader
 worker producers are included in the v0.3.1 release contents. Historical
 implementation evidence is at
-`6be18304d6e39a0eb6d88164a866b449d9396946`, after their recorded review chains.
+`183c7901aa7cdbf12116543c3e083e20e597b694`, after their recorded review chains.
 The owner authorized this release batch on 2026-10-24. Delivery is recorded
 by the [v0.3.1 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.1);
 this implementation record does not establish publication or live verification.
@@ -45,7 +45,7 @@ commander:
   refresh starts from an empty one; reuse of the scan inside a refresh is the
   reader's choice, as the reader tests already allow.
 
-**Historical design base:** local integration `64ace031ab5b17615a2cebef46f916bf4defd79c`.
+**Historical design base:** local integration `93adfcd8e29aad60ad4f2c1882ac1622ca5c3d1f`.
 
 **Goal:** Connect the bounded-I/O pieces that already exist as APIs or test-only
 code to the production refresh path of `MetadataPublisher`, without weakening
@@ -68,7 +68,7 @@ change delta in the same task, validated before the code. The approved change is
 
 ## 2. Historical state at the design base
 
-| Piece | State at `64ace03` | Production gap |
+| Piece | State at `93adfcd` | Production gap |
 |---|---|---|
 | Cycle deadline | Only readers share `reader_timeout_ms`, measured from after headings (`refresh_with_readers_inner`). Snapshot and every metadata exchange use `exchange()`, which calls `send_line`/`receive_line` without a caller deadline. | A refresh with N slow-but-live reports takes up to N × 2 s; there is no cycle end. |
 | Socket `*_before` | `Transport::{connect_before, reconnect_same_endpoint_before, send_line_before, receive_line_before}` exist, each capped locally (connect 1 s, write 0.5 s, read 0.5 s). | Not called by `publish.rs`. |

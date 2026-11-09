@@ -2,7 +2,7 @@
 
 ## Scope and definitions
 
-This record measures the unchanged source at `80e11d1604a2c4bb56d0fc008c157b3b4b179d0d`
+This record measures the unchanged source at `d60618bdd92414041583578f1f27c2d324bac3df`
 on Linux. It is a documentation-only candidate. The method was submitted as
 BLOCKED (Formation revision 184), then approved by commander note
 `note_lat_method` (source event revision 188). No user session was attached,
@@ -41,7 +41,7 @@ allow expiry. A changed state need not wait for TTL expiration.
 | Evidence | What it measures | What it excludes |
 | --- | --- | --- |
 | [Historical stage record](refresh-stage-latency-2026-10-23.md) | Cold synthetic refreshes, five pane counts; debug test; fake socket and SampleReader; several explicitly separated source snapshots | Provider state-change timestamps, periodic phase waiting, real provider discovery, real Herdr storage/rendering, macOS |
-| [Alternating stage comparison](stage-timing-comparison-2026-11-04.md) | Old `4afc9d42b9bab850576ffb3bd42d44accf2d21c2` and new `bd62eb512d7708346591e8df84f05bec0bd5e645`; tmpfs/ext4; six rows per version/size/filesystem; 120 rows | An isolated effect of one change, stable tails, actual UI or provider transitions |
+| [Alternating stage comparison](stage-timing-comparison-2026-11-04.md) | Old `4afc9d42b9bab850576ffb3bd42d44accf2d21c2` and new `d006263fe356a0e52ec368ec12aa93f6d54f6693`; tmpfs/ext4; six rows per version/size/filesystem; 120 rows | An isolated effect of one change, stable tails, actual UI or provider transitions |
 | Coverage N5 | Describes Linux/macOS report-complete and visible-delay evidence still needed | Existing synthetic report completion does not establish rendered latency |
 | Coverage L6 | Historical 5 s/default and 100 ms idle-loop follow-up | The 5 s wording is stale at this source: config, README and token specification now use 10 s/30 s; freshness/load acceptance remains undefined |
 
@@ -140,7 +140,7 @@ was attached.
 
 ```json
 {
-  "source": "80e11d1604a2c4bb56d0fc008c157b3b4b179d0d",
+  "source": "d60618bdd92414041583578f1f27c2d324bac3df",
   "test_binary": "/home/fujimogn/.cache/dev-task-temp/runs/4ee0a98a4a62c627b247712672dc193c/work/target/debug/deps/herdr_lineup-aa8a03e3a907570a",
   "test_sha256": "022bc0320f737ea16233b459c9168948336fcf91495966cfd165f2a4c30d1d74",
   "release_sha256": "1807f27cb3665993d1bdd1ddef549681f6d81821a88c7e31bfb40d68b9331ceb",
@@ -419,6 +419,6 @@ No real provider process, authenticated account, populated provider-history disc
 
 Suggested TODO/coverage wording only (those files are unchanged):
 
-- **N5:** Linux cold-refresh stages at fixed 80e11d1 and synthetic request-to-stored-state-token intervals recorded here (private Herdr 0.9.5, release publisher, 10 s post-cycle wait; three repeats/phase). Provider event timestamps, rendering, macOS and tails remain unmeasured. Keep conditional.
-- **L6:** Historical 5 s wording is superseded by the implemented 10,000 ms default and 30,000 ms TTL at 80e11d1; idle polling remains 100 ms. This record separates refresh waiting, overlapping stage samples and stored-token observations. Freshness/load acceptance and event-to-render evidence remain open; do not infer completion from the interval change.
+- **N5:** Linux cold-refresh stages at fixed d60618b and synthetic request-to-stored-state-token intervals recorded here (private Herdr 0.9.5, release publisher, 10 s post-cycle wait; three repeats/phase). Provider event timestamps, rendering, macOS and tails remain unmeasured. Keep conditional.
+- **L6:** Historical 5 s wording is superseded by the implemented 10,000 ms default and 30,000 ms TTL at d60618b; idle polling remains 100 ms. This record separates refresh waiting, overlapping stage samples and stored-token observations. Freshness/load acceptance and event-to-render evidence remain open; do not infer completion from the interval change.
 - **TODO:** Retain follow-up for actual provider-source event to rendered sidebar timing on Linux/macOS, exact renewal/expiry during degraded cycles, and an agreed freshness/load contract; link this record as limited Linux synthetic evidence.

@@ -17,7 +17,7 @@ Repository files and commit subjects are English. Conversation with the
 commander is Japanese. Support Linux and macOS. Keep source and endpoint
 identity. Do not touch a live Herdr session, user settings, secrets, or
 network APIs. Do not push, ACK, or ship from a member lane. Keep
-the current default `refresh_interval_ms` at 10000 (updated by `6f8f369`). Independent review is GPT-6.1 Sol high,
+the current default `refresh_interval_ms` at 10000 (updated by `e0f2cba`). Independent review is GPT-6.1 Sol high,
 read-only, with native subagent fork none. Members do not review each other.
 Questions go to the commander through a Formation report. A path outside the
 assignment is a `BLOCKED` touching request before any edit. Do not `cargo clean`
@@ -27,7 +27,7 @@ by hand and do not recursively delete. Report a build that is likely to exceed
 ## Implemented in the v0.3.1 release contents
 
 The implementation source is
-`0220da64f8545f89b6daca211553f486b271057f`. P runtime wiring, D control/doctor
+`8a0c87805c5139aae3f7bb9f974b31da8c447932`. P runtime wiring, D control/doctor
 wiring and all five worker producers are included in v0.3.1 alongside the
 first-wave fixes. The coverage table maps every original finding to source,
 fixtures and remaining limits; `TODO.md` keeps the open and completed items.
@@ -41,12 +41,12 @@ Owner: `lane_commander`. This is a completion condition for the integration
 candidate. A member lane does not launch it.
 
 Recorded outcome: inclusive Sol 6.1 high GO for fixed range
-`d3ccbc17d3f8344d466015fac580cd0fe3b60269..91268267f46061f5f0aaf46711ea10158bad0873`,
+`aca6e954cf2a10d2cbeb2144471886f129b9231b..4d35599ad2bf75c09dcc20c88f3a180683ccd21f`,
 with the Dplan NO-GO resolved. Mandatory checks passed as recorded in the
 coverage table. Automated queue acceptance and shipment are not established.
 The general procedure below applies to subsequent candidates.
 
-- Review the full diff from `d3ccbc17d3f8344d466015fac580cd0fe3b60269` to the
+- Review the full diff from `aca6e954cf2a10d2cbeb2144471886f129b9231b` to the
   final head fixed when the review starts, with GPT-6.1 Sol high.
 - Include every commit that an accepted review does not already cover, and
   resolve every NO-GO in that history with a later GO in the same chain.

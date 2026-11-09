@@ -5,12 +5,12 @@ included in the v0.3.1 release contents; the owner authorized the batch on
 2026-10-24. Delivery is recorded by the
 [v0.3.1 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.1).
 This preparation record does not establish publication.
-**Historical implementation source:** `0220da64f8545f89b6daca211553f486b271057f`.
+**Historical implementation source:** `8a0c87805c5139aae3f7bb9f974b31da8c447932`.
 Commander-owned inclusive Sol 6.1 high review is GO through
-`91268267f46061f5f0aaf46711ea10158bad0873`; see the full range in
+`4d35599ad2bf75c09dcc20c88f3a180683ccd21f`; see the full range in
 [the coverage record](../reviews/review-followup-coverage.md).
 No automated queue acceptance, shipment or live measurement is claimed.
-**Historical D baseline:** `bfe2a4d3a7a4369711b49057016ec233273f9484`.
+**Historical D baseline:** `ca2df93cc02d7dc991afa48b0a34e86f8b12d78d`.
 P was reviewed and integrated locally before the commander authorized D.
 This document supplements [the P plan](publisher-runtime-wiring.md); current
 assignment decisions supersede its older allocation of Arc ownership to D.

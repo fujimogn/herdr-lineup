@@ -21,7 +21,7 @@ started.
 
 - Host: Linux `7.3.1-1-cachyos`, x86_64 GNU/Linux; temporary storage: ext4.
 - Documentation/verification worktree base:
-  `bd47305c7fa901b852d076390f4ac57153482e67`, the local
+  `24d9fb0b977fca0f9b7ff084ad21708d48817a97`, the local
   `origin/develop` tip at worktree creation. This is **not** the live binary's
   proven source commit.
 - Primary live binary identity (SHA-256):
@@ -29,7 +29,7 @@ started.
   The running executable and the existing canonical release binary both
   matched this hash; size: 3,255,792 bytes.
 - Inferred source commit:
-  `2530402e34e645506fa048bc60c885615aa386d1`. Binary mtime
+  `77ddfeb366929d105d3ea117b59907fcc695daed`. Binary mtime
   `1792824253572430246` ns corresponds to 2026-10-24 15:44:13 JST.
   The canonical HEAD reflog stays at that commit from 10:28:54 until the next
   recorded change at 19:52:37 that day. **Whether the worktree was clean at
@@ -410,7 +410,7 @@ entries were available. Their header matches the preflight header below.
 
 The tracked change is this document only. Rust source, TODO, CHANGELOG and
 coverage rows are unchanged. The five mandatory commands were executed at
-worktree base `bd47305c7fa901b852d076390f4ac57153482e67` with this document
+worktree base `24d9fb0b977fca0f9b7ff084ad21708d48817a97` with this document
 added; no Rust fixes or test modifications were made.
 
 | Command | Result |

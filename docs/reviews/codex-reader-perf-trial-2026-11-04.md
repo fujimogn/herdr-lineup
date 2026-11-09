@@ -25,8 +25,8 @@ context, not a new inventory performed by this lane. No real rollout contents
 were used in this trial. The owner's decision was that the average live wait
 of about 4.2 milliseconds per call did not justify this optimization's risks.
 
-Trial source base: `80e11d1604a2c4bb56d0fc008c157b3b4b179d0d`.
-Documentation base: `551226d0ab0800e3ea32fd008a1ff8962fa63519`, the fetched
+Trial source base: `d60618bdd92414041583578f1f27c2d324bac3df`.
+Documentation base: `9b51c15f88e94681d231f86e64b058efc01f5f95`, the fetched
 `origin/develop` tip when the new documentation worktree was created.
 The original reader module copied into the harness was checked byte-for-byte
 against the trial base before this record was written; its SHA-256 is
@@ -248,7 +248,7 @@ bounds, service guarantees, or an acceptable tradeoff for weaker validation.
 ## Documentation worktree verification
 
 Only this Markdown record is changed against documentation base
-`551226d0ab0800e3ea32fd008a1ff8962fa63519`; Rust code, manifests, TODO and
+`9b51c15f88e94681d231f86e64b058efc01f5f95`; Rust code, manifests, TODO and
 CHANGELOG are unchanged. Fresh checks on this worktree completed successfully:
 
 | Command | Result |

@@ -40,7 +40,7 @@ Publication and artifacts are recorded by the
   with sampling and provenance limits in
   [stuck-worker-frequency-2026-11-04.md](docs/reviews/stuck-worker-frequency-2026-11-04.md).
 - [x] Make `envelope_expiring_after_admission_is_an_error_not_a_skip`
-  deterministic (`b924a54`): 20/20 runs passed under load; the old fixture
+  deterministic (`45b4626`): 20/20 runs passed under load; the old fixture
   failed 17/20 (commander-supplied comparison). Production deadlines are unchanged.
 - [x] Close stale N1 references in the historical stage record and follow-up
   plan using the [alternating comparison](docs/reviews/stage-timing-comparison-2026-11-04.md).
@@ -50,9 +50,9 @@ Publication and artifacts are recorded by the
 - [x] Record the [isolated latency investigation](docs/reviews/latency-investigation-2026-11-04.md);
   rendered latency, macOS, and stable tails remain unmeasured.
 - [x] Record the [source review](docs/reviews/code-review-2026-11-04.md) and
-  resolve CR-01 (`a9b4b84`) and CR-02 (`51be817`).
+  resolve CR-01 (`0b78c10`) and CR-02 (`7caf4f1`).
 - [x] Split bounded reader execution and diagnostics out of `model.rs` into
-  private modules without changing behavior (`0a37245`).
+  private modules without changing behavior (`97c9e24`).
 
 - [x] **Fix timing-dependent `publish::tests` failures.** Publisher fixtures
   inject the shared reader-budget clock and explicitly advance it for timeout

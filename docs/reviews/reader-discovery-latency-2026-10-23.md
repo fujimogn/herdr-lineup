@@ -3,13 +3,13 @@
 | Field | Details |
 |---|---|
 | Date | 2026-10-23 |
-| Target commit | `b5fc311` (`b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`) |
+| Target commit | `60214d2` (`60214d2ba9a8e7760f909c74247c563b88a28ee5`) |
 | Component | `src/reader_codex.rs`, `src/reader_kimi.rs`, `src/model.rs`, `src/publish.rs`, `src/config.rs` |
 | Reviewer | agy (lane: `lane_reader_measure_agy_4`) |
 | Environment | Linux 7.2.10-1-cachyos / x86_64, AMD Ryzen 9 9955HX (16 Cores), synthetic isolated `tmpfs` fixtures (`/tmp`) |
 | Primary touching path | `docs/reviews/reader-discovery-latency-2026-10-23.md` |
 
-Current local candidate source: `0220da64f8545f89b6daca211553f486b271057f`.
+Current local candidate source: `8a0c87805c5139aae3f7bb9f974b31da8c447932`.
 Publication now passes one diagnostics-bearing `ReadCycle` across each
 refresh; actual Codex/Kimi reader fixtures assert shared scans, and the next
 refresh starts with a new cycle. Discovery still re-proves ancestors,
@@ -17,7 +17,7 @@ uniqueness and validity. C1 retains a combined 4,096-entry budget across
 Codex roots with cumulative fallback charges and the original deadline.
 See `review-followup-coverage.md` L4/C1 for current source and fixtures.
 
-Everything below is historical evidence on `b5fc311`, tmpfs-only. It does
+Everything below is historical evidence on `60214d2`, tmpfs-only. It does
 not measure the wired candidate, a real disk, macOS or live Herdr latency.
 
 ---

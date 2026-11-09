@@ -4,17 +4,17 @@
 
 The owner chose the conservative policy: when ownership is uncertain, stop and
 leave recovery to the user. It is implemented on the local integration line,
-which is not shipped (source `0220da64f8545f89b6daca211553f486b271057f`):
+which is not shipped (source `8a0c87805c5139aae3f7bb9f974b31da8c447932`):
 
-- `f319f52` and `ead231d` remove automatic rollback. A failure after the
+- `3b94832` and `d0a736c` remove automatic rollback. A failure after the
   `pending` journal is written leaves earlier writes, any partially written
   font, and the journal in place, and the error states that no automatic
   rollback or deletion was attempted and names the paths to inspect
   (`apply_with_font_and_remove` in `src/font.rs`).
 - Planned original bytes are compared before each terminal write, and the
-  installed font is stamped again immediately before removal (`75865cd`,
+  installed font is stamped again immediately before removal (`2559029`,
   `apply_with_font_and_remove`).
-- `885194b` types the ownership journal at load and separates planning from
+- `f368a8b` types the ownership journal at load and separates planning from
   application; a `pending` journal still refuses every further action.
 
 What remains open (H1 and M1 stay `partial` in
@@ -30,15 +30,15 @@ describe that candidate, not the integration line.
 
 ## Decision in brief (historical, before the owner's decision)
 
-The unreviewed `79196492940e4266a0182aca4dd27e188cacbf51` candidate improves the `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0` baseline: it compares file identity and bytes before rollback, checks the font again before removal, and adds injected conflict tests. These are useful best-effort protections, **not a guarantee against an uncooperative editor**. Each check remains separate from the following pathname-based `rename` or `unlink`. Neither the portable API used by this crate nor the OS-specific APIs cited below offer a conditional "replace or unlink this name only if it still denotes this inode and these bytes" operation. Do not describe H1/M1 as fully closed or ship this policy as implemented.
+The unreviewed `79196492940e4266a0182aca4dd27e188cacbf51` candidate improves the `60214d2ba9a8e7760f909c74247c563b88a28ee5` baseline: it compares file identity and bytes before rollback, checks the font again before removal, and adds injected conflict tests. These are useful best-effort protections, **not a guarantee against an uncooperative editor**. Each check remains separate from the following pathname-based `rename` or `unlink`. Neither the portable API used by this crate nor the OS-specific APIs cited below offer a conditional "replace or unlink this name only if it still denotes this inode and these bytes" operation. Do not describe H1/M1 as fully closed or ship this policy as implemented.
 
 The smallest policy with a defensible preservation claim is to **stop automatic destructive recovery when ownership is uncertain**, retain the ownership record and any displaced file for inspection, and report a conflict with exact paths. That changes current rollback and uninstall behavior and requires owner approval. Until that decision, the candidate's checks can reduce common races, but an absolute external-edit preservation claim is unavailable. No implementation change is made here.
 
 ## Fixed code comparison (historical)
 
-This assessment compares exactly `b5fc311..7919649` (`src/font.rs` only, 219 insertions and 23 deletions). `7919649` is a local candidate, not reviewed, integrated, or shipped. The baseline's `apply_with_font` spans `src/font.rs:247-484`. The candidate introduces `apply_with_font_and_remove` at `src/font.rs:313-586`. `FontLock` serializes participating Lineup actions, not arbitrary terminal editors or font managers.
+This assessment compares exactly `60214d2..7919649` (`src/font.rs` only, 219 insertions and 23 deletions). `7919649` is a local candidate, not reviewed, integrated, or shipped. The baseline's `apply_with_font` spans `src/font.rs:247-484`. The candidate introduces `apply_with_font_and_remove` at `src/font.rs:313-586`. `FontLock` serializes participating Lineup actions, not arbitrary terminal editors or font managers.
 
-| Path | `b5fc311` | `7919649` | Remaining race |
+| Path | `60214d2` | `7919649` | Remaining race |
 | --- | --- | --- | --- |
 | Terminal install and uninstall | Planned bytes are compared with `fs::read` immediately before `writer`; `write_atomic` creates a sibling temporary file, syncs it, then uses `fs::rename` to replace the path. | Same prewrite comparison; records postwrite device, inode, and bytes, then checks written bytes. | An editor can replace the target after `fs::read` and before `rename`. The rename replaces that newer entry. An editor can also change a file after the postwrite check. |
 | Terminal rollback | On a later failure, every path in `changed_paths` is restored with `write_atomic`, without checking current content. H1. | `rollback_owned` compares a `FileStamp` (device, inode, bytes) with the recorded postwrite stamp before restoring. New install and uninstall tests inject edits after an earlier write. | An editor can write or replace the target after the stamp comparison and before rollback's `rename`; its edit is replaced. In-place edits during stamp's read are not a stable snapshot of pathname state. |
@@ -57,7 +57,7 @@ The candidate's `FileStamp` is stronger than a byte-only check for rename-based 
 5. **Journal remains, not tested:** Lineup compares the old journal with `require_bytes`; another process replaces it; `write_atomic` renames the new journal over it. Likewise, after `rollback_owned` stamps a candidate-owned journal, another writer can replace it before restoration or deletion.
 6. **Absent target remains, not tested:** A terminal path is absent at planning or a rollback target is absent at its stamp check; another writer creates it before Lineup's final rename. Plain `rename` replaces the newly created entry. `create_new` for the font has different semantics and does not protect terminal or journal rename destinations.
 
-The candidate tests use temporary homes and injected callbacks. They show specific scheduling orders, not a stress proof, kernel-level invariant, macOS execution, or behavior under a noncooperating process at every instruction boundary. `git diff b5fc311..7919649` is the evidence for implementation; this document does not claim those tests ran as part of this record-only lane.
+The candidate tests use temporary homes and injected callbacks. They show specific scheduling orders, not a stress proof, kernel-level invariant, macOS execution, or behavior under a noncooperating process at every instruction boundary. `git diff 60214d2..7919649` is the evidence for implementation; this document does not claim those tests ran as part of this record-only lane.
 
 ## Available filesystem primitives and limits
 
@@ -74,7 +74,7 @@ Primary sources: [Linux `renameat2(2)`](https://man7.org/linux/man-pages/man2/re
 
 The owner later chose option (b). See "Current status" above.
 
-1. **Now, with no behavior change:** Keep `7919649` identified as an unreviewed best-effort candidate. Review its full fixed range before any integration. Wording must say it detects the tested pre-operation conflicts and leaves a residual check-to-mutation race. Keep `b5fc311` as the baseline for this record.
+1. **Now, with no behavior change:** Keep `7919649` identified as an unreviewed best-effort candidate. Review its full fixed range before any integration. Wording must say it detects the tested pre-operation conflicts and leaves a residual check-to-mutation race. Keep `60214d2` as the baseline for this record.
 2. **Recommended minimal next implementation, subject to owner choice:** Fail closed on uncertain ownership, stop automatic destructive rollback/deletion, preserve the journal, and report a manual recovery path. If an action must replace a terminal config, consider an atomic exchange into retained quarantine so the displaced bytes remain recoverable. This still does not guarantee that an external edit remains at its original path. Bound retention and test APFS/Linux behavior before enabling it.
 3. **Owner decision required:** Choose between (a) best-effort automatic recovery with explicitly limited guarantees, (b) conservative partial-state/manual recovery, and (c) a stronger external-edit preservation requirement that blocks font actions until a proven platform-specific or cooperative protocol exists. Also decide whether retaining displaced user files in quarantine is acceptable, how long to retain them, and whether automatic font uninstall should be disabled when ownership is uncertain. These alter user-visible behavior and recovery responsibility.
 

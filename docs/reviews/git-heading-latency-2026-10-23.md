@@ -3,7 +3,7 @@
 | Field | Details |
 |---|---|
 | Date | 2026-10-23 |
-| Target commit | `b5fc311` (`b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`) |
+| Target commit | `60214d2` (`60214d2ba9a8e7760f909c74247c563b88a28ee5`) |
 | Component | `src/ship_time.rs`, `src/publish.rs`, `src/config.rs` |
 | Reviewer | agy (lane: `lane_latency_measure_agy_3`) |
 | Environment | Linux 7.2.10-1-cachyos / x86_64, isolated temporary filesystem fixtures |

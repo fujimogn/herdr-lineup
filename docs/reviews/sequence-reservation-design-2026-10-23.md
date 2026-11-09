@@ -10,7 +10,7 @@ this record.
 
 ## Historical sources and pre-window behavior
 
-This audit uses commit `b5fc3114565f63d6fc5765a36d69dcf3ba47f3a0`, notably
+This audit uses commit `60214d2ba9a8e7760f909c74247c563b88a28ee5`, notably
 `src/tokens.rs`, `src/publish.rs`, `src/protocol.rs`, `src/socket.rs`,
 `src/daemon.rs`, `openspec/specs/sidebar-tokens/spec.md`,
 `openspec/specs/daemon-lifecycle/spec.md`, `README.md`, and
@@ -166,7 +166,7 @@ high-water mark is not a safe rollback.
 ## Implementation status (2026-10-24)
 
 The endpoint-wide reservation window is implemented in `src/tokens.rs` and
-`src/publish.rs`. Current source: `0220da64f8545f89b6daca211553f486b271057f`;
+`src/publish.rs`. Current source: `8a0c87805c5139aae3f7bb9f974b31da8c447932`;
 see `review-followup-coverage.md` L1 for the current candidate. It is not shipped.
 
 1. **State separation**: `endpoint_floors` holds the durable upper bound `U`

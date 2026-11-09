@@ -1,7 +1,7 @@
 # Antigravity occupant generation contract
 
 Status: research and Planned design; C2 remains unresolved in production.
-Baseline: `894d2f25f3bc44e59a31ea48a6995c7cee1e6455`. Checked on 2026-10-24.
+Baseline: `a0d1d9f7c590eb8d2cee9df01b0c5f1698a46164`. Checked on 2026-10-24.
 This change documents the boundary; it does not change readers, capture, binding,
 publication, configuration, or the Herdr host.
 

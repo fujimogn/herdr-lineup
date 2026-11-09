@@ -9,7 +9,7 @@ It makes no speed-up, child-process reduction, or SLO claim.
 | Field | Value |
 |---|---|
 | Measurement date | 2026-11-04 (Asia/Tokyo) |
-| Measured source | `2eaa4c55c169702e71617aaaf0870d94b30bb317` (fixed `origin/develop` base) |
+| Measured source | `88f4d58de42d04cc100acdabafdc9f3b86fa0ab8` (fixed `origin/develop` base) |
 | Host | `dev`, Linux x86_64, CachyOS |
 | Kernel | `7.3.1-1-cachyos`, SMP PREEMPT_DYNAMIC |
 | CPU | AMD Ryzen 9 9955HX 16-Core Processor; 16 online logical CPUs, one socket, one thread per core exposed |
