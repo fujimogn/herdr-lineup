@@ -8240,6 +8240,10 @@ mod tests {
         first
             .refresh_with_readers(&mut transport, &enabled, &SampleReader, &TimeoutReader)
             .unwrap();
+        let (_, before) = first.request(&mut transport, "session.snapshot").unwrap();
+        let before_tokens = &before["result"]["snapshot"]["panes"][0]["tokens"];
+        assert_eq!(before_tokens["lineup_agent"], "codex");
+        assert_eq!(before_tokens["lineup_context_pct"], "42");
         assert_eq!(endpoint_upper_bound_on_disk(&fixture.state), Some(32));
         assert_eq!(fixture.seqs(), [(1, true), (2, true)]);
         drop(first);
