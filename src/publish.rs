@@ -886,6 +886,11 @@ type GitHook = dyn FnMut(&Path, Instant) -> ship_time::RepositoryObservation + S
 #[derive(Default)]
 struct TestHooks {
     git: Option<Box<GitHook>>,
+    /// Fail scoped Git worker admission after this many successful spawns.
+    git_spawn_fail_after: Option<usize>,
+    /// Count completed Git workers before the heading stage returns.
+    git_worker_finished: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    git_worker_delay: Option<Duration>,
     /// Runs after any reservation persist, before the admission check.
     before_admission: Option<Box<dyn FnMut() + Send>>,
     /// Runs after admission passed, right before the exchange starts.
@@ -1947,8 +1952,18 @@ impl MetadataPublisher {
                 let cache = std::sync::Mutex::new(&mut self.repositories);
                 let queue = &mut self.git_queue;
                 let shutdown = self.shutdown.as_deref();
-                let results = std::thread::scope(|scope| -> io::Result<Vec<_>> {
-                    let mut running = Vec::new();
+                #[cfg(test)]
+                let spawn_fail_after = self.hooks.git_spawn_fail_after;
+                #[cfg(test)]
+                let worker_finished = self.hooks.git_worker_finished.clone();
+                #[cfg(test)]
+                let worker_delay = self.hooks.git_worker_delay;
+                let (results, skipped) = std::thread::scope(|scope| -> io::Result<_> {
+                    let mut running: Vec<(
+                        PathBuf,
+                        std::thread::ScopedJoinHandle<'_, ship_time::RepositoryObservation>,
+                    )> = Vec::new();
+                    let mut skipped = Vec::new();
                     for (id, cwd) in batch {
                         if Instant::now() >= git_deadline
                             || shutdown.is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -1957,20 +1972,54 @@ impl MetadataPublisher {
                         }
                         let cache = &cache;
                         let path = cwd.clone();
-                        let handle =
+                        #[cfg(test)]
+                        let finished = worker_finished.clone();
+                        #[cfg(test)]
+                        let injected_failure = spawn_fail_after == Some(running.len());
+                        #[cfg(not(test))]
+                        let injected_failure = false;
+                        let spawned = if injected_failure {
+                            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+                        } else {
                             std::thread::Builder::new().spawn_scoped(scope, move || {
-                                ship_time::RepositoryCache::observe_shared(
+                                let observation = ship_time::RepositoryCache::observe_shared(
                                     cache,
                                     &path,
                                     shutdown,
                                     git_deadline,
-                                )
-                            })?;
+                                );
+                                #[cfg(test)]
+                                if let Some(delay) = worker_delay {
+                                    std::thread::sleep(delay);
+                                }
+                                #[cfg(test)]
+                                if let Some(finished) = finished {
+                                    finished.fetch_add(1, Ordering::Release);
+                                }
+                                observation
+                            })
+                        };
+                        let handle = match spawned {
+                            Ok(handle) => handle,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                skipped.push(cwd);
+                                continue;
+                            }
+                            Err(error) => {
+                                // Join admitted workers before propagating an unexpected error.
+                                for (_, handle) in running {
+                                    handle.join().map_err(|_| {
+                                        io::Error::other("Git observation thread panicked")
+                                    })?;
+                                }
+                                return Err(error);
+                            }
+                        };
                         // Rotate only admitted starters, never shared results.
                         queue.rotate(&id);
                         running.push((cwd, handle));
                     }
-                    running
+                    let results = running
                         .into_iter()
                         .map(|(cwd, handle)| {
                             handle
@@ -1978,10 +2027,14 @@ impl MetadataPublisher {
                                 .map(|observation| (cwd, HeadingRead::from(observation)))
                                 .map_err(|_| io::Error::other("Git observation thread panicked"))
                         })
-                        .collect()
+                        .collect::<io::Result<Vec<_>>>()?;
+                    Ok((results, skipped))
                 })?;
                 for (cwd, read) in results {
                     by_cwd.insert(cwd, read);
+                }
+                for cwd in skipped {
+                    by_cwd.insert(cwd, HeadingRead::NotAttempted);
                 }
                 self.check_shutdown()?;
             }
@@ -9331,6 +9384,54 @@ mod tests {
             })),
             verified_at: Some(Instant::now()),
         }
+    }
+
+    #[test]
+    fn scoped_git_spawn_eagain_keeps_stage_alive_and_joins_admitted_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspaces = (0..3)
+            .map(|index| {
+                let path = dir.path().join(format!("repo-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                protocol::Workspace {
+                    workspace_id: format!("w{index}"),
+                    checkout_path: path.to_str().map(String::from),
+                    stored_keys: BTreeSet::new(),
+                }
+            })
+            .collect();
+        let inventory = RefreshInventory {
+            snapshot: protocol::Snapshot {
+                version: "0.9.3".into(),
+                protocol: 17,
+                panes: vec![],
+                workspaces,
+            },
+            now_unix: 0,
+            mode: tokens::LogoMode::Text,
+            first_panes: BTreeSet::new(),
+            codex_weekly: None,
+            grok_weekly: None,
+            kimi_weekly: None,
+        };
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut publisher = budget_publisher(dir.path(), budget_terms(1000, 1000, 1000));
+        publisher.hooks.git_spawn_fail_after = Some(1);
+        publisher.hooks.git_worker_finished = Some(finished.clone());
+        publisher.hooks.git_worker_delay = Some(Duration::from_millis(50));
+        let started = Instant::now();
+        let headings = publisher
+            .resolve_headings_in_budget(&inventory, started + Duration::from_secs(2), started)
+            .expect("EAGAIN must not fail the heading stage");
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(finished.load(Ordering::Acquire), 1);
+        assert_eq!(publisher.git_queue.order, ["w1", "w2", "w0"]);
+        assert!(
+            headings
+                .by_workspace
+                .values()
+                .all(|heading| !heading.resolved)
+        );
     }
 
     #[test]
