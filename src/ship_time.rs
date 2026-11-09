@@ -163,7 +163,13 @@ struct CachedRepository {
 #[derive(Default)]
 pub(crate) struct RepositoryCache {
     entries: HashMap<PathBuf, CachedRepository>,
+    /// Monotonic sequence captured before each query's Git I/O.
     invalidation_generation: u64,
+    /// A refused cwd has no known common directory and invalidates all keys.
+    rejected_generation: u64,
+    /// Keep per-key invalidations only while an older query can still finish.
+    common_invalidations: HashMap<PathBuf, u64>,
+    in_flight: usize,
     #[cfg(test)]
     full_queries: usize,
     #[cfg(test)]
@@ -233,20 +239,50 @@ impl RepositoryCache {
         deadline: Instant,
         now: Instant,
     ) -> RepositoryObservation {
-        let generation = cache.lock().unwrap().invalidation_generation;
+        let generation = {
+            let mut cache = cache.lock().unwrap();
+            cache.in_flight += 1;
+            cache.invalidation_generation
+        };
         let outcome = Self::query(cache, cwd, shutdown, deadline, now);
         if Instant::now() >= deadline || shutdown.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             // An interrupted read proves nothing; leave every entry as it was.
+            cache.lock().unwrap().finish_query();
             return RepositoryObservation {
                 read: RepositoryRead::Interrupted,
                 verified_at: None,
             };
         }
-        cache.lock().unwrap().apply(outcome, generation, now)
+        let mut cache = cache.lock().unwrap();
+        let observation = cache.apply(outcome, generation, now);
+        cache.finish_query();
+        observation
     }
 
-    fn invalidate(&mut self) {
+    fn invalidate(&mut self, common: Option<PathBuf>) {
         self.invalidation_generation = self.invalidation_generation.wrapping_add(1);
+        if let Some(common) = common {
+            self.common_invalidations
+                .insert(common, self.invalidation_generation);
+        } else {
+            self.rejected_generation = self.invalidation_generation;
+            self.common_invalidations.clear();
+        }
+    }
+
+    fn current_for(&self, common: &Path, generation: u64) -> bool {
+        generation >= self.rejected_generation
+            && self
+                .common_invalidations
+                .get(common)
+                .is_none_or(|invalidated| generation >= *invalidated)
+    }
+
+    fn finish_query(&mut self) {
+        self.in_flight -= 1;
+        if self.in_flight == 0 {
+            self.common_invalidations.clear();
+        }
     }
 
     fn apply(&mut self, outcome: Outcome, generation: u64, now: Instant) -> RepositoryObservation {
@@ -259,12 +295,12 @@ impl RepositoryCache {
                 // The refused cwd may belong to any cached repository, and
                 // only 64 entries exist: verify everything again from Git.
                 self.entries.clear();
-                self.invalidate();
+                self.invalidate(None);
                 unverified
             }
             Outcome::Discard(common) => {
                 self.entries.remove(&common);
-                self.invalidate();
+                self.invalidate(Some(common));
                 unverified
             }
             Outcome::Hit {
@@ -272,7 +308,7 @@ impl RepositoryCache {
                 entry,
                 ship_unix,
             } => {
-                if generation == self.invalidation_generation
+                if self.current_for(&common, generation)
                     && let Some(current) = self.entries.get_mut(&common)
                 {
                     current.last_access = current.last_access.max(now);
@@ -294,10 +330,11 @@ impl RepositoryCache {
             } => {
                 match store {
                     Some(entry) => {
-                        // A rejection/discard during I/O forbids old queries
-                        // from restoring the invalidated cache. A later full
-                        // verification must also never be aged backwards.
-                        if generation == self.invalidation_generation
+                        // A rejection or a discard of this common directory
+                        // forbids older queries from restoring its entry.
+                        // Unrelated repositories may still cache their results.
+                        // A later full verification must not age backwards.
+                        if self.current_for(&common, generation)
                             && !self
                                 .entries
                                 .get(&common)
@@ -308,7 +345,7 @@ impl RepositoryCache {
                     }
                     None => {
                         self.entries.remove(&common);
-                        self.invalidate();
+                        self.invalidate(Some(common));
                     }
                 }
                 RepositoryObservation {
@@ -1702,6 +1739,8 @@ mod tests {
                 (None, Some(t0))
             );
         }
+        assert!(cache.common_invalidations.is_empty());
+        assert_eq!(cache.in_flight, 0);
         // A ref to an absent object reads as unavailable until the object exists.
         let commit = fixture.git(&["cat-file", "commit", "HEAD"], None);
         let commit = commit.replace("synthetic", "written later");
@@ -2099,6 +2138,38 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn missing_ref_in_one_repository_does_not_suppress_another_cache_write() {
+        let missing = Fixture::new();
+        let present = Fixture::with_origin_main();
+        let mut cache = RepositoryCache::default();
+        let now = Instant::now();
+        let generation = cache.invalidation_generation;
+        // Both queries start in one batch. The repository without origin/main
+        // finishes first, before the other repository publishes its result.
+        let present_result = RepositoryCache::query(
+            &Mutex::new(&mut cache),
+            &present.repo,
+            None,
+            Instant::now() + QUERY_LIMIT,
+            now,
+        );
+        let missing_result = RepositoryCache::query(
+            &Mutex::new(&mut cache),
+            &missing.repo,
+            None,
+            Instant::now() + QUERY_LIMIT,
+            now,
+        );
+        assert_eq!(ship(&cache.apply(missing_result, generation, now)), None);
+        assert_eq!(
+            ship(&cache.apply(present_result, generation, now)),
+            Some(DAY_ONE)
+        );
+        assert!(cache.entries.contains_key(&present.common()));
+    }
+
     #[test]
     fn concurrent_cache_invalidation_cannot_be_undone_by_old_queries() {
         let fixture = Fixture::with_origin_main();
