@@ -5806,15 +5806,15 @@ mod tests {
 
     #[test]
     fn fast_pane_publishes_before_subsequent_slow_reader() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        struct StepReader {
-            rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-        }
+        let fast_report_seen = Arc::new(AtomicBool::new(false));
+        struct StepReader(Arc<AtomicBool>);
         impl UsageReader for StepReader {
             fn read(&self, request: &ReadRequest<'_>) -> UsageReading {
                 if request.identity.native_session_id == "slow-native" {
-                    // Pane 2 waits until Pane 1 has already reached the server.
-                    let _ = self.rx.lock().unwrap().recv_timeout(Duration::from_secs(2));
+                    assert!(
+                        self.0.load(Ordering::Acquire),
+                        "fast pane must reach the server before the slow reader starts"
+                    );
                 }
                 TimeoutReader.read(request)
             }
@@ -5823,8 +5823,9 @@ mod tests {
         std::fs::create_dir(dir.path().join("state")).unwrap();
         let socket = dir.path().join("order.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        let server_fast_report_seen = fast_report_seen.clone();
         let server = std::thread::spawn(move || {
-            let mut stream = OneShotServer::new(listener, Duration::from_millis(500));
+            let mut stream = OneShotServer::new(listener, Duration::from_secs(5));
             let mut line = String::new();
             stream.read_line(&mut line).unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
@@ -5850,9 +5851,10 @@ mod tests {
                         .as_str()
                         .unwrap_or_default()
                         .to_string();
+                    if target == "w1:p1" {
+                        server_fast_report_seen.store(true, Ordering::Release);
+                    }
                     pane_order.push(target);
-                    // Signal to slow reader that first pane arrived at server.
-                    let _ = tx.send(());
                 }
                 writeln!(
                     stream.get_mut(),
@@ -5860,6 +5862,9 @@ mod tests {
                     json!({"id":request["id"],"result":{"type":"ok"}})
                 )
                 .unwrap();
+                if method == "workspace.report_metadata" {
+                    break;
+                }
             }
             pane_order
         });
@@ -5873,9 +5878,7 @@ mod tests {
             },
         )
         .unwrap();
-        let reader = StepReader {
-            rx: std::sync::Mutex::new(rx),
-        };
+        let reader = StepReader(fast_report_seen);
         let result = publisher.refresh_with_readers(
             &mut transport,
             &Config::default(),
