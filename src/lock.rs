@@ -190,9 +190,13 @@ impl LifecycleLock {
             if let Some(lock) = SessionLock::acquire_file(&path)? {
                 return Ok(Self { _lock: lock });
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(lifecycle_retry_delay(deadline, Instant::now()));
         }
     }
+}
+
+fn lifecycle_retry_delay(deadline: Instant, now: Instant) -> Duration {
+    Duration::from_millis(20).min(deadline.saturating_duration_since(now))
 }
 
 impl Drop for LifecycleLock {
@@ -336,6 +340,19 @@ mod tests {
             independent.try_lock(),
             Err(TryLockError::WouldBlock)
         ));
+    }
+
+    #[test]
+    fn lifecycle_retry_wait_never_exceeds_remaining_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            lifecycle_retry_delay(now + Duration::from_millis(1), now),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            lifecycle_retry_delay(now + Duration::from_millis(40), now),
+            Duration::from_millis(20)
+        );
     }
 
     #[test]

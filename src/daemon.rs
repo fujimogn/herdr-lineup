@@ -1389,20 +1389,32 @@ fn stop_with_lock(options: &Options, after_lock: impl FnOnce()) -> io::Result<()
     if read_frame_before(&mut stream, 8192, deadline)? != b"stopping" {
         return Err(io::Error::other("daemon refused shutdown identity"));
     }
+    wait_for_process_exit(
+        deadline,
+        || process.exited(),
+        Instant::now,
+        std::thread::sleep,
+    )
+}
+
+fn wait_for_process_exit(
+    deadline: Instant,
+    mut exited: impl FnMut() -> io::Result<bool>,
+    now: impl Fn() -> Instant,
+    sleep: impl Fn(Duration),
+) -> io::Result<()> {
     loop {
         // Termination includes destruction after flock release. A new ensure
         // may already own the lock, so do not wait on that unrelated owner.
-        if Instant::now() >= deadline {
+        if exited()? {
+            return Ok(());
+        }
+        if now() >= deadline {
             return Err(io::Error::other(
                 "daemon did not stop within five seconds; no signal sent",
             ));
         }
-        if process.exited()? {
-            return Ok(());
-        }
-        std::thread::sleep(
-            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
-        );
+        sleep(Duration::from_millis(20).min(deadline.saturating_duration_since(now())));
     }
 }
 fn verify_peer_pid(stream: &UnixStream, expected: u32) -> io::Result<()> {
@@ -2177,6 +2189,28 @@ mod tests {
     }
 
     // The synthetic control peer is this test process, never a Herdr server.
+    #[test]
+    fn stop_observes_exit_at_deadline_after_final_poll() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(20);
+        let now = std::cell::Cell::new(deadline - Duration::from_millis(1));
+        let stopped = std::cell::Cell::new(false);
+        let result = wait_for_process_exit(
+            deadline,
+            || Ok(stopped.get()),
+            || now.get(),
+            |delay| {
+                assert_eq!(delay, Duration::from_millis(1));
+                stopped.set(true);
+                now.set(deadline);
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "exit during the final wait was missed: {result:?}"
+        );
+    }
+
     fn stop_deadline_fixture(
         expire_after_lock: bool,
         slow_health: bool,
