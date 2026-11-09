@@ -67,9 +67,11 @@ daemon or its Herdr session.
    previous attempt (`src/publish.rs:1585`, `src/tokens.rs:624-635`). The
    one-interval renewal predicate is therefore met on the next scheduled
    cycle (`src/tokens.rs:543-548`). A snapshot-only cycle is possible when no
-   resource has a live value needing renewal or a repair/clear patch, or on
-   an earlier retry such as a reconnect-triggered refresh
-   (`src/daemon.rs:1071-1073`). This count excludes initial connection and
+   resource has a live value needing renewal or a repair/clear patch.
+   Reconnection instead restores sequence state without cached accepted
+   values (`src/publish.rs:2570-2577`, `src/tokens.rs:312-317`), forcing a
+   full authoritative republish of pane and workspace token maps, including
+   null values. This count excludes initial connection and
    any daemon recovery health exchange, and assumes no capacity/deadline
    refusal or error. Herdr v0.9.3 closes
    after each response, so the next request reconnects to the pinned endpoint
@@ -94,7 +96,10 @@ stops (`src/publish.rs:1674-1691`, `src/publish.rs:2446-2463`,
 `src/daemon.rs:486-495`). This means the 381 supplied skip attempts cannot be
 attributed to socket I/O alone. Earlier snapshot, Git, reader, synchronous
 planning, persistence, prior reports, or host scheduling could consume the
-budget. No per-attempt traces were available to distinguish them.
+budget. A full republish after reconnection could increase report demand and
+therefore contribute to later admission refusals; this is an unmeasured
+possibility, not an attribution of the 381 attempts. No per-attempt traces
+were available to distinguish these causes.
 
 Each exchange serializes JSON and sends one newline frame, then reads and
 parses one response (`src/publish.rs:2612-2622`). The same absolute deadline
