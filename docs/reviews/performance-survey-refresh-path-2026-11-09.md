@@ -59,11 +59,19 @@ daemon or its Herdr session.
    multi-resource request in this protocol adapter.
 4. Each admitted metadata report gets one request and one acknowledgement,
    checked for the matching id and `ok` result (`src/publish.rs:1628-1691`,
-   `src/protocol.rs:86-102`). Thus a successful cycle with P eligible panes
-   and W eligible workspaces has **1 + P + W** application round trips;
-   unchanged resources can reduce this to one snapshot round trip. This count
-   excludes initial connection and any daemon recovery health exchange. It
-   also assumes no capacity/deadline refusal or error. Herdr v0.9.3 closes
+   `src/protocol.rs:86-102`). Thus a successful cycle with P report-eligible
+   panes and W report-eligible workspaces has **1 + P + W** application round
+   trips. Unchanged *live* values normally remain eligible: the next scheduled
+   refresh starts one interval after the previous attempt finishes
+   (`src/daemon.rs:1113`), while their last publication was within that
+   previous attempt (`src/publish.rs:1585`, `src/tokens.rs:624-635`). The
+   one-interval renewal predicate is therefore met on the next scheduled
+   cycle (`src/tokens.rs:543-548`). A snapshot-only cycle is possible when no
+   resource has a live value needing renewal or a repair/clear patch, or on
+   an earlier retry such as a reconnect-triggered refresh
+   (`src/daemon.rs:1071-1073`). This count excludes initial connection and
+   any daemon recovery health exchange, and assumes no capacity/deadline
+   refusal or error. Herdr v0.9.3 closes
    after each response, so the next request reconnects to the pinned endpoint
    (`src/socket.rs:133-145`, `src/daemon.rs:1040-1047`). A one-pane,
    one-workspace cold fixture therefore has three round trips; the 256-pane
@@ -118,15 +126,16 @@ started 2026-11-09 11:40:12 UTC and ended 11:40:14 UTC. There are only two
 cold rows per pane count: these observations are not tail quantiles or a
 performance comparison with another revision.
 
-| Panes | Total ms (two rows) | Socket ms (two rows) | Snapshot ms | Persist ms | Acked reports |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 9.138 / 8.814 | 2.985 / 3.073 | 0.373 / 0.257 | 0.062 / 0.053 | 2 |
-| 8 | 24.120 / 24.817 | 17.435 / 17.668 | 0.605 / 1.093 | 0.053 / 0.070 | 9 |
-| 32 | 82.397 / 80.933 | 68.124 / 67.175 | 2.666 / 2.046 | 0.062 / 0.096 | 33 |
-| 128 | 310.038 / 297.388 | 262.134 / 263.926 | 7.404 / 6.735 | 0.195 / 0.103 | 129 |
-| 256 | 588.362 / 595.752 | 532.269 / 539.592 | 13.129 / 18.840 | 0.088 / 0.091 | 257 |
+| Panes | Total ms | Socket ms | Snapshot ms | Git ms | Reader ms | Persist ms | Acked reports |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 9.138 / 8.814 | 2.985 / 3.073 | 0.373 / 0.257 | 5.398 / 5.165 | 0.008 / 0.004 | 0.062 / 0.053 | 2 |
+| 8 | 24.120 / 24.817 | 17.435 / 17.668 | 0.605 / 1.093 | 4.864 / 5.055 | 0.022 / 0.027 | 0.053 / 0.070 | 9 |
+| 32 | 82.397 / 80.933 | 68.124 / 67.175 | 2.666 / 2.046 | 5.673 / 5.795 | 0.142 / 0.125 | 0.062 / 0.096 | 33 |
+| 128 | 310.038 / 297.388 | 262.134 / 263.926 | 7.404 / 6.735 | 9.726 / 6.078 | 0.670 / 0.447 | 0.195 / 0.103 | 129 |
+| 256 | 588.362 / 595.752 | 532.269 / 539.592 | 13.129 / 18.840 | 6.673 / 5.830 | 0.739 / 0.817 | 0.088 / 0.091 | 257 |
 
-Every row had one checkpoint row. This is **not** a count of checkpoint writes.
+Each cell lists run 0 / run 1. Every row had one checkpoint row. This is
+**not** a count of checkpoint writes.
 Socket is the largest recorded stage at 8–256 panes in this fixture. Stage
 columns overlap and must not be summed. The fake socket does not reproduce
 Herdr scheduling, storage, rendering, or a real provider's transitions.
@@ -153,7 +162,7 @@ needs an isolated comparison and real topology evidence.
   reports are eligible, perhaps reducing application round trips from
   `1 + P + W` to a snapshot plus bounded batches. No numeric speed-up is
   justified: host processing and acknowledgement cost are unmeasured, and
-  typical live eligible-report counts are unknown.
+  typical live-value resource counts are unknown.
 - **(c) Guarantees/risk:** Atomic or per-item acknowledgement semantics,
   sequence ordering, TTL, capacity, other plugins' keys, crash recovery,
   fairness, and ambiguous partial acceptance all need a specified contract.
@@ -179,14 +188,40 @@ needs an isolated comparison and real topology evidence.
 - **(c) Guarantees/risk:** Reuse must preserve pathname device/inode checks,
   endpoint generation binding, absolute deadlines, one-response framing,
   reconnect failure behavior, and no replay of ambiguous requests. Host
-  support is required for a persistent connection.
+  support is required for a persistent connection, as is a change to the
+  current one-request-per-connection specification
+  (`openspec/specs/sidebar-tokens/spec.md:228-233`).
 - **(d) Size:** Medium to large, depending on host protocol support.
 - **(e) Verification:** On a private socket fixture, trace connect/poll/read
   counts and durations without payloads. Add adversarial socket replacement,
   EOF, backpressure, incomplete response, and failed reconnect cases before
   an isolated Herdr comparison on Linux and macOS.
 
-### 3. Attribute socket and admission tails before tuning deadlines
+### 3. Revisit checkpoint cost only for demonstrated write tails
+
+- **(a) Basis:** Code: reservation writes sync file and directory before send
+  (`src/publish.rs:1383-1462`), and pruning may write on an authoritative
+  snapshot (`src/publish.rs:1694-1719`). Measured: the fake-socket cold rows
+  recorded 0.05–0.20 ms persist time on tmpfs, which includes little durable
+  device-sync cost; the supplied unverified doctor total is about
+  55 ms/attempt. The historical ext4 rows in
+  `stage-timing-comparison-2026-11-04.md` have a different source and load.
+  Different storage and workloads could explain the gap, but this is an
+  inference, not a demonstrated bottleneck.
+- **(b) Effect/uncertainty:** At most the measured persist component of a
+  matched workload, with a possible effect on admission tails. Current data
+  do not justify a faster persistence format or less durability.
+- **(c) Guarantees/risk:** The durable upper bound must precede sends, remain
+  monotonic across crashes/restarts and endpoint changes, and poison on an
+  uncertain write. Delaying or omitting sync would weaken this guarantee.
+- **(d) Size:** Medium for measurement and any safe implementation; high
+  validation cost.
+- **(e) Verification:** Measure write counts, row counts and sync latency on
+  isolated ext4/APFS fixtures with fixed sequence-window demand; inject
+  file-sync, rename and directory-sync failures, then restart and verify
+  monotonic sequences before considering a design change.
+
+### Prerequisite outside the effect ranking: attribute socket and admission tails
 
 - **(a) Basis:** Measured: supplied doctor totals are unverified and this
   survey's two-row fixture has no tail distribution. Code: the socket stage
@@ -206,27 +241,6 @@ needs an isolated comparison and real topology evidence.
   retaining diagnostics; sample per-attempt outcome and stage distributions
   without accessing a user session.
 
-### 4. Revisit checkpoint cost only for demonstrated write tails
-
-- **(a) Basis:** Code: reservation writes sync file and directory before send
-  (`src/publish.rs:1383-1462`), and pruning may write on an authoritative
-  snapshot (`src/publish.rs:1694-1719`). Measured: the fake-socket cold rows
-  recorded 0.05–0.20 ms persist time; the supplied unverified doctor total is
-  about 55 ms/attempt. Different storage and workloads could explain the gap,
-  but this is an inference, not a demonstrated bottleneck.
-- **(b) Effect/uncertainty:** At most the measured persist component of a
-  matched workload, with a possible effect on admission tails. Current data
-  do not justify a faster persistence format or less durability.
-- **(c) Guarantees/risk:** The durable upper bound must precede sends, remain
-  monotonic across crashes/restarts and endpoint changes, and poison on an
-  uncertain write. Delaying or omitting sync would weaken this guarantee.
-- **(d) Size:** Medium for measurement and any safe implementation; high
-  validation cost.
-- **(e) Verification:** Measure write counts, row counts and sync latency on
-  isolated ext4/APFS fixtures with fixed sequence-window demand; inject
-  file-sync, rename and directory-sync failures, then restart and verify
-  monotonic sequences before considering a design change.
-
 ## Changes to avoid on present evidence
 
 - Do not merely increase the 7 s envelope or 2 s metadata admission term:
@@ -240,6 +254,9 @@ needs an isolated comparison and real topology evidence.
 - Do not skip authoritative snapshots, extend renewal to the 30 s TTL edge,
   or cache a previous snapshot as truth. Snapshot identities and stored-key
   repair are safety inputs; long cycles and jitter can otherwise expire keys.
+  Renewing at two refresh intervals was previously deferred because it
+  conflicts with the next-refresh renewal specification and would require a
+  specification change (`docs/reviews/2026-10-18-survey.md:204`).
 - Do not drop file/directory sync or write an upper bound after sending.
   Sequence reuse after a crash would violate the publisher's durability rule.
 - Do not revive the rejected Codex append-only reader proposal, nor infer a
