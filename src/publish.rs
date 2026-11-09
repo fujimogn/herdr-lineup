@@ -8257,10 +8257,13 @@ mod tests {
             .find(|report| report["method"] == "pane.report_metadata")
             .expect("restart must clear the disabled provider");
         assert_eq!(pane_clear["params"]["seq"], 33);
-        assert_eq!(pane_clear["params"]["tokens"]["lineup_agent"], Value::Null);
         assert_eq!(
-            pane_clear["params"]["tokens"]["lineup_context_pct"],
-            Value::Null
+            pane_clear["params"]["tokens"].get("lineup_agent"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            pane_clear["params"]["tokens"].get("lineup_context_pct"),
+            Some(&Value::Null)
         );
         assert_eq!(
             fixture.seqs(),
