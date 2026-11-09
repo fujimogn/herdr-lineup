@@ -66,8 +66,8 @@ proxy settings are inherited, matching the retired quota client. Dependency wire
 headers, credential paths or underlying library error messages. No telemetry
 or conversation/session data is sent.
 
-Quota values are held only in memory. Case-insensitive `WEEKLY` and
-`BILLING_PERIOD_TYPE_WEEKLY` expose used percent and optional reset time;
+Quota values are held only in memory. Case-insensitive `WEEKLY`,
+`BILLING_PERIOD_TYPE_WEEKLY`, and `USAGE_PERIOD_TYPE_WEEKLY` expose used percent and optional reset time;
 `NON_WEEKLY`, `BIWEEKLY`, and `WEEK` do not. `MONTHLY` returns
 `NonWeekly`, so weekly displays stay missing. Without a reset, publication
 expires the value after the greater of `usage_max_age_ms` and the Grok query

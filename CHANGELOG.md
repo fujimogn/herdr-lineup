@@ -4,10 +4,16 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+## 0.3.3 (2026-11-09)
+
+Lineup restores the Grok weekly quota, makes Git headings and stop more reliable, and refreshes locked dependencies.
+
+- Fix: **Grok weekly quota** recognizes the `USAGE_PERIOD_TYPE_WEEKLY` billing period, so the weekly value is shown instead of `—`. Similar names such as `NON_WEEKLY` and `BIWEEKLY` remain unavailable.
 - Fix: **Git heading** keeps publishing when Git observation threads temporarily cannot be created: repositories that could not start are left unattempted for that cycle, and every started observation is still joined.
 - Fix: **Git heading cache** scopes invalidation per repository, so a repository without `origin/main` no longer suppresses another repository's cache update in the same parallel batch. A rejected working directory still invalidates all repositories.
 - Fix: **Stop** no longer reports a timeout when the daemon exits during the final wait, and lifecycle lock retries sleep no longer than the time left on the shared deadline.
-- Maintenance: **Tests** makes the fast-pane publication ordering test deterministic.
+- Maintenance: **Dependencies** refresh locked crates within the existing Cargo requirements, including cc 1.11.1, itoa 1.0.19, serde_spanned 1.1.3, syn 3.0.10, toml 1.2.1, toml_datetime 1.1.3, toml_edit 0.25.19, and winnow 1.0.5, and regenerate the binary dependency license notices.
+- Maintenance: **Tests** makes the fast-pane publication ordering test deterministic and confirms it reaches the slow reader, reports the Kimi wiring child's status and output on failure and timeout, and adds synthetic coverage for detached ensure and publisher restart.
 - Maintenance: **Repository history** was rewritten on 2026-11-09 to translate commit messages into English. Commit hashes from 2026-10-19 onward and the `v0.2.0` through `v0.3.2` tags changed, while the file contents of every commit and the published release assets did not. Existing clones must fetch and reset to the new history.
 
 ## 0.3.2 (2026-11-04)

@@ -13,21 +13,19 @@ Work waiting for the next release is in the `Unreleased` section of
 
 - [ ] Long-term OS-stall frequency (L5) remains unmeasured. A ten-minute
   sample does not establish an event rate or whether isolation is needed.
-- [ ] Remaining sequence-window failure rows (L1/N2). Publisher ownership
-  serialization and handover, a same-source writer no-op negative control,
-  and the in-flight loaded config with an explicitly reloaded provider clear
-  are verified by fixtures. Kernel crash/power loss, full daemon ensure
-  spawn/inheritance/readiness, competing-writer protection, automatic reload
-  or a restarted publisher clearing state, old-binary rollback, and macOS
-  disks remain open.
-- [ ] Investigate the macOS-only failure of
+- [ ] Remaining sequence-window failure rows (L1/N2). Fixtures now cover
+  publisher ownership and handover, detached ensure with lock inheritance and
+  readiness, and a new publisher clearing a disabled provider. Kernel
+  crash/power loss, old-binary rollback, and macOS disks remain unverified.
+  Competing-writer protection and automatic config reload are not implemented,
+  so there is no behavior to verify; see the
+  [sequence reservation record](docs/reviews/sequence-reservation-design-2026-10-23.md).
+- [ ] Find the cause of the macOS-only failure of
   `publish::tests::kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset`:
   the isolated child failed with empty stderr in the v0.3.2 platform check
-  (run 41847126534, first attempt) and passed on the job rerun. Its stdout is
-  piped but not reported, so the cause is unknown; Linux passed.
-- [ ] Assert that `publish::tests::fast_pane_publishes_before_subsequent_slow_reader`
-  reaches the slow reader, so a changed session ID or a skipped reader cannot
-  pass on pane order alone (non-blocking review finding).
+  (run 41847126534, first attempt) and passed on the job rerun; Linux passed.
+  The test now reports the child's status, stdout, and stderr, so start from
+  that output on the next failure. A passing rerun is not evidence of a fix.
 - [ ] Font check-then-rename and check-then-unlink races (H1, M1). Closing
   them needs an owner-approved design; partial-state recovery stays manual.
 
@@ -43,6 +41,16 @@ Start only when the named condition is met; these are not obligations.
   fixture, preserving the pathname identity check.
 - Reader process isolation (L5): measured stuck-worker frequency and a
   resource/privacy/restart contract.
+- Multi-resource metadata reports: a Herdr API that accepts several resources
+  in one request. The Herdr 0.9.5 API schema has none, so this cannot be done
+  in Lineup alone; see the
+  [refresh path survey](docs/reviews/performance-survey-refresh-path-2026-11-09.md).
+- Socket and admission tail attribution: a concrete decision that depends on
+  where deadline skips come from.
+
+Not planned: refreshing early on statusLine updates (item 1 of the
+[observer survey](docs/reviews/performance-survey-observers-2026-11-09.md)).
+The owner decided against it on 2026-11-09.
 
 ## Separate Herdr host task
 
@@ -71,6 +79,9 @@ investigation leaves rendered latency, macOS, and stable tails unmeasured:
   below the 10% criterion; the owner declined the append-only assumption and
   relaxed read guarantees, so no runtime change landed.
 - [Source review](docs/reviews/code-review-2026-11-04.md)
+- [Refresh path performance survey](docs/reviews/performance-survey-refresh-path-2026-11-09.md)
+  and [observer-side latency survey](docs/reviews/performance-survey-observers-2026-11-09.md)
+  (2026-11-09): improvement candidates only; nothing was changed.
 - `envelope_expiring_after_admission_is_an_error_not_a_skip` determinism:
   20/20 runs passed under load, while the old fixture failed 17/20
   (commander-supplied comparison). Production deadlines are unchanged.
