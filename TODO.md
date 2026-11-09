@@ -71,3 +71,6 @@ investigation leaves rendered latency, macOS, and stable tails unmeasured:
   below the 10% criterion; the owner declined the append-only assumption and
   relaxed read guarantees, so no runtime change landed.
 - [Source review](docs/reviews/code-review-2026-11-04.md)
+- `envelope_expiring_after_admission_is_an_error_not_a_skip` determinism:
+  20/20 runs passed under load, while the old fixture failed 17/20
+  (commander-supplied comparison). Production deadlines are unchanged.
