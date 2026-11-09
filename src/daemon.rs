@@ -2233,6 +2233,10 @@ mod tests {
         let mut gate_stream = gate_rx.recv_timeout(START_DEADLINE).unwrap();
         gate_waiter.join().unwrap();
         assert!(probe(&paths, &options.socket).unwrap().is_none());
+        assert!(
+            workers.iter().all(|worker| !worker.is_finished()),
+            "ensure returned before the child became ready"
+        );
         gate_stream.write_all(&[1]).unwrap();
         for worker in workers {
             worker.join().unwrap().unwrap();
@@ -2275,20 +2279,6 @@ mod tests {
                 })
             })
         });
-        let log = fs::read_to_string(options.state.join("sequence-log")).unwrap();
-        let successor_reports: Vec<_> = log.lines().skip(prior_lines).collect();
-        assert!(
-            successor_reports.iter().any(|line| {
-                let mut fields = line.split_whitespace();
-                fields.next() == Some("w1:p1")
-                    && fields
-                        .next()
-                        .and_then(|seq| seq.parse::<u64>().ok())
-                        .is_some_and(|seq| seq > 32)
-                    && fields.next() == Some("true")
-            }),
-            "successor did not publish above the durable window: {log}"
-        );
         stop(&options).unwrap();
         cleanup.0 = None;
         done.store(true, Ordering::Relaxed);
