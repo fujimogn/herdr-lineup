@@ -1718,6 +1718,23 @@ mod tests {
     #[test]
     #[ignore = "isolated daemon subprocess entry point"]
     fn child_entry() {
+        if std::env::var_os("LINEUP_TEST_FOREGROUND_WRAPPER").is_some() {
+            let options = Options::from_env().unwrap();
+            crate::test_support::require_isolated_runtime(&options).unwrap();
+            // Keep the existing injected-publisher entry points below intact.
+            // Only this isolated child exercises the public startup wrapper.
+            let result = foreground(&options);
+            fs::write(
+                options.state.join("wrapper-cwd"),
+                std::env::current_dir().unwrap().as_os_str().as_bytes(),
+            )
+            .unwrap();
+            if let Err(error) = result {
+                eprintln!("foreground wrapper: {error}");
+                std::process::exit(i32::from(crate::failure_exit_code(&error)));
+            }
+            return;
+        }
         if std::env::var_os("LINEUP_INHERITED_LOCK").is_some()
             || std::env::var_os("LINEUP_TEST_FOREGROUND").is_some()
         {
@@ -2335,6 +2352,158 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    // Stops only the fixture daemon and reaps only directly owned children,
+    // including when an assertion or a deliberately broken version fails.
+    struct ForegroundFixtureCleanup {
+        options: Options,
+        done: Arc<AtomicBool>,
+        child: Option<std::process::Child>,
+    }
+    impl Drop for ForegroundFixtureCleanup {
+        fn drop(&mut self) {
+            let _ = stop(&self.options);
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.done.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn foreground_wrapper_command(root: &std::path::Path, options: &Options) -> Command {
+        let mut command = crate::test_support::isolated_daemon_command(
+            root,
+            &options.socket,
+            &options.state,
+            &options.config,
+        );
+        command
+            .args([
+                "--exact",
+                "daemon::tests::child_entry",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("LINEUP_TEST_FOREGROUND_WRAPPER", "1")
+            .current_dir(root);
+        command
+    }
+
+    #[test]
+    fn foreground_wrapper_selects_lock_and_publishes_above_reserved_window() {
+        let (dir, options, done, server) = fixture();
+        eprintln!("isolated foreground fixture root: {}", dir.path().display());
+        let mut cleanup = ForegroundFixtureCleanup {
+            options: options.clone(),
+            done,
+            child: None,
+        };
+        fs::create_dir(&options.state).unwrap();
+        fs::write(options.state.join("sequence-fixture"), "").unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let patches = || -> Vec<serde_json::Value> {
+            fs::read_to_string(options.state.join("sequence-patches"))
+                .unwrap_or_default()
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let mut upper = 0;
+        // ensure transfers fd 3; direct startup must acquire its own lock both
+        // with an absent marker and with a marker other than the exact "3".
+        for mode in [Some("3"), None, Some("not-3")] {
+            let before = patches().len();
+            let command = foreground_wrapper_command(dir.path(), &options);
+            if mode == Some("3") {
+                ensure_command(&options, command).unwrap();
+            } else {
+                let mut command = command;
+                if let Some(value) = mode {
+                    command.env("LINEUP_INHERITED_LOCK", value);
+                }
+                cleanup.child = Some(command.spawn().unwrap());
+            }
+            wait_until(|| probe(&paths, &options.socket).ok().flatten().is_some());
+            assert!(SessionLock::acquire(&paths).unwrap().is_none());
+            wait_until(|| patches().len() > before);
+            let patch = &patches()[before];
+            assert!(patch["seq"].as_u64().unwrap() > upper, "{patch}");
+            assert_eq!(patch["tokens"]["lineup_agent"], "codex");
+            stop(&options).unwrap();
+            if let Some(mut child) = cleanup.child.take() {
+                assert!(child.wait().unwrap().success());
+            }
+            wait_until(|| options.state.join("wrapper-cwd").exists());
+            assert_eq!(
+                fs::canonicalize(fs::read_to_string(options.state.join("wrapper-cwd")).unwrap())
+                    .unwrap(),
+                fs::canonicalize(&paths.root).unwrap()
+            );
+            fs::remove_file(options.state.join("wrapper-cwd")).unwrap();
+            assert!(SessionLock::acquire(&paths).unwrap().is_some());
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_slice(&fs::read(paths.root.join("sequences.json")).unwrap())
+                    .unwrap();
+            upper = rows
+                .iter()
+                .filter(|row| row["kind"] == "endpoint")
+                .map(|row| row["seq"].as_u64().unwrap())
+                .max()
+                .unwrap();
+            assert!(upper >= 32);
+        }
+        drop(cleanup);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn foreground_wrapper_creates_runtime_and_logs_run_error() {
+        let (dir, options, done, server) = fixture();
+        eprintln!("isolated foreground error root: {}", dir.path().display());
+        let mut cleanup = ForegroundFixtureCleanup {
+            options: options.clone(),
+            done,
+            child: None,
+        };
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        assert!(!paths.root.exists());
+        // Publisher construction succeeds; Config::load inside run_foreground
+        // fails. This deliberately excludes errors before run_foreground.
+        fs::write(options.config.join("config.toml"), "unknown_key = true\n").unwrap();
+        cleanup.child = Some(
+            foreground_wrapper_command(dir.path(), &options)
+                .spawn()
+                .unwrap(),
+        );
+        wait_until(|| {
+            cleanup
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_some()
+        });
+        let status = cleanup.child.take().unwrap().wait().unwrap();
+        assert!(!status.success());
+        assert_eq!(
+            fs::canonicalize(fs::read_to_string(options.state.join("wrapper-cwd")).unwrap())
+                .unwrap(),
+            fs::canonicalize(&paths.root).unwrap()
+        );
+        let log = fs::read_to_string(&paths.log).unwrap();
+        let events: Vec<_> = log.lines().collect();
+        assert_eq!(events.len(), 1, "{log}");
+        let (timestamp, category) = events[0].split_once(' ').unwrap();
+        chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+        assert_eq!(category, "event=daemon_exit reason=runtime_error");
+        assert!(probe(&paths, &options.socket).unwrap().is_none());
+        assert!(SessionLock::acquire(&paths).unwrap().is_some());
+        drop(cleanup);
+        server.join().unwrap();
     }
 
     #[test]
