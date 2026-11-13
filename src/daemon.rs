@@ -1535,14 +1535,22 @@ mod tests {
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false).unwrap();
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(2)))
-                            .unwrap();
+                        // A daemon can exit after connect but before setup or send.
+                        if stream.set_nonblocking(false).is_err()
+                            || stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .is_err()
+                        {
+                            continue;
+                        }
+                        let Ok(reader_stream) = stream.try_clone() else {
+                            continue;
+                        };
                         let mut line = String::new();
-                        let bytes = std::io::BufReader::new(stream.try_clone().unwrap())
-                            .read_line(&mut line)
-                            .unwrap();
+                        let Ok(bytes) = std::io::BufReader::new(reader_stream).read_line(&mut line)
+                        else {
+                            continue;
+                        };
                         if bytes == 0 || line.trim().is_empty() {
                             // A daemon can exit after connect but before send.
                             continue;
@@ -3252,10 +3260,17 @@ mod tests {
             while !replacement_done.load(Ordering::Relaxed) {
                 match replacement.accept() {
                     Ok((mut stream, _)) => {
+                        let Ok(reader_stream) = stream.try_clone() else {
+                            continue;
+                        };
                         let mut line = String::new();
-                        BufReader::new(stream.try_clone().unwrap())
-                            .read_line(&mut line)
-                            .unwrap();
+                        let Ok(bytes) = BufReader::new(reader_stream).read_line(&mut line) else {
+                            continue;
+                        };
+                        if bytes == 0 || line.trim().is_empty() {
+                            // A daemon can exit after connect but before send.
+                            continue;
+                        }
                         let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                         writeln!(
                             stream,
