@@ -4,6 +4,10 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+## 0.3.4 (2026-11-13)
+
+Lineup moves to Rust 1.100.0 and refreshes locked dependencies.
+
 - Maintenance: **Rust toolchain** raises the pinned toolchain to 1.100.0 and the minimum supported Rust version to 1.100.
 - Maintenance: **Dependencies** update errno to 0.3.15, rustls-pki-types to 1.16.0, rustls-webpki to 0.103.17, ureq to 3.5.2, webpki-roots to 1.0.12, zstd to 0.14.4, zstd-safe to 8.3.0, and zstd-sys to 2.1.3+zstd.1.5.7 within the existing Cargo requirements, and regenerate the binary dependency license notices including the new zstd-sys BSD-2-Clause terms.
 
