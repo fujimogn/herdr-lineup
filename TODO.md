@@ -1,11 +1,11 @@
 # TODO
 
-Work after v0.3.4. Historical finding IDs, implementation snapshots,
+Work after v0.3.5. Historical finding IDs, implementation snapshots,
 fixtures, and limits are mapped in
 [review follow-up coverage](docs/reviews/review-followup-coverage.md).
 Working rules are in [the follow-up plan](docs/plans/review-followups-plan.md).
 Publication and artifacts are recorded by the
-[v0.3.4 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.4).
+[v0.3.5 tag and GitHub Release](https://github.com/fujimogn/herdr-lineup/releases/tag/v0.3.5).
 Work waiting for the next release is in the `Unreleased` section of
 [CHANGELOG.md](CHANGELOG.md).
 
