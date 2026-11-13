@@ -17,8 +17,11 @@ Work waiting for the next release is in the `Unreleased` section of
   publisher ownership and handover, detached ensure with lock inheritance and
   readiness, a new publisher clearing a disabled provider, and a detached
   daemon restarting after provider disablement and clearing retained provider keys
-  above the old sequence window. Kernel crash/power loss, old-binary rollback, macOS disks, the `foreground` wrapper
+  above the old sequence window. Kernel crash/power loss, macOS disks, the `foreground` wrapper
   setup, scheduler interleavings, and other config options remain unverified.
+  Actual 0.3.3 and 0.1.0 release-profile rollback and return to 0.3.4 are
+  [recorded on Linux](docs/reviews/old-binary-rollback-2026-11-13.md); other old
+  releases, checkpoint shapes, and crash rollback remain unverified.
   Competing-writer protection and automatic config reload are not implemented,
   so there is no behavior to verify; see the
   [sequence reservation record](docs/reviews/sequence-reservation-design-2026-10-23.md).

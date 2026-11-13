@@ -4,8 +4,8 @@
 on an unshipped candidate. It separates the durable upper bound `U` from the
 in-memory cursor `C` and amortizes the file and directory syncs across the
 reports in one window. Only the failure-table rows listed under "Verified
-failure rows" below have test evidence; the others remain design intent. No
-live Herdr session, user configuration, or production checkpoint was used for
+failure rows" below have test or recorded-run evidence; the others remain design intent. No
+user Herdr session, user configuration, or production checkpoint was used for
 this record.
 
 ## Historical sources and pre-window behavior
@@ -215,6 +215,7 @@ process; a real power loss or kernel crash was not simulated.
 | Error response | `rejected_report_burns_sequence_and_clear_preserves_other_keys`: the next report uses a fresh number. |
 | Endpoint replaced | `checkpoint_pruning_persists_floor_and_drops_replaced_endpoint`. |
 | Overflow | `checked_overflow_fails_closed_in_reservation_and_allocation`, `reservation_checked_overflow_fails_closed_before_send`. |
+| Old-binary rollback (Linux release executables) | [2026-11-13 observation](old-binary-rollback-2026-11-13.md): 0.3.3 reads a 0.3.4 endpoint-row checkpoint and publishes seq 33/34 above bound 32; 0.1.0 fails refresh and sends no metadata while retaining its seed bound 96. Returning to 0.3.4 with each case checkpoint intact publishes above its durable bound (65/66 and 97/98), with tokens observed on an isolated real Herdr 0.9.5. |
 | Legacy checkpoint without endpoint rows | `legacy_checkpoint_without_endpoint_rows_migrates_safely`, `legacy_checkpoint_migration_in_metadata_publisher`. |
 | Empty patch and capacity skip | `empty_patch_and_capacity_skip_preserve_reservation_cursor`. |
 | Publisher ownership serialization and handover (partial concurrent-ensure row) | `session_lock_serializes_sequence_window_owners`: two barrier-released acquisitions of the real session lock produce exactly one owner. Only the owner runs a publisher; after release, a new owner reloads the checkpoint, sends seq 33 after seq 1 / durable bound 32, and the latest patch applies. This does not exercise daemon ensure's spawn, descriptor inheritance, or readiness races. |
@@ -251,7 +252,7 @@ The remaining rows stay **Open**:
 | Concurrent ensure / second allocator (remainder) | The isolated detached-daemon test covers simultaneous ensure calls, inherited lock ownership, delayed readiness, and a successor's sequence floor. Its child enters `run_foreground` directly, so the `foreground` wrapper's setup and inherited-lock mode selection are not tested. It does not exhaust every scheduler interleaving or a writer outside the session-lock protocol. |
 | Competing same-source writer protection | Protection is not implemented, so there is no exclusion behavior to verify. `competing_same_source_writer_can_make_reserved_reports_noops` remains a negative control showing that an external writer can make a reserved report a no-op. |
 | Config changes (remainder) | The daemon has no automatic live-reload contract, so no automatic reload behavior exists to verify. The tests cover an in-flight loaded config, an explicit reload on the same publisher, and a new publisher instance loading a disabled-provider config; the detached-daemon restart fixture additionally covers a disabled provider after external SIGTERM. They do not cover every config option or automatic config reload. |
-| Old-binary rollback | No older binary was built and executed against the new checkpoint, so binary rollback remains unverified. A synthetic old-parser imitation cannot establish actual binary compatibility, including startup and state handling. Source inspection of tag `v0.1.0` shows that version's loader rejects row kinds other than `pane` and `workspace`, including the current `endpoint` row; this does not characterize every older version. Preserve the checkpoint and the existing compatibility warning. |
+| Old-binary rollback (remainder) | Actual release-profile 0.3.3 and 0.1.0 executables were run against 0.3.4 endpoint-row checkpoints on Linux; see the verified row and [run record](old-binary-rollback-2026-11-13.md). This does not characterize every old release, checkpoint shape, filesystem, or crash rollback. The 0.1.0 tag was built with commander-approved Rust 1.99.1 instead of pinned 1.99.0; compiler-patch equivalence is not tested. Preserve the checkpoint and the existing compatibility warning. |
 | macOS disks | No macOS disk run was available. Linux fixture results are not macOS storage measurements or durability evidence. |
 
 ### Measurement
