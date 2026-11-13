@@ -34,9 +34,12 @@ pushes the tag. The workflow never tags or pushes on its own.
    The version check must exit 0; before the tag exists it compares the version
    files declared under `release.versionFiles` in `.config/develop-tools.json`. The
    resolver downloads the pinned public develop-tools release and verifies its
-   SHA-256 against `.config/develop-tools.json`. This repository does not apply the
-   shared documentation rules of `develop-docs-check`; the Develop tools workflow
-   only checks that the resolver fetches the pinned tools. The extractor accepts
+   SHA-256 against `.config/develop-tools.json`. CI on `develop` and pull requests
+   runs `.develop-tools/resolve ci develop-docs-check --tracked` with the
+   `public-independent` profile and `.config/island-docs-scopes.json`. This checks
+   resident-document warnings, links, indexes, and byte limits without imposing
+   shared changelog, TODO layout, or required-file rules. The Develop tools
+   workflow on `main` also smoke-tests the pinned tools. The extractor accepts
    an optional changelog path: `scripts/extract-release-notes.sh X.Y.Z CHANGELOG.md`.
    Its output includes the dated version heading through the line before the
    next `## ` heading, trimming surrounding blank lines. A missing section or

@@ -25,6 +25,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+      - name: Check documentation
+        run: .develop-tools/resolve ci develop-docs-check --tracked
       - name: gitleaks
         run: |
           set -eu

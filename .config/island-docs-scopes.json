@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "byteLimits": [
+    {
+      "scope": "all",
+      "path": "AGENTS.md",
+      "maxBytes": "AGENTS_MAX_BYTES"
+    },
+    {
+      "scope": "all",
+      "path": "CLAUDE.md",
+      "maxBytes": "CLAUDE_MAX_BYTES"
+    },
+    {
+      "scope": "all",
+      "path": "CONTEXT.md",
+      "maxBytes": "CONTEXT_MAX_BYTES"
+    },
+    {
+      "scope": "all",
+      "path": "TODO.md",
+      "maxBytes": "TODO_MAX_BYTES"
+    },
+    {
+      "scope": "all",
+      "path": "CHANGELOG.md",
+      "maxBytes": "CHANGELOG_MAX_BYTES"
+    }
+  ],
+  "linkSourceExclusions": [
+    {
+      "scope": "all",
+      "prefix": "openspec/changes/archive/"
+    },
+    {
+      "scope": "all",
+      "prefix": ".claude/skills/"
+    }
+  ],
+  "hostPathLinkAllowScopes": [],
+  "indexRecordDirs": [
+    {
+      "scope": "all",
+      "dirs": [
+        "reviews",
+        "review",
+        "plans",
+        "research",
+        "experiments",
+        "archive"
+      ]
+    }
+  ],
+  "indexRequirements": [],
+  "docsLayouts": []
+}
