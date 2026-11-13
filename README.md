@@ -87,12 +87,15 @@ When installing or upgrading:
 - There is no `herdr plugin update`. To upgrade, install again.
 - Pin a version with a release tag:
   `herdr plugin install fujimogn/herdr-lineup --ref v0.3.4`.
-- Before downgrading, stop Lineup and preserve its state directory. Newer
-  releases may write `endpoint` rows to the per-session `sequences.json`
-  checkpoint when pruning absent resources. An older binary that does not
-  understand those rows can reject the checkpoint and fail to publish. Return
-  to the newer release rather than deleting the checkpoint: deleting it loses
-  the reserved sequence numbers used for safe metadata updates.
+- Before downgrading, stop Lineup and preserve its state directory. Current
+  releases write `endpoint` rows to the per-session `sequences.json`
+  checkpoint when reserving sequence windows, including for the first normal
+  publication. Versions before 0.1.1 do not understand those rows: 0.1.0 was
+  verified on Linux to reject the checkpoint and fail to publish, while
+  0.3.3 reads it. Returning to 0.3.4 with the checkpoint intact was verified
+  to restore publication. Return to the newer release rather than deleting
+  the checkpoint: deleting it loses the reserved sequence numbers used for
+  safe metadata updates.
 
 The [Herdr marketplace](https://herdr.dev/docs/marketplace/) is an automatic,
 unreviewed index of public repositories, not an endorsement or code review.

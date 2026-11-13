@@ -127,10 +127,12 @@ observed before each old-version stop, excluding shutdown-clear frames.
 The 0.1.0 observation is bounded to two completed failed refreshes, not an
 unbounded assertion that it can never publish under any conditions.
 
-README's downgrade warning is consistent with these observations: 0.1.0 can
-reject endpoint rows and fail to publish, and returning to 0.3.4 with the
-checkpoint intact restores publication. 0.3.3 reads this checkpoint. No README
-change is needed, and compatibility with every older version is not claimed.
+README's downgrade warning now explains that current releases write endpoint
+rows when reserving sequence windows, including for the first normal
+publication, rather than mentioning only absent-resource pruning. It records
+the observed 0.1.0 rejection, 0.3.3 compatibility, and recovery by returning to
+0.3.4 with the checkpoint intact. Compatibility with every older version is
+not claimed.
 
 ### Evidence retained for commander verification
 
