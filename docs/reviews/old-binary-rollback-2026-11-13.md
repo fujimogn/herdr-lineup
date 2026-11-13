@@ -201,7 +201,8 @@ rerun successfully. The new base adds the detached config-restart fixture:
 ignored. The source tree is identical to that base; both its detached-restart
 coverage and this record's rollback coverage remain in the shared documents.
 The original runtime observation still uses the fixed 0.3.4 source listed
-above. Its measured executable is preserved as
-`target/release/herdr-lineup-observed-v034` in the candidate worktree, with
-the same SHA-256 listed in this record. Restacked-check logs are retained as
-`restacked-*.log` under `/tmp/herdr-lineup-rb-5r6a4m/`.
+above. Its measured executable was kept as
+`target/release/herdr-lineup-observed-v034` in the candidate worktree until
+that worktree was removed after shipping; its SHA-256 is listed in this record.
+Restacked-check logs were written as `restacked-*.log` under
+`/tmp/herdr-lineup-rb-5r6a4m/`, which is not durable storage.
