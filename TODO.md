@@ -15,10 +15,10 @@ Work waiting for the next release is in the `Unreleased` section of
   sample does not establish an event rate or whether isolation is needed.
 - [ ] Remaining sequence-window failure rows (L1/N2). Fixtures now cover
   publisher ownership and handover, detached ensure with lock inheritance and
-  readiness, and a new publisher clearing a disabled provider. Kernel
-  crash/power loss, old-binary rollback, macOS disks, the `foreground` wrapper
-  setup, scheduler interleavings, and a detached daemon restart after a config
-  change remain unverified.
+  readiness, a new publisher clearing a disabled provider, and a detached
+  daemon restarting after provider disablement and clearing retained provider keys
+  above the old sequence window. Kernel crash/power loss, old-binary rollback, macOS disks, the `foreground` wrapper
+  setup, scheduler interleavings, and other config options remain unverified.
   Competing-writer protection and automatic config reload are not implemented,
   so there is no behavior to verify; see the
   [sequence reservation record](docs/reviews/sequence-reservation-design-2026-10-23.md).

@@ -1514,7 +1514,10 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
-        let dir = crate::lock::socket_test_dir();
+        let dir = tempfile::Builder::new()
+            .prefix("herdr-lineup-daemon-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let options = Options {
             socket: dir.path().join("herdr.sock"),
             state: dir.path().join("state"),
@@ -1528,6 +1531,7 @@ mod tests {
         let workspace = options.state.clone();
         let handle = std::thread::spawn(move || {
             let mut accepted = std::collections::BTreeMap::<(String, String), u64>::new();
+            let mut pane_tokens = serde_json::Map::new();
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -1553,7 +1557,7 @@ mod tests {
                                 "panes":[{"pane_id":"w1:p1", "workspace_id":"w1",
                                     "agent":"codex", "agent_session":{"agent":"codex",
                                         "kind":"id", "value":"synthetic-session"},
-                                    "agent_status":"working", "tokens":{}}],
+                                    "agent_status":"working", "tokens":pane_tokens}],
                                 "workspaces":[{"workspace_id":"w1", "tokens":{}}]
                             }})
                         } else if workspace.join("sequence-fixture").exists()
@@ -1573,6 +1577,29 @@ mod tests {
                             let applied = seq > *last;
                             if applied {
                                 *last = seq;
+                                if resource == "w1:p1" {
+                                    for (key, value) in params["tokens"].as_object().unwrap() {
+                                        if value.is_null() {
+                                            pane_tokens.remove(key);
+                                        } else {
+                                            pane_tokens.insert(key.clone(), value.clone());
+                                        }
+                                    }
+                                    let mut patches = OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(workspace.join("sequence-patches"))
+                                        .unwrap();
+                                    writeln!(
+                                        patches,
+                                        "{}",
+                                        serde_json::json!({
+                                            "seq":seq, "patch":params["tokens"],
+                                            "tokens":pane_tokens
+                                        })
+                                    )
+                                    .unwrap();
+                                }
                             }
                             let mut log = OpenOptions::new()
                                 .create(true)
@@ -1595,12 +1622,21 @@ mod tests {
                         } else {
                             serde_json::json!({"type":"pong", "version":"0.9.3", "protocol":17})
                         };
-                        writeln!(
+                        if let Err(error) = writeln!(
                             stream,
                             "{}",
                             serde_json::json!({"id":request["id"], "result":result})
-                        )
-                        .unwrap();
+                        ) {
+                            // A fixture may terminate its daemon after apply
+                            // but before the response is written.
+                            assert!(
+                                matches!(
+                                    error.kind(),
+                                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                                ),
+                                "fixture response failed: {error}"
+                            );
+                        }
                         // Herdr v0.9.3 ends each ordinary JSON response with EOF.
                         drop(stream);
                     }
@@ -2290,6 +2326,86 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn detached_daemon_restart_loads_changed_config_and_clears_disabled_provider() {
+        struct Cleanup(Options, Arc<AtomicBool>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = stop(&self.0);
+                self.1.store(true, Ordering::Relaxed);
+            }
+        }
+        let (dir, options, done, server) = fixture();
+        eprintln!("isolated daemon fixture root: {}", dir.path().display());
+        let cleanup = Cleanup(options.clone(), done.clone());
+        fs::create_dir(&options.state).unwrap();
+        fs::write(options.state.join("sequence-fixture"), "").unwrap();
+        let config = options.config.join("config.toml");
+        fs::write(&config, "providers = [\"codex\"]\n").unwrap();
+        let patches = || -> Vec<serde_json::Value> {
+            fs::read_to_string(options.state.join("sequence-patches"))
+                .unwrap_or_default()
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let start = || {
+            let mut command = child_command();
+            command.env("LINEUP_TEST_SEQUENCE_PUBLISHER", "1");
+            ensure_command(&options, command).unwrap();
+        };
+        start();
+        wait_until(|| {
+            patches()
+                .iter()
+                .any(|row| row["tokens"]["lineup_agent"] == "codex")
+        });
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        let first = probe(&paths, &options.socket).unwrap().unwrap();
+        fs::write(&config, "providers = []\n").unwrap();
+        // External termination leaves the accepted provider keys in the peer,
+        // so only the successor can clear them. Never signal a Herdr process.
+        assert_eq!(unsafe { libc::kill(first.pid as i32, libc::SIGTERM) }, 0);
+        wait_until(|| SessionLock::acquire(&paths).unwrap().is_some());
+        let before = patches();
+        assert_eq!(before.last().unwrap()["tokens"]["lineup_agent"], "codex");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(paths.root.join("sequences.json")).unwrap()).unwrap();
+        let upper = rows
+            .iter()
+            .filter(|row| row["kind"] == "endpoint")
+            .map(|row| row["seq"].as_u64().unwrap())
+            .max()
+            .unwrap();
+        assert!(upper >= 32);
+        start();
+        let successor = probe(&paths, &options.socket).unwrap().unwrap();
+        assert_ne!(successor.pid, first.pid);
+        wait_until(|| patches().len() > before.len());
+        let after = patches();
+        let clear = &after[before.len()];
+        assert!(
+            clear["seq"].as_u64().unwrap() > upper,
+            "successor reused the old window: {clear}"
+        );
+        let retained = before.last().unwrap()["tokens"].as_object().unwrap();
+        for key in retained
+            .keys()
+            .filter(|key| !key.starts_with("lineup_group"))
+        {
+            assert!(clear["patch"].as_object().unwrap().contains_key(key));
+            assert!(
+                clear["patch"][key].is_null(),
+                "provider key was not cleared: {key}"
+            );
+            assert!(!clear["tokens"].as_object().unwrap().contains_key(key));
+        }
+        stop(&options).unwrap();
+        drop(cleanup);
+        server.join().unwrap();
     }
 
     #[test]
