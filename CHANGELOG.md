@@ -4,6 +4,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Maintenance: **Rust toolchain** raises the pinned toolchain to 1.100.0 and the minimum supported Rust version to 1.100.
+
 ## 0.3.3 (2026-11-09)
 
 Lineup restores the Grok weekly quota, makes Git headings and stop more reliable, and refreshes locked dependencies.

@@ -2,7 +2,7 @@
 name = "herdr-lineup"
 version = "0.3.3"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 license = "MIT"
 description = "Agent status, context, quota, and local origin/main commit times for the Herdr sidebar"
 repository = "https://github.com/fujimogn/herdr-lineup"

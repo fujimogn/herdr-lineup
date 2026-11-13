@@ -55,7 +55,7 @@ decoded to the same opening fields as this checkout:
 | `description` | `herdr-plugin.toml:7` |
 | `platforms = ["macos", "linux"]` | `herdr-plugin.toml:8` |
 | `cargo build --release --locked` | `herdr-plugin.toml:10-11` |
-| Rust `1.99.0` | `rust-toolchain.toml:2` |
+| Rust `1.100.0` | `rust-toolchain.toml:2` |
 
 `plugin install` accepts GitHub shorthand only, clones with `git`,
 shows a preview in an interactive terminal, then runs build commands.
