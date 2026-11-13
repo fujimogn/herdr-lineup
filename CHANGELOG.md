@@ -4,6 +4,13 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+## 0.3.5 (2026-11-13)
+
+Lineup clarifies downgrade compatibility and expands isolated daemon startup and restart coverage.
+
+- Fix: **Downgrade guidance** explains that sequence-window reservations write `endpoint` rows even on the first normal publication. Linux checks confirmed that 0.1.0 rejects this checkpoint, 0.3.3 reads it, and returning to 0.3.4 restores publication with the checkpoint intact; preserve it rather than deleting reserved sequence numbers.
+- Maintenance: **Tests** adds isolated coverage for detached daemon restarts loading changed provider settings and clearing disabled provider metadata above the previous reserved sequence window, and for the foreground startup wrapper's lock handling, publication, runtime directory, and error logging. The daemon test peer also handles empty requests from exiting fixture daemons.
+
 ## 0.3.4 (2026-11-13)
 
 Lineup moves to Rust 1.100.0 and refreshes locked dependencies.
