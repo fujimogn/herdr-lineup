@@ -180,7 +180,7 @@ not a tested or safe recovery procedure.
 
 ## Candidate checks
 
-The unchanged Rust source passed the required checks on Linux:
+The initial candidate's unchanged Rust source passed the required checks on Linux:
 
 - `cargo fmt --all --check`: exit 0.
 - `cargo clippy --locked --all-targets -- -D warnings`: exit 0.
@@ -193,3 +193,15 @@ The unchanged Rust source passed the required checks on Linux:
 This change adds observation documentation, not an automated test. The old
 binary rejection and compatible binary recovery are the runtime negative
 and positive controls; no production mutation is left in any checkout.
+
+After restacking the documentation onto integrated base
+`eb696425d73037a216c9e2293f183917100635e3`, all five commands above were
+rerun successfully. The new base adds the detached config-restart fixture:
+463 unit tests and one integration test passed, with six existing tests
+ignored. The source tree is identical to that base; both its detached-restart
+coverage and this record's rollback coverage remain in the shared documents.
+The original runtime observation still uses the fixed 0.3.4 source listed
+above. Its measured executable is preserved as
+`target/release/herdr-lineup-observed-v034` in the candidate worktree, with
+the same SHA-256 listed in this record. Restacked-check logs are retained as
+`restacked-*.log` under `/tmp/herdr-lineup-rb-5r6a4m/`.
