@@ -1540,9 +1540,13 @@ mod tests {
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
                         let mut line = String::new();
-                        std::io::BufReader::new(stream.try_clone().unwrap())
+                        let bytes = std::io::BufReader::new(stream.try_clone().unwrap())
                             .read_line(&mut line)
                             .unwrap();
+                        if bytes == 0 || line.trim().is_empty() {
+                            // A daemon can exit after connect but before send.
+                            continue;
+                        }
                         let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                         if request["method"] == "ping"
                             && fs::remove_file(workspace.join("fail-next-ping")).is_ok()
@@ -1649,6 +1653,11 @@ mod tests {
     #[test]
     fn health_fixture_closes_after_one_json_response() {
         let (_dir, options, done, server) = fixture();
+        // A terminated daemon may connect and exit before writing a request.
+        drop(UnixStream::connect(&options.socket).unwrap());
+        let mut blank = UnixStream::connect(&options.socket).unwrap();
+        blank.write_all(b" \n").unwrap();
+        drop(blank);
         let mut stream = std::os::unix::net::UnixStream::connect(&options.socket).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
