@@ -19,7 +19,7 @@ SPECIAL_FILES = {
         "src/polyfill/once_cell/LICENSE-MIT",
         "third_party/fiat/LICENSE",
     ],
-    "zstd-sys": ["LICENSE", "LICENSE.BSD-3-Clause"],
+    "zstd-sys": ["LICENSE", "LICENSE.BSD-3-Clause", "LICENSE.BSD-2-Clause"],
     "rustix": ["COPYRIGHT", "LICENSE-MIT"],
     "linux-raw-sys": ["COPYRIGHT", "LICENSE-MIT"],
 }

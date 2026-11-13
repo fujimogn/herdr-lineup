@@ -27,7 +27,7 @@ and vendored C terms.
 | `colorchoice@1.0.5` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `core-foundation-sys@0.8.7` | `MIT OR Apache-2.0` | `MIT` | macos |
 | `equivalent@1.0.3` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
-| `errno@0.3.14` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `errno@0.3.15` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `fastrand@2.5.0` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `getrandom@0.2.17` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `hashbrown@0.17.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
@@ -47,8 +47,8 @@ and vendored C terms.
 | `ring@0.17.14` | `Apache-2.0 AND ISC` | `Apache-2.0 AND ISC` | linux, macos |
 | `rustix@1.1.6` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `rustls@0.23.46` | `Apache-2.0 OR ISC OR MIT` | `MIT` | linux, macos |
-| `rustls-pki-types@1.15.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `rustls-webpki@0.103.16` | `ISC` | `ISC` | linux, macos |
+| `rustls-pki-types@1.16.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `rustls-webpki@0.103.17` | `ISC` | `ISC` | linux, macos |
 | `serde@1.0.229` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `serde_core@1.0.229` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `serde_json@1.0.154` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
@@ -62,17 +62,17 @@ and vendored C terms.
 | `toml_parser@1.1.5+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `toml_writer@1.2.0+spec-1.1.0` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `untrusted@0.9.0` | `ISC` | `ISC` | linux, macos |
-| `ureq@3.5.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `ureq@3.5.2` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `ureq-proto@0.7.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `utf8-zero@0.8.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `utf8parse@0.2.2` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
-| `webpki-roots@1.0.11` | `CDLA-Permissive-2.0` | `CDLA-Permissive-2.0` | linux, macos |
+| `webpki-roots@1.0.12` | `CDLA-Permissive-2.0` | `CDLA-Permissive-2.0` | linux, macos |
 | `winnow@1.0.5` | `MIT` | `MIT` | linux, macos |
 | `zeroize@1.9.1` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
 | `zmij@1.0.23` | `MIT` | `MIT` | linux, macos |
-| `zstd@0.14.3` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
-| `zstd-safe@8.2.0` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
-| `zstd-sys@2.1.2+zstd.1.5.7` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
+| `zstd@0.14.4` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
+| `zstd-safe@8.3.0` | `BSD-3-Clause` | `BSD-3-Clause` | linux, macos |
+| `zstd-sys@2.1.3+zstd.1.5.7` | `BSD-3-Clause AND BSD-2-Clause` | `BSD-3-Clause AND BSD-2-Clause` | linux, macos |
 <!-- dependency-list:end -->
 
 ## License text 1
@@ -364,7 +364,7 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
-- errno@0.3.14 `LICENSE-MIT`
+- errno@0.3.15 `LICENSE-MIT`
 
 ````text
 Copyright (c) 2014 Chris Wong
@@ -1189,7 +1189,7 @@ at your option.
 
 Source crates and license files:
 
-- rustls-pki-types@1.15.1 `LICENSE-MIT`
+- rustls-pki-types@1.16.0 `LICENSE-MIT`
 
 ````text
 Copyright (c) 2023 Dirkjan Ochtman <dirkjan@ochtman.nl>
@@ -1223,7 +1223,7 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
-- rustls-webpki@0.103.16 `LICENSE`
+- rustls-webpki@0.103.17 `LICENSE`
 
 ````text
 Except as otherwise noted, this project is licensed under the following
@@ -1427,7 +1427,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Source crates and license files:
 
-- ureq@3.5.1 `LICENSE-MIT`
+- ureq@3.5.2 `LICENSE-MIT`
 
 ````text
 MIT License
@@ -1491,7 +1491,7 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
-- webpki-roots@1.0.11 `LICENSE`
+- webpki-roots@1.0.12 `LICENSE`
 
 ````text
 # Community Data License Agreement - Permissive - Version 2.0
@@ -1622,7 +1622,45 @@ DEALINGS IN THE SOFTWARE.
 
 Source crates and license files:
 
-- zstd-sys@2.1.2+zstd.1.5.7 `LICENSE.BSD-3-Clause`
+- zstd-sys@2.1.3+zstd.1.5.7 `LICENSE.BSD-2-Clause`
+
+````text
+The decoders for legacy formats, in zstd/lib/legacy/, include code under the
+2-clause BSD license:
+
+BSD 2-Clause License
+
+Copyright (C) 2013-2016, Yann Collet.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+````
+
+## License text 41
+
+Source crates and license files:
+
+- zstd-sys@2.1.3+zstd.1.5.7 `LICENSE.BSD-3-Clause`
 
 ````text
 The auto-generated bindings are under the 3-clause BSD license:
@@ -1659,13 +1697,13 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ````
 
-## License text 41
+## License text 42
 
 Source crates and license files:
 
-- zstd@0.14.3 `LICENSE`
-- zstd-safe@8.2.0 `LICENSE`
-- zstd-sys@2.1.2+zstd.1.5.7 `LICENSE`
+- zstd@0.14.4 `LICENSE`
+- zstd-safe@8.3.0 `LICENSE`
+- zstd-sys@2.1.3+zstd.1.5.7 `LICENSE`
 
 ````text
 BSD 3-Clause License
