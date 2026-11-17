@@ -539,7 +539,10 @@ mod tests {
     fn large_rollout_header_limit_includes_newline() {
         let dir = tempfile::tempdir().unwrap();
         let id = identity(Provider::Codex);
-        let r = request(&id, dir.path());
+        let mut r = request(&id, dir.path());
+        // This test pins the byte limit. Deadline behavior has its own tests,
+        // and a wall-clock budget makes this multi-megabyte read flaky under load.
+        r.timeout = Duration::MAX;
         fixture(dir.path(), "session-1", "2026-10-12T00:00:00Z", 26_000);
         let path = dir
             .path()
