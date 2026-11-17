@@ -5,6 +5,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 ## Unreleased
 
 - Pin the OpenSpec CLI to 2.1.0 in `.config/mise.toml`, so `openspec validate` no longer depends on a global install.
+- Remove the wall-clock budget from the Codex rollout header limit test, which could time out on a heavily loaded machine. Deadline behavior keeps its own tests.
 
 ## 0.3.5 (2026-11-13)
 
