@@ -4,6 +4,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Pin the OpenSpec CLI to 2.1.0 in `.config/mise.toml`, so `openspec validate` no longer depends on a global install.
+
 ## 0.3.5 (2026-11-13)
 
 Lineup clarifies downgrade compatibility and expands isolated daemon startup and restart coverage.
