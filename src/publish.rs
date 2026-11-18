@@ -5579,6 +5579,31 @@ mod tests {
         }
     }
 
+    fn configure_blocking_unix_fixture_stream(
+        stream: &std::os::unix::net::UnixStream,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        // Accepted Unix sockets inherit O_NONBLOCK on BSD, even with a timeout.
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(timeout))
+    }
+
+    #[test]
+    fn unix_fixture_clears_inherited_nonblocking_mode() {
+        use std::os::fd::AsRawFd;
+
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Force BSD's accepted-socket mode without depending on accept timing.
+        stream.set_nonblocking(true).unwrap();
+        configure_blocking_unix_fixture_stream(&stream, Duration::from_secs(2)).unwrap();
+
+        // SAFETY: stream owns a live descriptor; F_GETFL takes no third argument.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        assert_eq!(stream.read_timeout().unwrap(), Some(Duration::from_secs(2)));
+    }
+
     #[test]
     fn real_herdr_one_response_per_connection_publishes_heading() {
         let dir = tempfile::tempdir().unwrap();
@@ -5607,8 +5632,7 @@ mod tests {
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            stream
-                                .set_read_timeout(Some(Duration::from_secs(2)))
+                            configure_blocking_unix_fixture_stream(&stream, Duration::from_secs(2))
                                 .unwrap();
                             break BufReader::new(stream);
                         }
