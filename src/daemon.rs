@@ -226,8 +226,46 @@ fn reader_diagnostics_from_raw(raw: &serde_json::Value) -> Option<ReaderDiagnost
     })
 }
 
+/// Latest completed heading stage, with cumulative outcomes per workspace read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GitHeadingDiagnostics {
+    pub interrupted: u64,
+    pub not_attempted: u64,
+    pub unknown: u64,
+    pub workspaces: usize,
+    pub verification_age_ms: std::collections::BTreeMap<String, Option<u64>>,
+}
+
+/// Memory-only diagnostic state shared with the control snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct GitHeadingDiagnosticsHandle(Arc<Mutex<Option<GitHeadingDiagnostics>>>);
+
+impl GitHeadingDiagnosticsHandle {
+    pub(crate) fn record(&self, mut sample: GitHeadingDiagnostics) {
+        let mut latest = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = latest.as_ref() {
+            sample.interrupted = sample.interrupted.saturating_add(previous.interrupted);
+            sample.not_attempted = sample.not_attempted.saturating_add(previous.not_attempted);
+            sample.unknown = sample.unknown.saturating_add(previous.unknown);
+        }
+        *latest = Some(sample);
+    }
+
+    fn sample(&self) -> Option<GitHeadingDiagnostics> {
+        self.0.try_lock().ok()?.clone()
+    }
+}
+
 /// Implementations must bound I/O and clear only plugin-owned metadata.
 pub trait Publisher {
+    fn git_heading_diagnostics(&self) -> Option<GitHeadingDiagnosticsHandle> {
+        None
+    }
+
     /// Advisory reader state; unavailable for publishers without a registry.
     fn reader_diagnostics(&self) -> Option<ReaderDiagnosticsHandle> {
         None
@@ -417,6 +455,7 @@ struct ControlState {
     observation: Option<RefreshObservation>,
     deadline_skips: Option<DeadlineSkipObservation>,
     reader_diagnostics: Option<ReaderDiagnosticsHandle>,
+    git_heading_diagnostics: Option<GitHeadingDiagnosticsHandle>,
     #[cfg(test)]
     write_gate: Option<Arc<ControlTestGate>>,
 }
@@ -428,6 +467,7 @@ impl From<Health> for ControlState {
             observation: None,
             deadline_skips: None,
             reader_diagnostics: None,
+            git_heading_diagnostics: None,
             #[cfg(test)]
             write_gate: None,
         }
@@ -444,6 +484,8 @@ struct ControlResponse<'a> {
     refresh_deadline_skips: Option<&'a DeadlineSkipObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reader_diagnostics: Option<&'a ReaderDiagnosticsData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_heading_diagnostics: Option<GitHeadingDiagnostics>,
 }
 
 #[derive(Debug)]
@@ -452,6 +494,7 @@ pub(crate) struct ControlView {
     pub observation: Option<RefreshObservation>,
     pub deadline_skips: Option<DeadlineSkipObservation>,
     pub reader_diagnostics: Option<ReaderDiagnosticsData>,
+    pub git_heading_diagnostics: Option<GitHeadingDiagnostics>,
 }
 
 struct MeasuredRefresh<'a> {
@@ -774,21 +817,33 @@ fn control_frame(state: &ControlState) -> io::Result<Vec<u8>> {
         refresh_observation: state.observation.as_ref(),
         refresh_deadline_skips: state.deadline_skips.as_ref(),
         reader_diagnostics: readers.as_ref(),
+        git_heading_diagnostics: state
+            .git_heading_diagnostics
+            .as_ref()
+            .and_then(GitHeadingDiagnosticsHandle::sample),
     };
-    for step in 0..3 {
+    loop {
         let bytes = serde_json::to_vec(&response)
             .map_err(|_| io::Error::other("invalid daemon control snapshot"))?;
         // write_frame appends one newline, and read_frame counts that byte.
         if bytes.len() < 8192 {
             return Ok(bytes);
         }
-        match step {
-            0 => response.reader_diagnostics = None,
-            1 => {
-                response.refresh_observation = None;
-                response.refresh_deadline_skips = None;
-            }
-            _ => break,
+        if let Some(git) = response.git_heading_diagnostics.as_mut()
+            && !git.verification_age_ms.is_empty()
+        {
+            git.verification_age_ms.clear();
+        } else if response.git_heading_diagnostics.take().is_some() {
+            continue;
+        } else if response.reader_diagnostics.take().is_some() {
+            continue;
+        } else if response.refresh_observation.is_some()
+            || response.refresh_deadline_skips.is_some()
+        {
+            response.refresh_observation = None;
+            response.refresh_deadline_skips = None;
+        } else {
+            break;
         }
     }
     Err(io::Error::other(
@@ -816,6 +871,12 @@ pub(crate) fn control_view_from_frame(frame: &[u8]) -> io::Result<ControlView> {
         observation,
         deadline_skips,
         reader_diagnostics,
+        git_heading_diagnostics: value
+            .get("git_heading_diagnostics")
+            .and_then(|raw| serde_json::from_value(raw.clone()).ok())
+            .filter(|sample: &GitHeadingDiagnostics| {
+                sample.verification_age_ms.len() <= sample.workspaces
+            }),
     })
 }
 
@@ -1012,6 +1073,7 @@ fn run_locked(
         capacity_skipped_resources: 0,
     });
     state.reader_diagnostics = publisher.reader_diagnostics();
+    state.git_heading_diagnostics = publisher.git_heading_diagnostics();
     fs::write(&paths.pid, format!("{}\n", state.health.pid))?;
     let control = ControlWorker::start(listener, state.clone())?;
     publisher.set_shutdown(control.shutdown.clone());
@@ -4525,6 +4587,7 @@ mod tests {
             observation,
             deadline_skips: None,
             reader_diagnostics: None,
+            git_heading_diagnostics: None,
             #[cfg(test)]
             write_gate: None,
         };
@@ -4787,6 +4850,7 @@ mod tests {
             observation: parsed.observation.clone(),
             deadline_skips: None,
             reader_diagnostics: None,
+            git_heading_diagnostics: None,
             #[cfg(test)]
             write_gate: None,
         };

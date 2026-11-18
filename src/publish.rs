@@ -89,6 +89,9 @@ impl Default for CycleTerms {
 const HEADING_FALLBACK: Duration = Duration::from_secs(30);
 /// Each observation owns at most one Git child at a time.
 const MAX_CONCURRENT_GIT_OBSERVATIONS: usize = 4;
+/// Keep the advisory control sample small even for large snapshots.
+const MAX_GIT_DIAGNOSTIC_WORKSPACES: usize = 32;
+const MAX_GIT_DIAGNOSTIC_ID_BYTES: usize = 64;
 /// Clear runs at shutdown under its own deadline, never a refresh envelope.
 const CLEAR_DEADLINE: Duration = Duration::from_secs(3);
 
@@ -866,6 +869,7 @@ pub struct MetadataPublisher {
     repositories: ship_time::RepositoryCache,
     /// Shared by every refresh's reader cycle for the publisher's lifetime.
     reader_diagnostics: Arc<model::ReaderDiagnostics>,
+    git_heading_diagnostics: daemon::GitHeadingDiagnosticsHandle,
     /// Reset at the start of each refresh; `None` before the first one.
     stages: std::sync::Mutex<Option<StageTimes>>,
     /// Successful `sequences.json` writes. Tests assert one write per report.
@@ -1018,6 +1022,7 @@ impl MetadataPublisher {
             send_queue: FairQueue::default(),
             repositories: ship_time::RepositoryCache::default(),
             reader_diagnostics: Arc::new(model::ReaderDiagnostics::default()),
+            git_heading_diagnostics: daemon::GitHeadingDiagnosticsHandle::default(),
             stages: std::sync::Mutex::new(None),
             #[cfg(test)]
             checkpoint_persists: std::sync::atomic::AtomicU64::new(0),
@@ -2043,6 +2048,10 @@ impl MetadataPublisher {
         let local_now = chrono::Local::now();
         let now = Instant::now();
         let mut by_workspace = BTreeMap::new();
+        let mut diagnostics = daemon::GitHeadingDiagnostics {
+            workspaces: snapshot.workspaces.len(),
+            ..Default::default()
+        };
         for workspace in &snapshot.workspaces {
             let cwd = workspace_cwd(workspace);
             let occupants = panes_by_workspace
@@ -2055,6 +2064,37 @@ impl MetadataPublisher {
                 .remove(&workspace.workspace_id)
                 .or_else(|| cwd.as_ref().and_then(|cwd| by_cwd.get(cwd).cloned()))
                 .unwrap_or(HeadingRead::NotAttempted);
+            let verified_at = match &read {
+                HeadingRead::Confirmed { verified_at, .. } => Some(*verified_at),
+                HeadingRead::Interrupted | HeadingRead::NotAttempted => {
+                    match read {
+                        HeadingRead::Interrupted => diagnostics.interrupted += 1,
+                        _ => diagnostics.not_attempted += 1,
+                    }
+                    self.headings
+                        .get(&workspace.workspace_id)
+                        .filter(|heading| {
+                            Some(heading.cwd.as_path()) == cwd.as_deref()
+                                && heading.occupants == occupants
+                        })
+                        .map(|heading| heading.confirmed)
+                }
+                HeadingRead::Unknown => {
+                    diagnostics.unknown += u64::from(cwd.is_some());
+                    None
+                }
+            };
+            if diagnostics.verification_age_ms.len() < MAX_GIT_DIAGNOSTIC_WORKSPACES
+                && workspace.workspace_id.len() <= MAX_GIT_DIAGNOSTIC_ID_BYTES
+            {
+                let age_ms = verified_at.map(|verified| {
+                    u64::try_from(now.saturating_duration_since(verified).as_millis())
+                        .unwrap_or(u64::MAX)
+                });
+                diagnostics
+                    .verification_age_ms
+                    .insert(workspace.workspace_id.clone(), age_ms);
+            }
             let repository = self.heading_repository(
                 &workspace.workspace_id,
                 cwd.as_deref(),
@@ -2089,6 +2129,7 @@ impl MetadataPublisher {
                 WorkspaceHeading { resolved, desired },
             );
         }
+        self.git_heading_diagnostics.record(diagnostics);
         Ok(Headings { by_workspace })
     }
 
@@ -2492,6 +2533,10 @@ impl MetadataPublisher {
 }
 
 impl daemon::Publisher for MetadataPublisher {
+    fn git_heading_diagnostics(&self) -> Option<daemon::GitHeadingDiagnosticsHandle> {
+        Some(self.git_heading_diagnostics.clone())
+    }
+
     fn reader_diagnostics(&self) -> Option<daemon::ReaderDiagnosticsHandle> {
         Some(daemon::ReaderDiagnosticsHandle::new(
             self.reader_diagnostics.clone(),

@@ -462,12 +462,34 @@ fn deadline_metrics_report(skips: Option<&crate::daemon::DeadlineSkipObservation
     }
 }
 
+fn git_heading_report(git: Option<&crate::daemon::GitHeadingDiagnostics>) -> String {
+    let Some(git) = git else {
+        return "Git headings: unavailable".into();
+    };
+    let mut text = format!(
+        "Git headings: Interrupted {}; NotAttempted {}; explicit Unknown {} (cumulative workspace outcomes); workspace ages {}/{} at latest completed Git stage",
+        git.interrupted,
+        git.not_attempted,
+        git.unknown,
+        git.verification_age_ms.len(),
+        git.workspaces,
+    );
+    for (workspace, age) in &git.verification_age_ms {
+        let age = age.map_or_else(|| "unavailable".into(), |age| format!("{age} ms"));
+        text.push_str(&format!(
+            "\nGit heading {workspace:?}: verification age {age}"
+        ));
+    }
+    text
+}
+
 fn daemon_diagnostic_text(view: &ControlView) -> Result<String, (String, io::Error)> {
     let metrics = format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}",
         refresh_metrics_report(view.observation.as_ref()),
         deadline_metrics_report(view.deadline_skips.as_ref()),
-        reader_metrics_report(view.reader_diagnostics.as_ref())
+        reader_metrics_report(view.reader_diagnostics.as_ref()),
+        git_heading_report(view.git_heading_diagnostics.as_ref())
     );
     let last_refresh_ms = match refresh_diagnostic(&view.health) {
         Ok(last_refresh_ms) => last_refresh_ms,
@@ -1160,6 +1182,7 @@ Refresh counts: reports 2; checkpoints 1"
             observation: Some(observation.clone()),
             deadline_skips: None,
             reader_diagnostics: None,
+            git_heading_diagnostics: None,
         })
         .unwrap_err();
         assert_eq!(failed.1.to_string(), "daemon refresh is unhealthy");
@@ -1176,6 +1199,7 @@ Refresh counts: reports 2; checkpoints 1"
             observation: None,
             deadline_skips: None,
             reader_diagnostics: None,
+            git_heading_diagnostics: None,
         })
         .unwrap_err();
         assert!(
@@ -1192,6 +1216,7 @@ Refresh counts: reports 2; checkpoints 1"
             observation: Some(observation),
             deadline_skips: None,
             reader_diagnostics: None,
+            git_heading_diagnostics: None,
         })
         .unwrap();
         let metrics_at = ready.find("Refresh duration").unwrap();
@@ -1214,6 +1239,32 @@ Refresh counts: reports 2; checkpoints 1"
         assert!(text.contains("Refresh deadline skips: unavailable"));
         assert!(error.to_string().contains("first refresh"));
     }
+    #[test]
+    fn doctor_reports_git_outcomes_and_workspace_verification_ages() {
+        let mut raw = serde_json::json!({
+            "plugin": "herdr-lineup", "socket_path": "/fixture.sock",
+            "socket_key": "fixture", "endpoint": {"device": 1, "inode": 2},
+            "nonce": "synthetic", "pid": 7, "last_refresh_ms": null,
+            "refresh_failed": false,
+            "git_heading_diagnostics": {
+                "interrupted": 3, "not_attempted": 5, "unknown": 1,
+                "workspaces": 3, "verification_age_ms": {"w1": 29000, "w2": null}
+            }
+        });
+        let render = |raw: &serde_json::Value| {
+            let view =
+                crate::daemon::control_view_from_frame(&serde_json::to_vec(raw).unwrap()).unwrap();
+            daemon_diagnostic_text(&view).unwrap_err().0
+        };
+        let text = render(&raw);
+        assert!(text.contains("Git headings: Interrupted 3; NotAttempted 5; explicit Unknown 1"));
+        assert!(text.contains("workspace ages 2/3"));
+        assert!(text.contains("Git heading \"w1\": verification age 29000 ms"));
+        assert!(text.contains("Git heading \"w2\": verification age unavailable"));
+        raw["git_heading_diagnostics"]["unknown"] = serde_json::json!(-1);
+        assert!(render(&raw).contains("Git headings: unavailable"));
+    }
+
     // Formatting must never copy arbitrary wire labels or claim an unmeasured wait is zero.
     #[test]
     fn reader_doctor_uses_fixed_labels_units_and_retained_deadline_meaning() {
