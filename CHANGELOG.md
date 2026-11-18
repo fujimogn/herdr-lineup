@@ -4,6 +4,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Maintenance: **Foreground startup tests** check the exit status and stderr when the foreground wrapper rejects a relative socket or state path.
+
 ## 0.3.6 (2026-11-18)
 
 Lineup makes daemon and quota test coverage more reliable and refreshes development tools and compatible Rust dependencies.

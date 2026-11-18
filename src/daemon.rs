@@ -1508,12 +1508,7 @@ mod tests {
     use std::io::BufRead;
     use std::os::unix::ffi::OsStrExt;
 
-    fn fixture() -> (
-        tempfile::TempDir,
-        Options,
-        Arc<AtomicBool>,
-        std::thread::JoinHandle<()>,
-    ) {
+    fn fixture_paths() -> (tempfile::TempDir, Options) {
         let dir = tempfile::Builder::new()
             .prefix("herdr-lineup-daemon-")
             .tempdir_in("/tmp")
@@ -1524,6 +1519,16 @@ mod tests {
             config: dir.path().join("config"),
         };
         std::fs::create_dir(&options.config).unwrap();
+        (dir, options)
+    }
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        Options,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (dir, options) = fixture_paths();
         let listener = std::os::unix::net::UnixListener::bind(&options.socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let done = Arc::new(AtomicBool::new(false));
@@ -1727,13 +1732,28 @@ mod tests {
     #[ignore = "isolated daemon subprocess entry point"]
     fn child_entry() {
         if std::env::var_os("LINEUP_TEST_FOREGROUND_WRAPPER").is_some() {
-            let options = Options::from_env().unwrap();
+            let mut options = Options::from_env().unwrap();
             crate::test_support::require_isolated_runtime(&options).unwrap();
+            let cwd_record = options.state.join("wrapper-cwd");
+            if let Ok(field) = std::env::var("LINEUP_TEST_FOREGROUND_RELATIVE_PATH") {
+                // The CLI screens relative paths. Supply one directly to the
+                // wrapper, keeping its resolution inside the validated fixture.
+                let path = match field.as_str() {
+                    "socket" => &mut options.socket,
+                    "state" => &mut options.state,
+                    _ => panic!("unexpected relative path field: {field}"),
+                };
+                assert_eq!(
+                    fs::canonicalize(path.parent().unwrap()).unwrap(),
+                    fs::canonicalize(".").unwrap()
+                );
+                *path = PathBuf::from(path.file_name().unwrap());
+            }
             // Keep the existing injected-publisher entry points below intact.
             // Only this isolated child exercises the public startup wrapper.
             let result = foreground(&options);
             fs::write(
-                options.state.join("wrapper-cwd"),
+                cwd_record,
                 std::env::current_dir().unwrap().as_os_str().as_bytes(),
             )
             .unwrap();
@@ -2528,6 +2548,44 @@ mod tests {
             drop(cleanup);
             server.join().unwrap();
         }
+    }
+
+    fn assert_foreground_wrapper_rejects_relative_path(field: &str) {
+        let (dir, options) = fixture_paths();
+        fs::create_dir(&options.state).unwrap();
+        // If the wrapper continues past path validation, loading config fails
+        // with a different error before starting the daemon.
+        fs::write(options.config.join("config.toml"), "unknown_key = true\n").unwrap();
+        let output = foreground_wrapper_command(dir.path(), &options)
+            .env("LINEUP_TEST_FOREGROUND_RELATIVE_PATH", field)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.lines().any(|line| {
+                line == "foreground wrapper: socket and state directory must be absolute paths"
+            }),
+            "{stderr}"
+        );
+        assert_eq!(
+            fs::read_dir(&options.state)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            ["wrapper-cwd"],
+            "path validation must return before creating runtime state"
+        );
+    }
+
+    #[test]
+    fn foreground_wrapper_rejects_relative_socket_path() {
+        assert_foreground_wrapper_rejects_relative_path("socket");
+    }
+
+    #[test]
+    fn foreground_wrapper_rejects_relative_state_path() {
+        assert_foreground_wrapper_rejects_relative_path("state");
     }
 
     #[test]

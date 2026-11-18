@@ -21,10 +21,22 @@ Work waiting for the next release is in the `Unreleased` section of
   inherited/non-inherited lock selection, the real publisher, sequence handover,
   private cwd setup, a returned config error's runtime log, and pre-run directory
   setup failures from a regular-file runtime root (EEXIST) or a symlink runtime
-  root (stderr and exit status). Kernel crash/power loss, macOS disks, scheduler
-  interleavings, other setup failures before `run_foreground` (owner, metadata,
-  permission, cwd-change, and publisher-construction errors), other runtime error
-  sources, and other config options remain unverified.
+  root. Pre-run tests check stderr and exit status for those failures and for
+  `RuntimePaths::new` rejecting a relative socket or state path passed directly
+  to the wrapper. Ownership mismatch remains unverified because a same-user
+  fixture cannot assign the directory to another UID. Metadata and chmod
+  failures remain unverified. Making metadata lookup fail after directory
+  creation needs a path change or filesystem fault. The Linux read-only bind
+  fixture for chmod requires unprivileged user namespaces, which macOS lacks
+  and CI may disable. The `set_current_dir` failure remains unverified because
+  setup gives the owner search permission with mode 0700. The proposed
+  directory-removal fixture would insert a test-only hook between setup and
+  the cwd change.
+  Publisher construction performs no state I/O, and its only validation
+  receives an absolute directory and a nonempty key from `RuntimePaths::new`,
+  making its error unreachable through the wrapper. Kernel crash/power loss,
+  macOS disks, scheduler interleavings, other runtime error sources, and other
+  config options remain unverified.
   Actual 0.3.3 and 0.1.0 release-profile rollback and return to 0.3.4 are
   [recorded on Linux](docs/reviews/old-binary-rollback-2026-11-13.md); other old
   releases, checkpoint shapes, and crash rollback remain unverified.
