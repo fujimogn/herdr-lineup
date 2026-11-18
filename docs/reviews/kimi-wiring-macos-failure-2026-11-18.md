@@ -58,7 +58,7 @@ the investigation base, before this patch.
 | File / function | Evidence |
 | --- | --- |
 | `src/publish.rs`, `serve_kimi_fixture`, historical lines 2756–2821; base lines 2809–2874 | The listener is nonblocking. Accepted streams receive a two-second read timeout but no blocking-mode reset. Every read error breaks the header loop. A missing matching bearer token selects 401. Response write errors are ignored. |
-| `src/publish.rs`, `kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset`, historical lines 3874–4160; base lines 3927–4264 | The parent binds loopback before spawning one exact child test. It supplies an isolated HOME/Kimi home, a loopback endpoint and 100 ms polling; removes provider/base-URL/Herdr overrides; and uses no real Herdr session or account. |
+| `src/publish.rs`, `kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset`, historical lines 3874–4160; base lines 3927–4229 | The parent binds loopback before spawning one exact child test. It supplies an isolated HOME/Kimi home, a loopback endpoint and 100 ms polling; removes provider/base-URL/Herdr overrides; and uses no real Herdr session or account. |
 | Same test, historical lines 3894–3936 | Both child output streams are piped, but only stderr is read after exit. The parent has a distinct 60-second timeout message. Libtest captures a failing test's panic output in its stdout report, so empty stderr is compatible with an ordinary assertion failure. It is not evidence of a signal or silent crash. |
 | Same test, historical lines 3996–4009, 4032 onward | Individual phase waits are five seconds; clearing/expiry waits are eight seconds. An initial opt-out check sleeps 400 ms. The 5.824 s failure is compatible with a five-second phase wait, but does not identify which phase. |
 | Same test, historical lines 4046–4060, 4114–4158 | Reply scripts use rename replacement; credential writes truncate in place. Reset and credential expiry are set roughly four seconds ahead. The test checks success, rotation, transient retention, reset-less clearing, reset clearing and credential expiry. |
@@ -104,7 +104,11 @@ explanation from code and platform sources, not a recovered packet trace.
    explanation.** It directly explains the OS asymmetry and premature
    unauthorized/transient replies. A deterministic Linux regression fails
    before normalization and passes after it. The old CI log cannot tie the
-   particular child failure to one request or phase.
+   particular child failure to one request or phase. In particular, an
+   unintended 401 during the transient-retention phase would clear the 50%
+   sample; subsequent scripted 500 replies cannot recreate it. The phase
+   would then reach its five-second deadline even if later requests are read
+   correctly. This fits the elapsed time but remains an unverified sequence.
 2. **Credential replacement/source observation race: possible, weaker.**
    Truncating credential writes can expose an empty/partial file or changed
    stamp to a concurrent poll. The source guards intentionally clear mixed
@@ -140,7 +144,9 @@ client and quota behavior are unchanged.
 
 `kimi_fixture_clears_inherited_nonblocking_mode` uses a real loopback socket,
 explicitly forces its accepted stream into nonblocking mode on every OS,
-then invokes the same setup as the fixture. It checks the kernel's `F_GETFL`
+then invokes the same setup as the fixture. Its listener stays blocking so
+accept waits for the connection queue independently of client scheduling.
+It checks the kernel's `F_GETFL`
 result to prove `O_NONBLOCK` is cleared and the two-second timeout is retained.
 There is no sleep, request-arrival race, retry, skip or external server. It
 tests the normalization boundary; the existing wiring test supplies the

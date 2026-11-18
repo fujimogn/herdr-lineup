@@ -2820,7 +2820,6 @@ mod tests {
         use std::os::fd::AsRawFd;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().unwrap();
         // Reproduce BSD's accepted-socket mode even on Linux, without relying
