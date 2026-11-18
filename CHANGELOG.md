@@ -5,6 +5,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 ## Unreleased
 
 - Maintenance: **Foreground startup tests** check the exit status and stderr when the foreground wrapper rejects a relative socket or state path.
+- Maintenance: **Daemon idle wakeups** use inotify to wait for socket changes and an explicit wakeup for shutdown on Linux. macOS and Linux paths without a usable watch keep the 100 ms endpoint check.
 
 ## 0.3.6 (2026-11-18)
 
