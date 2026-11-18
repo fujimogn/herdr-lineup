@@ -19,9 +19,12 @@ Work waiting for the next release is in the `Unreleased` section of
   daemon restarting after provider disablement and clearing retained provider keys
   above the old sequence window. Dedicated `foreground` wrapper fixtures cover
   inherited/non-inherited lock selection, the real publisher, sequence handover,
-  private cwd setup, and a returned config error's runtime log. Kernel crash/power
-  loss, macOS disks, scheduler interleavings, setup failures before `run_foreground`,
-  other runtime error sources, and other config options remain unverified.
+  private cwd setup, a returned config error's runtime log, and pre-run directory
+  setup failures from a regular-file runtime root (EEXIST) or a symlink runtime
+  root (stderr and exit status). Kernel crash/power loss, macOS disks, scheduler
+  interleavings, other setup failures before `run_foreground` (owner, metadata,
+  permission, cwd-change, and publisher-construction errors), other runtime error
+  sources, and other config options remain unverified.
   Actual 0.3.3 and 0.1.0 release-profile rollback and return to 0.3.4 are
   [recorded on Linux](docs/reviews/old-binary-rollback-2026-11-13.md); other old
   releases, checkpoint shapes, and crash rollback remain unverified.

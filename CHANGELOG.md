@@ -4,9 +4,14 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
-- Update Rust dependencies to their latest compatible versions (clap 4.6.8 and its lock).
-- Pin the OpenSpec CLI to 2.1.0 in `.config/mise.toml`, so `openspec validate` no longer depends on a global install.
-- Remove the wall-clock budget from the Codex rollout header limit test, which could time out on a heavily loaded machine. Deadline behavior keeps its own tests.
+## 0.3.6 (2026-11-18)
+
+Lineup makes test coverage more reliable and refreshes development tools and compatible Rust dependencies.
+
+- Fix: **Codex header tests** remove the wall-clock budget from the rollout header limit test, which could time out on a heavily loaded machine. Deadline behavior keeps its own tests.
+- Maintenance: **Foreground startup tests** add isolated coverage for private runtime directory setup failures caused by a regular-file root or a symlink root, checking the returned error on stderr and the nonzero exit status before the daemon starts.
+- Maintenance: **Dependencies** update Rust dependencies to their latest compatible versions, including clap 4.6.8 and its lockfile entries, and refresh the locked dependency license notices.
+- Maintenance: **OpenSpec CLI** pins version 2.1.0 in `.config/mise.toml`, so `openspec validate` no longer depends on a global install.
 
 ## 0.3.5 (2026-11-13)
 

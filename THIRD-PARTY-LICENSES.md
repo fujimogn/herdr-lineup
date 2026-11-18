@@ -21,9 +21,9 @@ and vendored C terms.
 | `bytes@1.12.1` | `MIT` | `MIT` | linux, macos |
 | `cfg-if@1.0.5` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `chrono@0.4.45` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `clap@4.6.7` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `clap@4.6.8` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `clap_builder@4.6.7` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
-| `clap_lex@1.1.1` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
+| `clap_lex@1.1.2` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `colorchoice@1.0.5` | `MIT OR Apache-2.0` | `MIT` | linux, macos |
 | `core-foundation-sys@0.8.7` | `MIT OR Apache-2.0` | `MIT` | macos |
 | `equivalent@1.0.3` | `Apache-2.0 OR MIT` | `MIT` | linux, macos |
@@ -83,9 +83,9 @@ Source crates and license files:
 - anstyle@1.0.14 `LICENSE-MIT`
 - anstyle-parse@1.0.0 `LICENSE-MIT`
 - anstyle-query@1.1.5 `LICENSE-MIT`
-- clap@4.6.7 `LICENSE-MIT`
+- clap@4.6.8 `LICENSE-MIT`
 - clap_builder@4.6.7 `LICENSE-MIT`
-- clap_lex@1.1.1 `LICENSE-MIT`
+- clap_lex@1.1.2 `LICENSE-MIT`
 - colorchoice@1.0.5 `LICENSE-MIT`
 - is_terminal_polyfill@1.70.2 `LICENSE-MIT`
 - serde_spanned@1.1.3 `LICENSE-MIT`
