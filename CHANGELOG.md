@@ -4,8 +4,11 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
-- Fix: **Sidebar headings** retain the last verified display for up to 120 seconds during interrupted Git reads and prioritize heading checks by their verification cutoff.
+## 0.3.7 (2026-11-18)
 
+Lineup keeps verified sidebar headings visible during Git stalls, reduces idle daemon wakeups, and expands foreground startup error coverage.
+
+- Fix: **Sidebar headings** retain the last verified display for up to 120 seconds during interrupted Git reads and prioritize heading checks by their verification cutoff.
 - Maintenance: **Foreground startup tests** check the exit status and stderr when the foreground wrapper rejects a relative socket or state path.
 - Maintenance: **Daemon idle wakeups** replace the control worker's 100 ms poll with an explicit shutdown wakeup on Linux and macOS. On Linux, supported socket paths use inotify to wait for changes. macOS and Linux paths without a usable watch keep the 100 ms endpoint check.
 
