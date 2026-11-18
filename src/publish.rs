@@ -86,7 +86,7 @@ impl Default for CycleTerms {
 }
 
 /// A heading not confirmed by Git for this long is no longer published.
-const HEADING_FALLBACK: Duration = Duration::from_secs(30);
+const HEADING_FALLBACK: Duration = Duration::from_secs(120);
 /// Each observation owns at most one Git child at a time.
 const MAX_CONCURRENT_GIT_OBSERVATIONS: usize = 4;
 /// Keep the advisory control sample small even for large snapshots.
@@ -780,8 +780,28 @@ struct HeadingCache {
     cwd: PathBuf,
     occupants: Vec<(String, Option<tokens::Occupant>)>,
     repository: ship_time::Repository,
+    ship_text: String,
     /// The original Git verification instant; a fallback never renews it.
     confirmed: Instant,
+}
+
+impl HeadingCache {
+    fn matches(
+        &self,
+        cwd: Option<&Path>,
+        occupants: &[(String, Option<tokens::Occupant>)],
+    ) -> bool {
+        Some(self.cwd.as_path()) == cwd && self.occupants == occupants
+    }
+
+    fn within_grace(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.confirmed) < HEADING_FALLBACK
+    }
+}
+
+struct HeadingInput<'a> {
+    cwd: Option<&'a Path>,
+    occupants: Vec<(String, Option<tokens::Occupant>)>,
 }
 
 struct RefreshInventory {
@@ -1061,8 +1081,47 @@ impl MetadataPublisher {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(StageTimes::default());
     }
 
-    /// Decide the published repository: Confirmed, a bounded Fallback for an
-    /// interrupted or unattempted read, or `None` for Unknown.
+    /// Update the memory-only heading, keeping the exact rendered values on fallback.
+    fn update_heading(
+        &mut self,
+        workspace: &str,
+        cwd: Option<&Path>,
+        occupants: &[(String, Option<tokens::Occupant>)],
+        read: HeadingRead,
+        now: Instant,
+        local_now: &chrono::DateTime<chrono::Local>,
+    ) -> Option<&HeadingCache> {
+        match (cwd, read) {
+            (
+                Some(cwd),
+                HeadingRead::Confirmed {
+                    repository,
+                    verified_at,
+                },
+            ) => {
+                self.headings.insert(
+                    workspace.into(),
+                    HeadingCache {
+                        cwd: cwd.to_owned(),
+                        occupants: occupants.to_vec(),
+                        ship_text: ship_time::format_ship_time(repository.ship_unix, local_now),
+                        repository,
+                        confirmed: verified_at,
+                    },
+                );
+            }
+            (_, HeadingRead::Interrupted | HeadingRead::NotAttempted)
+                if self.headings.get(workspace).is_some_and(|previous| {
+                    previous.matches(cwd, occupants) && previous.within_grace(now)
+                }) => {}
+            _ => {
+                self.headings.remove(workspace);
+            }
+        }
+        self.headings.get(workspace)
+    }
+
+    #[cfg(test)]
     fn heading_repository(
         &mut self,
         workspace: &str,
@@ -1071,51 +1130,8 @@ impl MetadataPublisher {
         read: HeadingRead,
         now: Instant,
     ) -> Option<ship_time::Repository> {
-        let Some(cwd) = cwd else {
-            self.headings.remove(workspace);
-            return None;
-        };
-        if self
-            .headings
-            .get(workspace)
-            .is_some_and(|previous| previous.cwd != cwd || previous.occupants != occupants)
-        {
-            self.headings.remove(workspace);
-        }
-        match read {
-            HeadingRead::Confirmed {
-                repository,
-                verified_at,
-            } => {
-                self.headings.insert(
-                    workspace.into(),
-                    HeadingCache {
-                        cwd: cwd.to_owned(),
-                        occupants: occupants.to_vec(),
-                        repository: repository.clone(),
-                        confirmed: verified_at,
-                    },
-                );
-                Some(repository)
-            }
-            HeadingRead::Interrupted | HeadingRead::NotAttempted => {
-                let fresh = self.headings.get(workspace).is_some_and(|previous| {
-                    now.saturating_duration_since(previous.confirmed) < HEADING_FALLBACK
-                });
-                if fresh {
-                    self.headings
-                        .get(workspace)
-                        .map(|previous| previous.repository.clone())
-                } else {
-                    self.headings.remove(workspace);
-                    None
-                }
-            }
-            HeadingRead::Unknown => {
-                self.headings.remove(workspace);
-                None
-            }
-        }
+        self.update_heading(workspace, cwd, occupants, read, now, &chrono::Local::now())
+            .map(|heading| heading.repository.clone())
     }
 
     #[cfg(test)]
@@ -1853,6 +1869,52 @@ impl MetadataPublisher {
         result
     }
 
+    fn prioritize_git(
+        &self,
+        pass: &mut [String],
+        inputs: &BTreeMap<&str, HeadingInput<'_>>,
+        now: Instant,
+    ) {
+        let verified = |id: &String| {
+            let input = &inputs[id.as_str()];
+            self.headings
+                .get(id)
+                .filter(|heading| {
+                    heading.matches(input.cwd, &input.occupants) && heading.within_grace(now)
+                })
+                .map(|heading| heading.confirmed)
+        };
+        // Stable sort preserves attempt-based rotation among equal deadlines
+        // and among headings without a valid confirmation.
+        pass.sort_by_cached_key(|id| {
+            let instant = verified(id);
+            (instant.is_none(), instant)
+        });
+        let preferred = pass.partition_point(|id| verified(id).is_some());
+        let mut preferred_cwds = BTreeSet::new();
+        let mut last_first_batch_slot = None;
+        for (index, id) in pass[..preferred].iter().enumerate() {
+            let cwd = inputs[id.as_str()]
+                .cwd
+                .expect("confirmed heading has a cwd");
+            if preferred_cwds.insert(cwd) && preferred_cwds.len() == MAX_CONCURRENT_GIT_OBSERVATIONS
+            {
+                last_first_batch_slot = Some(index);
+            }
+        }
+        // Reserve one slot in the first batch for a distinct cwd without a
+        // current heading. Additional discovery uses any remaining budget.
+        if let Some(slot) = last_first_batch_slot
+            && let Some(discovery) = (preferred..pass.len()).find(|&index| {
+                inputs[pass[index].as_str()]
+                    .cwd
+                    .is_some_and(|cwd| !preferred_cwds.contains(cwd))
+            })
+        {
+            pass[slot..=discovery].rotate_right(1);
+        }
+    }
+
     fn resolve_headings_in_budget(
         &mut self,
         inventory: &RefreshInventory,
@@ -1868,30 +1930,34 @@ impl MetadataPublisher {
                 .or_default()
                 .push(pane);
         }
-        let workspace_cwd = |workspace: &protocol::Workspace| {
-            let panes: Vec<_> = panes_by_workspace
-                .get(workspace.workspace_id.as_str())
-                .into_iter()
-                .flatten()
-                .map(|pane| (pane.pane_id.as_str(), pane.cwd.as_deref().map(Path::new)))
-                .collect();
-            ship_time::resolve_workspace_cwd(
-                workspace.checkout_path.as_deref().map(Path::new),
-                &panes,
-            )
-            .map(Path::to_path_buf)
-        };
-        let workspaces: BTreeMap<&str, &protocol::Workspace> = snapshot
+        let inputs: BTreeMap<_, _> = snapshot
             .workspaces
             .iter()
-            .map(|workspace| (workspace.workspace_id.as_str(), workspace))
+            .map(|workspace| {
+                let id = workspace.workspace_id.as_str();
+                let panes = panes_by_workspace.get(id).map_or(&[][..], Vec::as_slice);
+                let pane_cwds: Vec<_> = panes
+                    .iter()
+                    .map(|pane| (pane.pane_id.as_str(), pane.cwd.as_deref().map(Path::new)))
+                    .collect();
+                let cwd = ship_time::resolve_workspace_cwd(
+                    workspace.checkout_path.as_deref().map(Path::new),
+                    &pane_cwds,
+                );
+                let occupants = panes
+                    .iter()
+                    .map(|pane| (pane.pane_id.clone(), pane.occupant.clone()))
+                    .collect();
+                (id, HeadingInput { cwd, occupants })
+            })
             .collect();
-        let pass = self.git_queue.sync(
+        let mut pass = self.git_queue.sync(
             snapshot
                 .workspaces
                 .iter()
                 .map(|workspace| workspace.workspace_id.clone()),
         );
+        self.prioritize_git(&mut pass, &inputs, started);
         // `reads` doubles as the visited set: no workspace is read twice.
         let mut reads: BTreeMap<String, HeadingRead> = BTreeMap::new();
         let mut by_cwd: BTreeMap<PathBuf, HeadingRead> = BTreeMap::new();
@@ -1905,20 +1971,17 @@ impl MetadataPublisher {
                 if reads.contains_key(&id) {
                     continue;
                 }
-                let Some(workspace) = workspaces.get(id.as_str()) else {
-                    continue;
-                };
                 self.check_shutdown()?;
-                let read = match workspace_cwd(workspace) {
+                let read = match inputs[id.as_str()].cwd {
                     None => HeadingRead::Unknown,
-                    Some(cwd) => match by_cwd.get(&cwd) {
+                    Some(cwd) => match by_cwd.get(cwd) {
                         // A shared result starts no Git I/O, so it does not rotate.
                         Some(shared) => shared.clone(),
                         None if Instant::now() >= git_deadline => HeadingRead::NotAttempted,
                         None => {
                             self.git_queue.rotate(&id);
-                            let read = self.read_heading(&cwd, git_deadline);
-                            by_cwd.insert(cwd, read.clone());
+                            let read = self.read_heading(cwd, git_deadline);
+                            by_cwd.insert(cwd.to_owned(), read.clone());
                             read
                         }
                     },
@@ -1933,22 +1996,19 @@ impl MetadataPublisher {
                 let mut batch = Vec::new();
                 let mut scheduled = BTreeSet::new();
                 for id in pending.by_ref() {
-                    let Some(workspace) = workspaces.get(id.as_str()) else {
-                        continue;
-                    };
-                    let Some(cwd) = workspace_cwd(workspace) else {
+                    let Some(cwd) = inputs[id.as_str()].cwd else {
                         reads.insert(id, HeadingRead::Unknown);
                         continue;
                     };
-                    if let Some(shared) = by_cwd.get(&cwd) {
+                    if let Some(shared) = by_cwd.get(cwd) {
                         reads.insert(id, shared.clone());
                     } else if scheduled.contains(&cwd) {
                         // Its starter in this batch supplies the shared result.
                     } else if Instant::now() >= git_deadline {
                         reads.insert(id, HeadingRead::NotAttempted);
                     } else {
-                        scheduled.insert(cwd.clone());
-                        batch.push((id, cwd));
+                        scheduled.insert(cwd);
+                        batch.push((id, cwd.to_owned()));
                         if batch.len() == MAX_CONCURRENT_GIT_OBSERVATIONS {
                             break;
                         }
@@ -2053,16 +2113,11 @@ impl MetadataPublisher {
             ..Default::default()
         };
         for workspace in &snapshot.workspaces {
-            let cwd = workspace_cwd(workspace);
-            let occupants = panes_by_workspace
-                .get(workspace.workspace_id.as_str())
-                .into_iter()
-                .flatten()
-                .map(|pane| (pane.pane_id.clone(), pane.occupant.clone()))
-                .collect::<Vec<_>>();
+            let input = &inputs[workspace.workspace_id.as_str()];
+            let cwd = input.cwd;
             let read = reads
                 .remove(&workspace.workspace_id)
-                .or_else(|| cwd.as_ref().and_then(|cwd| by_cwd.get(cwd).cloned()))
+                .or_else(|| cwd.and_then(|cwd| by_cwd.get(cwd).cloned()))
                 .unwrap_or(HeadingRead::NotAttempted);
             let verified_at = match &read {
                 HeadingRead::Confirmed { verified_at, .. } => Some(*verified_at),
@@ -2073,10 +2128,7 @@ impl MetadataPublisher {
                     }
                     self.headings
                         .get(&workspace.workspace_id)
-                        .filter(|heading| {
-                            Some(heading.cwd.as_path()) == cwd.as_deref()
-                                && heading.occupants == occupants
-                        })
+                        .filter(|heading| heading.matches(cwd, &input.occupants))
                         .map(|heading| heading.confirmed)
                 }
                 HeadingRead::Unknown => {
@@ -2095,29 +2147,24 @@ impl MetadataPublisher {
                     .verification_age_ms
                     .insert(workspace.workspace_id.clone(), age_ms);
             }
-            let repository = self.heading_repository(
+            let heading = self.update_heading(
                 &workspace.workspace_id,
-                cwd.as_deref(),
-                &occupants,
+                cwd,
+                &input.occupants,
                 read,
                 now,
+                &local_now,
             );
-            let resolved = repository.is_some();
+            let resolved = heading.is_some();
             // Unknown publishes null, never `—`: absence was not confirmed.
-            let desired = match repository {
-                Some(repository) => BTreeMap::from([
+            let desired = match heading {
+                Some(heading) => BTreeMap::from([
                     (
                         "lineup_ship_unix".into(),
-                        repository.ship_unix.map(|unix| unix.to_string()),
+                        heading.repository.ship_unix.map(|unix| unix.to_string()),
                     ),
-                    (
-                        "lineup_ship_text".into(),
-                        Some(ship_time::format_ship_time(
-                            repository.ship_unix,
-                            &local_now,
-                        )),
-                    ),
-                    ("lineup_repo".into(), Some(repository.name)),
+                    ("lineup_ship_text".into(), Some(heading.ship_text.clone())),
+                    ("lineup_repo".into(), Some(heading.repository.name.clone())),
                 ]),
                 None => tokens::WORKSPACE_KEYS
                     .iter()
@@ -3720,7 +3767,7 @@ mod tests {
     // F14 and F18: the fallback is bounded by the original verification
     // instant, even when the occupants never change.
     #[test]
-    fn heading_fallback_expires_thirty_seconds_after_the_original_verification() {
+    fn heading_fallback_expires_at_120_seconds_after_original_verification() {
         let dir = tempfile::tempdir().unwrap();
         let mut publisher =
             MetadataPublisher::new(dir.path().to_owned(), "fake".into(), Homes::default()).unwrap();
@@ -3732,31 +3779,99 @@ mod tests {
         let t0 = Instant::now();
         let at = |seconds: u64| t0 + Duration::from_secs(seconds);
         publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, t0), t0);
+        for (seconds, read) in [
+            (29, HeadingRead::Interrupted),
+            (30, HeadingRead::NotAttempted),
+            (119, HeadingRead::Interrupted),
+        ] {
+            assert_eq!(
+                publisher.heading_repository("w1", Some(cwd), &[], read, at(seconds)),
+                Some(repo.clone()),
+                "fallback changed at {seconds} s"
+            );
+        }
         assert_eq!(
-            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(29)),
-            Some(repo.clone()),
-            "fallback must hold just before 30 s"
-        );
-        assert_eq!(
-            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(30)),
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::NotAttempted, at(120)),
             None,
-            "fallback must end at 30 s"
+            "fallback must end at 120 s"
         );
         assert_eq!(
-            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(31)),
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(121)),
             None,
             "an expired heading is not retained by occupant equality"
         );
 
         // A cache hit inherits its root's old verification and does not renew it.
-        let root_verified = t0.checked_sub(Duration::from_secs(25)).unwrap();
-        publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, root_verified), t0);
+        publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, t0), at(25));
         assert_eq!(
-            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::NotAttempted, at(4)),
-            Some(repo.clone())
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::NotAttempted, at(119)),
+            Some(repo)
         );
         assert_eq!(
-            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::NotAttempted, at(5)),
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::Interrupted, at(120)),
+            None
+        );
+    }
+
+    #[test]
+    fn interrupted_heading_keeps_the_confirmed_ship_text_across_local_midnight() {
+        use chrono::TimeZone;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut publisher =
+            MetadataPublisher::new(dir.path().to_owned(), "fake".into(), Homes::default()).unwrap();
+        let cwd = Some(Path::new("/synthetic/repo"));
+        let local = |day, hour, minute| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 1, day, hour, minute, 0)
+                .single()
+                .unwrap()
+        };
+        let repo = ship_time::Repository {
+            name: "repo".into(),
+            ship_unix: Some(local(16, 16, 30).timestamp()),
+        };
+        let t0 = Instant::now();
+        let confirmed_heading = publisher
+            .update_heading("w1", cwd, &[], confirmed(&repo, t0), t0, &local(16, 23, 59))
+            .unwrap();
+        assert_eq!(confirmed_heading.ship_text, "16:30");
+
+        let t1 = t0 + Duration::from_secs(60);
+        let next_day = local(17, 0, 0);
+        let interrupted = publisher
+            .update_heading("w1", cwd, &[], HeadingRead::Interrupted, t1, &next_day)
+            .unwrap();
+        assert_eq!(interrupted.ship_text, "16:30");
+        assert_eq!(interrupted.repository, repo);
+        let updated = publisher
+            .update_heading("w1", cwd, &[], confirmed(&repo, t1), t1, &next_day)
+            .unwrap();
+        assert_eq!(updated.ship_text, "1/16");
+    }
+
+    #[test]
+    fn missing_workspace_discards_the_heading_even_if_its_identity_reappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(2000, 1000, 100));
+        publisher.endpoint = Some("fake:1:2".into());
+        let cwd = Path::new("/synthetic/repo");
+        let repo = ship_time::Repository {
+            name: "repo".into(),
+            ship_unix: Some(123),
+        };
+        let now = Instant::now();
+        publisher.heading_repository("w1", Some(cwd), &[], confirmed(&repo, now), now);
+        publisher
+            .reconcile_missing(&protocol::Snapshot {
+                version: "0.9.3".into(),
+                protocol: 22,
+                panes: vec![],
+                workspaces: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            publisher.heading_repository("w1", Some(cwd), &[], HeadingRead::NotAttempted, now),
             None
         );
     }
@@ -9765,6 +9880,91 @@ mod tests {
         assert!(
             paths.iter().all(|path| path.join("pids").exists()),
             "unattempted cwd must advance next cycle"
+        );
+    }
+
+    #[test]
+    fn git_reads_nearest_cutoff_first_and_reserves_one_slot_for_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut publisher = budget_publisher(dir.path(), budget_terms(2000, 1000, 100));
+        let older = Instant::now();
+        let started = older + Duration::from_secs(119);
+        let work = [
+            ("new-first", "new-first", None),
+            ("recent", "recent", Some(100)),
+            ("new-second", "new-second", None),
+            ("shared", "urgent", None),
+            ("third", "third", Some(70)),
+            ("next", "next", Some(30)),
+            ("urgent", "urgent", Some(0)),
+        ];
+        let workspaces = work
+            .into_iter()
+            .map(|(id, cwd, verified)| {
+                let cwd = dir.path().join(cwd);
+                if let Some(offset) = verified {
+                    let repository = ship_time::Repository {
+                        name: id.into(),
+                        ship_unix: None,
+                    };
+                    let verified = older + Duration::from_secs(offset);
+                    publisher.heading_repository(
+                        id,
+                        Some(&cwd),
+                        &[],
+                        confirmed(&repository, verified),
+                        started,
+                    );
+                }
+                protocol::Workspace {
+                    workspace_id: id.into(),
+                    checkout_path: cwd.to_str().map(String::from),
+                    stored_keys: BTreeSet::new(),
+                }
+            })
+            .collect();
+        let inventory = RefreshInventory {
+            snapshot: protocol::Snapshot {
+                version: "0.9.3".into(),
+                protocol: 22,
+                panes: vec![],
+                workspaces,
+            },
+            now_unix: 0,
+            mode: tokens::LogoMode::Text,
+            first_panes: BTreeSet::new(),
+            codex_weekly: None,
+            grok_weekly: None,
+            kimi_weekly: None,
+        };
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = reads.clone();
+        publisher.hooks.git = Some(Box::new(move |cwd, _| {
+            let name = cwd.file_name().unwrap().to_str().unwrap();
+            seen.lock().unwrap().push(name.to_owned());
+            git_observation(name, None)
+        }));
+        let headings = publisher
+            .resolve_headings_in_budget(&inventory, started + Duration::from_secs(1), started)
+            .unwrap();
+        assert_eq!(
+            *reads.lock().unwrap(),
+            [
+                "urgent",
+                "next",
+                "third",
+                "new-first",
+                "recent",
+                "new-second"
+            ]
+        );
+        assert_eq!(
+            headings.by_workspace["shared"].desired["lineup_repo"].as_deref(),
+            Some("urgent")
+        );
+        assert_eq!(
+            headings.by_workspace["urgent"].desired["lineup_repo"].as_deref(),
+            Some("urgent")
         );
     }
 

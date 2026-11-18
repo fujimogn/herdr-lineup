@@ -33,7 +33,7 @@ admission. Other resources in the same pass can still be published.
 [Per-resource admission and skip accounting](../../src/publish.rs#L1639-L1666) ·
 [Refresh send pass](../../src/publish.rs#L2401-L2463)
 
-## Why the paths differ
+## Why the paths differed before the fix
 
 - The Git stage gets a shared 1 s budget, limited by the remaining refresh
   envelope, with at most four concurrent observations. One query also has a
@@ -134,7 +134,7 @@ These are fixture timings under injected Git stalls. The current production
 failure frequency and the host's sustained memory-pressure threshold remain
 unmeasured.
 
-The repository's existing isolated tests also cover
+The pinned source's isolated tests also cover
 `heading_fallback_expires_thirty_seconds_after_the_original_verification`
 (including 29 s and 30 s), `group_heading_moves_with_snapshot_order_and_clears_without_repository`,
 `logo_indent_tracks_snapshot_order_and_changes_only_logos`,
@@ -142,7 +142,84 @@ The repository's existing isolated tests also cover
 `deadline_skip_counts_refused_frames_and_rotates_only_started_items`.
 They ran in the pinned `cargo test --locked` suite.
 
-## Options for a follow-up
+## Implemented owner decision (2026-11-18)
+
+The owner selected A and B. Interrupted and unattempted reads preserve the
+exact rendered heading for less than 120 s from the original verification
+while workspace ID, cwd, and ordered pane occupants match. The fallback is
+memory-only and displays no stale marker. Explicit `Unknown` for a completed
+read without a repository, a changed cwd or occupant order, or a missing
+workspace invalidates the old heading immediately. A cache hit and fallback
+leave the verification instant unchanged. Metadata TTL, the sequence
+checkpoint, and accepted-frame handling retain their existing contracts.
+
+Eligible headings are scheduled in cutoff order, with attempt-based rotation
+for equal cutoffs and workspaces without a current heading. The first batch
+reserves one slot for a distinct cwd without a current heading when verified
+headings would otherwise occupy the whole batch. Reads still share one
+observation per cwd, the one-second cycle budget, and up to four scoped
+workers. The existing Git process-group kill and reap rules apply.
+
+Doctor reports cumulative per-workspace counts for interrupted, unattempted,
+and explicit unknown Git reads. The verification ages describe the latest
+completed Git stage. The sample includes up to 32 workspace IDs of at most
+64 bytes each. Ages can be omitted to preserve outcome counts and existing
+diagnostics within the control frame limit. The diagnostic sample carries no
+cwd, repository name, or pane identity.
+
+### Before and after in the isolated publisher
+
+One release run per version and fixture on Linux x86_64 with Rust 1.100.0 and
+Git 2.56.0. The baseline (`a17e6d4edee6f8088e31257b14ddfd6f2d996699`) adds only
+the diagnostics to the original 30 s behavior. Both versions used the same
+replay driver. It extends the original two-workspace fixture to sample the
+private control socket, log Git admissions, and wait for the configured
+cutoff. For the mixed run it starts two healthy workspaces, then adds three
+healthy repositories and three stalled repositories at cycle 5. The peer
+still applies a 3 s per-key TTL and accepts monotonically increasing
+sequence numbers.
+
+| Fixture and sample | Metric | Before | After |
+| --- | --- | ---: | ---: |
+| Stalled, first 15 stalled cycles of both runs | Verification age median / max (30 workspace samples each) | 16.213 / 30.349 s | 16.418 / 30.651 s |
+| Stalled, first 15 stalled cycles of both runs | Git stage median / max | 1,001.973 / 1,006.789 ms | 1,004.742 / 1,018.677 ms |
+| Stalled, until cutoff and recovery | Heading-clear frames before age 120 s | 4 | 0 |
+| Stalled, until cutoff and recovery | Verification age at clear, measured at the Git stage | 30.349 s | 120.274–120.279 s |
+| Mixed, cycles 5–25 (21 stage samples of the 26-cycle run) | Verification age median / max (102 / 100 available workspace samples) | 13.134 / 31.518 s | 11.420 / 29.711 s |
+| Mixed, cycles 5–25 | Git stage median / max | 1,003.370 / 1,006.633 ms | 1,003.074 / 1,054.940 ms |
+| Mixed, full run | Heading-clear frames from previously resolved workspaces or their first panes | 4 | 0 |
+| Mixed, 20 transitions between sampled cycles | Oldest eligible heading from the preceding sample admitted in the next first batch | 9 / 20 | 20 / 20 |
+| Mixed, through cycle 25 | Interrupted / NotAttempted / explicit Unknown (workspace outcomes) | 32 / 84 / 0 | 24 / 80 / 0 |
+
+In the paired stalled window both versions recorded 30 interruptions and no
+unattempted or explicit unknown reads. The full candidate run recorded 118
+interruptions in 59 stalled cycles. Its four clear frames all landed in
+cycle 60, 120.139–120.145 s after the first complete publication. The peer
+held the same heading values before those frames. Both headings recovered
+on cycle 61. The longest gap between accepted heading-resource reports
+while the keys were live was 2.039 s before and 2.085 s after. When the
+synthetic peer stopped returning snapshots, the tokens expired about
+3.02 s after the last accepted report in both runs.
+
+The mixed admission metric checks membership in the first batch, since
+the OS can start concurrent child processes in a different order. It takes
+the maximum measured prior age among headings within that version's cutoff,
+counts ties as eligible, and excludes missing ages. An injected-order unit
+test checks exact priority and the discovery slot independently of OS
+scheduling. The unit tests also check 29 s, 30 s, 119 s and 120 s directly,
+identity loss, and exact ship-text retention across local midnight.
+
+These are injected Git stalls at the stored-metadata boundary. Host load
+was variable and concurrent activity was uncontrolled. No production
+latency, rendered sidebar, or macOS result is inferred.
+
+SHA-256:
+
+- Replay driver: `00ec5fbdfe561b8806d4f372715cb536434758464f7a4c4e577a28ac510b41cb`
+- Baseline release binary: `046192af0d41c315af19c51e33949ad0a3f9476f369d99fdb0102f43fbdd32ea`
+- Candidate release binary: `d23764f7a2af01c3ac6d3e080dd026511d45e6fb4dbd46779282ae755eadc914`
+
+## Options considered before owner selection
 
 | Option | User-visible effect and staleness | Sequence and durability | Verification |
 | --- | --- | --- | --- |
@@ -157,5 +234,4 @@ pressure replay before choosing a scheduling change. A is an owner decision
 about the acceptable age of displayed Git information. C addresses a separate
 publication failure mode supported by the no-frame control. Raising token TTL
 or changing the refresh interval would leave the explicit null patches in
-place and would change the degraded-expiry contract. The recorded options
-await owner selection.
+place and would change the degraded-expiry contract. Option C remains a separate follow-up for accepted-frame gaps.

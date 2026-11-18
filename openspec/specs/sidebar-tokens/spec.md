@@ -139,17 +139,22 @@ later than the refresh envelope. All queries SHALL stop when the daemon is
 shutting down. Each Git child SHALL run in its own
 process group. That group, including descendants, SHALL be killed and the
 leader reaped; the leader SHALL stay unreaped until descendants are killed,
-including when stdout has already closed. Workspaces SHALL be read in a fair
-queue keyed by workspace ID: a workspace whose read starts moves to the tail
-of the queue, workspaces sharing one cwd share one read per cycle, and
-workspaces not reached before `G` are not attempted in that cycle.
+including when stdout has already closed. Workspaces sharing one cwd SHALL
+share one read per cycle. Workspaces whose last confirmed heading matches
+their current identity and remains within its fallback window SHALL be
+scheduled by earliest cutoff first. If the first batch would otherwise be
+full of such reads, one slot SHALL be reserved for a distinct cwd without a
+current heading, when one is available. Ties and workspaces without a current
+heading SHALL use queue order keyed by workspace ID. Only the workspace
+whose read starts moves to the tail. Workspaces not reached before `G` are
+not attempted in that cycle.
 
 Each workspace heading SHALL be in exactly one state per refresh:
 
 | State | Condition | Workspace keys | First-pane group keys |
 | --- | --- | --- | --- |
 | Confirmed | Git returned a repository together with its verification instant | name; ship text, or `—` when `origin/main` is confirmed absent | copied |
-| Fallback | The read was interrupted or not attempted, the previous heading was Confirmed with the same cwd and occupants, and less than 30 s passed since its original verification instant | previous values | copied |
+| Fallback | The read was interrupted or not attempted, the last confirmed heading has the same workspace ID, cwd and ordered pane occupants, and less than 120 s passed since its original verification instant | previous values | copied |
 | Unknown | Every other case, including a completed read that returned no repository | null | null |
 
 An interrupted or unattempted read SHALL NOT be treated as a confirmed missing
@@ -157,7 +162,11 @@ repository. A completed read without a repository also covers rejection
 (`safe.directory`, ownership) and unreadable state; it SHALL discard the
 previous heading and SHALL NOT start a fallback. A fallback SHALL NOT renew the
 verification instant, and a cached Git result SHALL age from its original
-verification, not from the refresh that reused it.
+verification, not from the refresh that reused it. A fallback SHALL keep
+the exact previous heading values without a stale marker. A missing
+workspace or a change to its cwd or ordered pane occupants discards the
+old heading immediately. The fallback SHALL remain in memory and SHALL
+NOT change checkpoint contents or metadata key TTL.
 
 Formatting SHALL use the daemon host's local timezone and date. `HH:MM` uses
 two digits per field; `M/D` has no leading zeros. All dates other than today,
@@ -189,8 +198,8 @@ repository name and show `—` for its pane ship-time text.
 
 #### Scenario: Interrupted heading falls back for a bounded time
 - **WHEN** a heading was confirmed at `t0` and later reads are interrupted or
-  not attempted while cwd and occupants stay the same
-- **THEN** the previous heading is published until `t0 + 30 s` and cleared
+  not attempted while workspace ID, cwd and ordered pane occupants stay the same
+- **THEN** the previous heading is published unchanged until `t0 + 120 s` and cleared
   from then on, even though the occupants are unchanged
 
 #### Scenario: New workspace not yet read

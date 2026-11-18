@@ -833,9 +833,9 @@ fn control_frame(state: &ControlState) -> io::Result<Vec<u8>> {
             && !git.verification_age_ms.is_empty()
         {
             git.verification_age_ms.clear();
-        } else if response.git_heading_diagnostics.take().is_some() {
-            continue;
-        } else if response.reader_diagnostics.take().is_some() {
+        } else if response.git_heading_diagnostics.take().is_some()
+            || response.reader_diagnostics.take().is_some()
+        {
             continue;
         } else if response.refresh_observation.is_some()
             || response.refresh_deadline_skips.is_some()
@@ -5352,6 +5352,34 @@ mod tests {
             last_capacity_skipped: u64::MAX,
         });
         state
+    }
+
+    #[test]
+    fn git_heading_counts_survive_control_frame_age_truncation() {
+        let mut state = maximum_reader_state();
+        let handle = GitHeadingDiagnosticsHandle::default();
+        handle.record(GitHeadingDiagnostics {
+            interrupted: 8,
+            ..Default::default()
+        });
+        handle.record(GitHeadingDiagnostics {
+            interrupted: 1,
+            not_attempted: 3,
+            unknown: 2,
+            workspaces: 32,
+            verification_age_ms: (0..32)
+                .map(|index| (format!("{index:02}{}", "\\".repeat(62)), Some(119_000)))
+                .collect(),
+        });
+        state.git_heading_diagnostics = Some(handle);
+        let frame = control_frame(&state).unwrap();
+        let view = control_view_from_frame(&frame).unwrap();
+        let git = view.git_heading_diagnostics.unwrap();
+        assert_eq!((git.interrupted, git.not_attempted, git.unknown), (9, 3, 2));
+        assert_eq!(git.workspaces, 32);
+        assert!(git.verification_age_ms.is_empty());
+        assert!(view.reader_diagnostics.is_some());
+        assert!(view.observation.unwrap().stages.is_some());
     }
 
     // Wrong budget, partial provider removal or resampling on fallback fails here.

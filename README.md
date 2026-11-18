@@ -917,10 +917,17 @@ is not applied with `setsockopt`.
 The local candidate uses a cooperative refresh envelope of
 `2 s + 1 s + reader_timeout_ms + 2 s` (7 s by default). Git headings share a
 one-second cycle budget, observe up to four distinct working directories
-concurrently, and use an attempt-based fair queue. The persistent
-Git cache stores only worktree root/name; a hit still runs three children,
-and interrupted reads can use a confirmed heading for at most 30 s without
-renewing that age on a cache hit. A
+concurrently, and share reads per working directory. Headings nearest their
+cutoff take priority, with one slot in the first batch available to a
+directory without a current heading. The in-memory Git cache stores only
+worktree root/name, and a hit still runs three children. An interrupted or
+unattempted read can reuse the exact last heading while the workspace, working
+directory and ordered pane occupants still match and the original
+verification is less than 120 s old. A completed read without a repository or
+a changed identity clears the old heading immediately. The fallback does
+not change metadata TTL or checkpoint contents. Doctor reports verification
+ages at the latest completed Git stage and cumulative workspace counts of
+interrupted, unattempted and explicit unknown reads. A
 [limited synthetic comparison](https://github.com/fujimogn/herdr-lineup/blob/main/docs/reviews/git-cache-design.md#95-limited-synthetic-observation-2026-11-04)
 records lower median heading time for 15 distinct working directories on Linux;
 it does not establish general performance, macOS, or rendered latency.
