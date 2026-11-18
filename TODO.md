@@ -31,12 +31,17 @@ Work waiting for the next release is in the `Unreleased` section of
   Competing-writer protection and automatic config reload are not implemented,
   so there is no behavior to verify; see the
   [sequence reservation record](docs/reviews/sequence-reservation-design-2026-10-23.md).
-- [ ] Find the cause of the macOS-only failure of
-  `publish::tests::kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset`:
-  the isolated child failed with empty stderr in the v0.3.2 platform check
-  (run 41847126534, first attempt) and passed on the job rerun; Linux passed.
-  The test now reports the child's status, stdout, and stderr, so start from
-  that output on the next failure. A passing rerun is not evidence of a fix.
+- [ ] Verify the Kimi wiring fixture fix on macOS. The fixture bug where accepted
+  sockets inherit the listener's nonblocking mode on macOS is fixed by explicitly
+  restoring blocking mode, with a deterministic regression test. The historical
+  failure point in
+  `publish::tests::kimi_production_wiring_covers_opt_in_success_rotation_expiry_and_reset`
+  remains unconfirmed: the isolated child failed with empty stderr in the v0.3.2
+  platform check (run 41847126534, first attempt) and passed on the job rerun;
+  Linux passed. The test now reports the child's status, stdout, and stderr, so
+  retain that output on the next failure. A passing rerun is not evidence of a
+  fix, and macOS runtime behavior after this fix remains unverified. See the
+  [failure investigation](docs/reviews/kimi-wiring-macos-failure-2026-11-18.md).
 - [ ] Font check-then-rename and check-then-unlink races (H1, M1). Closing
   them needs an owner-approved design; partial-state recovery stays manual.
 

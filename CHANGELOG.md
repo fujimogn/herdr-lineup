@@ -6,10 +6,11 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## 0.3.6 (2026-11-18)
 
-Lineup makes test coverage more reliable and refreshes development tools and compatible Rust dependencies.
+Lineup makes daemon and quota test coverage more reliable and refreshes development tools and compatible Rust dependencies.
 
 - Fix: **Codex header tests** remove the wall-clock budget from the rollout header limit test, which could time out on a heavily loaded machine. Deadline behavior keeps its own tests.
 - Maintenance: **Foreground startup tests** add isolated coverage for private runtime directory setup failures caused by a regular-file root or a symlink root, checking the returned error on stderr and the nonzero exit status before the daemon starts.
+- Maintenance: **Kimi wiring tests** normalize accepted TCP fixture sockets to blocking mode for macOS and add deterministic regression coverage. The historical v0.3.2 failure point remains unconfirmed, and macOS runtime behavior after the fix remains unverified.
 - Maintenance: **Dependencies** update Rust dependencies to their latest compatible versions, including clap 4.6.8 and its lockfile entries, and refresh the locked dependency license notices.
 - Maintenance: **OpenSpec CLI** pins version 2.1.0 in `.config/mise.toml`, so `openspec validate` no longer depends on a global install.
 
