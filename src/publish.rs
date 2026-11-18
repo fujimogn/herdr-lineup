@@ -2806,6 +2806,35 @@ mod tests {
         }
     }
 
+    fn configure_kimi_fixture_stream(stream: &std::net::TcpStream) {
+        // BSD accepts inherit the listener's nonblocking mode. The header
+        // reader needs blocking I/O so it can wait for the complete request.
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+    }
+
+    #[test]
+    fn kimi_fixture_clears_inherited_nonblocking_mode() {
+        use std::os::fd::AsRawFd;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        // Reproduce BSD's accepted-socket mode even on Linux, without relying
+        // on whether the client has sent bytes before the fixture reads.
+        stream.set_nonblocking(true).unwrap();
+        configure_kimi_fixture_stream(&stream);
+
+        // SAFETY: stream owns a live descriptor; F_GETFL takes no third argument.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        assert_eq!(stream.read_timeout().unwrap(), Some(Duration::from_secs(2)));
+    }
+
     fn serve_kimi_fixture(
         listener: std::net::TcpListener,
         replies: &Path,
@@ -2821,7 +2850,7 @@ mod tests {
                     let temporary = connections.with_extension("tmp");
                     std::fs::write(&temporary, count.to_string()).unwrap();
                     std::fs::rename(&temporary, connections).unwrap();
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    configure_kimi_fixture_stream(&stream);
                     let mut request = Vec::new();
                     let mut buffer = [0; 1024];
                     while !request.windows(4).any(|window| window == b"\r\n\r\n")
