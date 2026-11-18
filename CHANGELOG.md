@@ -4,7 +4,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
-- Maintenance — **Kimi local reads** reuse verified session bindings with fewer filesystem metadata checks.
+- Maintenance: **Kimi local reads** reuse verified session bindings with fewer filesystem metadata checks.
 
 ## 0.3.7 (2026-11-18)
 
