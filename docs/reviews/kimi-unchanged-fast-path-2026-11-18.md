@@ -1,6 +1,8 @@
 # Kimi unchanged-state fast path on Linux, 2026-11-18
 
-The experiment meets the code selection gate on this fixture. The ordinary
+The trial calls for shipping code when Kimi file calls drop, daemon CPU
+or user-space instructions improve beyond the A/A spread, and stored tokens
+match. The experiment meets those conditions on this fixture. The ordinary
 Kimi path drops from 2,212 to 1,828 read, open and stat calls per refresh
 (17.4%). Across three refreshes, B uses 99,482 fewer instructions in AB
 and 145,721 fewer in BA with identical checkpoint tokens. The A/A instruction spread
@@ -59,6 +61,9 @@ test thread before checking identity, files, or budget. `cargo test --locked
 unchanged_trial --lib` finished with 11 assertion failures and exit 101.
 Restoring B gave 11 passing tests in the full suite. The variant patch and
 test logs are under the experiment worktree's `target/kimi-unchanged-trial/`.
+The zero-duration request exercises deadline rejection before discovery.
+An expiry during the cache hit and a same-size rewrite with restored mtime
+remain outside the mutation coverage.
 
 ## Comparison method
 
@@ -101,7 +106,7 @@ All entries represent three completed refreshes. Process CPU, task-clock and
 instructions are totals for those refreshes. File calls are per refresh.
 
 | Run | Daemon CPU ms | Instructions:u | Task-clock ms | RSS KiB | PSS KiB | Kimi reads | Kimi opens | Kimi stats | Kimi read/open/stat | Kimi dirent calls |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | A1 | 280 | 25,029,575 | 300.09 | 5,568 | 3,324 | 0.0 | 406.0 | 1,806.0 | 2,212.0 | 418.0 |
 | A2 | 160 | 25,029,916 | 181.90 | 5,620 | 3,451 | 0.0 | 545.3 | 2,084.7 | 2,630.0 | 696.7 |
 | A3 | 460 | 25,035,942 | 484.77 | 5,556 | 3,312 | 0.0 | 475.7 | 1,945.3 | 2,421.0 | 557.3 |
@@ -142,9 +147,11 @@ reached the end of the Kimi model-window check, and attributed payload reads
 were zero.
 
 The instruction decreases are 0.40% in AB and 0.58% in BA. Both exceed the
-341-instruction A/A spread. Daemon CPU changes of 0 ms and 110 ms fall within
-the 120 ms A/A spread. CPU and memory measurements include the effects of a
-shared host and the affinity settings did not reserve cores.
+341-instruction A/A spread. Across all four A windows the spread is 36,220
+instructions, and the two B windows differ by 16,386. The lowest A count is
+93,115 instructions higher than the highest B count. Daemon CPU changes of
+0 ms and 110 ms fall within the 120 ms A/A spread. CPU and memory
+measurements include the effects of a shared host with unreserved cores.
 
 ## Source-to-token delay
 
