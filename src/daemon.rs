@@ -2468,6 +2468,69 @@ mod tests {
     }
 
     #[test]
+    fn foreground_wrapper_reports_private_runtime_setup_errors() {
+        for symlink_root in [false, true] {
+            let (dir, options, done, server) = fixture();
+            eprintln!("isolated foreground setup root: {}", dir.path().display());
+            let mut cleanup = ForegroundFixtureCleanup {
+                options: options.clone(),
+                done,
+                child: None,
+            };
+            let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+            fs::create_dir(&options.state).unwrap();
+            let expected_error = if symlink_root {
+                let target = dir.path().join("runtime-target");
+                fs::create_dir(&target).unwrap();
+                std::os::unix::fs::symlink(&target, &paths.root).unwrap();
+                "runtime directory must be owned by this user".to_owned()
+            } else {
+                // A regular file blocks create_dir_all without depending on
+                // permissions (which a privileged test runner could bypass).
+                fs::write(&paths.root, "blocked runtime directory").unwrap();
+                io::Error::from_raw_os_error(libc::EEXIST).to_string()
+            };
+            // A later config error must not substitute for the setup error
+            // if the wrapper stops propagating the private-directory failure.
+            fs::write(options.config.join("config.toml"), "unknown_key = true\n").unwrap();
+            cleanup.child = Some(
+                foreground_wrapper_command(dir.path(), &options)
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            wait_until(|| {
+                cleanup
+                    .child
+                    .as_mut()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_some()
+            });
+            let output = cleanup.child.take().unwrap().wait_with_output().unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{stderr}");
+            assert!(
+                stderr.contains(&format!("foreground wrapper: {expected_error}")),
+                "{stderr}"
+            );
+            assert_eq!(
+                fs::canonicalize(fs::read_to_string(options.state.join("wrapper-cwd")).unwrap())
+                    .unwrap(),
+                fs::canonicalize(dir.path()).unwrap(),
+                "setup failure must return before changing the working directory"
+            );
+            assert!(!paths.log.exists(), "setup failure reached runtime logging");
+            assert!(!paths.lock.exists());
+            assert!(!paths.pid.exists());
+            assert!(!paths.control.exists());
+            drop(cleanup);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
     fn foreground_wrapper_creates_runtime_and_logs_run_error() {
         let (dir, options, done, server) = fixture();
         eprintln!("isolated foreground error root: {}", dir.path().display());
