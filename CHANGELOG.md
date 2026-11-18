@@ -4,6 +4,10 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+## 0.3.8 (2026-11-18)
+
+Lineup reduces filesystem checks when reading unchanged Kimi session state.
+
 - Maintenance: **Kimi local reads** reuse verified session bindings with fewer filesystem metadata checks.
 
 ## 0.3.7 (2026-11-18)
