@@ -13,12 +13,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::{self, BufReader, Read, Write},
+    net::Shutdown,
+    os::fd::{AsRawFd, OwnedFd},
     os::unix::{
         fs::OpenOptionsExt,
         net::{UnixListener, UnixStream},
         process::CommandExt,
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -30,7 +32,7 @@ use std::{
 pub const PLUGIN_ID: &str = "herdr-lineup";
 const START_DEADLINE: Duration = Duration::from_secs(5);
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
-const IDLE_WAIT: Duration = Duration::from_millis(100);
+const ENDPOINT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const RECONNECT_RETRY: Duration = Duration::from_millis(250);
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 pub(crate) const LOCK_CONTENDED_EXIT_CODE: u8 = 75;
@@ -1011,11 +1013,12 @@ fn run_locked(
     });
     state.reader_diagnostics = publisher.reader_diagnostics();
     fs::write(&paths.pid, format!("{}\n", state.health.pid))?;
-    let control = ControlWorker::start(listener, state.clone());
+    let control = ControlWorker::start(listener, state.clone())?;
     publisher.set_shutdown(control.shutdown.clone());
     let started = Instant::now();
     let mut refresh_at = Instant::now();
     let mut reconnect = false;
+    let mut endpoint_watch = watch_endpoint(&options.socket);
     let mut socket_missing_since: Option<Instant> = None;
     let socket_missing_ttl = Duration::from_millis(config.refresh_interval_ms.saturating_mul(3));
     let result = (|| {
@@ -1062,7 +1065,7 @@ fn run_locked(
                     }
                     reconnect = true;
                     *control.state.lock().unwrap() = state.clone();
-                    std::thread::sleep(RECONNECT_RETRY);
+                    control.wait_until(Instant::now() + RECONNECT_RETRY, None)?;
                     continue;
                 }
                 socket_missing_since = None;
@@ -1116,7 +1119,16 @@ fn run_locked(
             if control.shutdown.load(Ordering::Acquire) {
                 continue;
             }
-            std::thread::sleep(IDLE_WAIT);
+            let wake_at = if reconnect || endpoint_watch.is_none() {
+                refresh_at.min(Instant::now() + ENDPOINT_CHECK_INTERVAL)
+            } else {
+                refresh_at
+            };
+            if control.wait_until(wake_at, endpoint_watch.as_ref())? {
+                // Re-arm before looking up the endpoint again. A queued event
+                // (including queue overflow) only requests a fresh identity check.
+                endpoint_watch = watch_endpoint(&options.socket);
+            }
         }
     })();
     control.shutdown.store(true, Ordering::Release);
@@ -1129,43 +1141,113 @@ fn control_worker_exited_unexpectedly(
 ) -> bool {
     is_finished() && !shutdown.load(Ordering::Acquire)
 }
+
+/// Watch ordinary local directory paths. If any component cannot be watched
+/// (including symlink paths), fall back to the regular endpoint checks.
+#[cfg(target_os = "linux")]
+fn watch_endpoint(path: &Path) -> Option<OwnedFd> {
+    use std::{ffi::CString, os::fd::FromRawFd, os::unix::ffi::OsStrExt};
+
+    let parent = path.parent()?;
+    if fs::canonicalize(parent).ok()? != parent {
+        return None;
+    }
+    // SAFETY: this call returns a new descriptor, transferred to OwnedFd.
+    let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    if raw < 0 {
+        return None;
+    }
+    let watch = unsafe { OwnedFd::from_raw_fd(raw) };
+    // Establish ancestor watches first so a move during setup queues a wake.
+    let ancestors: Vec<_> = parent.ancestors().collect();
+    for dir in ancestors.into_iter().rev() {
+        let filename = CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: filename is NUL terminated, and stats has room for statfs.
+        if unsafe { libc::statfs(filename.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        if !matches!(
+            unsafe { stats.assume_init() }.f_type,
+            libc::EXT4_SUPER_MAGIC | libc::BTRFS_SUPER_MAGIC | libc::TMPFS_MAGIC
+        ) {
+            return None;
+        }
+        let mut mask = libc::IN_ONLYDIR
+            | libc::IN_DONT_FOLLOW
+            | libc::IN_ATTRIB
+            | libc::IN_MOVE_SELF
+            | libc::IN_DELETE_SELF;
+        if dir == parent {
+            mask |= libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO;
+        }
+        // SAFETY: the descriptor and NUL-terminated filename stay live for the call.
+        if unsafe { libc::inotify_add_watch(watch.as_raw_fd(), filename.as_ptr(), mask) } < 0 {
+            return None;
+        }
+    }
+    Some(watch)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn watch_endpoint(_: &Path) -> Option<OwnedFd> {
+    None
+}
+
+fn wait_for_descriptors(
+    descriptors: &mut [libc::pollfd],
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    loop {
+        let timeout = deadline.map_or(-1, |at| {
+            let remaining = at.saturating_duration_since(Instant::now());
+            i32::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
+        });
+        // SAFETY: poll may write to the provided initialized slice only.
+        if unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) } >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// Own the control listener independently of publication. Drop joins the worker
 /// before runtime paths are removed and session ownership is released.
 struct ControlWorker {
     state: Arc<Mutex<ControlState>>,
     shutdown: Arc<AtomicBool>,
-    done: Arc<AtomicBool>,
+    wake: UnixStream,
     worker: Option<std::thread::JoinHandle<io::Result<()>>>,
 }
 impl ControlWorker {
-    fn start(listener: UnixListener, state: ControlState) -> Self {
+    fn start(listener: UnixListener, state: ControlState) -> io::Result<Self> {
+        let (wake, worker_wake) = UnixStream::pair()?;
         let state = Arc::new(Mutex::new(state));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
         let worker_state = state.clone();
         let worker_shutdown = shutdown.clone();
-        let worker_done = done.clone();
-        let worker = std::thread::spawn(move || {
-            use std::os::fd::AsRawFd;
-            while !worker_done.load(Ordering::Acquire) {
-                let mut descriptor = libc::pollfd {
+        let worker = std::thread::Builder::new().spawn(move || {
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: worker_wake.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
                     fd: listener.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
-                };
-                // Bound drop's join while sleeping until a client arrives.
-                let ready = unsafe { libc::poll(&mut descriptor, 1, 100) };
-                if ready < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(error);
+                },
+            ];
+            loop {
+                wait_for_descriptors(&mut descriptors, None)?;
+                if descriptors[0].revents != 0 {
+                    return Ok(());
                 }
-                if ready == 0 {
-                    continue;
-                }
-                if descriptor.revents & libc::POLLIN == 0 {
+                if descriptors[1].revents & libc::POLLIN == 0 {
                     return Err(io::Error::other("daemon control listener poll failed"));
                 }
                 match listener.accept() {
@@ -1181,19 +1263,47 @@ impl ControlWorker {
                     Err(error) => return Err(error),
                 }
             }
-            Ok(())
-        });
-        Self {
+        })?;
+        Ok(Self {
             state,
             shutdown,
-            done,
+            wake,
             worker: Some(worker),
+        })
+    }
+
+    fn wait_until(&self, deadline: Instant, endpoint_watch: Option<&OwnedFd>) -> io::Result<bool> {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: endpoint_watch.map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        wait_for_descriptors(&mut descriptors, Some(deadline))?;
+        // A worker closes its socket on every exit, including panic. Only a
+        // validated stop request sets the flag before closing its end.
+        if descriptors[0].revents != 0 {
+            return if self.shutdown.load(Ordering::Acquire) {
+                Ok(false)
+            } else {
+                Err(io::Error::other(
+                    "daemon control worker exited unexpectedly",
+                ))
+            };
         }
+        Ok(descriptors[1].revents != 0)
     }
 }
 impl Drop for ControlWorker {
     fn drop(&mut self) {
-        self.done.store(true, Ordering::Release);
+        // End the worker's indefinite poll before joining it.
+        let _ = self.wake.shutdown(Shutdown::Write);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -3347,24 +3457,161 @@ mod tests {
     }
     #[test]
     fn socket_replacement_stops_daemon_without_connecting_to_replacement() {
-        let (_dir, options, done, server) = fixture();
+        let (dir, options, done, server) = fixture();
+        fs::write(
+            options.config.join("config.toml"),
+            "refresh_interval_ms = 60000\n",
+        )
+        .unwrap();
         ensure_command(&options, child_command()).unwrap();
         let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
-        std::fs::remove_file(&options.socket).unwrap();
+        wait_until(|| {
+            probe(&paths, &options.socket)
+                .unwrap()
+                .is_some_and(|health| health.last_refresh_ms.is_some())
+        });
+        let original = dir.path().join("original.sock");
+        fs::rename(&options.socket, &original).unwrap();
         let replacement = std::os::unix::net::UnixListener::bind(&options.socket).unwrap();
         replacement.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        let exited = loop {
             if SessionLock::acquire(&paths).unwrap().is_some() {
-                break;
+                break true;
             }
-            assert!(Instant::now() < deadline);
+            if Instant::now() >= deadline {
+                break false;
+            }
             std::thread::sleep(Duration::from_millis(20));
+        };
+        let replacement_contacted = replacement.accept().is_ok();
+        if !exited {
+            fs::rename(&original, &options.socket).unwrap();
+            stop(&options).unwrap();
         }
-        assert!(replacement.accept().is_err());
         done.store(true, Ordering::Relaxed);
         server.join().unwrap();
+        assert!(
+            exited,
+            "old daemon remained alive after endpoint replacement"
+        );
+        assert!(!replacement_contacted);
     }
+
+    #[test]
+    fn control_stop_wakes_daemon_before_a_distant_refresh() {
+        let (_dir, options, done, server) = fixture();
+        fs::write(
+            options.config.join("config.toml"),
+            "refresh_interval_ms = 60000\n",
+        )
+        .unwrap();
+        ensure_command(&options, child_command()).unwrap();
+        let paths = RuntimePaths::new(&options.state, &options.socket).unwrap();
+        wait_until(|| {
+            probe(&paths, &options.socket)
+                .unwrap()
+                .is_some_and(|health| health.last_refresh_ms.is_some())
+        });
+
+        let result = stop(&options);
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        result.unwrap();
+        assert!(!SessionLock::is_held(&paths).unwrap());
+    }
+
+    #[test]
+    fn dropping_idle_control_worker_wakes_the_listener() {
+        let (dir, _) = fixture_paths();
+        let listener = UnixListener::bind(dir.path().join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let control = ControlWorker::start(listener, sample_health().into()).unwrap();
+        let (finished, dropped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(control);
+            let _ = finished.send(());
+        });
+        dropped.recv_timeout(START_DEADLINE).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_endpoint_notifications_wake_for_unlink_and_ancestor_rename() {
+        let (dir, _) = fixture_paths();
+        let ancestor = dir.path().join("ancestor");
+        let parent = ancestor.join("session");
+        fs::create_dir_all(&parent).unwrap();
+        let socket = parent.join("herdr.sock");
+        let original = UnixListener::bind(&socket).unwrap();
+        let Some(watch) = watch_endpoint(&socket) else {
+            // Some test environments mount their temp directory on an
+            // unsupported filesystem. The portable path still polls identity.
+            return;
+        };
+        let listener = UnixListener::bind(dir.path().join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let control = ControlWorker::start(listener, sample_health().into()).unwrap();
+        fs::remove_file(&socket).unwrap();
+        assert!(
+            control
+                .wait_until(Instant::now() + START_DEADLINE, Some(&watch))
+                .unwrap()
+        );
+        let replacement = UnixListener::bind(&socket).unwrap();
+        drop(watch);
+        let watch = watch_endpoint(&socket).unwrap();
+        fs::rename(&ancestor, dir.path().join("moved")).unwrap();
+        assert!(
+            control
+                .wait_until(Instant::now() + START_DEADLINE, Some(&watch))
+                .unwrap()
+        );
+        assert!(!socket.exists());
+        drop((original, replacement));
+    }
+
+    #[test]
+    fn endpoint_directory_activity_does_not_advance_refresh() {
+        struct ObservedPublisher(std::sync::mpsc::Sender<Instant>);
+        impl Publisher for ObservedPublisher {
+            fn refresh(&mut self, _: &mut Transport, _: &Config) -> io::Result<()> {
+                self.0.send(Instant::now()).unwrap();
+                Ok(())
+            }
+
+            fn clear(&mut self, _: &mut Transport) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (dir, options, done, server) = fixture();
+        fs::write(
+            options.config.join("config.toml"),
+            "refresh_interval_ms = 1000\nreader_timeout_ms = 100\n",
+        )
+        .unwrap();
+        let (sent, attempts) = std::sync::mpsc::channel();
+        let daemon_options = options.clone();
+        let daemon = std::thread::spawn(move || {
+            run_foreground(&daemon_options, false, &mut ObservedPublisher(sent))
+        });
+
+        let first = attempts.recv_timeout(START_DEADLINE).unwrap();
+        let unrelated = dir.path().join("unrelated");
+        fs::write(&unrelated, "").unwrap();
+        fs::remove_file(unrelated).unwrap();
+        let second = attempts.recv_timeout(Duration::from_secs(3)).unwrap();
+        let replacement = dir.path().join("replacement.sock");
+        let _replacement = UnixListener::bind(&replacement).unwrap();
+        fs::rename(replacement, &options.socket).unwrap();
+        assert!(daemon.join().unwrap().is_err());
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+
+        assert!(second.duration_since(first) >= Duration::from_secs(1));
+    }
+
     #[test]
     fn ensure_waits_for_old_daemon_after_missing_socket_is_replaced() {
         let (_dir, options, done, server) = fixture();
@@ -5184,7 +5431,7 @@ mod tests {
         let path = dir.path().join("control.sock");
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let control = ControlWorker::start(listener, state);
+        let control = ControlWorker::start(listener, state).unwrap();
         let mut client = UnixStream::connect(path).unwrap();
         client.write_all(b"health\n").unwrap();
         sample_arrived.recv_timeout(Duration::from_secs(2)).unwrap();
