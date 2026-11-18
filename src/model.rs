@@ -698,6 +698,13 @@ impl Budget {
         String::from_utf8(bytes).map_err(|_| MissingReason::SourceError)
     }
     pub(crate) fn open(&self, path: &Path) -> Result<File, MissingReason> {
+        self.open_with_metadata(path).map(|(file, _)| file)
+    }
+
+    pub(crate) fn open_with_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<(File, Metadata), MissingReason> {
         self.check()?;
         let meta = fs::symlink_metadata(path).map_err(|e| io_reason(&e))?;
         if !meta.is_file() || meta.file_type().is_symlink() {
@@ -708,11 +715,12 @@ impl Budget {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|e| io_reason(&e))?;
-        if !file.metadata().map_err(|e| io_reason(&e))?.is_file() {
+        let opened = file.metadata().map_err(|e| io_reason(&e))?;
+        if !opened.is_file() {
             return Err(MissingReason::Invalid);
         }
         self.check()?;
-        Ok(file)
+        Ok((file, opened))
     }
     /// Read only a bounded region of a regular file already opened without following symlinks.
     pub(crate) fn read_range(

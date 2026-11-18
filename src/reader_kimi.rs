@@ -8,8 +8,8 @@ use crate::reader_cache::FingerprintCache;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, File, Metadata};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -23,7 +23,9 @@ type WindowCache = FingerprintCache<(PathBuf, String), Result<f64, MissingReason
 static CACHE: LazyLock<Mutex<WireCache>> =
     LazyLock::new(|| Mutex::new(FingerprintCache::new(CACHE_ENTRIES)));
 type StateBinding = Result<Option<(String, PathBuf)>, MissingReason>;
-static STATE_CACHE: LazyLock<Mutex<FingerprintCache<PathBuf, StateBinding>>> =
+type StateChangeTime = (i64, i64);
+type StateCache = FingerprintCache<PathBuf, (StateChangeTime, StateBinding)>;
+static STATE_CACHE: LazyLock<Mutex<StateCache>> =
     LazyLock::new(|| Mutex::new(FingerprintCache::new(MAX_DIRECTORY_ENTRIES)));
 static WINDOW_CACHE: LazyLock<Mutex<WindowCache>> =
     LazyLock::new(|| Mutex::new(FingerprintCache::new(CACHE_ENTRIES)));
@@ -123,21 +125,39 @@ fn read_session_in_cycle(
 }
 
 fn state_binding(budget: &Budget, path: &Path) -> Result<Option<(String, PathBuf)>, MissingReason> {
-    let mut file = budget.open(path)?;
-    let before = Fingerprint::of(&file.metadata().map_err(|error| io_reason(&error))?);
-    if let Some(binding) = STATE_CACHE
+    let (mut file, opened) = budget.open_with_metadata(path)?;
+    let before = Fingerprint::of(&opened);
+    let changed_at = state_change_time(&opened);
+    let key = path.to_path_buf();
+    let matches_opened = |current: &Metadata| {
+        current.is_file()
+            && Fingerprint::of(current) == before
+            && state_change_time(current) == changed_at
+    };
+    let path_matches = || {
+        fs::symlink_metadata(path)
+            .map(|current| matches_opened(&current))
+            .map_err(|error| io_reason(&error))
+    };
+    let cached = STATE_CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .get(&path.to_path_buf(), before)
+        .get(&key, before);
+    if let Some((cached_change_time, binding)) = cached
+        && cached_change_time == changed_at
     {
         budget.check()?;
-        if stable_file(path, &file, before)? {
-            return binding;
+        // The fresh no-follow open proves readability. No payload was read
+        // from the descriptor, so the final path stat is the point at which
+        // we accept the previously parsed bytes for this same inode.
+        if !path_matches()? {
+            return Err(MissingReason::SourceError);
         }
-        return Err(MissingReason::SourceError);
+        budget.check()?;
+        return binding;
     }
     let bytes = budget.read_range(&mut file, 0, before.size as usize)?;
-    if !stable_file(path, &file, before)? {
+    if !path_matches()? || !matches_opened(&file.metadata().map_err(|error| io_reason(&error))?) {
         return Err(MissingReason::SourceError);
     }
     let binding = serde_json::from_slice::<Value>(&bytes)
@@ -157,8 +177,12 @@ fn state_binding(budget: &Budget, path: &Path) -> Result<Option<(String, PathBuf
     STATE_CACHE
         .lock()
         .map_err(|_| MissingReason::SourceError)?
-        .insert(path.to_path_buf(), before, binding.clone());
+        .insert(key, before, (changed_at, binding.clone()));
     binding
+}
+
+fn state_change_time(meta: &Metadata) -> StateChangeTime {
+    (meta.ctime(), meta.ctime_nsec())
 }
 
 fn stable_file(path: &Path, file: &File, before: Fingerprint) -> Result<bool, MissingReason> {
@@ -739,6 +763,173 @@ mod tests {
         identity.native_session_id = session.into();
         identity.repository_identity = cwd.into();
         KimiReader.read(&request(&identity, home)).context
+    }
+
+    struct UnchangedTrial {
+        home: tempfile::TempDir,
+        identity: SessionIdentity,
+    }
+
+    impl UnchangedTrial {
+        fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let mut identity = identity(Provider::Kimi);
+            identity.repository_identity = "/synthetic/repo".into();
+            install(
+                home.path(),
+                &identity.native_session_id,
+                &identity.repository_identity,
+                75,
+                fresh_ms(&request(&identity, home.path())),
+                "",
+            );
+            Self { home, identity }
+        }
+
+        fn state(&self) -> PathBuf {
+            self.home
+                .path()
+                .join("sessions/wd_synthetic/session-1/state.json")
+        }
+
+        fn percent(&self) -> Result<f64, MissingReason> {
+            read_session(&request(&self.identity, self.home.path())).map(|(percent, _)| percent)
+        }
+    }
+
+    #[test]
+    fn unchanged_trial_binding_change() {
+        let trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        fs::write(trial.state(), r#"{"id":"other","cwd":"/synthetic/repo"}"#).unwrap();
+        assert_eq!(trial.percent(), Err(MissingReason::Unassociated));
+    }
+
+    #[test]
+    fn unchanged_trial_native_binding_switch() {
+        let mut trial = UnchangedTrial::new();
+        let r = request(&trial.identity, trial.home.path());
+        install(
+            trial.home.path(),
+            "session-2",
+            &trial.identity.repository_identity,
+            125,
+            fresh_ms(&r),
+            "",
+        );
+        assert_eq!(trial.percent(), Ok(7.5));
+        trial.identity.native_session_id = "session-2".into();
+        assert_eq!(trial.percent(), Ok(12.5));
+    }
+
+    #[test]
+    fn unchanged_trial_wire_append() {
+        use std::io::Write;
+
+        let trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        let wire = trial
+            .state()
+            .with_file_name("agents")
+            .join("main/wire.jsonl");
+        let r = request(&trial.identity, trial.home.path());
+        writeln!(
+            fs::OpenOptions::new().append(true).open(wire).unwrap(),
+            r#"{{"type":"token_counting.turn_recorded","agentId":"main","tokens":125,"time":{}}}"#,
+            fresh_ms(&r)
+        )
+        .unwrap();
+        assert_eq!(trial.percent(), Ok(12.5));
+    }
+
+    #[test]
+    fn unchanged_trial_atomic_rename() {
+        let trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        let staged = trial.state().with_file_name("state.new");
+        fs::write(&staged, r#"{"id":"other","cwd":"/synthetic/repo"}"#).unwrap();
+        fs::rename(staged, trial.state()).unwrap();
+        assert_eq!(trial.percent(), Err(MissingReason::Unassociated));
+    }
+
+    #[test]
+    fn unchanged_trial_wire_atomic_rename() {
+        let trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        let wire = trial
+            .state()
+            .with_file_name("agents")
+            .join("main/wire.jsonl");
+        let staged = wire.with_file_name("wire.new");
+        let before = fs::read_to_string(&wire).unwrap();
+        assert!(before.contains(r#""tokens":75"#));
+        fs::write(&staged, before.replace(r#""tokens":75"#, r#""tokens":95"#)).unwrap();
+        fs::rename(staged, wire).unwrap();
+        assert_eq!(trial.percent(), Ok(9.5));
+    }
+
+    #[test]
+    fn unchanged_trial_new_session_directory() {
+        let trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        let duplicate = trial.home.path().join("sessions/wd_other/session-1");
+        fs::create_dir_all(&duplicate).unwrap();
+        fs::copy(trial.state(), duplicate.join("state.json")).unwrap();
+        assert_eq!(trial.percent(), Err(MissingReason::Unassociated));
+    }
+
+    #[test]
+    fn unchanged_trial_removed_session_directory() {
+        let trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        fs::rename(
+            trial.state().parent().unwrap(),
+            trial.home.path().join("saved-session"),
+        )
+        .unwrap();
+        assert_eq!(trial.percent(), Err(MissingReason::NotFound));
+    }
+
+    #[test]
+    fn unchanged_trial_cwd_change() {
+        let mut trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        trial.identity.repository_identity = "/synthetic/different".into();
+        assert_eq!(trial.percent(), Err(MissingReason::Unassociated));
+    }
+
+    #[test]
+    fn unchanged_trial_permission_change() {
+        // A privileged test process can read mode 000; exercise denial as the
+        // normal daemon user, as in the other Kimi permission tests.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        fs::set_permissions(trial.state(), fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(trial.percent(), Err(MissingReason::Unassociated));
+    }
+
+    #[test]
+    fn unchanged_trial_expired_deadline() {
+        let trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        let mut r = request(&trial.identity, trial.home.path());
+        r.timeout = Duration::ZERO;
+        assert_eq!(read_session(&r), Err(MissingReason::Timeout));
+    }
+
+    #[test]
+    fn unchanged_trial_model_window_change() {
+        let trial = UnchangedTrial::new();
+        assert_eq!(trial.percent(), Ok(7.5));
+        fs::write(
+            trial.home.path().join("config.toml"),
+            "[models.synthetic-alias]\nmax_input_size = 500\n",
+        )
+        .unwrap();
+        assert_eq!(trial.percent(), Ok(15.0));
     }
 
     #[test]
