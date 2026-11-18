@@ -170,8 +170,11 @@ cwd, repository name, or pane identity.
 ### Before and after in the isolated publisher
 
 One release run per version and fixture on Linux x86_64 with Rust 1.100.0 and
-Git 2.56.0. The baseline (`a17e6d4edee6f8088e31257b14ddfd6f2d996699`) adds only
-the diagnostics to the original 30 s behavior. Both versions used the same
+Git 2.56.0. Both versions include idle wake handling from
+`5eb6493a997b02828045dab45704af2658ee298e`. The baseline
+(`9603a44ee106cbaac8f78be2b71efd3601a22624`) adds the diagnostics to the
+original 30 s behavior. The candidate code was built from
+`4bce472be88a7ef128928aa41fc51413fcc79c63`. Both versions used the same
 replay driver. It extends the original two-workspace fixture to sample the
 private control socket, log Git admissions, and wait for the configured
 cutoff. For the mixed run it starts two healthy workspaces, then adds three
@@ -181,25 +184,26 @@ sequence numbers.
 
 | Fixture and sample | Metric | Before | After |
 | --- | --- | ---: | ---: |
-| Stalled, first 15 stalled cycles of both runs | Verification age median / max (30 workspace samples each) | 16.213 / 30.349 s | 16.418 / 30.651 s |
-| Stalled, first 15 stalled cycles of both runs | Git stage median / max | 1,001.973 / 1,006.789 ms | 1,004.742 / 1,018.677 ms |
+| Stalled, first 15 stalled cycles of both runs | Verification age median / max (30 workspace samples each) | 16.216 / 30.433 s | 16.151 / 30.310 s |
+| Stalled, first 15 stalled cycles of both runs | Git stage median / max | 1,004.548 / 1,010.824 ms | 1,002.341 / 1,010.110 ms |
 | Stalled, until cutoff and recovery | Heading-clear frames before age 120 s | 4 | 0 |
-| Stalled, until cutoff and recovery | Verification age at clear, measured at the Git stage | 30.349 s | 120.274–120.279 s |
-| Mixed, cycles 5–25 (21 stage samples of the 26-cycle run) | Verification age median / max (102 / 100 available workspace samples) | 13.134 / 31.518 s | 11.420 / 29.711 s |
-| Mixed, cycles 5–25 | Git stage median / max | 1,003.370 / 1,006.633 ms | 1,003.074 / 1,054.940 ms |
+| Stalled, until cutoff and recovery | Verification age at clear, measured at the Git stage | 30.432–30.433 s | 121.233 s |
+| Mixed, cycles 5–25 (21 stage samples of the 26-cycle run) | Verification age median / max (102 / 100 available workspace samples) | 13.175 / 31.593 s | 11.299 / 29.448 s |
+| Mixed, cycles 5–25 | Git stage median / max | 1,003.789 / 1,015.842 ms | 1,001.941 / 1,009.231 ms |
 | Mixed, full run | Heading-clear frames from previously resolved workspaces or their first panes | 4 | 0 |
 | Mixed, 20 transitions between sampled cycles | Oldest eligible heading from the preceding sample admitted in the next first batch | 9 / 20 | 20 / 20 |
 | Mixed, through cycle 25 | Interrupted / NotAttempted / explicit Unknown (workspace outcomes) | 32 / 84 / 0 | 24 / 80 / 0 |
 
 In the paired stalled window both versions recorded 30 interruptions and no
-unattempted or explicit unknown reads. The full candidate run recorded 118
-interruptions in 59 stalled cycles. Its four clear frames all landed in
-cycle 60, 120.139–120.145 s after the first complete publication. The peer
-held the same heading values before those frames. Both headings recovered
-on cycle 61. The longest gap between accepted heading-resource reports
-while the keys were live was 2.039 s before and 2.085 s after. When the
-synthetic peer stopped returning snapshots, the tokens expired about
-3.02 s after the last accepted report in both runs.
+unattempted or explicit unknown reads. The full candidate run recorded 120
+interruptions in 60 stalled cycles. Its four clear frames all landed in
+cycle 61, 121.186–121.191 s after the first complete publication, during
+the first Git stage that crossed the cutoff. The peer held the same
+heading values before those frames. Both headings recovered on cycle 62.
+The longest gap between accepted heading-resource reports while the keys
+were live was 2.053 s before and 2.069 s after. When the synthetic peer
+stopped returning snapshots, the tokens expired about 3.01 s after the
+last accepted report in both runs.
 
 The mixed admission metric checks membership in the first batch, since
 the OS can start concurrent child processes in a different order. It takes
@@ -209,6 +213,12 @@ test checks exact priority and the discovery slot independently of OS
 scheduling. The unit tests also check 29 s, 30 s, 119 s and 120 s directly,
 identity loss, and exact ship-text retention across local midnight.
 
+If enough previously verified repositories stall together, their reads can
+occupy the first batch until their headings expire. A healthy repository
+waiting behind that batch can age out before its next read. The mixed
+replay introduced slow repositories without a prior verification and leaves
+that case unmeasured.
+
 These are injected Git stalls at the stored-metadata boundary. Host load
 was variable and concurrent activity was uncontrolled. No production
 latency, rendered sidebar, or macOS result is inferred.
@@ -216,8 +226,8 @@ latency, rendered sidebar, or macOS result is inferred.
 SHA-256:
 
 - Replay driver: `00ec5fbdfe561b8806d4f372715cb536434758464f7a4c4e577a28ac510b41cb`
-- Baseline release binary: `046192af0d41c315af19c51e33949ad0a3f9476f369d99fdb0102f43fbdd32ea`
-- Candidate release binary: `d23764f7a2af01c3ac6d3e080dd026511d45e6fb4dbd46779282ae755eadc914`
+- Baseline release binary: `ecd98affab1d24e367f3a57fae60274d802ec02d6853ef940fb5f311758a14e0`
+- Candidate release binary: `fc4f614810ca7e11328fb8107337a62a7e6ae4f14d8d36bdbf1dd5ad284bd886`
 
 ## Options considered before owner selection
 
